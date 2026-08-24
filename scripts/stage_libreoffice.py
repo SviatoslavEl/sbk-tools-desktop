@@ -6,7 +6,6 @@ import platform
 import shutil
 import subprocess
 import tempfile
-import urllib.request
 from pathlib import Path
 
 
@@ -35,6 +34,19 @@ def digest(path: Path) -> str:
     return result.hexdigest()
 
 
+def download_verified(url: str, destination: Path, expected: str) -> None:
+    for attempt in range(1, 4):
+        subprocess.run([
+            "curl", "--fail", "--location", "--retry", "5", "--retry-delay", "5",
+            "--retry-all-errors", "--continue-at", "-", "--output", str(destination), url,
+        ], check=True)
+        if digest(destination) == expected:
+            return
+        destination.unlink(missing_ok=True)
+        print(f"Checksum mismatch after attempt {attempt}; downloading again", flush=True)
+    raise SystemExit("LibreOffice package checksum mismatch after retries")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Stage pinned LibreOffice runtime")
     parser.add_argument("--target", required=True, choices=PACKAGES)
@@ -45,9 +57,7 @@ def main() -> None:
     with tempfile.TemporaryDirectory(prefix="sbk-libreoffice-") as temporary_name:
         temporary = Path(temporary_name)
         package = temporary / Path(url).name
-        urllib.request.urlretrieve(url, package)
-        if digest(package) != expected:
-            raise SystemExit("LibreOffice package checksum mismatch")
+        download_verified(url, package, expected)
         if args.target.endswith("apple-darwin"):
             mount = temporary / "mount"
             mount.mkdir()
