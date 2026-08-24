@@ -1,0 +1,17 @@
+{
+  "inputPath": "scanner-worker/tests/fixtures/simple.pdf",
+  "outputPath": "scanner-worker/tests/output/processed-facsimile.pdf",
+  "preset": "Офисный скан",
+  "seed": 42,
+  "ocrEnabled": false,
+  "facsimile": {
+    "imagePath": "src-tauri/icons/icon.png",
+    "x": 0.65,
+    "y": 0.72,
+    "width": 0.18,
+    "rotation": -7,
+    "opacity": 0.8,
+    "pages": [0],
+    "removeLightBackground": true
+  }
+}

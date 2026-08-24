@@ -11,8 +11,22 @@ node_modules
 dist
 dist-ssr
 *.local
+nuitka-crash-report.xml
+__pycache__/
+*.py[cod]
+*.egg-info/
 ProductData/
 src-tauri/target/
+.venv-scanner/
+scanner-worker/build/
+scanner-worker/dist/
+src-tauri/binaries/*
+!src-tauri/binaries/.gitkeep
+src-tauri/runtime-resources/
+scanner-worker/tests/output/
+tmp/
+portable-stage/
+release-artifacts/
 
 # Editor directories and files
 .vscode/*

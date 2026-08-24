@@ -1,0 +1,9 @@
+{
+  "README.md": "0fbfeed35d2dde4779751f30961eb353d0d7d5ca8c586312399d2e7b085e3362",
+  "fonts/NotoSans-Bold.ttf": "c6e5c368da9713feab735c545d7a497bffa052adbd6a084675ddad0253b818f8",
+  "fonts/NotoSans-Italic.ttf": "33feb0da8b68240c6b57cdf1955c8e66b6c0081aea1763f62223490204c21734",
+  "fonts/NotoSans-Regular.ttf": "371924e7480d3d01807fdc1bd30442d0a6651e6b5ea546482f5883d613cf0419",
+  "ocr/darwin/bin/tesseract": "ff009311fd8283daf9ac49e56fbf22e16e5e5b91166c9ce664dc1657a73102ca",
+  "ocr/darwin/tessdata/eng.traineddata": "7d4322bd2a7749724879683fc3912cb542f19906c83bcc1a52132556427170b2",
+  "ocr/darwin/tessdata/rus.traineddata": "e16e5e036cce1d9ec2b00063cf8b54472625b9e14d893a169e2b0dedeb4df225"
+}

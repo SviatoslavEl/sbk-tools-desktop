@@ -1,0 +1,7 @@
+{
+  "inputPath": "scanner-worker/tests/fixtures/simple.pdf",
+  "outputPath": "scanner-worker/tests/output/processed.pdf",
+  "preset": "Офисный скан",
+  "seed": 42,
+  "ocrEnabled": false
+}

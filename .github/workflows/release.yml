@@ -1,0 +1,128 @@
+name: Release desktop builds
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-15
+            target: aarch64-apple-darwin
+            args: --target aarch64-apple-darwin
+          - platform: macos-15-intel
+            target: x86_64-apple-darwin
+            args: --target x86_64-apple-darwin
+          - platform: windows-latest
+            target: x86_64-pc-windows-msvc
+            args: --target x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - run: npm ci
+      - run: python -m pip install -e scanner-worker nuitka ordered-set zstandard
+      - name: Build scanner sidecar
+        run: python scripts/build_scanner_worker.py --target ${{ matrix.target }}
+      - name: Stage macOS OCR runtime
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          brew install tesseract tesseract-lang dylibbundler
+          mkdir -p src-tauri/runtime-resources/resources/ocr/darwin/bin src-tauri/runtime-resources/resources/ocr/darwin/lib src-tauri/runtime-resources/resources/ocr/darwin/tessdata
+          cp "$(brew --prefix tesseract)/bin/tesseract" src-tauri/runtime-resources/resources/ocr/darwin/bin/tesseract
+          dylibbundler -od -b -x src-tauri/runtime-resources/resources/ocr/darwin/bin/tesseract -d src-tauri/runtime-resources/resources/ocr/darwin/lib -p @executable_path/../lib
+          cp "$(brew --prefix tesseract)/share/tessdata/eng.traineddata" src-tauri/runtime-resources/resources/ocr/darwin/tessdata/
+          cp "$(brew --prefix tesseract-lang)/share/tessdata/rus.traineddata" src-tauri/runtime-resources/resources/ocr/darwin/tessdata/
+      - name: Stage Windows OCR runtime
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install tesseract --no-progress -y
+          New-Item -ItemType Directory -Force src-tauri/runtime-resources/resources/ocr/windows/bin | Out-Null
+          New-Item -ItemType Directory -Force src-tauri/runtime-resources/resources/ocr/windows/tessdata | Out-Null
+          Copy-Item 'C:\Program Files\Tesseract-OCR\*.exe' src-tauri/runtime-resources/resources/ocr/windows/bin/
+          Copy-Item 'C:\Program Files\Tesseract-OCR\*.dll' src-tauri/runtime-resources/resources/ocr/windows/bin/
+          Copy-Item 'C:\Program Files\Tesseract-OCR\tessdata\eng.traineddata' src-tauri/runtime-resources/resources/ocr/windows/tessdata/
+          Invoke-WebRequest 'https://github.com/tesseract-ocr/tessdata_fast/raw/4.1.0/rus.traineddata' -OutFile src-tauri/runtime-resources/resources/ocr/windows/tessdata/rus.traineddata
+      - name: Stage pinned LibreOffice runtime
+        run: python scripts/stage_libreoffice.py --target ${{ matrix.target }}
+      - name: Test scanner sidecar
+        shell: bash
+        run: |
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            src-tauri/binaries/sbk-scanner-worker-${{ matrix.target }}.exe info
+          else
+            src-tauri/binaries/sbk-scanner-worker-${{ matrix.target }} info
+          fi
+      - uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APPLE_SIGNING_IDENTITY: "-"
+        with:
+          tagName: v__VERSION__
+          releaseName: СБК Инструменты v__VERSION__
+          releaseBody: Portable open-source desktop release for Windows and macOS.
+          releaseDraft: true
+          prerelease: false
+          args: ${{ matrix.args }}
+      - name: Ad-hoc sign and archive portable macOS app
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          APP="src-tauri/target/${{ matrix.target }}/release/bundle/macos/СБК Инструменты.app"
+          mkdir -p release-artifacts
+          codesign --force --deep --sign - --timestamp=none "$APP"
+          codesign --verify --deep --strict "$APP"
+          ditto -c -k --sequesterRsrc --keepParent "$APP" "release-artifacts/SBK-Tools-${{ github.ref_name }}-${{ matrix.target }}.app.zip"
+      - name: Upload portable macOS app
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: SBK-Tools-${{ matrix.target }}-App
+          path: release-artifacts/*.zip
+      - name: Attach portable macOS app to release
+        if: runner.os == 'macOS' && startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload '${{ github.ref_name }}' release-artifacts/*.zip --clobber
+      - name: Build one-file Windows portable launcher
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install 7zip --no-progress -y
+          $version = '${{ github.ref_name }}'.TrimStart('v')
+          ./scripts/package_windows_portable.ps1 -Target '${{ matrix.target }}' -Version $version
+      - name: Upload portable Windows artifact
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: SBK-Tools-Windows-x64-Portable
+          path: release-artifacts/*.exe
+      - name: Attach portable Windows launcher to release
+        if: runner.os == 'Windows' && startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload '${{ github.ref_name }}' release-artifacts/*.exe --clobber

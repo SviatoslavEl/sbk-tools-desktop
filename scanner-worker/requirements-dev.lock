@@ -1,0 +1,8 @@
+-e .
+pytest==8.4.0
+pytest-qt==4.4.0
+ruff==0.11.13
+Nuitka==2.7.6
+ordered-set==4.1.0
+zstandard==0.23.0
+

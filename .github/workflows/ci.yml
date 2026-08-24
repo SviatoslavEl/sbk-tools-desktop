@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - run: npm ci
+      - run: npm run test
+      - run: npm run build
+      - run: cargo check --manifest-path src-tauri/Cargo.toml
+
+  scanner-worker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -e scanner-worker
+      - run: PYTHONPATH=scanner-worker/src python -m scandocument.worker_cli preview --config scanner-worker/tests/fixtures/preview.json
+      - run: PYTHONPATH=scanner-worker/src python -m scandocument.worker_cli process --config scanner-worker/tests/fixtures/process.json

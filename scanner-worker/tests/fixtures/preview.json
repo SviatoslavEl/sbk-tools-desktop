@@ -1,0 +1,7 @@
+{
+  "inputPath": "scanner-worker/tests/fixtures/simple.pdf",
+  "outputPath": "scanner-worker/tests/output/preview.png",
+  "preset": "Офисный скан",
+  "pageIndex": 0,
+  "seed": 42
+}
