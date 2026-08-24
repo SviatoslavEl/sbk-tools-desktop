@@ -1,0 +1,18 @@
+ScanDocument
+Copyright (C) 2026 ScanDocument contributors
+
+This program is free software: you can redistribute it and/or modify it under the
+terms of the GNU General Public License as published by the Free Software
+Foundation, version 3 of the License.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE. See <https://www.gnu.org/licenses/gpl-3.0.html> for the full
+license text.
+
+A release distributor must include the complete corresponding source code and
+the full GPL version 3 license text with the distribution or provide it by a
+GPL-compliant written offer. The application exposes license information from
+its About screen; release packaging keeps notices inside the single application
+object.
+
