@@ -24,6 +24,15 @@ PRESET_ALIASES = {
 }
 
 
+def configure_protocol_encoding() -> None:
+    # The JSON-lines protocol is always UTF-8, including on Windows runners with
+    # a legacy console code page. Rust reads the child process through pipes.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="strict")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="backslashreplace")
+
+
 def settings_for(name: str, overrides: dict | None = None) -> EffectSettings:
     original_name = PRESET_ALIASES.get(name, name)
     settings = preset_copy(original_name) if original_name in PRESETS else EffectSettings()
@@ -100,6 +109,7 @@ def process(config: dict) -> int:
 
 
 def main() -> int:
+    configure_protocol_encoding()
     parser = argparse.ArgumentParser(prog="sbk-scanner-worker")
     parser.add_argument("command", choices=("preview", "process", "info"))
     parser.add_argument("--config")
