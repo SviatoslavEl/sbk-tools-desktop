@@ -75,7 +75,9 @@ jobs:
           else
             src-tauri/binaries/sbk-scanner-worker-${{ matrix.target }} info
           fi
-      - uses: tauri-apps/tauri-action@v1
+      - name: Build and attach macOS bundles
+        if: runner.os == 'macOS'
+        uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           APPLE_SIGNING_IDENTITY: "-"
@@ -86,6 +88,10 @@ jobs:
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}
+      - name: Build Windows application
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: npm run tauri build -- --target '${{ matrix.target }}' --no-bundle
       - name: Ad-hoc sign and archive portable macOS app
         if: runner.os == 'macOS'
         shell: bash
