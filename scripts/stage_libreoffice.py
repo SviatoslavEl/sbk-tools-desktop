@@ -29,25 +29,36 @@ PACKAGES = {
 
 def stage_windows_cpp_runtime(destination: Path) -> None:
     """Bundle the supported app-local MSVC runtime required on clean Windows systems."""
-    candidates: list[Path] = []
+    libraries: dict[str, Path] = {}
     configured = os.environ.get("VCToolsRedistDir")
     if configured:
-        candidates.extend(Path(configured).glob("x64/Microsoft.VC*.CRT"))
-    program_files = Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
-    candidates.extend(
-        program_files.glob("Microsoft Visual Studio/2022/*/VC/Redist/MSVC/*/x64/Microsoft.VC*.CRT")
-    )
-    runtime = next((path for path in sorted(candidates, reverse=True) if path.is_dir()), None)
-    if runtime is None:
-        raise SystemExit("Microsoft Visual C++ app-local runtime was not found")
+        for library in Path(configured).glob("x64/Microsoft.VC*.CRT/*.dll"):
+            libraries[library.name.lower()] = library
+    program_files_x86 = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"))
+    vswhere = program_files_x86 / "Microsoft Visual Studio/Installer/vswhere.exe"
+    if vswhere.is_file():
+        result = subprocess.run(
+            [
+                str(vswhere), "-latest", "-products", "*", "-requires",
+                "Microsoft.VisualStudio.Component.VC.Redist.14.Latest", "-find",
+                r"VC\Redist\MSVC\**\x64\Microsoft.VC*.CRT\*.dll",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        for value in result.stdout.splitlines():
+            library = Path(value.strip())
+            if library.is_file():
+                libraries[library.name.lower()] = library
+    if not libraries:
+        raise SystemExit(
+            "Microsoft Visual C++ app-local runtime was not found via VCToolsRedistDir or vswhere"
+        )
     program = destination / "program"
-    copied = 0
-    for library in runtime.glob("*.dll"):
+    for library in libraries.values():
         shutil.copy2(library, program / library.name)
-        copied += 1
-    if copied == 0:
-        raise SystemExit(f"No app-local runtime DLLs found in {runtime}")
-    print(f"Staged {copied} Microsoft Visual C++ app-local runtime DLLs", flush=True)
+    print(f"Staged {len(libraries)} Microsoft Visual C++ app-local runtime DLLs", flush=True)
 
 
 def digest(path: Path) -> str:
