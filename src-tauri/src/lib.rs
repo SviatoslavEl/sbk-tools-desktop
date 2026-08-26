@@ -1386,6 +1386,23 @@ fn verify_packaged_runtime(worker: &Path, runtime_root: &Path) -> Result<(), Str
         .clone()
 }
 
+fn start_runtime_verification(app: &AppHandle) {
+    let Ok((command, true)) = scanner_worker_command() else {
+        return;
+    };
+    let Ok(resource_dir) = app.path().resource_dir() else {
+        return;
+    };
+    let runtime = resource_dir.join("scanner-runtime");
+    if !runtime.join("resources").is_dir() {
+        return;
+    }
+    let worker = PathBuf::from(command.get_program());
+    thread::spawn(move || {
+        let _ = verify_packaged_runtime(&worker, &runtime);
+    });
+}
+
 #[cfg(unix)]
 fn configure_scanner_process_group(command: &mut Command) {
     use std::os::unix::process::CommandExt;
@@ -1731,6 +1748,10 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .setup(|app| {
+            start_runtime_verification(app.handle());
+            Ok(())
+        })
         .manage(AppState {
             workspace: Arc::new(workspace),
             scanner_jobs: Arc::new(Mutex::new(HashMap::new())),
