@@ -27,7 +27,8 @@ jobs:
       - name: Install Linux desktop dependencies
         run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf
       - run: npm ci
-      - run: pip install -r scanner-worker/requirements-dev.lock
+      - run: pip install -r requirements-dev.lock
+        working-directory: scanner-worker
       - run: python scripts/check_versions.py
       - run: npm test
       - run: npm run build
