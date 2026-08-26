@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 
-export type ModuleId = "settings" | "calculator" | "scanner" | "contract-experience" | "staff" | "procurement";
+export type ModuleId = "settings" | "calculator" | "scanner" | "contract-experience" | "staff" | "procurement" | "tender-calendar";
 
 export interface StoredRecord<T = unknown> {
   id: string;

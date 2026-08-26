@@ -4,13 +4,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 pub(crate) const SCHEMA_VERSION: i64 = 3;
-pub(crate) const MODULES: [&str; 6] = [
+pub(crate) const MODULES: [&str; 7] = [
     "settings",
     "calculator",
     "scanner",
     "contract-experience",
     "staff",
     "procurement",
+    "tender-calendar",
 ];
 
 pub(crate) fn validated_module(module: &str) -> Result<&str, String> {

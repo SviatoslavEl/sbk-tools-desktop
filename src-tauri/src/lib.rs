@@ -2466,8 +2466,14 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM records", [], |row| row.get(0))
             .expect("count");
         assert_eq!(count, 0);
+        let tender_calendar = open_database(&root, "tender-calendar").expect("calendar db");
+        let calendar_count: i64 = tender_calendar
+            .query_row("SELECT COUNT(*) FROM records", [], |row| row.get(0))
+            .expect("calendar count");
+        assert_eq!(calendar_count, 0);
         drop(calculator);
         drop(staff);
+        drop(tender_calendar);
         let _ = fs::remove_dir_all(root);
     }
 

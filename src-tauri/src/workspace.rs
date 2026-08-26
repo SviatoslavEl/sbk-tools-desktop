@@ -2,13 +2,14 @@ use fs2::FileExt;
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 
-const WORKSPACE_DIRS: [&str; 12] = [
+const WORKSPACE_DIRS: [&str; 13] = [
     "settings",
     "calculator",
     "scanner",
     "contract-experience",
     "staff",
     "procurement",
+    "tender-calendar",
     "attachments",
     "attachment-staging",
     "backups",

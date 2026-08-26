@@ -9,12 +9,14 @@ import { About, Settings } from "./modules/settings/Settings";
 import { StaffRegistry } from "./modules/staff/Staff";
 import { Dashboard } from "./modules/dashboard/Dashboard";
 import { ProcurementRegistry } from "./modules/procurement/Procurement";
+import { TenderCalendar } from "./modules/tender-calendar/TenderCalendar";
 
-type ToolId = "dashboard" | "procurement" | "calculator" | "scanner" | "contracts" | "staff" | "archive" | "settings" | "about";
+type ToolId = "dashboard" | "procurement" | "tender-calendar" | "calculator" | "scanner" | "contracts" | "staff" | "archive" | "settings" | "about";
 
 const tools: Array<{ id: ToolId; icon: string; label: string }> = [
   { id: "dashboard", icon: "▦", label: "Главная" },
   { id: "procurement", icon: "◆", label: "Закупки" },
+  { id: "tender-calendar", icon: "▣", label: "Календарь тендеров" },
   { id: "calculator", icon: "₽", label: "Тендерный калькулятор" },
   { id: "scanner", icon: "▤", label: "Сканирование документов" },
   { id: "contracts", icon: "✓", label: "Опыт по договорам" },
@@ -24,6 +26,7 @@ const tools: Array<{ id: ToolId; icon: string; label: string }> = [
 const toolTitles: Record<ToolId, [string, string]> = {
   dashboard: ["Главная", "Сроки, риски и готовность рабочих данных"],
   procurement: ["Закупки", "Требования, расчёты, команда, документы и переторжка"],
+  "tender-calendar": ["Календарь тендеров", "Распределение заявок, контроль сроков и загрузка специалистов"],
   calculator: ["Тендерный калькулятор", "Цена, дополнительные расходы, прибыль и сценарии"],
   scanner: ["Сканирование документов", "Выберите файл, пресет и сохраните новый PDF"],
   contracts: ["Опыт по договорам", "Самостоятельный реестр исполнения, оплат и актов"],
@@ -36,6 +39,7 @@ const toolTitles: Record<ToolId, [string, string]> = {
 const helpText: Record<ToolId, string> = {
   dashboard: "Главная показывает ближайшие сроки и риски из локальных реестров. Данные не отправляются в сеть.",
   procurement: "Карточка закупки хранит только явно добавленные снимки расчётов, опыта и команды. Исходные реестры автоматически не связываются.",
+  "tender-calendar": "Руководитель группы распределяет подготовку заявок между менеджерами и специалистами. Рекомендации учитывают сложность, навыки, опыт, доступность и уже назначенную загрузку.",
   calculator: "Введите себестоимость и выберите режим расчёта. Дополнительные расходы можно задавать суммой или процентом от выбранной базы. Графики обновляются сразу.",
   scanner: "Обычный сценарий требует трёх действий: выбрать документ, выбрать пресет и сохранить новый PDF. Исходный файл не перезаписывается.",
   contracts: "Стадия исполнения, состояние оплаты и состояние актов — независимые поля. Двойной щелчок по строке открывает карточку.",
@@ -75,6 +79,7 @@ function App() {
       <div className="tool-content">
         {activeTool === "dashboard" && <Dashboard />}
         {activeTool === "procurement" && <ProcurementRegistry />}
+        {activeTool === "tender-calendar" && <TenderCalendar />}
         {activeTool === "calculator" && <Calculator />}
         {activeTool === "scanner" && <Scanner />}
         {activeTool === "contracts" && <ContractsRegistry />}

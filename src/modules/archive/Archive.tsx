@@ -6,6 +6,7 @@ const sections: Array<{ module: ModuleId; title: string }> = [
   { module: "contract-experience", title: "Договоры" },
   { module: "staff", title: "Кадры" },
   { module: "procurement", title: "Закупки" },
+  { module: "tender-calendar", title: "Календарь тендеров" },
 ];
 
 type ArchiveData = Partial<Record<ModuleId, StoredRecord[]>>;
