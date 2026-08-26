@@ -23,6 +23,8 @@ export interface StaffData {
   fullName: string;
   birthDate: string;
   role: string;
+  grade: string;
+  skills: string[];
   qualification: string;
   basis: typeof cooperationBases[number];
   basisOther: string;
@@ -34,6 +36,10 @@ export interface StaffData {
   email: string;
   experienceYears: number;
   experienceNotes: string;
+  availableFrom: string;
+  availableTo: string;
+  hourlyRate: number;
+  disclosureAllowed: boolean;
   documents: StaffDocument[];
   notes: string;
 }
@@ -43,5 +49,5 @@ export const emptyStaffDocument = (category: StaffDocument["category"] = "certif
 });
 
 export const emptyStaff = (): StaffData => ({
-  fullName: "", birthDate: "", role: "", qualification: "", basis: "Штат", basisOther: "", basisNumber: "", startDate: "", endDate: "", status: "Работает", phone: "", email: "", experienceYears: 0, experienceNotes: "", documents: [], notes: "",
+  fullName: "", birthDate: "", role: "", grade: "", skills: [], qualification: "", basis: "Штат", basisOther: "", basisNumber: "", startDate: "", endDate: "", status: "Работает", phone: "", email: "", experienceYears: 0, experienceNotes: "", availableFrom: "", availableTo: "", hourlyRate: 0, disclosureAllowed: false, documents: [], notes: "",
 });

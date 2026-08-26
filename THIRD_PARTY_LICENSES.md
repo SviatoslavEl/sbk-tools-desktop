@@ -5,6 +5,7 @@
 | Компонент | Назначение | Лицензия |
 |---|---|---|
 | Tauri и плагины Tauri | desktop-оболочка | Apache-2.0 / MIT |
+| Microsoft Edge WebView2 Fixed Version Runtime | встроенный Windows webview | Microsoft Edge WebView2 Runtime license; разрешено распространение только как части приложения |
 | React, React DOM, Vite | пользовательский интерфейс | MIT |
 | Rust и crates.io зависимости | локальный host, SQLite, архивы, XLSX | лицензии отдельных пакетов; преимущественно Apache-2.0 / MIT |
 | Python | runtime worker | Python Software Foundation License |
@@ -19,4 +20,4 @@
 | LibreOffice | локальная конвертация DOCX | MPL-2.0 / LGPL-3.0-or-later |
 | SQLite | локальные базы | Public Domain |
 
-LibreOffice и Tesseract запускаются как самостоятельные локальные программы. Ссылки и контрольные суммы загрузок закреплены в `scripts/stage_libreoffice.py` и release workflow.
+LibreOffice, Tesseract и WebView2 запускаются как самостоятельные локальные компоненты. Ссылки и контрольные суммы загрузок закреплены в `scripts/stage_libreoffice.py` и release workflow. WebView2 не распространяется отдельно от приложения и не используется не по назначению.

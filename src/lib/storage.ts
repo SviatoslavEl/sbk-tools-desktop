@@ -27,6 +27,14 @@ export interface AttachmentInfo {
   mimeType: string;
 }
 
+export interface AttachmentAudit {
+  referencedFiles: number;
+  storedFiles: number;
+  orphanedFiles: number;
+  orphanedBytes: number;
+  removedFiles: number;
+}
+
 export interface BackupInfo {
   path: string;
   fileName: string;
@@ -128,6 +136,14 @@ export async function saveRecord<T>(
   return record;
 }
 
+export async function importRecordsAtomic<T>(module: ModuleId, records: Array<{ id: string; title: string; payload: T }>): Promise<number> {
+  if (isTauri()) return invoke<number>("import_records_atomic", { module, records });
+  const existing = readFallback<T>(module);
+  const now = new Date().toISOString();
+  writeFallback(module, [...records.map((record) => ({ ...record, archived: false, createdAt: now, updatedAt: now })), ...existing]);
+  return records.length;
+}
+
 export async function archiveRecord(module: ModuleId, id: string, archived = true): Promise<void> {
   if (isTauri()) {
     await invoke("archive_record", { module, id, archived });
@@ -164,6 +180,16 @@ export async function deleteAttachment(relativePath: string): Promise<void> {
   await invoke("delete_attachment", { relativePath });
 }
 
+export async function discardStagedAttachments(module: ModuleId, recordId: string): Promise<void> {
+  if (!isTauri()) return;
+  await invoke("discard_staged_attachments", { module, recordId });
+}
+
+export async function auditAttachments(remove = false): Promise<AttachmentAudit> {
+  if (!isTauri()) return { referencedFiles: 0, storedFiles: 0, orphanedFiles: 0, orphanedBytes: 0, removedFiles: 0 };
+  return invoke<AttachmentAudit>("audit_attachments", { remove });
+}
+
 export async function writeTextFile(path: string, content: string): Promise<void> {
   if (!isTauri()) {
     const blob = new Blob([content], { type: "text/plain;charset=utf-8" });
@@ -186,6 +212,9 @@ export async function createBackup(module?: ModuleId): Promise<BackupInfo> {
   if (!isTauri()) throw new Error("Резервные копии доступны в desktop-версии");
   return invoke<BackupInfo>("create_backup", { module: module || null });
 }
+export async function createEncryptedBackup(password: string, module?: ModuleId): Promise<BackupInfo> { if (!isTauri()) throw new Error("Зашифрованные копии доступны в desktop-версии"); return invoke("create_encrypted_backup", { module: module || null, password }); }
+export async function verifyEncryptedBackup(path: string, password: string): Promise<BackupVerification> { if (!isTauri()) throw new Error("Проверка доступна в desktop-версии"); return invoke("verify_encrypted_backup", { path, password }); }
+export async function restoreEncryptedBackup(path: string, password: string): Promise<void> { if (!isTauri()) throw new Error("Восстановление доступно в desktop-версии"); await invoke("restore_encrypted_backup", { path, password }); }
 
 export async function restoreBackup(path: string): Promise<void> {
   if (!isTauri()) throw new Error("Восстановление доступно в desktop-версии");
@@ -195,30 +224,35 @@ export async function restoreBackup(path: string): Promise<void> {
 export async function listBackups(): Promise<BackupListItem[]> { return isTauri() ? invoke("list_backups") : []; }
 export async function setBackupPinned(fileName: string, pinned: boolean): Promise<void> { if (!isTauri()) return; await invoke("set_backup_pinned", { fileName, pinned }); }
 export async function deleteBackup(fileName: string): Promise<void> { if (!isTauri()) return; await invoke("delete_backup", { fileName }); }
-export async function rotateBackups(keep: number): Promise<number> { if (!isTauri()) return 0; return invoke<number>("rotate_backups", { keep }); }
+export async function rotateBackups(keep: number, maxAgeDays: number): Promise<number> { if (!isTauri()) return 0; return invoke<number>("rotate_backups", { keep, maxAgeDays }); }
 export async function verifyBackup(path: string): Promise<BackupVerification> { if (!isTauri()) throw new Error("Проверка доступна в desktop-версии"); return invoke("verify_backup", { path }); }
 
-export async function saveDraft<T>(key: ModuleId, value: T): Promise<void> {
+export async function saveDraft<T>(key: ModuleId, value: T, draftKey = "current"): Promise<void> {
   if (isTauri()) {
-    await invoke("save_draft", { module: key, key: "current", payload: value });
+    await invoke("save_draft", { module: key, key: draftKey, payload: value });
     return;
   }
-  localStorage.setItem(`sbk-tools:draft:${key}`, JSON.stringify({ value, savedAt: new Date().toISOString() }));
+  localStorage.setItem(`sbk-tools:draft:${key}:${draftKey}`, JSON.stringify({ value, savedAt: new Date().toISOString() }));
 }
 
-export async function readDraft<T>(key: ModuleId): Promise<T | null> {
-  if (isTauri()) return invoke<T | null>("read_draft", { module: key, key: "current" });
+export async function readDraft<T>(key: ModuleId, draftKey = "current"): Promise<T | null> {
+  if (isTauri()) return invoke<T | null>("read_draft", { module: key, key: draftKey });
   try {
-    return JSON.parse(localStorage.getItem(`sbk-tools:draft:${key}`) || "null")?.value ?? null;
+    return JSON.parse(localStorage.getItem(`sbk-tools:draft:${key}:${draftKey}`) || "null")?.value ?? null;
   } catch {
     return null;
   }
 }
 
-export async function clearDraft(key: ModuleId): Promise<void> {
+export async function clearDraft(key: ModuleId, draftKey = "current"): Promise<void> {
   if (isTauri()) {
-    await invoke("clear_draft", { module: key, key: "current" });
+    await invoke("clear_draft", { module: key, key: draftKey });
     return;
   }
-  localStorage.removeItem(`sbk-tools:draft:${key}`);
+  localStorage.removeItem(`sbk-tools:draft:${key}:${draftKey}`);
+}
+
+export async function pruneHistory(limit: number): Promise<number> {
+  if (!isTauri()) return 0;
+  return invoke<number>("prune_history", { limit });
 }

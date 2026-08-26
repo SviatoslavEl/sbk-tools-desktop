@@ -85,6 +85,7 @@ def _process_page(
     request: ProcessRequest,
     index: int,
     page_size: tuple[float, float],
+    rotation: int,
     workspace: Path,
     token: CancellationToken,
 ) -> tuple[bytes, list[Any] | None, tuple[int, int]]:
@@ -112,6 +113,10 @@ def _process_page(
                     round((redaction.y + redaction.height) * processed.height),
                 )
                 draw.rectangle(bounds, fill=redaction.color)
+    if rotation:
+        processed = processed.rotate(-rotation, expand=True)
+        if rotation in {90, 270}:
+            page_size = (page_size[1], page_size[0])
     token.check()
     page_pdf = image_page_pdf(processed, page_size, request.settings.jpeg_quality)
     words = None
@@ -134,11 +139,11 @@ def process_document(
     request: ProcessRequest,
     callback: ProgressCallback | None = None,
     cancellation: CancellationToken | None = None,
-) -> list[str]:
+) -> tuple[list[str], float | None, str, list[dict[str, Any]]]:
     import pypdfium2 as pdfium
     from pypdf import PdfWriter
 
-    from scandocument.pdf_engine import append_pdf_page, render_page, write_atomic
+    from scandocument.pdf_engine import append_pdf_page, configure_pdfa_2b, render_page, write_atomic
 
     token = cancellation or CancellationToken()
     warnings: list[str] = []
@@ -184,6 +189,9 @@ def process_document(
         page_order = request.page_order or list(range(source_total))
         if not page_order or len(set(page_order)) != len(page_order) or any(index < 0 or index >= source_total for index in page_order):
             raise ScanDocumentError("Порядок страниц содержит повторения или недопустимые номера.")
+        if any(index < 0 or index >= source_total or rotation not in {0, 90, 180, 270}
+               for index, rotation in request.page_rotations.items()):
+            raise ScanDocumentError("Поворот страниц содержит недопустимое значение.")
         total = len(page_order)
         for facsimile in request.facsimiles:
             facsimile.validate_for_document(source_total)
@@ -198,6 +206,8 @@ def process_document(
         try:
             pending: deque[tuple[int, int, tuple[float, float], Future]] = deque()
             confidence_values: list[float] = []
+            recognized_pages: list[str] = []
+            low_confidence_words: list[dict[str, Any]] = []
 
             if request.ocr_enabled:
                 from scandocument.ocr import add_invisible_text
@@ -209,6 +219,9 @@ def process_document(
                 if words is not None:
                     page_pdf = add_invisible_text(page_pdf, words, image_size, page_size)
                     confidence_values.extend(word.confidence for word in words)
+                    recognized_pages.append(" ".join(word.text for word in words))
+                    low_confidence_words.extend({"page": position + 1, "text": word.text, "confidence": word.confidence}
+                                                for word in words if word.confidence < 50 and len(low_confidence_words) < 200)
                 append_pdf_page(writer, page_pdf)
                 page_number = position + 1
                 _notify(
@@ -235,7 +248,7 @@ def process_document(
                         index,
                         page_size,
                         executor.submit(
-                            _process_page, image, request, index, page_size, workspace, token,
+                            _process_page, image, request, index, page_size, request.page_rotations.get(index, 0), workspace, token,
                         ),
                     ))
                     if len(pending) >= worker_count:
@@ -244,9 +257,12 @@ def process_document(
                     finish_oldest()
             token.check()
             _notify(callback, "Сборка итогового PDF", total, total, 97)
+            if request.pdfa_enabled:
+                configure_pdfa_2b(writer)
             write_atomic(writer, output)
             _notify(callback, "Готово", total, total, 100)
-            return warnings, (sum(confidence_values) / len(confidence_values) if confidence_values else None)
+            recognized_text = "\n\n".join(recognized_pages)[:200_000]
+            return warnings, (sum(confidence_values) / len(confidence_values) if confidence_values else None), recognized_text, low_confidence_words
         except CancelledError:
             output.with_name(f".{output.name}.scandocument-part").unlink(missing_ok=True)
             raise

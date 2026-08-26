@@ -216,6 +216,27 @@ describe("financing and compatibility", () => {
     expect(withFinancing.profit).toBeCloseTo(987_000, 8);
   });
 
+  it("calculates own work, subcontracting and partner scenarios separately", () => {
+    const own = calculate(data({ mode: "price-to-margin", proposedPrice: 1_000, priceAmountType: "without-vat", priceVatRate: 0, cost: 400 }));
+    const subcontractor = calculate(data({ mode: "price-to-margin", proposedPrice: 1_000, priceAmountType: "without-vat", priceVatRate: 0, cost: 0, subcontractors: [{ id: "s", name: "Подрядчик", amount: 500, amountType: "without-vat", vatRate: 0, taxRegime: "no-vat", inputVatDeductible: false, includeInTotalCost: true }] }));
+    const partner = calculate(data({ mode: "price-to-margin", proposedPrice: 1_000, priceAmountType: "without-vat", priceVatRate: 0, cost: 0, hasAgent: true, agentType: "percent", agentValue: 20 }));
+    expect(own.profit).toBe(600);
+    expect(subcontractor.profit).toBe(500);
+    expect(partner.profit).toBe(800);
+  });
+
+  it("uses staged payments and validates their total share", () => {
+    const staged = calculate(data({ mode: "price-to-margin", proposedPrice: 1_000, priceAmountType: "without-vat", priceVatRate: 0, cost: 0, financingEnabled: true, annualFinancingRate: 12, paymentStages: [{ id: "1", name: "Аванс", sharePercent: 50, delayDays: 0, plannedDate: "2026-01-01" }, { id: "2", name: "Финал", sharePercent: 50, delayDays: 365, plannedDate: "2027-01-01" }] }));
+    expect(staged.financingCost).toBeCloseTo(60, 8);
+    expect(calculate(data({ paymentStages: [{ id: "1", name: "Не всё", sharePercent: 80, delayDays: 0, plannedDate: "" }] })).valid).toBe(false);
+  });
+
+  it("converts an offline currency component at the user supplied rate", () => {
+    const result = calculate(data({ mode: "price-to-margin", proposedPrice: 2_000, priceAmountType: "without-vat", priceVatRate: 0, cost: 0, currencyComponentEnabled: true, foreignCurrency: "USD", foreignAmount: 10, exchangeRate: 90 }));
+    expect(result.currencyCost).toBe(900);
+    expect(result.profit).toBe(1_100);
+  });
+
   it("migrates a version 1.0.1 calculation without dropping arrays", () => {
     const migrated = migrateCalculatorData({
       name: "Старый расчёт",

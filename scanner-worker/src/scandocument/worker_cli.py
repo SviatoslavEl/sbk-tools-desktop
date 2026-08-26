@@ -157,6 +157,15 @@ def preview(config: dict) -> int:
                     round((redaction.x + redaction.width) * processed.width),
                     round((redaction.y + redaction.height) * processed.height),
                 ), fill=redaction.color)
+    rotations = {int(key): int(value) for key, value in config.get("pageRotations", {}).items()}
+    rotation = rotations.get(int(config.get("pageIndex", 0)), 0)
+    if rotation not in {0, 90, 180, 270}:
+        raise ValueError("Поворот страницы должен быть 0, 90, 180 или 270 градусов.")
+    if rotation:
+        original = original.rotate(-rotation, expand=True)
+        processed = processed.rotate(-rotation, expand=True)
+        if rotation in {90, 270}:
+            page_size = (page_size[1], page_size[0])
     output.parent.mkdir(parents=True, exist_ok=True)
     original_output = output.with_name(f"{output.stem}.original.png")
     original.thumbnail((1400, 1400), Image.Resampling.LANCZOS)
@@ -179,12 +188,15 @@ def process(config: dict) -> int:
         seed=int(config.get("seed", 42)), ocr_enabled=ocr_enabled,
         ocr_languages=ocr_languages, facsimiles=placements_from(config),
         page_order=[int(value) for value in config.get("pageOrder", [])],
+        page_rotations={int(key): int(value) for key, value in config.get("pageRotations", {}).items()},
         redactions=redactions_from(config),
+        pdfa_enabled=bool(config.get("pdfaEnabled", False)),
     )
-    warnings, confidence = process_document(request, lambda event: emit({"type": "progress", "stage": event.stage,
+    warnings, confidence, ocr_text, low_confidence_words = process_document(request, lambda event: emit({"type": "progress", "stage": event.stage,
         "currentPage": event.current_page, "totalPages": event.total_pages, "percent": event.percent}))
     emit({"type": "complete", "outputPath": str(request.output_path), "warnings": warnings,
-          "ocrConfidence": confidence, "protocolVersion": 2})
+          "ocrConfidence": confidence, "ocrText": ocr_text, "lowConfidenceWords": low_confidence_words,
+          "protocolVersion": 2})
     return 0
 
 

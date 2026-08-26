@@ -40,6 +40,9 @@ export interface Competitor {
   adjustmentPercent: number;
 }
 
+export interface PaymentStage { id: string; name: string; sharePercent: number; delayDays: number; plannedDate: string; }
+export type ForeignCurrency = "USD" | "EUR" | "CNY";
+
 export interface CalculatorData {
   schemaVersion: 2;
   name: string;
@@ -79,6 +82,11 @@ export interface CalculatorData {
   performanceGuaranteeCost: number;
   advanceGuaranteeCost: number;
   costGrowthReservePercent: number;
+  paymentStages: PaymentStage[];
+  currencyComponentEnabled: boolean;
+  foreignCurrency: ForeignCurrency;
+  foreignAmount: number;
+  exchangeRate: number;
   minMargin: number;
   warningMargin: number;
   notes: string;
@@ -127,6 +135,7 @@ export interface CalculationResult {
   additionalCosts: number;
   agentCommission: number;
   financingCost: number;
+  currencyCost: number;
   fullCosts: number;
   totalCost: number;
   profit: number;
@@ -225,6 +234,11 @@ export const initialCalculatorData: CalculatorData = {
   performanceGuaranteeCost: 0,
   advanceGuaranteeCost: 0,
   costGrowthReservePercent: 0,
+  paymentStages: [],
+  currencyComponentEnabled: false,
+  foreignCurrency: "USD",
+  foreignAmount: 0,
+  exchangeRate: 0,
   minMargin: 10,
   warningMargin: 15,
   notes: "",
@@ -265,6 +279,9 @@ export function migrateCalculatorData(value: unknown, strict = false): Calculato
   }
   if (strict && source.competitors != null && !Array.isArray(source.competitors)) {
     throw new CalculatorImportError("Список конкурентов повреждён.");
+  }
+  if (strict && source.paymentStages != null && !Array.isArray(source.paymentStages)) {
+    throw new CalculatorImportError("График платежей повреждён.");
   }
   const legacyPaymentRiskEnabled = source.paymentRiskEnabled === true;
   const legacyPaymentRiskPercent = Math.max(0, finite(source.paymentRiskPercent, 0));
@@ -333,6 +350,14 @@ export function migrateCalculatorData(value: unknown, strict = false): Calculato
     performanceGuaranteeCost: finite(source.performanceGuaranteeCost, 0),
     advanceGuaranteeCost: finite(source.advanceGuaranteeCost, 0),
     costGrowthReservePercent: finite(source.costGrowthReservePercent, 0),
+    paymentStages: Array.isArray(source.paymentStages) ? source.paymentStages.map((item) => {
+      const entry = item && typeof item === "object" ? item as Record<string, unknown> : {};
+      return { id: typeof entry.id === "string" ? entry.id : crypto.randomUUID(), name: typeof entry.name === "string" ? entry.name : "Платёж", sharePercent: finite(entry.sharePercent, 0), delayDays: finite(entry.delayDays, 0), plannedDate: typeof entry.plannedDate === "string" ? entry.plannedDate : "" };
+    }) : [],
+    currencyComponentEnabled: source.currencyComponentEnabled === true,
+    foreignCurrency: enumValue(source.foreignCurrency, ["USD", "EUR", "CNY"] as const, "USD", "валюта", strict),
+    foreignAmount: finite(source.foreignAmount, 0),
+    exchangeRate: finite(source.exchangeRate, 0),
     minMargin: finite(source.minMargin, initialCalculatorData.minMargin),
     warningMargin: finite(source.warningMargin, initialCalculatorData.warningMargin),
     notes: typeof source.notes === "string" ? source.notes : "",

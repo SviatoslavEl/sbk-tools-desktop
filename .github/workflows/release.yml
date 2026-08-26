@@ -9,7 +9,46 @@ permissions:
   contents: write
 
 jobs:
+  quality-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          components: clippy, rustfmt
+      - name: Install Linux desktop dependencies
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+      - run: npm ci
+      - run: pip install -r scanner-worker/requirements-dev.lock
+      - run: python scripts/check_versions.py
+      - run: npm test
+      - run: npm run build
+      - run: python -m pytest -q
+        working-directory: scanner-worker
+      - run: python -m ruff check .
+        working-directory: scanner-worker
+      - run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
+      - run: cargo test --manifest-path src-tauri/Cargo.toml --all-targets
+      - run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+      - run: cargo fmt --manifest-path windows-launcher/Cargo.toml --check
+      - run: cargo test --manifest-path windows-launcher/Cargo.toml --all-targets
+      - run: cargo clippy --manifest-path windows-launcher/Cargo.toml --all-targets -- -D warnings
+      - run: python scripts/generate_sbom.py
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: SBK-Tools-SBOM
+          path: release-artifacts/SBK-Tools.cyclonedx.json
+
   build:
+    needs: quality-gate
     strategy:
       fail-fast: false
       matrix:
@@ -68,7 +107,26 @@ jobs:
           Copy-Item 'C:\Program Files\Tesseract-OCR\*.exe' src-tauri/runtime-resources/resources/ocr/windows/bin/
           Copy-Item 'C:\Program Files\Tesseract-OCR\*.dll' src-tauri/runtime-resources/resources/ocr/windows/bin/
           Copy-Item 'C:\Program Files\Tesseract-OCR\tessdata\eng.traineddata' src-tauri/runtime-resources/resources/ocr/windows/tessdata/
-          Invoke-WebRequest 'https://github.com/tesseract-ocr/tessdata_fast/raw/4.1.0/rus.traineddata' -OutFile src-tauri/runtime-resources/resources/ocr/windows/tessdata/rus.traineddata
+          $rus = 'src-tauri/runtime-resources/resources/ocr/windows/tessdata/rus.traineddata'
+          Invoke-WebRequest 'https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/4.1.0/rus.traineddata' -OutFile $rus
+          $rusHash = (Get-FileHash -Algorithm SHA256 $rus).Hash.ToLowerInvariant()
+          if ($rusHash -ne 'e16e5e036cce1d9ec2b00063cf8b54472625b9e14d893a169e2b0dedeb4df225') { throw "Russian OCR model checksum mismatch: $rusHash" }
+      - name: Stage pinned WebView2 Fixed Runtime
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = '151.0.4129.107'
+          $cab = Join-Path $env:RUNNER_TEMP "Microsoft.WebView2.FixedVersionRuntime.$version.x64.cab"
+          $url = 'https://msedge.sf.dl.delivery.mp.microsoft.com/filestreamingservice/files/ab25c23c-1b43-4759-826f-75267a2235d9/Microsoft.WebView2.FixedVersionRuntime.151.0.4129.107.x64.cab'
+          Invoke-WebRequest $url -OutFile $cab
+          $actual = (Get-FileHash -Algorithm SHA256 $cab).Hash.ToLowerInvariant()
+          $expected = 'f1e1c2c9b34c79ba4d88df77fb79a05441e1bd7481d6a985d76dd377cda45f33'
+          if ($actual -ne $expected) { throw "WebView2 Fixed Runtime checksum mismatch: $actual" }
+          New-Item -ItemType Directory -Force src-tauri/webview2-runtime | Out-Null
+          & expand.exe $cab -F:* src-tauri/webview2-runtime
+          if ($LASTEXITCODE -ne 0) { throw 'WebView2 Fixed Runtime extraction failed' }
+          $runtime = "src-tauri/webview2-runtime/Microsoft.WebView2.FixedVersionRuntime.$version.x64"
+          if (-not (Test-Path "$runtime/msedgewebview2.exe")) { throw 'WebView2 Fixed Runtime executable is missing' }
       - name: Stage pinned LibreOffice runtime
         run: python scripts/stage_libreoffice.py --target ${{ matrix.target }}
       - name: Generate trusted runtime manifest
@@ -80,6 +138,34 @@ jobs:
             WORKER="src-tauri/binaries/sbk-scanner-worker-${{ matrix.target }}"
           fi
           python scripts/generate_runtime_manifest.py --root src-tauri/runtime-resources --worker "$WORKER"
+      - name: Require Apple release credentials
+        if: runner.os == 'macOS' && startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            test -n "${!name}" || { echo "Missing required secret: $name"; exit 1; }
+          done
+      - name: Import Developer ID certificate
+        if: runner.os == 'macOS' && startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          echo "$APPLE_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/developer-id.p12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security import "$RUNNER_TEMP/developer-id.p12" -k build.keychain -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" build.keychain
       - name: Test packaged scanner protocol with PDF, DOCX, OCR and facsimile
         shell: bash
         run: |
@@ -96,12 +182,16 @@ jobs:
           SCANDOCUMENT_RESOURCE_ROOT=src-tauri/runtime-resources "$WORKER" process --config scanner-worker/tests/fixtures/process-docx.json
           SCANDOCUMENT_RESOURCE_ROOT=src-tauri/runtime-resources "$WORKER" process --config scanner-worker/tests/fixtures/process-ocr.json
           SCANDOCUMENT_RESOURCE_ROOT=src-tauri/runtime-resources "$WORKER" process --config scanner-worker/tests/fixtures/process-facsimile.json
-      - name: Build and attach macOS bundles
-        if: runner.os == 'macOS'
+      - name: Build macOS app for manual verification
+        if: runner.os == 'macOS' && !startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: npm run tauri build -- ${{ matrix.args }}
+      - name: Build and attach signed macOS release bundles
+        if: runner.os == 'macOS' && startsWith(github.ref, 'refs/tags/v')
         uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          APPLE_SIGNING_IDENTITY: "-"
+          APPLE_SIGNING_IDENTITY: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.APPLE_SIGNING_IDENTITY || '-' }}
         with:
           tagName: v__VERSION__
           releaseName: СБК Инструменты v__VERSION__
@@ -113,21 +203,39 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: npm run tauri build -- --target '${{ matrix.target }}' --no-bundle
-      - name: Ad-hoc sign and archive portable macOS app
+      - name: Sign, notarize and archive portable macOS app
         if: runner.os == 'macOS'
         shell: bash
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           APP="src-tauri/target/${{ matrix.target }}/release/bundle/macos/СБК Инструменты.app"
           mkdir -p release-artifacts
-          codesign --force --deep --sign - --timestamp=none "$APP"
+          if [[ "${{ github.ref }}" != refs/tags/v* ]]; then
+            codesign --force --deep --sign - --timestamp=none "$APP"
+          fi
           codesign --verify --deep --strict "$APP"
-          ditto -c -k --sequesterRsrc --keepParent "$APP" "release-artifacts/SBK-Tools-${{ github.ref_name }}-${{ matrix.target }}.app.zip"
+          ZIP="release-artifacts/SBK-Tools-${{ github.ref_name }}-${{ matrix.target }}.app.zip"
+          ditto -c -k --sequesterRsrc --keepParent "$APP" "$ZIP"
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            xcrun notarytool submit "$ZIP" --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" --wait
+            xcrun stapler staple "$APP"
+            codesign --verify --deep --strict "$APP"
+            spctl --assess --type execute --verbose=4 "$APP"
+            rm "$ZIP"
+            ditto -c -k --sequesterRsrc --keepParent "$APP" "$ZIP"
+          fi
+          shasum -a 256 "$ZIP" > "$ZIP.sha256"
       - name: Upload portable macOS app
         if: runner.os == 'macOS'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: SBK-Tools-${{ matrix.target }}-App
-          path: release-artifacts/*.zip
+          path: |
+            release-artifacts/*.zip
+            release-artifacts/*.sha256
       - name: Attach portable macOS app to release
         if: runner.os == 'macOS' && startsWith(github.ref, 'refs/tags/v')
         shell: bash
@@ -138,18 +246,43 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          choco install 7zip --no-progress -y
           $version = '${{ github.ref_name }}'.TrimStart('v')
           ./scripts/package_windows_portable.ps1 -Target '${{ matrix.target }}' -Version $version
+      - name: Sign and verify Windows release launcher
+        if: runner.os == 'Windows' && startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          if (-not $env:WINDOWS_CERTIFICATE -or -not $env:WINDOWS_CERTIFICATE_PASSWORD) {
+            throw 'Windows release requires WINDOWS_CERTIFICATE and WINDOWS_CERTIFICATE_PASSWORD secrets'
+          }
+          $certificate = Join-Path $env:RUNNER_TEMP 'windows-signing.pfx'
+          [IO.File]::WriteAllBytes($certificate, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
+          $kits = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin'
+          $signtool = Get-ChildItem $kits -Filter signtool.exe -File -Recurse |
+            Where-Object { $_.FullName -match '\\x64\\signtool\.exe$' } |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $signtool) { throw 'Windows SDK signtool.exe not found' }
+          $launcher = Get-ChildItem release-artifacts -Filter '*.exe' | Select-Object -First 1
+          & $signtool.FullName sign /fd SHA256 /f $certificate /p $env:WINDOWS_CERTIFICATE_PASSWORD /tr http://timestamp.digicert.com /td SHA256 $launcher.FullName
+          if ($LASTEXITCODE -ne 0) { throw 'Authenticode signing failed' }
+          & $signtool.FullName verify /pa /v $launcher.FullName
+          if ($LASTEXITCODE -ne 0) { throw 'Authenticode verification failed' }
+          $hash = (Get-FileHash -Algorithm SHA256 $launcher.FullName).Hash.ToLowerInvariant()
+          Set-Content -Encoding ASCII -Path "$($launcher.FullName).sha256" -Value "$hash  $($launcher.Name)"
       - name: Upload portable Windows artifact
         if: runner.os == 'Windows'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: SBK-Tools-Windows-x64-Portable
-          path: release-artifacts/*.exe
+          path: |
+            release-artifacts/*.exe
+            release-artifacts/*.sha256
       - name: Attach portable Windows launcher to release
         if: runner.os == 'Windows' && startsWith(github.ref, 'refs/tags/v')
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload '${{ github.ref_name }}' release-artifacts/*.exe --clobber
+        run: gh release upload '${{ github.ref_name }}' release-artifacts/*.exe release-artifacts/*.sha256 --clobber

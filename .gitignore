@@ -17,6 +17,7 @@ __pycache__/
 *.egg-info/
 ProductData/
 src-tauri/target/
+windows-launcher/target/
 .venv-scanner/
 scanner-worker/build/
 scanner-worker/dist/

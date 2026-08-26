@@ -1,4 +1,6 @@
 import type { ProcurementData, ProcurementRequirement } from "./types";
+import type { ContractData } from "../contracts/types";
+import type { StaffData } from "../staff/types";
 
 export type RebidPreset = "comfort" | "working-minimum" | "any-price";
 export interface RebidStep { number: number; price: number; reduction: number; profit: number; margin: number; headroom: number; loss: boolean; }
@@ -38,4 +40,32 @@ export function daysUntil(value: string, now = new Date()) {
   if (!value) return null;
   const today = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
   return Math.ceil((new Date(`${value}T23:59:59`).getTime() - today) / 86_400_000);
+}
+
+const significantWords = (text: string) => new Set((text.toLowerCase().match(/[\p{L}\p{N}]+/gu) || []).filter((word) => word.length >= 4));
+const relevance = (need: Set<string>, values: string[]) => {
+  const candidate = significantWords(values.join(" "));
+  return [...need].filter((word) => candidate.has(word)).length;
+};
+
+export function suggestedExperience(item: ProcurementData, records: Array<{ id: string; payload: ContractData }>): string[] {
+  const need = significantWords([item.subject, ...item.requirements.map((row) => row.text)].join(" "));
+  return records
+    .filter((record) => record.payload.disclosureAllowed)
+    .map((record) => ({ id: record.id, score: relevance(need, [record.payload.subject, record.payload.industry, record.payload.serviceType, record.payload.workScope, ...(record.payload.standards || [])]) }))
+    .filter((entry) => entry.score > 0)
+    .sort((left, right) => right.score - left.score || left.id.localeCompare(right.id))
+    .map((entry) => entry.id);
+}
+
+export function suggestedTeam(item: ProcurementData, records: Array<{ id: string; payload: StaffData }>): string[] {
+  const need = significantWords([item.subject, ...item.requirements.map((row) => row.text)].join(" "));
+  return records
+    .filter((record) => record.payload.disclosureAllowed)
+    .filter((record) => !item.submissionDeadline || !record.payload.availableFrom || record.payload.availableFrom <= item.submissionDeadline)
+    .filter((record) => !item.submissionDeadline || !record.payload.availableTo || record.payload.availableTo >= item.submissionDeadline)
+    .map((record) => ({ id: record.id, score: relevance(need, [record.payload.role, record.payload.grade, record.payload.qualification, record.payload.experienceNotes, ...(record.payload.skills || [])]) }))
+    .filter((entry) => entry.score > 0)
+    .sort((left, right) => right.score - left.score || left.id.localeCompare(right.id))
+    .map((entry) => entry.id);
 }

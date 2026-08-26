@@ -135,7 +135,9 @@ class ProcessRequest:
     ocr_languages: str = "rus+eng"
     facsimiles: list[FacsimilePlacement] = field(default_factory=list)
     page_order: list[int] = field(default_factory=list)
+    page_rotations: dict[int, int] = field(default_factory=dict)
     redactions: list[Redaction] = field(default_factory=list)
+    pdfa_enabled: bool = False
 
 
 @dataclass(slots=True)

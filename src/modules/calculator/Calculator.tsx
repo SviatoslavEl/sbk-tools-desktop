@@ -72,7 +72,7 @@ export function Calculator() {
 
   useEffect(() => {
     let active = true;
-    void readDraft<unknown>("calculator")
+    void readDraft<unknown>("calculator", "new")
       .then((draft) => { if (active) { if (draft) setData(restoredCalculatorData(draft)); setSavedStatus(draft ? "Черновик восстановлен" : "Новый черновик"); } })
       .catch(() => { if (active) setSavedStatus("Черновик не удалось восстановить"); })
       .finally(() => { if (active) setDraftReady(true); });
@@ -83,12 +83,12 @@ export function Calculator() {
     if (!draftReady) return;
     setSavedStatus("Сохраняем черновик…");
     const timer = window.setTimeout(() => {
-      void saveDraft("calculator", data)
+      void saveDraft("calculator", data, recordId || "new")
         .then(() => setSavedStatus("Изменения сохранены"))
         .catch(() => setSavedStatus("Черновик не сохранён"));
     }, 450);
     return () => window.clearTimeout(timer);
-  }, [data, draftReady]);
+  }, [data, draftReady, recordId]);
 
   const update = <K extends keyof CalculatorData>(key: K, value: CalculatorData[K]) =>
     setData((current) => ({ ...current, [key]: value }));
@@ -101,7 +101,7 @@ export function Calculator() {
     const title = data.name.trim() || "Расчёт без названия";
     const record = await saved.save(title, data, duplicate ? undefined : recordId);
     setRecordId(record.id);
-    void clearDraft("calculator");
+    void clearDraft("calculator", recordId || "new");
     setSavedStatus(duplicate ? "Копия сохранена" : "Расчёт сохранён");
   };
 
@@ -142,7 +142,7 @@ export function Calculator() {
             const record = saved.records.find((item) => item.id === event.target.value);
             if (record) {
               setRecordId(record.id);
-              setData(restoredCalculatorData(record.payload));
+              void readDraft<unknown>("calculator", record.id).then((draft) => setData(restoredCalculatorData(draft || record.payload)));
             }
           }}>
             <option value="">Черновик — {data.name}</option>
@@ -209,6 +209,8 @@ export function Calculator() {
               {data.agentTaxRegime === "vat-payer" && <><label>НДС агента<VatSelect value={data.agentVatRate} onChange={(value) => update("agentVatRate", value)} /></label><label className="checkbox-row"><input type="checkbox" checked={data.agentInputVatDeductible} onChange={(event) => update("agentInputVatDeductible", event.target.checked)} /> Входной НДС к вычету</label></>}
             </div>}
             <Subcontractors items={data.subcontractors} onChange={(items) => update("subcontractors", items)} />
+            <label className="checkbox-row"><input type="checkbox" checked={data.currencyComponentEnabled} onChange={(event) => update("currencyComponentEnabled", event.target.checked)} /> Учитывать валютную составляющую по фиксированному курсу</label>
+            {data.currencyComponentEnabled && <div className="form-grid compact"><label>Валюта<select value={data.foreignCurrency} onChange={(event) => update("foreignCurrency", event.target.value as CalculatorData["foreignCurrency"])}><option>USD</option><option>EUR</option><option>CNY</option></select></label><label>Сумма<NumberField value={data.foreignAmount} min={0} onChange={(value) => update("foreignAmount", value)} suffix={data.foreignCurrency} /></label><label>Курс к рублю<NumberField value={data.exchangeRate} min={0.0001} onChange={(value) => update("exchangeRate", value)} suffix="₽" /></label><div className="metric-inline"><span>В затратах</span><strong>{money(data.foreignAmount * data.exchangeRate)}</strong></div></div>}
             <label className="checkbox-row"><input type="checkbox" checked={data.financingEnabled} onChange={(event) => update("financingEnabled", event.target.checked)} /> Учитывать стоимость финансирования и гарантий</label>
             {data.financingEnabled && <div className="form-grid compact">
               <label>Аванс<NumberField value={data.advancePercent} min={0} max={100} onChange={(value) => update("advancePercent", value)} suffix="%" /></label>
@@ -222,6 +224,7 @@ export function Calculator() {
               <label>Гарантия аванса<NumberField value={data.advanceGuaranteeCost} min={0} onChange={(value) => update("advanceGuaranteeCost", value)} suffix="₽" /></label>
               <label>Резерв роста стоимости<NumberField value={data.costGrowthReservePercent} min={0} max={100} onChange={(value) => update("costGrowthReservePercent", value)} suffix="% прямых затрат" /></label>
             </div>}
+            {data.financingEnabled && <PaymentStages data={data} setData={setData} />}
           </div>
         </details>
 
@@ -255,9 +258,11 @@ export function Calculator() {
               <div><span>Доп. расходы</span><strong>{money(result.additionalCosts)}</strong></div>
               <div><span>Агентская комиссия</span><strong>{money(result.agentCommission)}</strong></div>
               <div><span>Финансирование</span><strong>{money(result.financingCost)}</strong></div>
+              <div><span>Валютная составляющая</span><strong>{money(result.currencyCost)}</strong></div>
               <div><span>Полные затраты</span><strong>{money(result.fullCosts)}</strong></div>
               <div><span>Рентабельность полных затрат</span><strong>{percent(result.profitability)}</strong></div>
             </div>
+            <details className="formula-details"><summary>Как получены цена и прибыль</summary><div><span>Полные затраты = прямые {money(result.directCosts)} + валюта {money(result.currencyCost)} + дополнительные {money(result.additionalCosts)} + агент {money(result.agentCommission)} + финансирование {money(result.financingCost)}</span><strong>{money(result.fullCosts)}</strong><span>Прибыль = цена без НДС {money(result.priceNet)} − полные затраты {money(result.fullCosts)}</span><strong>{money(result.profit)}</strong><span>Маржа = прибыль ÷ цена без НДС; наценка = прибыль ÷ полные затраты</span><strong>{percent(result.margin)} / {percent(result.markup)}</strong>{result.expenseResults.map((expense) => <small key={expense.id}>{expense.name}: {expense.explanation} → {money(expense.effectiveCost)}</small>)}</div></details>
             {!result.valid && <div className="notice error"><strong>Цена не рассчитана.</strong><span>{result.issues.find((issue) => issue.blocking)?.message}</span></div>}
             {result.valid && result.status === "danger" && <div className="notice warning"><strong>Проверьте цену.</strong><span>Расчёт убыточный или находится ниже установленного порога.</span></div>}
             {recommendation && !recommendation.valid && <div className="notice error"><strong>Рекомендация недоступна.</strong><span>{recommendation.issue?.message}</span></div>}
@@ -297,6 +302,12 @@ function ExpensesTable({ data, setData, result }: { data: CalculatorData; setDat
       })}
     </tbody></table><div className="total-row"><span>Всего дополнительных расходов</span><strong>{money(result.expensesTotal)}</strong></div></div>
   </div>;
+}
+
+function PaymentStages({ data, setData }: { data: CalculatorData; setData: Dispatch<SetStateAction<CalculatorData>> }) {
+  const update = (id: string, patch: Partial<CalculatorData["paymentStages"][number]>) => setData((current) => ({ ...current, paymentStages: current.paymentStages.map((stage) => stage.id === id ? { ...stage, ...patch } : stage) }));
+  const total = data.paymentStages.reduce((sum, stage) => sum + stage.sharePercent, 0);
+  return <div className="repeatable-block"><div className="inline-heading"><div><h3>График платежей</h3><p>{data.paymentStages.length ? `Сумма долей: ${total.toFixed(1)}%` : "Если не задан, используются общий аванс и отсрочка."}</p></div><button className="secondary small" type="button" onClick={() => setData((current) => ({ ...current, paymentStages: [...current.paymentStages, { id: crypto.randomUUID(), name: `Этап ${current.paymentStages.length + 1}`, sharePercent: 0, delayDays: 0, plannedDate: "" }] }))}>Добавить этап</button></div>{data.paymentStages.map((stage) => <div className="payment-stage-row" key={stage.id}><input aria-label="Название этапа" value={stage.name} onChange={(event) => update(stage.id, { name: event.target.value })} /><label>Доля, %<NumberField value={stage.sharePercent} min={0} max={100} onChange={(value) => update(stage.id, { sharePercent: value })} /></label><label>Отсрочка, дней<NumberField value={stage.delayDays} min={0} max={3650} onChange={(value) => update(stage.id, { delayDays: value })} /></label><label>Плановая дата<input type="date" value={stage.plannedDate} onChange={(event) => update(stage.id, { plannedDate: event.target.value })} /></label><button className="icon-button danger" type="button" onClick={() => setData((current) => ({ ...current, paymentStages: current.paymentStages.filter((item) => item.id !== stage.id) }))}>×</button></div>)}</div>;
 }
 
 function Subcontractors({ items, onChange }: { items: Subcontractor[]; onChange: (items: Subcontractor[]) => void }) {

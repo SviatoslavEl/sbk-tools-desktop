@@ -89,13 +89,14 @@ function expenseResultsAtPrice(
 
 function financingCostAtPrice(data: CalculatorData, directCosts: number, priceGross: number) {
   if (!data.financingEnabled) return 0;
-  const advanceShare = Math.max(0, Math.min(100, data.advancePercent)) / 100;
-  const financedAmount = priceGross * (1 - advanceShare);
-  const delayDays = Math.max(0, data.paymentDelayDays);
   const financingRate = Math.max(0, data.annualFinancingRate) / 100;
-  const financing = data.financingRatePeriod === "monthly"
-    ? financedAmount * financingRate * delayDays / 30
-    : financedAmount * financingRate * delayDays / 365;
+  const stages = data.paymentStages.length ? data.paymentStages : [{ sharePercent: 100 - Math.max(0, Math.min(100, data.advancePercent)), delayDays: data.paymentDelayDays }];
+  const financing = stages.reduce((sum, stage) => {
+    const financedAmount = priceGross * Math.max(0, stage.sharePercent) / 100;
+    const delayDays = Math.max(0, stage.delayDays);
+    return sum + (data.financingRatePeriod === "monthly" ? financedAmount * financingRate * delayDays / 30 : financedAmount * financingRate * delayDays / 365);
+  }, 0);
+  const financedAmount = priceGross * Math.max(0, stages.reduce((sum, stage) => sum + stage.sharePercent, 0)) / 100;
   const factoring = data.factoringEnabled
     ? financedAmount * Math.max(0, data.factoringCommissionPercent) / 100
     : 0;
@@ -124,6 +125,9 @@ function validationIssues(data: CalculatorData): CalculationIssue[] {
       message: "Целевой показатель должен быть конечным числом.",
     });
   }
+  const stageShare = data.paymentStages.reduce((sum, stage) => sum + stage.sharePercent, 0);
+  if (data.paymentStages.length && Math.abs(stageShare - 100) > 0.001) issues.push({ code: "invalid-data", field: "paymentStages", blocking: true, message: `Сумма долей графика платежей должна быть 100%, сейчас ${stageShare.toFixed(2)}%.` });
+  if (data.currencyComponentEnabled && (data.foreignAmount < 0 || data.exchangeRate <= 0)) issues.push({ code: "invalid-data", field: "exchangeRate", blocking: true, message: "Для валютной составляющей укажите положительные сумму и курс." });
   return issues;
 }
 
@@ -153,6 +157,7 @@ function resultAtPrice(
   const subcontractorsNet = subcontractors.reduce((sum, item) => sum + item.netAmount, 0);
   const directCosts = internal.effectiveCost
     + subcontractors.reduce((sum, item) => sum + item.effectiveCost, 0);
+  const currencyCost = data.currencyComponentEnabled ? Math.max(0, data.foreignAmount) * Math.max(0, data.exchangeRate) : 0;
   const expenseResults = expenseResultsAtPrice(data, directCosts, safePriceNet, priceGross);
   const additionalCosts = expenseResults.reduce((sum, expense) => sum + expense.effectiveCost, 0);
   const agentQuotedAmount = !data.hasAgent
@@ -168,8 +173,8 @@ function resultAtPrice(
     data.agentInputVatDeductible,
     data.hasAgent && data.agentIncludeInTotalCost,
   );
-  const financingCost = financingCostAtPrice(data, directCosts, priceGross);
-  const fullCosts = directCosts + additionalCosts + agent.effectiveCost + financingCost;
+  const financingCost = financingCostAtPrice(data, directCosts + currencyCost, priceGross);
+  const fullCosts = directCosts + currencyCost + additionalCosts + agent.effectiveCost + financingCost;
   const profit = safePriceNet - fullCosts;
   const margin = safePriceNet > EPSILON ? profit / safePriceNet * 100 : profit < 0 ? -Infinity : 0;
   const markup = fullCosts > EPSILON ? profit / fullCosts * 100 : profit > 0 ? Infinity : 0;
@@ -200,6 +205,7 @@ function resultAtPrice(
     additionalCosts,
     agentCommission: agent.effectiveCost,
     financingCost,
+    currencyCost,
     fullCosts,
     totalCost: fullCosts,
     profit,

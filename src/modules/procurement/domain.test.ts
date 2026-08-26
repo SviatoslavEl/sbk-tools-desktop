@@ -1,11 +1,27 @@
 import { describe, expect, it } from "vitest";
-import { buildRebidSteps, complianceSummary, procurementWarnings } from "./domain";
+import { buildRebidSteps, complianceSummary, procurementWarnings, suggestedExperience, suggestedTeam } from "./domain";
+import { emptyContract } from "../contracts/types";
+import { emptyStaff } from "../staff/types";
 import { emptyProcurement, emptyRequirement } from "./types";
 
 describe("procurement domain", () => {
   it("builds a bounded rebid ladder and marks losses", () => {
     expect(buildRebidSteps(100, 80, 3, 10, "comfort").map((step) => step.price)).toEqual([100, 92, 92]);
     expect(buildRebidSteps(100, 120, 2, 10, "any-price")[0].loss).toBe(true);
+  });
+
+  it("suggests only relevant records that may be disclosed while leaving final choice to UI", () => {
+    const item = { ...emptyProcurement(), subject: "Проектирование энергетических объектов", submissionDeadline: "2026-09-01" };
+    const contracts = [
+      { id: "allowed", payload: { ...emptyContract(), subject: "Проектирование энергетических объектов", disclosureAllowed: true } },
+      { id: "private", payload: { ...emptyContract(), subject: "Проектирование энергетических объектов", disclosureAllowed: false } },
+    ];
+    const staff = [
+      { id: "engineer", payload: { ...emptyStaff(), skills: ["проектирование", "энергетика"], disclosureAllowed: true, availableTo: "2026-12-31" } },
+      { id: "busy", payload: { ...emptyStaff(), skills: ["проектирование"], disclosureAllowed: true, availableTo: "2026-08-01" } },
+    ];
+    expect(suggestedExperience(item, contracts)).toEqual(["allowed"]);
+    expect(suggestedTeam(item, staff)).toEqual(["engineer"]);
   });
 
   it("collects compliance gaps and questions", () => {

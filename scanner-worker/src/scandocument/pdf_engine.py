@@ -42,6 +42,31 @@ def append_pdf_page(writer: PdfWriter, page_pdf: bytes) -> None:
     writer.add_page(reader.pages[0])
 
 
+def configure_pdfa_2b(writer: PdfWriter) -> None:
+    from PIL import ImageCms
+    from pypdf.generic import ArrayObject, DictionaryObject, NameObject, NumberObject, StreamObject, TextStringObject
+
+    writer.pdf_header = "%PDF-1.7"
+    profile = StreamObject()
+    profile.set_data(ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes())
+    profile.update({NameObject("/N"): NumberObject(3)})
+    profile_ref = writer._add_object(profile)
+    intent = DictionaryObject({
+        NameObject("/Type"): NameObject("/OutputIntent"),
+        NameObject("/S"): NameObject("/GTS_PDFA1"),
+        NameObject("/OutputConditionIdentifier"): TextStringObject("sRGB IEC61966-2.1"),
+        NameObject("/Info"): TextStringObject("sRGB IEC61966-2.1"),
+        NameObject("/DestOutputProfile"): profile_ref,
+    })
+    writer._root_object[NameObject("/OutputIntents")] = ArrayObject([writer._add_object(intent)])
+    xmp = b'''<?xpacket begin="\xef\xbb\xbf" id="W5M0MpCehiHzreSzNTczkc9d"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" xmlns:pdfaid="http://www.aiim.org/pdfa/ns/id/"><pdfaid:part>2</pdfaid:part><pdfaid:conformance>B</pdfaid:conformance></rdf:Description></rdf:RDF></x:xmpmeta><?xpacket end="w"?>'''
+    metadata = StreamObject()
+    metadata.set_data(xmp)
+    metadata.update({NameObject("/Type"): NameObject("/Metadata"), NameObject("/Subtype"): NameObject("/XML")})
+    writer._root_object[NameObject("/Metadata")] = writer._add_object(metadata)
+
+
 def write_atomic(writer: PdfWriter, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_name(f".{destination.name}.scandocument-part")

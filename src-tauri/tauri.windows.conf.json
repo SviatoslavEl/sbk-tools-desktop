@@ -1,0 +1,10 @@
+{
+  "bundle": {
+    "windows": {
+      "webviewInstallMode": {
+        "type": "fixedRuntime",
+        "path": "./webview2-runtime/Microsoft.WebView2.FixedVersionRuntime.151.0.4129.107.x64"
+      }
+    }
+  }
+}

@@ -25,6 +25,8 @@ export function staffRequirements(item: StaffData, warningDays = 60, now = new D
   const checks = [
     { label: "ФИО", met: Boolean(item.fullName.trim()) },
     { label: "Должность или роль", met: Boolean(item.role.trim()) },
+    { label: "Грейд", met: Boolean(item.grade?.trim()) },
+    { label: "Навыки", met: Boolean(item.skills?.length) },
     { label: "Основание сотрудничества", met: Boolean(item.basis && (item.basis !== "Иное" || item.basisOther.trim())) },
     { label: "Дата начала", met: Boolean(item.startDate) },
     { label: "Квалификация", met: Boolean(item.qualification.trim()) },

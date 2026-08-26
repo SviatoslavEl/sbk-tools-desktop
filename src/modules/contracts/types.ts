@@ -7,7 +7,13 @@ export interface ContractData {
   date: string;
   customer: string;
   subject: string;
+  industry: string;
+  serviceType: string;
+  standards: string[];
+  workScope: string;
+  contractRole: string;
   amount: number;
+  ourShareAmount: number;
   startDate: string;
   endDate: string;
   stage: typeof contractStages[number];
@@ -19,6 +25,8 @@ export interface ContractData {
   nextImportantDate: string;
   responsible: string;
   contact: string;
+  reviewAvailable: boolean;
+  disclosureAllowed: boolean;
   notes: string;
 }
 
@@ -26,8 +34,9 @@ export const emptyContract = (): ContractData => ({
   number: "",
   date: new Date().toISOString().slice(0, 10),
   customer: "",
-  subject: "",
+  subject: "", industry: "", serviceType: "", standards: [], workScope: "", contractRole: "Генеральный подрядчик",
   amount: 0,
+  ourShareAmount: 0,
   startDate: "",
   endDate: "",
   stage: "Подготовка",
@@ -38,6 +47,6 @@ export const emptyContract = (): ContractData => ({
   paymentActualDate: "",
   nextImportantDate: "",
   responsible: "",
-  contact: "",
+  contact: "", reviewAvailable: false, disclosureAllowed: false,
   notes: "",
 });
