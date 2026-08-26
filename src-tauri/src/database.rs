@@ -3,7 +3,7 @@ use rusqlite::Connection;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub(crate) const SCHEMA_VERSION: i64 = 2;
+pub(crate) const SCHEMA_VERSION: i64 = 3;
 pub(crate) const MODULES: [&str; 6] = [
     "settings",
     "calculator",
@@ -107,6 +107,126 @@ pub(crate) fn open_database(root: &Path, module: &str) -> Result<Connection, Str
                 PRAGMA user_version = 2;",
             )
             .map_err(|error| format!("Не удалось обновить схему раздела {module}: {error}"))?;
+        transaction.commit().map_err(|error| error.to_string())?;
+    }
+    if current_version < 3 {
+        let transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        if module == "procurement" {
+            transaction
+                .execute_batch(
+                    "CREATE TABLE IF NOT EXISTS intelligence_providers (
+                        id TEXT PRIMARY KEY NOT NULL,
+                        name TEXT NOT NULL,
+                        mode TEXT NOT NULL CHECK(mode IN ('disabled', 'same-computer', 'local-network')),
+                        endpoint TEXT,
+                        secret_reference TEXT,
+                        certificate_fingerprint TEXT,
+                        enabled INTEGER NOT NULL DEFAULT 0,
+                        configuration_json TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS analysis_jobs (
+                        id TEXT PRIMARY KEY NOT NULL,
+                        request_id TEXT NOT NULL UNIQUE,
+                        capability TEXT NOT NULL,
+                        procurement_id TEXT NOT NULL,
+                        workspace_id TEXT NOT NULL,
+                        input_revision INTEGER NOT NULL,
+                        input_hash TEXT NOT NULL,
+                        document_versions_json TEXT NOT NULL,
+                        provider_id TEXT,
+                        server_version TEXT,
+                        model_version TEXT,
+                        schema_version TEXT NOT NULL,
+                        attempts INTEGER NOT NULL DEFAULT 0,
+                        status TEXT NOT NULL CHECK(status IN ('queued','running','succeeded','failed','cancelled','interrupted','expired')),
+                        remote_job_id TEXT,
+                        cancellation_requested INTEGER NOT NULL DEFAULT 0,
+                        error_code TEXT,
+                        created_at TEXT NOT NULL,
+                        started_at TEXT,
+                        finished_at TEXT,
+                        FOREIGN KEY(provider_id) REFERENCES intelligence_providers(id) ON DELETE SET NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_analysis_jobs_scope ON analysis_jobs(workspace_id, procurement_id, created_at DESC);
+                    CREATE TABLE IF NOT EXISTS analysis_artifacts (
+                        id TEXT PRIMARY KEY NOT NULL,
+                        job_id TEXT NOT NULL,
+                        kind TEXT NOT NULL,
+                        content_hash TEXT NOT NULL,
+                        content_json TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        FOREIGN KEY(job_id) REFERENCES analysis_jobs(id) ON DELETE CASCADE
+                    );
+                    CREATE TABLE IF NOT EXISTS analysis_suggestions (
+                        id TEXT PRIMARY KEY NOT NULL,
+                        job_id TEXT NOT NULL,
+                        procurement_id TEXT NOT NULL,
+                        capability TEXT NOT NULL,
+                        input_revision INTEGER NOT NULL,
+                        input_hash TEXT NOT NULL,
+                        target TEXT NOT NULL,
+                        operation TEXT NOT NULL,
+                        value_json TEXT NOT NULL,
+                        confidence REAL,
+                        warnings_json TEXT NOT NULL,
+                        incomplete INTEGER NOT NULL DEFAULT 0,
+                        status TEXT NOT NULL CHECK(status IN ('proposed','accepted','rejected','edited','stale','invalid')),
+                        created_at TEXT NOT NULL,
+                        reviewed_at TEXT,
+                        reviewed_by TEXT,
+                        FOREIGN KEY(job_id) REFERENCES analysis_jobs(id) ON DELETE CASCADE
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_analysis_suggestions_scope ON analysis_suggestions(procurement_id, status, created_at DESC);
+                    CREATE TABLE IF NOT EXISTS analysis_evidence (
+                        id TEXT PRIMARY KEY NOT NULL,
+                        suggestion_id TEXT NOT NULL,
+                        document_id TEXT NOT NULL,
+                        version_id TEXT NOT NULL,
+                        source_sha256 TEXT NOT NULL,
+                        locator TEXT NOT NULL,
+                        excerpt TEXT NOT NULL,
+                        FOREIGN KEY(suggestion_id) REFERENCES analysis_suggestions(id) ON DELETE CASCADE
+                    );
+                    CREATE TABLE IF NOT EXISTS document_versions (
+                        version_id TEXT PRIMARY KEY NOT NULL,
+                        document_id TEXT NOT NULL,
+                        procurement_id TEXT NOT NULL,
+                        file_name TEXT NOT NULL,
+                        mime_type TEXT NOT NULL,
+                        size_bytes INTEGER NOT NULL,
+                        source_sha256 TEXT NOT NULL,
+                        source_label TEXT NOT NULL,
+                        relative_path TEXT,
+                        extraction_engine_version TEXT NOT NULL,
+                        processing_status TEXT NOT NULL,
+                        warnings_json TEXT NOT NULL,
+                        supersedes_version_id TEXT,
+                        created_at TEXT NOT NULL,
+                        FOREIGN KEY(supersedes_version_id) REFERENCES document_versions(version_id)
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_document_versions_document ON document_versions(procurement_id, document_id, created_at DESC);
+                    CREATE TABLE IF NOT EXISTS document_text_extractions (
+                        id TEXT PRIMARY KEY NOT NULL,
+                        version_id TEXT NOT NULL,
+                        locator TEXT NOT NULL,
+                        page_number INTEGER,
+                        section_name TEXT,
+                        sheet_name TEXT,
+                        cell_range TEXT,
+                        text_content TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        FOREIGN KEY(version_id) REFERENCES document_versions(version_id) ON DELETE CASCADE
+                    );",
+                )
+                .map_err(|error| format!("Не удалось создать AI-ready схему закупок: {error}"))?;
+        }
+        transaction
+            .execute_batch("PRAGMA user_version = 3;")
+            .map_err(|error| format!("Не удалось завершить миграцию схемы: {error}"))?;
         transaction.commit().map_err(|error| error.to_string())?;
     }
     connection

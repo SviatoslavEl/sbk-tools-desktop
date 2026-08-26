@@ -29,9 +29,14 @@ use zip::write::SimpleFileOptions;
 
 mod attachments;
 mod database;
+mod intelligence;
 mod workspace;
 use attachments::AttachmentAudit;
 use database::{MODULES, SCHEMA_VERSION, open_database, validated_module};
+use intelligence::{
+    DisabledProvider, IntelligenceProvider, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES,
+    ProviderConfiguration, validate_provider_configuration,
+};
 use workspace::{Workspace, ensure_workspace, open_workspace, workspace_pointer_path};
 
 #[derive(Clone)]
@@ -49,6 +54,52 @@ struct WorkspaceInfo {
     writable: bool,
     schema_version: i64,
     free_space_bytes: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IntelligenceProviderStatus {
+    enabled: bool,
+    healthy: bool,
+    capabilities: Vec<intelligence::Capability>,
+    message: String,
+    max_request_bytes: usize,
+    max_response_bytes: usize,
+}
+
+#[tauri::command]
+fn intelligence_provider_status() -> Result<IntelligenceProviderStatus, String> {
+    let provider = DisabledProvider;
+    Ok(IntelligenceProviderStatus {
+        enabled: false,
+        healthy: provider.health()?,
+        capabilities: provider.capabilities()?,
+        message: "AI-сервер не настроен. Все локальные функции продолжают работать.".to_string(),
+        max_request_bytes: MAX_REQUEST_BYTES,
+        max_response_bytes: MAX_RESPONSE_BYTES,
+    })
+}
+
+#[tauri::command]
+fn validate_intelligence_configuration(config: ProviderConfiguration) -> Result<(), String> {
+    validate_provider_configuration(&config)
+}
+
+#[tauri::command]
+fn analysis_job_list(
+    state: State<'_, AppState>,
+    procurement_id: String,
+) -> Result<Vec<intelligence::AnalysisJobSummary>, String> {
+    intelligence::list_analysis_jobs(&state.workspace.root, &procurement_id)
+}
+
+#[tauri::command]
+fn analysis_job_cancel(
+    state: State<'_, AppState>,
+    procurement_id: String,
+    job_id: String,
+) -> Result<(), String> {
+    intelligence::cancel_analysis_job(&state.workspace.root, &procurement_id, &job_id)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -2008,16 +2059,34 @@ impl Drop for ScannerJobGuard {
 }
 
 fn validate_scanner_result(operation: &str, event: &Value) -> Result<(), String> {
-    let expected_type = if operation == "preview" {
-        "preview"
-    } else {
-        "complete"
+    let expected_type = match operation {
+        "preview" => "preview",
+        "extract" => "extraction",
+        _ => "complete",
     };
     if event.get("type").and_then(Value::as_str) != Some(expected_type) {
         return Err("Worker вернул незавершённый результат".to_string());
     }
     if event.get("protocolVersion").and_then(Value::as_i64) != Some(2) {
         return Err("Worker вернул несовместимую версию протокола".to_string());
+    }
+    if operation == "extract" {
+        let sha256 = event.get("sha256").and_then(Value::as_str).unwrap_or("");
+        let mime = event.get("mimeType").and_then(Value::as_str).unwrap_or("");
+        let fragments = event.get("fragments").and_then(Value::as_array);
+        if sha256.len() != 64
+            || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || !matches!(
+                mime,
+                "application/pdf"
+                    | "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                    | "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+            || fragments.is_none_or(|entries| entries.len() > 50_000)
+        {
+            return Err("Worker вернул некорректный результат извлечения".to_string());
+        }
+        return Ok(());
     }
     let output = event
         .get("outputPath")
@@ -2051,7 +2120,7 @@ fn run_scanner_worker(
     operation: String,
     mut config: Value,
 ) -> Result<Value, String> {
-    if operation != "preview" && operation != "process" {
+    if operation != "preview" && operation != "process" && operation != "extract" {
         return Err("Неизвестная операция сканера".to_string());
     }
     if config.get("protocolVersion").and_then(Value::as_i64) != Some(2) {
@@ -2074,7 +2143,7 @@ fn run_scanner_worker(
                 .to_string_lossy()
                 .into_owned(),
         );
-    } else {
+    } else if operation == "process" {
         let output = config
             .get("outputPath")
             .and_then(Value::as_str)
@@ -2157,10 +2226,10 @@ fn run_scanner_worker(
         let _ = BufReader::new(stderr).read_to_string(&mut text);
         text
     });
-    let expected_type = if operation == "preview" {
-        "preview"
-    } else {
-        "complete"
+    let expected_type = match operation.as_str() {
+        "preview" => "preview",
+        "extract" => "extraction",
+        _ => "complete",
     };
     let mut final_event = None;
     let mut error_event = None;
@@ -2299,6 +2368,8 @@ fn delete_runtime_file(state: State<'_, AppState>, path: String) -> Result<(), S
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let workspace = open_workspace().expect("SBK Tools workspace could not be opened");
+    intelligence::recover_interrupted_jobs(&workspace.root)
+        .expect("SBK Tools intelligence queue could not be recovered");
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
@@ -2313,6 +2384,10 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             workspace_info,
+            intelligence_provider_status,
+            validate_intelligence_configuration,
+            analysis_job_list,
+            analysis_job_cancel,
             set_workspace_location,
             read_xlsx,
             write_xlsx,
@@ -2479,7 +2554,7 @@ mod tests {
     }
 
     #[test]
-    fn database_v1_migrates_to_v2_without_losing_records() {
+    fn database_v1_migrates_to_v3_without_losing_records() {
         let root = std::env::temp_dir().join(format!("sbk-tools-migration-{}", Uuid::new_v4()));
         ensure_workspace(&root).expect("workspace");
         let path = root.join("calculator").join("data.sqlite3");
@@ -2513,7 +2588,7 @@ mod tests {
                 [],
             )
             .expect("draft table");
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
         assert_eq!(records, 1);
         let migration_backups = fs::read_dir(root.join("backups"))
             .expect("backups")
@@ -2527,6 +2602,45 @@ mod tests {
             .count();
         assert_eq!(migration_backups, 1);
         drop(migrated);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn procurement_migration_creates_separate_ai_ready_tables() {
+        let root = std::env::temp_dir().join(format!("sbk-tools-ai-migration-{}", Uuid::new_v4()));
+        ensure_workspace(&root).expect("workspace");
+        let connection = open_database(&root, "procurement").expect("migration");
+        for table in [
+            "intelligence_providers",
+            "analysis_jobs",
+            "analysis_artifacts",
+            "analysis_suggestions",
+            "analysis_evidence",
+            "document_versions",
+            "document_text_extractions",
+        ] {
+            let exists: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .expect("schema query");
+            assert_eq!(exists, 1, "missing table {table}");
+        }
+        let columns: Vec<String> = {
+            let mut statement = connection
+                .prepare("PRAGMA table_info(intelligence_providers)")
+                .expect("pragma");
+            statement
+                .query_map([], |row| row.get(1))
+                .expect("columns")
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .expect("collect")
+        };
+        assert!(columns.contains(&"secret_reference".to_string()));
+        assert!(!columns.contains(&"token".to_string()));
+        drop(connection);
         let _ = fs::remove_dir_all(root);
     }
 

@@ -1,0 +1,86 @@
+openapi: 3.1.0
+info:
+  title: SBK Tools Local Intelligence API
+  version: 1.0.0
+  description: Контракт будущего локального AI-сервера. Desktop остаётся владельцем данных и решений.
+servers:
+  - url: https://sbk-ai.internal
+paths:
+  /v1/health:
+    get:
+      operationId: health
+      responses:
+        "200":
+          description: Состояние сервера
+          content:
+            application/json:
+              schema: { $ref: "./schemas.json#/$defs/health" }
+  /v1/capabilities:
+    get:
+      operationId: capabilities
+      responses:
+        "200":
+          description: Закрытый список доступных операций
+          content:
+            application/json:
+              schema: { $ref: "./schemas.json#/$defs/capabilities" }
+  /v1/jobs:
+    post:
+      operationId: submit
+      parameters:
+        - in: header
+          name: Idempotency-Key
+          required: true
+          schema: { type: string, minLength: 1, maxLength: 128 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "./schemas.json#/$defs/analysisRequest" }
+      responses:
+        "202":
+          description: Задание принято
+          content:
+            application/json:
+              schema: { $ref: "./schemas.json#/$defs/jobAccepted" }
+        "400": { description: Ошибка схемы, повтор запрещён }
+        "401": { description: Ошибка авторизации, повтор запрещён }
+        "403": { description: Доступ запрещён, повтор запрещён }
+        "429": { description: Временный лимит, ограниченный повтор разрешён }
+  /v1/jobs/{jobId}:
+    parameters:
+      - in: path
+        name: jobId
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      operationId: status
+      responses:
+        "200":
+          description: Статус задания
+          content:
+            application/json:
+              schema: { $ref: "./schemas.json#/$defs/jobStatus" }
+    delete:
+      operationId: cancel
+      responses:
+        "204": { description: Отмена принята }
+  /v1/jobs/{jobId}/result:
+    parameters:
+      - in: path
+        name: jobId
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      operationId: result
+      responses:
+        "200":
+          description: Валидируемые предложения, не изменения бизнес-данных
+          content:
+            application/json:
+              schema: { $ref: "./schemas.json#/$defs/analysisResult" }
+components:
+  securitySchemes:
+    bearerAuth: { type: http, scheme: bearer }
+security:
+  - bearerAuth: []

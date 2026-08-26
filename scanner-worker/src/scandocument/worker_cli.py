@@ -12,6 +12,7 @@ from scandocument.pipeline import make_preview, process_document
 from scandocument.presets import PRESETS, preset_copy
 from scandocument.tempfiles import SecureWorkspace
 from scandocument.validation import validate_ocr_languages
+from scandocument.extraction import extract_document
 
 
 PRESET_ALIASES = {
@@ -204,7 +205,7 @@ def main() -> int:
     configure_protocol_encoding()
     SecureWorkspace.cleanup_stale()
     parser = argparse.ArgumentParser(prog="sbk-scanner-worker")
-    parser.add_argument("command", choices=("preview", "process", "info"))
+    parser.add_argument("command", choices=("preview", "process", "extract", "info"))
     parser.add_argument("--config")
     args = parser.parse_args()
     try:
@@ -214,6 +215,10 @@ def main() -> int:
         if not args.config:
             raise ValueError("Не указан --config")
         config = json.loads(Path(args.config).read_text(encoding="utf-8"))
+        if args.command == "extract":
+            validate_protocol(config)
+            emit(extract_document(Path(config["inputPath"])))
+            return 0
         return preview(config) if args.command == "preview" else process(config)
     except Exception as error:
         emit({"type": "error", "message": str(error), "class": type(error).__name__})

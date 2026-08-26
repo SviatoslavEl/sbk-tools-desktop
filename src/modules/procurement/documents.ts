@@ -13,7 +13,7 @@ export function documentHtml(item: ProcurementData, title: string, body: string)
 
 export function summaryBody(item: ProcurementData) {
   const gaps = item.requirements.filter((row) => row.status !== "Подтверждено");
-  const questions = item.requirements.filter((row) => row.status === "Вопрос" || row.question.trim());
+  const questions = item.requirements.filter((row) => row.status === "Требует уточнения" || row.question.trim());
   return `<h2>Сводка</h2><p><b>Площадка:</b> ${html(item.platform)}<br><b>Срок подачи:</b> ${html(item.submissionDeadline)}<br><b>Статус:</b> ${html(item.status)}</p><h2>Матрица соответствия</h2><table><tr><th>Требование</th><th>Источник</th><th>Подтверждение</th><th>Статус</th></tr>${item.requirements.map((row) => `<tr><td>${html(row.text)}</td><td>${html(row.evidenceKind)}</td><td>${html(row.evidence)}</td><td>${html(row.status)}</td></tr>`).join("")}</table><h2>Чек-лист подачи</h2><ul>${item.checklist.map((row) => `<li>${row.done ? "☑" : "☐"} ${html(row.text)} — ${html(row.responsible)}</li>`).join("")}</ul><h2>Пробелы и вопросы</h2><ul>${gaps.map((row) => `<li class="warn">${html(row.text)}: ${html(row.status)}</li>`).join("")}${questions.map((row) => `<li>${html(row.question || row.text)}</li>`).join("")}</ul>`;
 }
 

@@ -2,7 +2,7 @@
   "name": "sbk-tools-desktop",
   "description": "Open-source portable desktop toolkit for tenders and business operations",
   "private": true,
-  "version": "2.0.0",
+  "version": "2.1.0",
   "type": "module",
   "scripts": {
     "dev": "vite",

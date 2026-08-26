@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sbk.local/contracts/intelligence/v1/schemas.json",
+  "$defs": {
+    "capability": {
+      "type": "string",
+      "enum": [
+        "tender.extract_requirements", "tender.summarize", "tender.generate_questions",
+        "contract.detect_risks", "experience.rank", "team.rank",
+        "document.detect_conflicts", "document.classify", "application.review_completeness"
+      ]
+    },
+    "jobState": { "type": "string", "enum": ["queued", "running", "succeeded", "failed", "cancelled", "interrupted", "expired"] },
+    "health": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schemaVersion", "status", "serverVersion"],
+      "properties": { "schemaVersion": { "const": "1.0" }, "status": { "enum": ["ok", "degraded"] }, "serverVersion": { "type": "string", "maxLength": 128 } }
+    },
+    "capabilities": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schemaVersion", "capabilities"],
+      "properties": { "schemaVersion": { "const": "1.0" }, "capabilities": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/capability" } } }
+    },
+    "analysisRequest": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schemaVersion", "requestId", "capability", "workspaceId", "procurementId", "inputRevision", "inputHash", "documentVersionIds", "payload"],
+      "properties": {
+        "schemaVersion": { "const": "1.0" }, "requestId": { "type": "string", "format": "uuid" },
+        "capability": { "$ref": "#/$defs/capability" }, "workspaceId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "procurementId": { "type": "string", "format": "uuid" }, "inputRevision": { "type": "integer", "minimum": 1 },
+        "inputHash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "documentVersionIds": { "type": "array", "maxItems": 500, "items": { "type": "string", "format": "uuid" } },
+        "payload": { "type": "object" }
+      }
+    },
+    "jobAccepted": {
+      "type": "object", "additionalProperties": false, "required": ["schemaVersion", "jobId", "requestId", "status"],
+      "properties": { "schemaVersion": { "const": "1.0" }, "jobId": { "type": "string", "format": "uuid" }, "requestId": { "type": "string", "format": "uuid" }, "status": { "$ref": "#/$defs/jobState" } }
+    },
+    "jobStatus": {
+      "type": "object", "additionalProperties": false, "required": ["schemaVersion", "jobId", "requestId", "status"],
+      "properties": { "schemaVersion": { "const": "1.0" }, "jobId": { "type": "string", "format": "uuid" }, "requestId": { "type": "string", "format": "uuid" }, "status": { "$ref": "#/$defs/jobState" }, "errorCode": { "type": ["string", "null"], "maxLength": 128 } }
+    },
+    "evidence": {
+      "type": "object", "additionalProperties": false,
+      "required": ["documentId", "versionId", "sha256", "locator", "excerpt"],
+      "properties": { "documentId": { "type": "string", "format": "uuid" }, "versionId": { "type": "string", "format": "uuid" }, "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" }, "locator": { "type": "string", "minLength": 1, "maxLength": 256 }, "excerpt": { "type": "string", "minLength": 1, "maxLength": 2000 } }
+    },
+    "suggestion": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schemaVersion", "capability", "inputRevision", "inputHash", "suggestionId", "target", "operation", "value", "evidence", "warnings", "incomplete", "serverVersion", "modelVersion"],
+      "properties": {
+        "schemaVersion": { "const": "1.0" }, "capability": { "$ref": "#/$defs/capability" }, "inputRevision": { "type": "integer", "minimum": 1 }, "inputHash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "suggestionId": { "type": "string", "format": "uuid" }, "target": { "type": "string", "minLength": 1, "maxLength": 256 }, "operation": { "enum": ["propose", "append", "replace-draft"] }, "value": {},
+        "confidence": { "type": ["number", "null"], "minimum": 0, "maximum": 1 }, "evidence": { "type": "array", "minItems": 1, "maxItems": 100, "items": { "$ref": "#/$defs/evidence" } },
+        "warnings": { "type": "array", "maxItems": 100, "items": { "type": "string", "maxLength": 1000 } }, "incomplete": { "type": "boolean" }, "serverVersion": { "type": "string", "maxLength": 128 }, "modelVersion": { "type": "string", "maxLength": 128 }
+      }
+    },
+    "analysisResult": {
+      "type": "object", "additionalProperties": false, "required": ["schemaVersion", "requestId", "suggestions"],
+      "properties": { "schemaVersion": { "const": "1.0" }, "requestId": { "type": "string", "format": "uuid" }, "suggestions": { "type": "array", "maxItems": 1000, "items": { "$ref": "#/$defs/suggestion" } } }
+    }
+  }
+}
