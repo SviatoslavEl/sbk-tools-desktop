@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { ConfirmDialog } from "../../components/Dialog";
 import { useRecords } from "../../hooks/useRecords";
+import packageInfo from "../../../package.json";
 import { chooseDirectory, chooseOpenPath } from "../../lib/files";
 import { createBackup, getWorkspaceInfo, restoreBackup, setWorkspaceLocation, type BackupInfo, type WorkspaceInfo } from "../../lib/storage";
 
@@ -31,7 +32,7 @@ export function Settings({ collapsed, onCollapsed }: { collapsed: boolean; onCol
   };
   const restore = async () => {
     const path = restorePath; setRestorePath(""); setMessage("Восстанавливаем данные…");
-    try { await restoreBackup(path); setMessage("Данные восстановлены. Перезапустите приложение, чтобы обновить все открытые экраны."); }
+    try { await restoreBackup(path); setMessage("Данные восстановлены. Перезагружаем приложение…"); window.setTimeout(() => window.location.reload(), 350); }
     catch (reason) { setMessage(`Восстановление не выполнено: ${String(reason)}`); }
   };
   const selectWorkspace = async () => {
@@ -53,6 +54,6 @@ export function Settings({ collapsed, onCollapsed }: { collapsed: boolean; onCol
 }
 
 export function About() {
-  const version = "1.0.1";
+  const version = packageInfo.version;
   return <div className="about-layout"><section className="surface about-hero"><div className="surface-body"><div className="brand-mark large">СБК</div><h2>СБК Инструменты</h2><p>Открытый набор независимых настольных инструментов для расчётов, документов, договорного опыта и кадров.</p><div className="about-badges"><span>Версия {version}</span><span>GPL-3.0</span><span>Windows · macOS</span></div></div></section><section className="surface"><div className="surface-title"><h2>Приватность</h2></div><div className="surface-body"><p>Приложение работает офлайн. Расчёты, реестры, документы и OCR не отправляются в облако. Сетевой сервис для обработки файлов не запускается.</p></div></section><section className="surface"><div className="surface-title"><h2>Компоненты и лицензии</h2></div><div className="surface-body"><dl className="license-list"><div><dt>СБК Инструменты и ScanDocument worker</dt><dd>GNU GPL 3.0 only</dd></div><div><dt>Tauri</dt><dd>Apache-2.0 / MIT</dd></div><div><dt>React</dt><dd>MIT</dd></div><div><dt>Python</dt><dd>PSF License</dd></div><div><dt>Tesseract OCR</dt><dd>Apache-2.0</dd></div><div><dt>LibreOffice</dt><dd>MPL-2.0 / LGPLv3+</dd></div><div><dt>PDFium и Python-библиотеки</dt><dd>См. THIRD_PARTY_LICENSES в поставке</dd></div></dl></div></section></div>;
 }

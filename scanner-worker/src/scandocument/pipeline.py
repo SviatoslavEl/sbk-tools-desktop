@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any
 from scandocument.errors import CancelledError, SaveError, ScanDocumentError
 from scandocument.models import ProcessRequest, ProgressEvent
 from scandocument.tempfiles import SecureWorkspace
-from scandocument.validation import detect_kind
+from scandocument.validation import detect_kind, inspect_document, validate_render_budget
 
 if TYPE_CHECKING:
     from PIL import Image
@@ -136,18 +136,29 @@ def process_document(
     SecureWorkspace.cleanup_stale()
     with SecureWorkspace() as workspace:
         pdf_source = source
+        prepared_warnings: list[str] = []
         if kind == "docx":
             from scandocument.docx_engine import convert_docx_to_pdf
 
             token.check()
             _notify(callback, "Подготовка DOCX", 0, 1, 2)
             pdf_source = workspace / "converted.pdf"
-            warnings.extend(convert_docx_to_pdf(source, pdf_source, lambda: token.cancelled))
+            prepared_warnings = convert_docx_to_pdf(source, pdf_source, lambda: token.cancelled)
+        info = inspect_document(
+            source,
+            cancelled=lambda: token.cancelled,
+            prepared_docx_pdf=pdf_source if kind == "docx" else None,
+            prepared_docx_warnings=prepared_warnings,
+        )
+        warnings.extend(info.warnings)
+        validate_render_budget(info, request.settings.dpi)
         try:
             document = pdfium.PdfDocument(str(pdf_source))
         except Exception as exc:
             raise ScanDocumentError("Документ не удалось подготовить к обработке.") from exc
         total = len(document)
+        if request.facsimile is not None:
+            request.facsimile.validate_for_document(total)
         writer = PdfWriter()
         writer.add_metadata({
             "/Producer": "ScanDocument",
@@ -222,7 +233,8 @@ def make_preview(
     page_index: int,
     max_dimension: int = 1100,
     cancellation: CancellationToken | None = None,
-) -> tuple[Image.Image, Image.Image, int]:
+    facsimile=None,
+) -> tuple[Image.Image, Image.Image, int, list[str]]:
     import pypdfium2 as pdfium
 
     from scandocument.filters import apply_scan_effect
@@ -237,19 +249,37 @@ def make_preview(
             from scandocument.docx_engine import convert_docx_to_pdf
 
             pdf_source = workspace / "preview.pdf"
-            convert_docx_to_pdf(source, pdf_source, lambda: token.cancelled)
+            prepared_warnings = convert_docx_to_pdf(source, pdf_source, lambda: token.cancelled)
+        else:
+            prepared_warnings = []
         token.check()
+        info = inspect_document(
+            source,
+            cancelled=lambda: token.cancelled,
+            prepared_docx_pdf=pdf_source if kind == "docx" else None,
+            prepared_docx_warnings=prepared_warnings,
+        )
+        validate_render_budget(info, min(144, settings.dpi))
         document = pdfium.PdfDocument(str(pdf_source))
         try:
-            index = max(0, min(int(page_index), len(document) - 1))
+            index = int(page_index)
+            if index < 0 or index >= len(document):
+                raise ScanDocumentError("Выбранная страница отсутствует в документе.")
             page = document[index]
             width, height = page.get_size()
             dpi = min(144, max(72, 72 * max_dimension / max(width, height)))
             page.close()
             original, _ = render_page(document, index, int(dpi))
             token.check()
-            processed = apply_scan_effect(original, settings, seed, index)
+            source_for_processing = original.copy()
+            if facsimile is not None:
+                facsimile.validate_for_document(len(document))
+                if facsimile.applies_to(index):
+                    from scandocument.facsimile import apply_facsimile
+
+                    source_for_processing = apply_facsimile(source_for_processing, facsimile)
+            processed = apply_scan_effect(source_for_processing, settings, seed, index)
             token.check()
-            return original, processed, len(document)
+            return original, processed, len(document), info.warnings
         finally:
             document.close()

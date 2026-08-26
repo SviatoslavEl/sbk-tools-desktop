@@ -79,6 +79,7 @@ class DocumentInfo:
 @dataclass(slots=True)
 class FacsimilePlacement:
     image_path: Path
+    application: str = "current"
     x: float = 0.62
     y: float = 0.72
     width: float = 0.22
@@ -88,7 +89,21 @@ class FacsimilePlacement:
     remove_light_background: bool = False
 
     def applies_to(self, page_index: int) -> bool:
-        return not self.pages or page_index in self.pages
+        return self.application == "all" or page_index in self.pages
+
+    def validate_for_document(self, page_count: int) -> None:
+        if self.application not in {"current", "all", "explicitPages"}:
+            raise ValueError("Неизвестный режим применения факсимиле.")
+        if self.application == "all":
+            if self.pages:
+                raise ValueError("Режим всех страниц не должен содержать скрытый диапазон.")
+            return
+        if not self.pages:
+            raise ValueError("Пустой диапазон факсимиле запрещён.")
+        if self.application == "current" and len(self.pages) != 1:
+            raise ValueError("Для текущей страницы должен быть передан ровно один номер.")
+        if any(page < 0 or page >= page_count for page in self.pages):
+            raise ValueError("Диапазон факсимиле выходит за пределы документа.")
 
 
 @dataclass(slots=True)

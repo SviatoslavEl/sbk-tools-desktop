@@ -10,6 +10,8 @@ from PIL import Image
 from scandocument.models import ColorMode, EffectSettings, FacsimilePlacement, ProcessRequest
 from scandocument.pipeline import make_preview, process_document
 from scandocument.presets import PRESETS, preset_copy
+from scandocument.tempfiles import SecureWorkspace
+from scandocument.validation import validate_ocr_languages
 
 
 PRESET_ALIASES = {
@@ -66,13 +68,37 @@ def settings_for(name: str, overrides: dict | None = None) -> EffectSettings:
 def placement_from(data: dict | None) -> FacsimilePlacement | None:
     if not data or not data.get("imagePath"):
         return None
-    return FacsimilePlacement(
-        image_path=Path(data["imagePath"]),
+    image_path = Path(data["imagePath"]).expanduser().resolve()
+    if not image_path.is_file() or image_path.suffix.lower() not in {".png", ".jpg", ".jpeg"}:
+        raise ValueError("Факсимиле должно быть существующим PNG или JPEG.")
+    if image_path.stat().st_size > 12 * 1024 * 1024:
+        raise ValueError("Файл факсимиле превышает безопасный предел 12 МБ.")
+    try:
+        with Image.open(image_path) as image:
+            width, height = image.size
+            if width < 1 or height < 1 or width > 12_000 or height > 12_000 or width * height > 40_000_000:
+                raise ValueError("Размер изображения факсимиле превышает безопасный предел.")
+            image.verify()
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError("Изображение факсимиле повреждено или имеет неподдерживаемый формат.") from exc
+    application = data.get("application")
+    if application not in {"current", "all", "explicitPages"}:
+        raise ValueError("Укажите явный режим применения факсимиле.")
+    pages = [int(value) for value in data.get("pages", [])]
+    placement = FacsimilePlacement(
+        image_path=image_path, application=application,
         x=float(data.get("x", 0.62)), y=float(data.get("y", 0.72)),
         width=float(data.get("width", 0.22)), rotation=float(data.get("rotation", 0)),
-        opacity=float(data.get("opacity", 1)), pages=[int(value) for value in data.get("pages", [])],
+        opacity=float(data.get("opacity", 1)), pages=pages,
         remove_light_background=bool(data.get("removeLightBackground", False)),
     )
+    if not 0 <= placement.x <= 1 or not 0 <= placement.y <= 1:
+        raise ValueError("Координаты факсимиле находятся вне страницы.")
+    if not 0.02 <= placement.width <= 0.95 or not 0.05 <= placement.opacity <= 1:
+        raise ValueError("Размер или прозрачность факсимиле недопустимы.")
+    return placement
 
 
 def emit(payload: dict) -> None:
@@ -83,24 +109,28 @@ def preview(config: dict) -> int:
     source = Path(config["inputPath"])
     output = Path(config["outputPath"])
     settings = settings_for(config.get("preset", "Офисный скан"), config.get("settings"))
-    _, processed, pages = make_preview(source, settings, int(config.get("seed", 42)), int(config.get("pageIndex", 0)))
     placement = placement_from(config.get("facsimile"))
-    if placement and placement.applies_to(int(config.get("pageIndex", 0))):
-        from scandocument.facsimile import apply_facsimile
-        processed = apply_facsimile(processed, placement)
+    _, processed, pages, warnings = make_preview(
+        source, settings, int(config.get("seed", 42)), int(config.get("pageIndex", 0)),
+        facsimile=placement,
+    )
+    if placement:
+        placement.validate_for_document(pages)
     output.parent.mkdir(parents=True, exist_ok=True)
     processed.thumbnail((1400, 1400), Image.Resampling.LANCZOS)
     processed.save(output, "PNG", optimize=True)
-    emit({"type": "preview", "outputPath": str(output), "pageCount": pages})
+    emit({"type": "preview", "outputPath": str(output), "pageCount": pages, "warnings": warnings})
     return 0
 
 
 def process(config: dict) -> int:
+    ocr_enabled = bool(config.get("ocrEnabled", False))
+    ocr_languages = validate_ocr_languages(config.get("ocrLanguages", "rus+eng")) if ocr_enabled else "rus+eng"
     request = ProcessRequest(
         input_path=Path(config["inputPath"]), output_path=Path(config["outputPath"]),
         settings=settings_for(config.get("preset", "Офисный скан"), config.get("settings")),
-        seed=int(config.get("seed", 42)), ocr_enabled=bool(config.get("ocrEnabled", False)),
-        ocr_languages=config.get("ocrLanguages", "rus+eng"), facsimile=placement_from(config.get("facsimile")),
+        seed=int(config.get("seed", 42)), ocr_enabled=ocr_enabled,
+        ocr_languages=ocr_languages, facsimile=placement_from(config.get("facsimile")),
     )
     warnings = process_document(request, lambda event: emit({"type": "progress", "stage": event.stage,
         "currentPage": event.current_page, "totalPages": event.total_pages, "percent": event.percent}))
@@ -110,6 +140,7 @@ def process(config: dict) -> int:
 
 def main() -> int:
     configure_protocol_encoding()
+    SecureWorkspace.cleanup_stale()
     parser = argparse.ArgumentParser(prog="sbk-scanner-worker")
     parser.add_argument("command", choices=("preview", "process", "info"))
     parser.add_argument("--config")

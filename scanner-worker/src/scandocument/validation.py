@@ -15,6 +15,10 @@ from scandocument.errors import (
 from scandocument.models import DocumentInfo
 
 MAX_RECOMMENDED_BYTES = 50 * 1024 * 1024
+MAX_FILE_BYTES = 200 * 1024 * 1024
+MAX_PAGES = 500
+MAX_PAGE_POINTS = 14_400
+MAX_TOTAL_PIXELS = 1_200_000_000
 PDF_MAGIC = b"%PDF-"
 
 
@@ -69,7 +73,7 @@ def inspect_document(
     warnings: list[str] = []
     if size > MAX_RECOMMENDED_BYTES:
         warnings.append("Файл больше рекомендуемых 50 МБ; обработка может занять много времени.")
-    if size > MAX_RECOMMENDED_BYTES * 4:
+    if size > MAX_FILE_BYTES:
         raise DocumentTooLargeError("Файл больше 200 МБ. Сначала уменьшите его размер.")
     if kind == "pdf":
         try:
@@ -109,6 +113,31 @@ def inspect_document(
             raise
         except Exception as exc:
             raise CorruptDocumentError("DOCX повреждён или содержит неподдерживаемую структуру.") from exc
+    if count < 1:
+        raise CorruptDocumentError("Документ не содержит страниц.")
+    if count > MAX_PAGES:
+        raise DocumentTooLargeError(f"В документе больше {MAX_PAGES} страниц.")
+    if any(width <= 0 or height <= 0 or width > MAX_PAGE_POINTS or height > MAX_PAGE_POINTS for width, height in sizes):
+        raise DocumentTooLargeError("Документ содержит страницу чрезмерного размера.")
     if count > 100:
         warnings.append("В документе больше рекомендуемых 100 страниц.")
     return DocumentInfo(source, kind, size, count, sizes, warnings)
+
+
+def validate_render_budget(info: DocumentInfo, dpi: int) -> None:
+    safe_dpi = max(72, int(dpi))
+    total_pixels = sum(
+        round(width / 72 * safe_dpi) * round(height / 72 * safe_dpi)
+        for width, height in info.page_sizes_points
+    )
+    if total_pixels > MAX_TOTAL_PIXELS:
+        raise DocumentTooLargeError(
+            "Документ слишком велик для выбранного DPI. Уменьшите DPI или разделите документ."
+        )
+
+
+def validate_ocr_languages(value: str) -> str:
+    languages = [part.strip() for part in value.split("+") if part.strip()]
+    if not languages or any(language not in {"rus", "eng"} for language in languages):
+        raise UnsupportedFormatError("Доступны только встроенные языки OCR: русский и английский.")
+    return "+".join(dict.fromkeys(languages))

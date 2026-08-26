@@ -130,6 +130,14 @@ export async function archiveRecord(module: ModuleId, id: string, archived = tru
   }
 }
 
+export async function deleteRecord(module: ModuleId, id: string): Promise<void> {
+  if (isTauri()) {
+    await invoke("delete_record", { module, id });
+    return;
+  }
+  writeFallback(module, readFallback(module).filter((record) => record.id !== id));
+}
+
 export async function copyAttachment(
   sourcePath: string,
   module: ModuleId,
@@ -167,11 +175,16 @@ export async function restoreBackup(path: string): Promise<void> {
   await invoke("restore_backup", { path });
 }
 
-export function saveDraft<T>(key: string, value: T) {
+export async function saveDraft<T>(key: ModuleId, value: T): Promise<void> {
+  if (isTauri()) {
+    await invoke("save_draft", { module: key, key: "current", payload: value });
+    return;
+  }
   localStorage.setItem(`sbk-tools:draft:${key}`, JSON.stringify({ value, savedAt: new Date().toISOString() }));
 }
 
-export function readDraft<T>(key: string): T | null {
+export async function readDraft<T>(key: ModuleId): Promise<T | null> {
+  if (isTauri()) return invoke<T | null>("read_draft", { module: key, key: "current" });
   try {
     return JSON.parse(localStorage.getItem(`sbk-tools:draft:${key}`) || "null")?.value ?? null;
   } catch {
@@ -179,6 +192,10 @@ export function readDraft<T>(key: string): T | null {
   }
 }
 
-export function clearDraft(key: string) {
+export async function clearDraft(key: ModuleId): Promise<void> {
+  if (isTauri()) {
+    await invoke("clear_draft", { module: key, key: "current" });
+    return;
+  }
   localStorage.removeItem(`sbk-tools:draft:${key}`);
 }

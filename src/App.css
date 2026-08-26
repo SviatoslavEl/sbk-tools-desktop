@@ -92,6 +92,13 @@ textarea { resize: vertical; }
 .notice.success { color: #247936; background: #e4f5e8; }
 .notice.warning { color: #77500a; background: #fff3d9; border: 1px solid #edce8d; }
 .notice.error { color: #8d2830; background: #fbe8e9; border: 1px solid #efc4c7; }
+.archive-grid { display: grid; gap: 14px; }
+.archive-list { display: grid; gap: 8px; }
+.archive-row { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 9px; align-items: center; padding: 10px 0; border-bottom: 1px solid #e2e9e3; }
+.archive-row:last-child { border-bottom: 0; }
+.archive-row > div { min-width: 0; display: grid; gap: 3px; }
+.archive-row span { color: #67726c; font-size: 11px; }
+@media (max-width: 760px) { .archive-row { grid-template-columns: 1fr; } }
 .stacked-bar { display: flex; height: 18px; overflow: hidden; background: #edf2ee; border-radius: 6px; }
 .stacked-bar span { display: block; height: 100%; }
 .stacked-bar .cost, .cost-dot { background: #8fb99a; }

@@ -1,26 +1,28 @@
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use calamine::{Reader, open_workbook_auto};
 use chrono::Utc;
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use calamine::{open_workbook_auto, Reader};
 use fs2::FileExt;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, DatabaseName, OptionalExtension, params};
+use rust_xlsxwriter::{Format, Workbook};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{collections::HashMap, io::BufRead, io::BufReader};
 use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
 use walkdir::WalkDir;
 use zip::write::SimpleFileOptions;
-use rust_xlsxwriter::{Format, Workbook};
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const MODULES: [&str; 5] = [
     "settings",
     "calculator",
@@ -45,6 +47,7 @@ const WORKSPACE_DIRS: [&str; 10] = [
 struct AppState {
     workspace: Arc<Workspace>,
     scanner_jobs: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+    maintenance: Arc<Mutex<()>>,
 }
 
 struct Workspace {
@@ -52,6 +55,14 @@ struct Workspace {
     portable: bool,
     writable: bool,
     _lock: File,
+}
+
+impl Drop for Workspace {
+    fn drop(&mut self) {
+        let runtime = self.root.join("runtime-cache");
+        let _ = fs::remove_dir_all(&runtime);
+        let _ = fs::create_dir_all(runtime);
+    }
 }
 
 #[derive(Serialize)]
@@ -93,6 +104,43 @@ struct BackupInfo {
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct BackupFileMeta {
+    size_bytes: u64,
+    sha256: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BackupManifest {
+    product: String,
+    backup_format_version: u32,
+    schema_version: i64,
+    created_at: String,
+    modules: Vec<String>,
+    files: BTreeMap<String, BackupFileMeta>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeFileMeta {
+    size_bytes: u64,
+    sha256: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeManifest {
+    schema_version: u32,
+    worker: RuntimeFileMeta,
+    resources: BTreeMap<String, RuntimeFileMeta>,
+}
+
+const TRUSTED_RUNTIME_MANIFEST: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/trusted-runtime-manifest.json"));
+static RUNTIME_VERIFICATION: OnceLock<Result<(), String>> = OnceLock::new();
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct SpreadsheetData {
     sheet_name: Option<String>,
     rows: Vec<Vec<String>>,
@@ -121,13 +169,12 @@ fn adjacent_product_directory() -> Result<PathBuf, String> {
 
     #[cfg(target_os = "macos")]
     {
-        if let Some(bundle) = executable
+        if let Some(parent) = executable
             .ancestors()
             .find(|path| path.extension().is_some_and(|extension| extension == "app"))
+            .and_then(Path::parent)
         {
-            if let Some(parent) = bundle.parent() {
-                return Ok(parent.join("ProductData"));
-            }
+            return Ok(parent.join("ProductData"));
         }
     }
 
@@ -141,20 +188,24 @@ fn product_directory() -> Result<(PathBuf, bool), String> {
     if let Some(override_path) = std::env::var_os("SBK_TOOLS_WORKSPACE") {
         return Ok((PathBuf::from(override_path), false));
     }
-    if let Ok(pointer) = workspace_pointer_path() {
-        if let Ok(content) = fs::read_to_string(pointer) {
-            let selected = PathBuf::from(content.trim());
-            if !content.trim().is_empty() {
-                return Ok((selected, false));
-            }
+    if let Ok(content) = workspace_pointer_path()
+        .and_then(|pointer| fs::read_to_string(pointer).map_err(|error| error.to_string()))
+    {
+        let selected = PathBuf::from(content.trim());
+        if !content.trim().is_empty() {
+            return Ok((selected, false));
         }
     }
     adjacent_product_directory().map(|path| (path, true))
 }
 
 fn ensure_workspace(root: &Path) -> Result<(), String> {
-    fs::create_dir_all(root)
-        .map_err(|error| format!("Не удалось создать рабочую папку {}: {error}", root.display()))?;
+    fs::create_dir_all(root).map_err(|error| {
+        format!(
+            "Не удалось создать рабочую папку {}: {error}",
+            root.display()
+        )
+    })?;
     for directory in WORKSPACE_DIRS {
         fs::create_dir_all(root.join(directory))
             .map_err(|error| format!("Не удалось подготовить раздел {directory}: {error}"))?;
@@ -167,7 +218,12 @@ fn open_workspace() -> Result<Workspace, String> {
     let mut root = preferred.clone();
     if ensure_workspace(&root).is_err() {
         root = dirs::data_local_dir()
-            .ok_or_else(|| format!("Папка {} недоступна, резервное расположение не найдено", preferred.display()))?
+            .ok_or_else(|| {
+                format!(
+                    "Папка {} недоступна, резервное расположение не найдено",
+                    preferred.display()
+                )
+            })?
             .join("SBKTools")
             .join("ProductData");
         portable = false;
@@ -185,13 +241,18 @@ fn open_workspace() -> Result<Workspace, String> {
     }
     let lock = OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(root.join(".workspace.lock"))
         .map_err(|error| format!("Не удалось открыть блокировку workspace: {error}"))?;
-    lock.try_lock_exclusive().map_err(|_| {
-        "Эта рабочая папка уже открыта в другом экземпляре приложения.".to_string()
-    })?;
+    lock.try_lock_exclusive()
+        .map_err(|_| "Эта рабочая папка уже открыта в другом экземпляре приложения.".to_string())?;
+    let runtime = root.join("runtime-cache");
+    fs::remove_dir_all(&runtime)
+        .map_err(|error| format!("Не удалось очистить временные данные: {error}"))?;
+    fs::create_dir_all(&runtime)
+        .map_err(|error| format!("Не удалось подготовить временные данные: {error}"))?;
     Ok(Workspace {
         root,
         portable,
@@ -253,7 +314,9 @@ fn open_database(root: &Path, module: &str) -> Result<Connection, String> {
         backup_database_before_migration(&path, module)?;
     }
     if current_version < 1 {
-        let transaction = connection.transaction().map_err(|error| error.to_string())?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
         transaction
             .execute_batch(
                 "CREATE TABLE IF NOT EXISTS records (
@@ -276,6 +339,22 @@ fn open_database(root: &Path, module: &str) -> Result<Connection, String> {
                 PRAGMA user_version = 1;",
             )
             .map_err(|error| format!("Не удалось создать схему раздела {module}: {error}"))?;
+        transaction.commit().map_err(|error| error.to_string())?;
+    }
+    if current_version < 2 {
+        let transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS drafts (
+                    key TEXT PRIMARY KEY NOT NULL,
+                    payload TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                PRAGMA user_version = 2;",
+            )
+            .map_err(|error| format!("Не удалось обновить схему раздела {module}: {error}"))?;
         transaction.commit().map_err(|error| error.to_string())?;
     }
     connection
@@ -313,14 +392,18 @@ fn set_workspace_location(path: String) -> Result<String, String> {
     if selected.as_os_str().is_empty() {
         return Err("Выберите папку".to_string());
     }
-    let root = if selected.file_name().is_some_and(|name| name == "ProductData") {
+    let root = if selected
+        .file_name()
+        .is_some_and(|name| name == "ProductData")
+    {
         selected
     } else {
         selected.join("ProductData")
     };
     ensure_workspace(&root)?;
     let probe = root.join(".write-probe");
-    fs::write(&probe, b"ok").and_then(|_| fs::remove_file(&probe))
+    fs::write(&probe, b"ok")
+        .and_then(|_| fs::remove_file(&probe))
         .map_err(|error| format!("Выбранная папка недоступна для записи: {error}"))?;
     let pointer = workspace_pointer_path()?;
     if let Some(parent) = pointer.parent() {
@@ -334,12 +417,22 @@ fn set_workspace_location(path: String) -> Result<String, String> {
 fn read_xlsx(path: String) -> Result<SpreadsheetData, String> {
     let mut workbook = open_workbook_auto(&path)
         .map_err(|error| format!("Не удалось открыть Excel-файл: {error}"))?;
-    let sheet_name = workbook.sheet_names().first().cloned()
+    let sheet_name = workbook
+        .sheet_names()
+        .first()
+        .cloned()
         .ok_or_else(|| "В книге нет листов".to_string())?;
-    let range = workbook.worksheet_range(&sheet_name)
+    let range = workbook
+        .worksheet_range(&sheet_name)
         .map_err(|error| format!("Не удалось прочитать лист: {error}"))?;
-    let rows = range.rows().map(|row| row.iter().map(|cell| cell.to_string()).collect()).collect();
-    Ok(SpreadsheetData { sheet_name: Some(sheet_name), rows })
+    let rows = range
+        .rows()
+        .map(|row| row.iter().map(|cell| cell.to_string()).collect())
+        .collect();
+    Ok(SpreadsheetData {
+        sheet_name: Some(sheet_name),
+        rows,
+    })
 }
 
 #[tauri::command]
@@ -347,24 +440,32 @@ fn write_xlsx(path: String, data: SpreadsheetData) -> Result<(), String> {
     let mut workbook = Workbook::new();
     let worksheet = workbook.add_worksheet();
     if let Some(name) = data.sheet_name.as_deref() {
-        worksheet.set_name(name).map_err(|error| error.to_string())?;
+        worksheet
+            .set_name(name)
+            .map_err(|error| error.to_string())?;
     }
     let header = Format::new().set_bold().set_background_color("#DCEFD8");
     for (row_index, row) in data.rows.iter().enumerate() {
         for (column_index, value) in row.iter().enumerate() {
-            let row_number = u32::try_from(row_index).map_err(|_| "Слишком много строк".to_string())?;
-            let column_number = u16::try_from(column_index).map_err(|_| "Слишком много колонок".to_string())?;
+            let row_number =
+                u32::try_from(row_index).map_err(|_| "Слишком много строк".to_string())?;
+            let column_number =
+                u16::try_from(column_index).map_err(|_| "Слишком много колонок".to_string())?;
             if row_index == 0 {
-                worksheet.write_string_with_format(row_number, column_number, value, &header)
+                worksheet
+                    .write_string_with_format(row_number, column_number, value, &header)
                     .map_err(|error| error.to_string())?;
             } else {
-                worksheet.write_string(row_number, column_number, value)
+                worksheet
+                    .write_string(row_number, column_number, value)
                     .map_err(|error| error.to_string())?;
             }
         }
     }
     worksheet.autofit();
-    workbook.save(path).map_err(|error| format!("Не удалось сохранить Excel-файл: {error}"))
+    workbook
+        .save(path)
+        .map_err(|error| format!("Не удалось сохранить Excel-файл: {error}"))
 }
 
 #[tauri::command]
@@ -405,12 +506,22 @@ fn get_record(
 }
 
 #[tauri::command]
-fn record_history(state: State<'_, AppState>, module: String, id: String) -> Result<Vec<HistoryEntry>, String> {
+fn record_history(
+    state: State<'_, AppState>,
+    module: String,
+    id: String,
+) -> Result<Vec<HistoryEntry>, String> {
     let connection = open_database(&state.workspace.root, &module)?;
     let mut statement = connection.prepare(
         "SELECT action, created_at FROM history WHERE record_id = ?1 ORDER BY created_at DESC LIMIT 100",
     ).map_err(|error| error.to_string())?;
-    statement.query_map([id], |row| Ok(HistoryEntry { action: row.get(0)?, created_at: row.get(1)? }))
+    statement
+        .query_map([id], |row| {
+            Ok(HistoryEntry {
+                action: row.get(0)?,
+                created_at: row.get(1)?,
+            })
+        })
         .map_err(|error| error.to_string())?
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(|error| error.to_string())
@@ -424,6 +535,10 @@ fn upsert_record(
     title: String,
     payload: Value,
 ) -> Result<StoredRecord, String> {
+    let _maintenance = state
+        .maintenance
+        .lock()
+        .map_err(|_| "Хранилище временно недоступно".to_string())?;
     if title.trim().is_empty() {
         return Err("Укажите название записи".to_string());
     }
@@ -431,9 +546,15 @@ fn upsert_record(
     let record_id = id.unwrap_or_else(|| Uuid::new_v4().to_string());
     let now = Utc::now().to_rfc3339();
     let payload_text = serde_json::to_string(&payload).map_err(|error| error.to_string())?;
-    let transaction = connection.transaction().map_err(|error| error.to_string())?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
     let previous: Option<String> = transaction
-        .query_row("SELECT payload FROM records WHERE id = ?1", [&record_id], |row| row.get(0))
+        .query_row(
+            "SELECT payload FROM records WHERE id = ?1",
+            [&record_id],
+            |row| row.get(0),
+        )
         .optional()
         .map_err(|error| error.to_string())?;
     transaction
@@ -448,10 +569,20 @@ fn upsert_record(
     transaction
         .execute(
             "INSERT INTO history(record_id, action, snapshot, created_at) VALUES (?1, ?2, ?3, ?4)",
-            params![record_id, if previous.is_some() { "updated" } else { "created" }, previous, now],
+            params![
+                record_id,
+                if previous.is_some() {
+                    "updated"
+                } else {
+                    "created"
+                },
+                previous,
+                now
+            ],
         )
         .map_err(|error| error.to_string())?;
     transaction.commit().map_err(|error| error.to_string())?;
+    drop(_maintenance);
     get_record(state, module, record_id)?
         .ok_or_else(|| "Запись не найдена после сохранения".to_string())
 }
@@ -463,6 +594,10 @@ fn archive_record(
     id: String,
     archived: bool,
 ) -> Result<(), String> {
+    let _maintenance = state
+        .maintenance
+        .lock()
+        .map_err(|_| "Хранилище временно недоступно".to_string())?;
     let connection = open_database(&state.workspace.root, &module)?;
     let now = Utc::now().to_rfc3339();
     let changed = connection
@@ -480,6 +615,106 @@ fn archive_record(
             params![id, if archived { "archived" } else { "restored" }, now],
         )
         .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn save_draft(
+    state: State<'_, AppState>,
+    module: String,
+    key: String,
+    payload: Value,
+) -> Result<(), String> {
+    if key.trim().is_empty() || key.len() > 100 {
+        return Err("Некорректный ключ черновика".to_string());
+    }
+    let _maintenance = state
+        .maintenance
+        .lock()
+        .map_err(|_| "Хранилище временно недоступно".to_string())?;
+    let connection = open_database(&state.workspace.root, &module)?;
+    connection
+        .execute(
+            "INSERT INTO drafts(key, payload, updated_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(key) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at",
+            params![
+                key,
+                serde_json::to_string(&payload).map_err(|error| error.to_string())?,
+                Utc::now().to_rfc3339()
+            ],
+        )
+        .map_err(|error| format!("Не удалось сохранить черновик: {error}"))?;
+    Ok(())
+}
+
+#[tauri::command]
+fn read_draft(
+    state: State<'_, AppState>,
+    module: String,
+    key: String,
+) -> Result<Option<Value>, String> {
+    let connection = open_database(&state.workspace.root, &module)?;
+    let payload: Option<String> = connection
+        .query_row("SELECT payload FROM drafts WHERE key = ?1", [key], |row| {
+            row.get(0)
+        })
+        .optional()
+        .map_err(|error| error.to_string())?;
+    payload
+        .map(|text| {
+            serde_json::from_str(&text).map_err(|_| "Сохранённый черновик повреждён".to_string())
+        })
+        .transpose()
+}
+
+#[tauri::command]
+fn clear_draft(state: State<'_, AppState>, module: String, key: String) -> Result<(), String> {
+    let _maintenance = state
+        .maintenance
+        .lock()
+        .map_err(|_| "Хранилище временно недоступно".to_string())?;
+    let connection = open_database(&state.workspace.root, &module)?;
+    connection
+        .execute("DELETE FROM drafts WHERE key = ?1", [key])
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn delete_record(state: State<'_, AppState>, module: String, id: String) -> Result<(), String> {
+    let _maintenance = state
+        .maintenance
+        .lock()
+        .map_err(|_| "Хранилище временно недоступно".to_string())?;
+    let mut connection = open_database(&state.workspace.root, &module)?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+    let archived: Option<i64> = transaction
+        .query_row("SELECT archived FROM records WHERE id = ?1", [&id], |row| {
+            row.get(0)
+        })
+        .optional()
+        .map_err(|error| error.to_string())?;
+    if archived != Some(1) {
+        return Err("Окончательно удалить можно только запись из архива".to_string());
+    }
+    transaction
+        .execute("DELETE FROM history WHERE record_id = ?1", [&id])
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute("DELETE FROM records WHERE id = ?1", [&id])
+        .map_err(|error| error.to_string())?;
+    transaction.commit().map_err(|error| error.to_string())?;
+    let attachment_dir = state
+        .workspace
+        .root
+        .join("attachments")
+        .join(validated_module(&module)?)
+        .join(safe_file_name(&id));
+    if attachment_dir.is_dir() {
+        fs::remove_dir_all(attachment_dir).map_err(|error| error.to_string())?;
+    }
     Ok(())
 }
 
@@ -509,6 +744,10 @@ fn copy_attachment(
     module: String,
     record_id: String,
 ) -> Result<AttachmentInfo, String> {
+    let _maintenance = state
+        .maintenance
+        .lock()
+        .map_err(|_| "Хранилище временно недоступно".to_string())?;
     validated_module(&module)?;
     let source = PathBuf::from(source_path);
     if !source.is_file() {
@@ -529,7 +768,9 @@ fn copy_attachment(
     }
     fs::copy(&source, &destination)
         .map_err(|error| format!("Не удалось скопировать вложение: {error}"))?;
-    let size_bytes = fs::metadata(&destination).map_err(|error| error.to_string())?.len();
+    let size_bytes = fs::metadata(&destination)
+        .map_err(|error| error.to_string())?
+        .len();
     Ok(AttachmentInfo {
         relative_path: relative.to_string_lossy().replace('\\', "/"),
         file_name: original_name,
@@ -543,7 +784,10 @@ fn atomic_write(destination: &Path, bytes: &[u8]) -> Result<(), String> {
     }
     let temporary = destination.with_extension(format!(
         "{}.part",
-        destination.extension().and_then(|part| part.to_str()).unwrap_or("tmp")
+        destination
+            .extension()
+            .and_then(|part| part.to_str())
+            .unwrap_or("tmp")
     ));
     let result = (|| {
         let mut file = File::create(&temporary).map_err(|error| error.to_string())?;
@@ -566,7 +810,10 @@ fn read_text_file(path: String, max_bytes: Option<u64>) -> Result<String, String
     let metadata = fs::metadata(&path).map_err(|error| format!("Файл не найден: {error}"))?;
     let limit = max_bytes.unwrap_or(20 * 1024 * 1024);
     if metadata.len() > limit {
-        return Err(format!("Файл больше допустимого размера {} МБ", limit / 1024 / 1024));
+        return Err(format!(
+            "Файл больше допустимого размера {} МБ",
+            limit / 1024 / 1024
+        ));
     }
     fs::read_to_string(path)
         .map_err(|error| format!("Не удалось прочитать текстовый файл: {error}"))
@@ -578,10 +825,19 @@ fn read_binary_file(path: String, max_bytes: Option<u64>) -> Result<String, Stri
     let metadata = fs::metadata(&path).map_err(|error| format!("Файл не найден: {error}"))?;
     let limit = max_bytes.unwrap_or(24 * 1024 * 1024);
     if metadata.len() > limit {
-        return Err(format!("Файл больше допустимого размера {} МБ", limit / 1024 / 1024));
+        return Err(format!(
+            "Файл больше допустимого размера {} МБ",
+            limit / 1024 / 1024
+        ));
     }
     let bytes = fs::read(&path).map_err(|error| error.to_string())?;
-    let mime = match path.extension().and_then(|value| value.to_str()).unwrap_or("").to_ascii_lowercase().as_str() {
+    let mime = match path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "jpg" | "jpeg" => "image/jpeg",
         "gif" => "image/gif",
         "webp" => "image/webp",
@@ -590,66 +846,182 @@ fn read_binary_file(path: String, max_bytes: Option<u64>) -> Result<String, Stri
     Ok(format!("data:{mime};base64,{}", BASE64.encode(bytes)))
 }
 
-fn add_directory_to_zip<W: Write + std::io::Seek>(
-    writer: &mut zip::ZipWriter<W>,
+fn sha256_file(path: &Path) -> Result<String, String> {
+    let mut input = File::open(path).map_err(|error| error.to_string())?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = input.read(&mut buffer).map_err(|error| error.to_string())?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn collect_backup_files(
     source: &Path,
     prefix: &str,
+    files: &mut Vec<(PathBuf, String)>,
 ) -> Result<(), String> {
-    let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    if !source.exists() {
+        return Ok(());
+    }
     for entry in WalkDir::new(source).follow_links(false) {
         let entry = entry.map_err(|error| error.to_string())?;
         if entry.file_type().is_symlink() || !entry.file_type().is_file() {
             continue;
         }
-        let relative = entry.path().strip_prefix(source).map_err(|error| error.to_string())?;
-        let name = format!("{}/{}", prefix, relative.to_string_lossy().replace('\\', "/"));
-        writer.start_file(name, options).map_err(|error| error.to_string())?;
-        let mut input = File::open(entry.path()).map_err(|error| error.to_string())?;
-        std::io::copy(&mut input, writer).map_err(|error| error.to_string())?;
+        let relative = entry
+            .path()
+            .strip_prefix(source)
+            .map_err(|error| error.to_string())?;
+        let name = format!(
+            "{}/{}",
+            prefix,
+            relative.to_string_lossy().replace('\\', "/")
+        );
+        files.push((entry.path().to_path_buf(), name));
     }
     Ok(())
 }
 
-#[tauri::command]
-fn create_backup(state: State<'_, AppState>, module: Option<String>) -> Result<BackupInfo, String> {
+fn create_backup_impl(workspace: &Workspace, module: Option<String>) -> Result<BackupInfo, String> {
     let selected_modules: Vec<&str> = match module.as_deref() {
         Some(name) => vec![validated_module(name)?],
         None => MODULES.to_vec(),
     };
+    let snapshot_path = workspace
+        .root
+        .join("runtime-cache")
+        .join(format!("backup-{}", Uuid::new_v4()));
+    fs::create_dir(&snapshot_path).map_err(|error| error.to_string())?;
+    let _snapshot = TemporaryDirectory(snapshot_path.clone());
     for name in &selected_modules {
-        let connection = open_database(&state.workspace.root, name)?;
+        let source_dir = workspace.root.join(name);
+        let snapshot_dir = snapshot_path.join(name);
+        fs::create_dir_all(&snapshot_dir).map_err(|error| error.to_string())?;
+        let connection = open_database(&workspace.root, name)?;
+        let snapshot_database = snapshot_dir.join("data.sqlite3");
         connection
-            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .backup(DatabaseName::Main, &snapshot_database, None)
+            .map_err(|error| {
+                format!("Не удалось создать согласованный снимок базы {name}: {error}")
+            })?;
+        let snapshot_connection = Connection::open_with_flags(
+            &snapshot_database,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .map_err(|error| error.to_string())?;
+        let integrity: String = snapshot_connection
+            .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
             .map_err(|error| error.to_string())?;
+        if integrity != "ok" {
+            return Err(format!("Снимок базы {name} не прошёл проверку целостности"));
+        }
+        for entry in WalkDir::new(&source_dir).min_depth(1).follow_links(false) {
+            let entry = entry.map_err(|error| error.to_string())?;
+            if !entry.file_type().is_file()
+                || entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("data.sqlite3")
+            {
+                continue;
+            }
+            let relative = entry
+                .path()
+                .strip_prefix(&source_dir)
+                .map_err(|error| error.to_string())?;
+            let destination = snapshot_dir.join(relative);
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+            }
+            fs::copy(entry.path(), destination).map_err(|error| error.to_string())?;
+        }
     }
     let label = module.as_deref().unwrap_or("all");
-    let file_name = format!("sbk-tools-{}-{}.sbkbackup", label, Utc::now().format("%Y%m%d-%H%M%S"));
-    let destination = state.workspace.root.join("backups").join(&file_name);
+    let file_name = format!(
+        "sbk-tools-{}-{}-{:03}.sbkbackup",
+        label,
+        Utc::now().format("%Y%m%d-%H%M%S"),
+        Utc::now().timestamp_subsec_millis()
+    );
+    let destination = workspace.root.join("backups").join(&file_name);
     let temporary = destination.with_extension("sbkbackup.part");
+    let mut backup_files = Vec::new();
+    for name in &selected_modules {
+        collect_backup_files(&snapshot_path.join(name), name, &mut backup_files)?;
+        collect_backup_files(
+            &workspace.root.join("attachments").join(name),
+            &format!("attachments/{name}"),
+            &mut backup_files,
+        )?;
+    }
+    let mut checksums = BTreeMap::new();
+    for (path, name) in &backup_files {
+        checksums.insert(
+            name.clone(),
+            BackupFileMeta {
+                size_bytes: fs::metadata(path).map_err(|error| error.to_string())?.len(),
+                sha256: sha256_file(path)?,
+            },
+        );
+    }
+    let manifest = BackupManifest {
+        product: "sbk-tools-desktop".to_string(),
+        backup_format_version: 2,
+        schema_version: SCHEMA_VERSION,
+        created_at: Utc::now().to_rfc3339(),
+        modules: selected_modules
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect(),
+        files: checksums,
+    };
     let file = File::create(&temporary).map_err(|error| error.to_string())?;
     let mut archive = zip::ZipWriter::new(file);
-    let manifest = serde_json::json!({
-        "product": "sbk-tools-desktop",
-        "schemaVersion": SCHEMA_VERSION,
-        "createdAt": Utc::now().to_rfc3339(),
-        "modules": selected_modules,
-    });
     archive
         .start_file("manifest.json", SimpleFileOptions::default())
         .map_err(|error| error.to_string())?;
     archive
-        .write_all(manifest.to_string().as_bytes())
+        .write_all(
+            serde_json::to_string_pretty(&manifest)
+                .map_err(|error| error.to_string())?
+                .as_bytes(),
+        )
         .map_err(|error| error.to_string())?;
-    for name in &selected_modules {
-        add_directory_to_zip(&mut archive, &state.workspace.root.join(name), name)?;
-        let attachments = state.workspace.root.join("attachments").join(name);
-        if attachments.exists() {
-            add_directory_to_zip(&mut archive, &attachments, &format!("attachments/{name}"))?;
-        }
+    let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    for (path, name) in backup_files {
+        archive
+            .start_file(name, options)
+            .map_err(|error| error.to_string())?;
+        let mut input = File::open(path).map_err(|error| error.to_string())?;
+        std::io::copy(&mut input, &mut archive).map_err(|error| error.to_string())?;
     }
-    archive.finish().map_err(|error| error.to_string())?;
-    fs::rename(&temporary, &destination).map_err(|error| error.to_string())?;
-    let size_bytes = fs::metadata(&destination).map_err(|error| error.to_string())?.len();
+    let completed = archive.finish().map_err(|error| error.to_string())?;
+    completed.sync_all().map_err(|error| error.to_string())?;
+    if let Err(error) = fs::rename(&temporary, &destination) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error.to_string());
+    }
+    let size_bytes = fs::metadata(&destination)
+        .map_err(|error| error.to_string())?
+        .len();
+    if let Ok(mut log) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(workspace.root.join("logs").join("backup-restore.log"))
+    {
+        let message = format!(
+            "{} backup completed; scope={}; size={size_bytes}\n",
+            Utc::now().to_rfc3339(),
+            label
+        );
+        let _ = log.write_all(message.as_bytes());
+        let _ = log.sync_all();
+    }
     Ok(BackupInfo {
         path: destination.to_string_lossy().into_owned(),
         file_name,
@@ -657,35 +1029,169 @@ fn create_backup(state: State<'_, AppState>, module: Option<String>) -> Result<B
     })
 }
 
-fn valid_archive_path(path: &Path) -> bool {
-    path.components().all(|component| matches!(component, Component::Normal(_)))
-        && path.components().next().is_some_and(|component| {
-            let first = component.as_os_str().to_string_lossy();
-            MODULES.contains(&first.as_ref()) || first == "attachments" || first == "manifest.json"
+#[tauri::command]
+fn create_backup(state: State<'_, AppState>, module: Option<String>) -> Result<BackupInfo, String> {
+    let _maintenance = state
+        .maintenance
+        .lock()
+        .map_err(|_| "Хранилище временно недоступно".to_string())?;
+    create_backup_impl(&state.workspace, module)
+}
+
+fn valid_archive_path(path: &Path, modules: &HashSet<String>) -> bool {
+    let parts: Vec<String> = path
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(value) => Some(value.to_string_lossy().into_owned()),
+            _ => None,
         })
+        .collect();
+    if parts.len() != path.components().count() || parts.is_empty() {
+        return false;
+    }
+    if parts[0] == "manifest.json" {
+        return parts.len() == 1;
+    }
+    if parts[0] == "attachments" {
+        return parts.len() >= 3 && modules.contains(&parts[1]);
+    }
+    modules.contains(&parts[0]) && parts.len() >= 2
+}
+
+struct TemporaryDirectory(PathBuf);
+
+impl Drop for TemporaryDirectory {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn validate_sqlite_files(stage: &Path, modules: &[String]) -> Result<(), String> {
+    for module in modules {
+        let database = stage.join(module).join("data.sqlite3");
+        if !database.is_file() {
+            return Err(format!(
+                "В резервной копии отсутствует база раздела {module}"
+            ));
+        }
+        let connection =
+            Connection::open_with_flags(&database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .map_err(|_| format!("База раздела {module} повреждена"))?;
+        let result: String = connection
+            .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+            .map_err(|_| format!("База раздела {module} не прошла проверку"))?;
+        if result != "ok" {
+            return Err(format!("База раздела {module} повреждена: {result}"));
+        }
+    }
+    Ok(())
+}
+
+fn rollback_workspace_swaps(swaps: &[(PathBuf, PathBuf, bool)]) {
+    for (target, rollback, existed) in swaps.iter().rev() {
+        let _ = fs::remove_dir_all(target);
+        if *existed {
+            let _ = fs::rename(rollback, target);
+        }
+    }
 }
 
 #[tauri::command]
 fn restore_backup(state: State<'_, AppState>, path: String) -> Result<(), String> {
-    let safety_backup = create_backup(state.clone(), None)?;
+    let _maintenance = state
+        .maintenance
+        .lock()
+        .map_err(|_| "Хранилище временно недоступно".to_string())?;
+    const MAX_BACKUP_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+    const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
+    let archive_size = fs::metadata(&path)
+        .map_err(|error| format!("Не удалось проверить резервную копию: {error}"))?
+        .len();
+    if archive_size == 0 || archive_size > MAX_BACKUP_BYTES {
+        return Err("Размер файла резервной копии превышает безопасный предел".to_string());
+    }
     let file = File::open(&path)
         .map_err(|error| format!("Не удалось открыть резервную копию: {error}"))?;
     let mut archive = zip::ZipArchive::new(file)
         .map_err(|_| "Файл не является резервной копией СБК".to_string())?;
-    let manifest: Value = {
+    let manifest: BackupManifest = {
         let mut manifest_file = archive
             .by_name("manifest.json")
             .map_err(|_| "В резервной копии нет manifest.json".to_string())?;
+        if manifest_file.size() > MAX_MANIFEST_BYTES {
+            return Err("Manifest резервной копии превышает безопасный предел".to_string());
+        }
         let mut text = String::new();
-        manifest_file.read_to_string(&mut text).map_err(|error| error.to_string())?;
-        serde_json::from_str(&text).map_err(|_| "Manifest резервной копии повреждён".to_string())?
+        manifest_file
+            .read_to_string(&mut text)
+            .map_err(|error| error.to_string())?;
+        serde_json::from_str(&text)
+            .map_err(|_| "Manifest резервной копии повреждён или устарел".to_string())?
     };
-    if manifest.get("product").and_then(Value::as_str) != Some("sbk-tools-desktop") {
+    if manifest.product != "sbk-tools-desktop" {
         return Err("Выбран файл другого приложения".to_string());
     }
-    if manifest.get("schemaVersion").and_then(Value::as_i64).unwrap_or(i64::MAX) > SCHEMA_VERSION {
+    if manifest.backup_format_version != 2 || manifest.schema_version > SCHEMA_VERSION {
         return Err("Резервная копия создана более новой версией приложения".to_string());
     }
+    let modules: HashSet<String> = manifest.modules.iter().cloned().collect();
+    if modules.is_empty()
+        || modules.len() != manifest.modules.len()
+        || modules
+            .iter()
+            .any(|module| validated_module(module).is_err())
+    {
+        return Err("Manifest содержит неизвестные или повторяющиеся разделы".to_string());
+    }
+    const MAX_BACKUP_ENTRIES: usize = 10_000;
+    if archive.len() > MAX_BACKUP_ENTRIES {
+        return Err("В резервной копии слишком много файлов".to_string());
+    }
+    let mut declared_size = 0_u64;
+    let mut declared_names = HashSet::new();
+    for index in 0..archive.len() {
+        let entry = archive.by_index(index).map_err(|error| error.to_string())?;
+        if entry.is_dir() || entry.name() == "manifest.json" {
+            continue;
+        }
+        let enclosed = entry
+            .enclosed_name()
+            .ok_or_else(|| "Опасный путь внутри архива".to_string())?;
+        if !valid_archive_path(&enclosed, &modules) {
+            return Err("Недопустимый путь внутри резервной копии".to_string());
+        }
+        let name = enclosed.to_string_lossy().replace('\\', "/");
+        if !declared_names.insert(name) {
+            return Err("Резервная копия содержит повторяющийся путь".to_string());
+        }
+        declared_size = declared_size
+            .checked_add(entry.size())
+            .ok_or_else(|| "Размер резервной копии некорректен".to_string())?;
+        if declared_size > MAX_BACKUP_BYTES || entry.size() > MAX_BACKUP_BYTES / 2 {
+            return Err(
+                "Распакованный размер резервной копии превышает безопасный предел".to_string(),
+            );
+        }
+        if entry.compressed_size() > 0 && entry.size() / entry.compressed_size() > 250 {
+            return Err("Резервная копия имеет небезопасно высокий коэффициент сжатия".to_string());
+        }
+    }
+    let required_space = declared_size.saturating_mul(2).saturating_add(archive_size);
+    let available =
+        fs2::available_space(&state.workspace.root).map_err(|error| error.to_string())?;
+    if available < required_space {
+        return Err("Недостаточно свободного места для безопасного восстановления".to_string());
+    }
+    let stage_parent = state
+        .workspace
+        .root
+        .parent()
+        .ok_or_else(|| "Не удалось выбрать staging-каталог".to_string())?;
+    let stage_path = stage_parent.join(format!(".sbk-tools-restore-{}", Uuid::new_v4()));
+    fs::create_dir(&stage_path).map_err(|error| error.to_string())?;
+    let stage = TemporaryDirectory(stage_path.clone());
+    let mut total_size = 0_u64;
+    let mut extracted = BTreeMap::new();
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index).map_err(|error| error.to_string())?;
         if entry.is_dir() || entry.name() == "manifest.json" {
@@ -694,37 +1200,137 @@ fn restore_backup(state: State<'_, AppState>, path: String) -> Result<(), String
         let enclosed = entry
             .enclosed_name()
             .ok_or_else(|| "Опасный путь внутри архива".to_string())?;
-        if !valid_archive_path(&enclosed) {
+        if !valid_archive_path(&enclosed, &modules) {
             return Err("Недопустимый путь внутри резервной копии".to_string());
         }
-        let destination = state.workspace.root.join(enclosed);
+        total_size = total_size
+            .checked_add(entry.size())
+            .ok_or_else(|| "Размер резервной копии некорректен".to_string())?;
+        if total_size > MAX_BACKUP_BYTES || entry.size() > MAX_BACKUP_BYTES / 2 {
+            return Err(
+                "Распакованный размер резервной копии превышает безопасный предел".to_string(),
+            );
+        }
+        if entry.compressed_size() > 0 && entry.size() / entry.compressed_size() > 250 {
+            return Err("Резервная копия имеет небезопасно высокий коэффициент сжатия".to_string());
+        }
+        let name = enclosed.to_string_lossy().replace('\\', "/");
+        if extracted.contains_key(&name) {
+            return Err("Резервная копия содержит повторяющийся путь".to_string());
+        }
+        let destination = stage_path.join(&enclosed);
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent).map_err(|error| error.to_string())?;
         }
-        let temporary = destination.with_extension("restore-part");
-        let mut output = File::create(&temporary).map_err(|error| error.to_string())?;
+        let mut output = File::create(&destination).map_err(|error| error.to_string())?;
         std::io::copy(&mut entry, &mut output).map_err(|error| error.to_string())?;
         output.sync_all().map_err(|error| error.to_string())?;
-        fs::rename(&temporary, destination).map_err(|error| error.to_string())?;
+        extracted.insert(
+            name.clone(),
+            BackupFileMeta {
+                size_bytes: entry.size(),
+                sha256: sha256_file(&destination)?,
+            },
+        );
+    }
+    if extracted.len() != manifest.files.len() {
+        return Err("Состав резервной копии не совпадает с manifest".to_string());
+    }
+    for (name, expected) in &manifest.files {
+        let actual = extracted
+            .get(name)
+            .ok_or_else(|| format!("В резервной копии отсутствует {name}"))?;
+        if actual.size_bytes != expected.size_bytes || actual.sha256 != expected.sha256 {
+            return Err(format!("Контрольная сумма файла {name} не совпадает"));
+        }
+    }
+    validate_sqlite_files(&stage_path, &manifest.modules)?;
+
+    let safety_backup = create_backup_impl(&state.workspace, None)?;
+    let rollback_root = stage_path.join("rollback");
+    fs::create_dir(&rollback_root).map_err(|error| error.to_string())?;
+    let mut replacements = Vec::new();
+    for module in &manifest.modules {
+        for relative in [
+            PathBuf::from(module),
+            PathBuf::from("attachments").join(module),
+        ] {
+            let staged = stage_path.join(&relative);
+            fs::create_dir_all(&staged).map_err(|error| error.to_string())?;
+            let target = state.workspace.root.join(&relative);
+            let rollback = rollback_root.join(&relative);
+            if let Some(parent) = rollback.parent() {
+                fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+            }
+            replacements.push((staged, target, rollback));
+        }
+    }
+    let mut swaps: Vec<(PathBuf, PathBuf, bool)> = Vec::new();
+    for (staged, target, rollback) in replacements {
+        let existed = target.exists();
+        let move_old_result = if existed {
+            fs::rename(&target, &rollback)
+        } else {
+            Ok(())
+        };
+        if let Err(error) = move_old_result {
+            rollback_workspace_swaps(&swaps);
+            return Err(format!("Не удалось подготовить замену данных: {error}"));
+        }
+        if let Err(error) = fs::rename(&staged, &target) {
+            if existed {
+                let _ = fs::rename(&rollback, &target);
+            }
+            rollback_workspace_swaps(&swaps);
+            return Err(format!("Не удалось применить резервную копию: {error}"));
+        }
+        swaps.push((target, rollback, existed));
     }
     let message = format!(
         "{} restore completed; safety backup: {}\n",
-        Utc::now().to_rfc3339(), safety_backup.file_name
+        Utc::now().to_rfc3339(),
+        safety_backup.file_name
     );
-    let _ = fs::write(state.workspace.root.join("logs").join("restore.log"), message);
+    if let Ok(mut log) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(state.workspace.root.join("logs").join("backup-restore.log"))
+    {
+        let _ = log.write_all(message.as_bytes());
+        let _ = log.sync_all();
+    }
+    drop(stage);
     Ok(())
 }
 
 fn scanner_worker_command() -> Result<(Command, bool), String> {
     if let Some(path) = std::env::var_os("SBK_SCANNER_WORKER") {
-        return Ok((Command::new(path), true));
+        return Ok((Command::new(path), false));
     }
     let executable = std::env::current_exe().map_err(|error| error.to_string())?;
-    let binary_name = if cfg!(windows) { "sbk-scanner-worker.exe" } else { "sbk-scanner-worker" };
-    let mut candidates = vec![executable.parent().unwrap_or(Path::new(".")).join(binary_name)];
+    let binary_name = if cfg!(windows) {
+        "sbk-scanner-worker.exe"
+    } else {
+        "sbk-scanner-worker"
+    };
+    let mut candidates = vec![
+        executable
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join(binary_name),
+    ];
     #[cfg(target_os = "macos")]
-    if let Some(resources) = executable.ancestors().find(|path| path.ends_with("Contents/MacOS")) {
-        candidates.push(resources.parent().unwrap_or(resources).join("Resources").join(binary_name));
+    if let Some(resources) = executable
+        .ancestors()
+        .find(|path| path.ends_with("Contents/MacOS"))
+    {
+        candidates.push(
+            resources
+                .parent()
+                .unwrap_or(resources)
+                .join("Resources")
+                .join(binary_name),
+        );
     }
     if let Some(path) = candidates.into_iter().find(|path| path.is_file()) {
         return Ok((Command::new(path), true));
@@ -735,6 +1341,146 @@ fn scanner_worker_command() -> Result<(Command, bool), String> {
     command.env("PYTHONPATH", source);
     command.arg("-m").arg("scandocument.worker_cli");
     Ok((command, false))
+}
+
+fn verify_runtime_file(path: &Path, expected: &RuntimeFileMeta) -> Result<(), String> {
+    let metadata = fs::metadata(path)
+        .map_err(|_| format!("Обязательный компонент {} отсутствует", path.display()))?;
+    if !metadata.is_file() || metadata.len() != expected.size_bytes {
+        return Err(format!(
+            "Размер компонента {} не совпадает с релизом",
+            path.display()
+        ));
+    }
+    if sha256_file(path)? != expected.sha256 {
+        return Err(format!(
+            "Компонент {} был изменён и не будет запущен",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn verify_packaged_runtime(worker: &Path, runtime_root: &Path) -> Result<(), String> {
+    RUNTIME_VERIFICATION
+        .get_or_init(|| {
+            let manifest: RuntimeManifest = serde_json::from_str(TRUSTED_RUNTIME_MANIFEST)
+                .map_err(|_| "Встроенный manifest компонентов повреждён".to_string())?;
+            if manifest.schema_version != 1 || manifest.resources.is_empty() {
+                return Err("Встроенный manifest компонентов имеет неизвестную версию".to_string());
+            }
+            verify_runtime_file(worker, &manifest.worker)?;
+            let resources = runtime_root.join("resources");
+            for (relative, expected) in &manifest.resources {
+                let relative_path = Path::new(relative);
+                if relative_path
+                    .components()
+                    .any(|component| !matches!(component, Component::Normal(_)))
+                {
+                    return Err("Встроенный manifest содержит опасный путь".to_string());
+                }
+                verify_runtime_file(&resources.join(relative_path), expected)?;
+            }
+            Ok(())
+        })
+        .clone()
+}
+
+#[cfg(unix)]
+fn configure_scanner_process_group(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn configure_scanner_process_group(_command: &mut Command) {}
+
+fn terminate_scanner_tree(child: &mut Child) {
+    let pid = child.id();
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    #[cfg(unix)]
+    {
+        let _ = Command::new("kill")
+            .args(["-TERM", &format!("-{pid}")])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if child.try_wait().ok().flatten().is_some() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(40));
+    }
+    #[cfg(unix)]
+    {
+        let _ = Command::new("kill")
+            .args(["-KILL", &format!("-{pid}")])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+struct ScannerJobGuard {
+    jobs: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+    job_id: String,
+    config_path: PathBuf,
+}
+
+impl Drop for ScannerJobGuard {
+    fn drop(&mut self) {
+        if let Ok(mut jobs) = self.jobs.lock() {
+            jobs.remove(&self.job_id);
+        }
+        let _ = fs::remove_file(&self.config_path);
+    }
+}
+
+fn validate_scanner_result(operation: &str, event: &Value) -> Result<(), String> {
+    let expected_type = if operation == "preview" {
+        "preview"
+    } else {
+        "complete"
+    };
+    if event.get("type").and_then(Value::as_str) != Some(expected_type) {
+        return Err("Worker вернул незавершённый результат".to_string());
+    }
+    let output = event
+        .get("outputPath")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "Worker не указал итоговый файл".to_string())?;
+    let metadata =
+        fs::metadata(output).map_err(|_| "Worker не создал итоговый файл".to_string())?;
+    if !metadata.is_file() || metadata.len() == 0 {
+        return Err("Worker создал пустой итоговый файл".to_string());
+    }
+    let mut magic = [0_u8; 8];
+    let count = File::open(output)
+        .and_then(|mut file| file.read(&mut magic))
+        .map_err(|error| format!("Не удалось проверить итоговый файл: {error}"))?;
+    let valid = if operation == "preview" {
+        count == magic.len() && magic == [137, 80, 78, 71, 13, 10, 26, 10]
+    } else {
+        count >= 5 && &magic[..5] == b"%PDF-"
+    };
+    if !valid {
+        return Err("Worker создал файл неверного формата".to_string());
+    }
+    Ok(())
 }
 
 fn run_scanner_worker(
@@ -748,7 +1494,10 @@ fn run_scanner_worker(
     if operation != "preview" && operation != "process" {
         return Err("Неизвестная операция сканера".to_string());
     }
-    let input = config.get("inputPath").and_then(Value::as_str)
+    Uuid::parse_str(&job_id).map_err(|_| "Некорректный идентификатор задачи".to_string())?;
+    let input = config
+        .get("inputPath")
+        .and_then(Value::as_str)
         .ok_or_else(|| "Не выбран исходный документ".to_string())?;
     if !Path::new(input).is_file() {
         return Err("Исходный документ не найден".to_string());
@@ -756,33 +1505,86 @@ fn run_scanner_worker(
     if operation == "preview" {
         let preview_dir = workspace.root.join("runtime-cache").join("previews");
         fs::create_dir_all(&preview_dir).map_err(|error| error.to_string())?;
-        config["outputPath"] = Value::String(preview_dir.join(format!("{job_id}.png")).to_string_lossy().into_owned());
+        config["outputPath"] = Value::String(
+            preview_dir
+                .join(format!("{job_id}.png"))
+                .to_string_lossy()
+                .into_owned(),
+        );
     } else {
-        let output = config.get("outputPath").and_then(Value::as_str)
+        let output = config
+            .get("outputPath")
+            .and_then(Value::as_str)
             .ok_or_else(|| "Не выбран путь итогового PDF".to_string())?;
-        if Path::new(input).canonicalize().ok() == Path::new(output).canonicalize().ok() && Path::new(output).exists() {
+        if Path::new(input).canonicalize().ok() == Path::new(output).canonicalize().ok()
+            && Path::new(output).exists()
+        {
             return Err("Исходный документ нельзя перезаписать".to_string());
         }
     }
-    let config_path = workspace.root.join("runtime-cache").join(format!("scanner-{job_id}.json"));
-    atomic_write(&config_path, serde_json::to_string(&config).map_err(|error| error.to_string())?.as_bytes())?;
+    let preview_output = if operation == "preview" {
+        config
+            .get("outputPath")
+            .and_then(Value::as_str)
+            .map(PathBuf::from)
+    } else {
+        None
+    };
+    let config_path = workspace
+        .root
+        .join("runtime-cache")
+        .join(format!("scanner-{job_id}.json"));
+    atomic_write(
+        &config_path,
+        serde_json::to_string(&config)
+            .map_err(|error| error.to_string())?
+            .as_bytes(),
+    )?;
     let cancellation = Arc::new(AtomicBool::new(false));
-    jobs.lock().map_err(|_| "Не удалось зарегистрировать задачу".to_string())?
+    jobs.lock()
+        .map_err(|_| "Не удалось зарегистрировать задачу".to_string())?
         .insert(job_id.clone(), cancellation.clone());
-    let (mut command, _) = scanner_worker_command()?;
+    let _guard = ScannerJobGuard {
+        jobs: jobs.clone(),
+        job_id: job_id.clone(),
+        config_path: config_path.clone(),
+    };
+    let (mut command, packaged_worker) = scanner_worker_command()?;
+    let worker_path = PathBuf::from(command.get_program());
+    let mut runtime_root = None;
     if let Ok(resource_dir) = app.path().resource_dir() {
         let scanner_runtime = resource_dir.join("scanner-runtime");
         if scanner_runtime.join("resources").is_dir() {
             command.env("SCANDOCUMENT_RESOURCE_ROOT", scanner_runtime);
+            runtime_root = Some(resource_dir.join("scanner-runtime"));
         }
     }
-    command.arg(&operation).arg("--config").arg(&config_path)
-        .stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = command.spawn().map_err(|error| format!("Не удалось запустить локальный модуль обработки: {error}"))?;
-    let stdout = child.stdout.take().ok_or_else(|| "Worker не открыл канал прогресса".to_string())?;
-    let stderr = child.stderr.take().ok_or_else(|| "Worker не открыл канал ошибок".to_string())?;
+    if packaged_worker {
+        let runtime = runtime_root
+            .as_deref()
+            .ok_or_else(|| "В поставке отсутствуют встроенные компоненты обработки".to_string())?;
+        verify_packaged_runtime(&worker_path, runtime)?;
+    }
+    command
+        .arg(&operation)
+        .arg("--config")
+        .arg(&config_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    configure_scanner_process_group(&mut command);
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("Не удалось запустить локальный модуль обработки: {error}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "Worker не открыл канал прогресса".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "Worker не открыл канал ошибок".to_string())?;
     let (sender, receiver) = std::sync::mpsc::channel::<String>();
-    thread::spawn(move || {
+    let stdout_thread = thread::spawn(move || {
         for line in BufReader::new(stdout).lines().map_while(Result::ok) {
             let _ = sender.send(line);
         }
@@ -792,37 +1594,84 @@ fn run_scanner_worker(
         let _ = BufReader::new(stderr).read_to_string(&mut text);
         text
     });
+    let expected_type = if operation == "preview" {
+        "preview"
+    } else {
+        "complete"
+    };
     let mut final_event = None;
+    let mut error_event = None;
+    let accept_event = |event: Value,
+                        final_event: &mut Option<Value>,
+                        error_event: &mut Option<Value>| {
+        match event.get("type").and_then(Value::as_str) {
+            Some(kind) if kind == expected_type => *final_event = Some(event),
+            Some("error") => *error_event = Some(event),
+            _ => {}
+        }
+    };
     loop {
         while let Ok(line) = receiver.try_recv() {
             if let Ok(event) = serde_json::from_str::<Value>(&line) {
-                let _ = app.emit("scanner-progress", serde_json::json!({ "jobId": job_id, "event": event }));
-                final_event = Some(event);
+                let _ = app.emit(
+                    "scanner-progress",
+                    serde_json::json!({ "jobId": job_id, "event": &event }),
+                );
+                accept_event(event, &mut final_event, &mut error_event);
             }
         }
         if cancellation.load(Ordering::Relaxed) {
-            let _ = child.kill();
-            let _ = child.wait();
-            jobs.lock().ok().map(|mut map| map.remove(&job_id));
-            let _ = fs::remove_file(&config_path);
+            terminate_scanner_tree(&mut child);
+            let _ = stdout_thread.join();
+            let _ = stderr_thread.join();
+            if let Some(path) = &preview_output {
+                let _ = fs::remove_file(path);
+            }
             return Err("Обработка отменена. Исходный документ не изменён.".to_string());
         }
         if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
+            let _ = stdout_thread.join();
             while let Ok(line) = receiver.try_recv() {
-                if let Ok(event) = serde_json::from_str::<Value>(&line) { final_event = Some(event); }
+                if let Ok(event) = serde_json::from_str::<Value>(&line) {
+                    accept_event(event, &mut final_event, &mut error_event);
+                }
             }
             let stderr_text = stderr_thread.join().unwrap_or_default();
-            jobs.lock().ok().map(|mut map| map.remove(&job_id));
-            let _ = fs::remove_file(&config_path);
             if !status.success() {
-                let message = final_event.as_ref().and_then(|event| event.get("message")).and_then(Value::as_str)
-                    .map(str::to_string).unwrap_or_else(|| {
-                        if stderr_text.trim().is_empty() { "Обработка документа завершилась с ошибкой".to_string() }
-                        else { stderr_text.lines().last().unwrap_or("Ошибка worker").to_string() }
+                if let Some(path) = &preview_output {
+                    let _ = fs::remove_file(path);
+                }
+                let message = error_event
+                    .as_ref()
+                    .and_then(|event| event.get("message"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| {
+                        if stderr_text.trim().is_empty() {
+                            "Обработка документа завершилась с ошибкой".to_string()
+                        } else {
+                            stderr_text
+                                .lines()
+                                .last()
+                                .unwrap_or("Ошибка worker")
+                                .to_string()
+                        }
                     });
                 return Err(message);
             }
-            return final_event.ok_or_else(|| "Worker не вернул результат".to_string());
+            let Some(event) = final_event else {
+                if let Some(path) = &preview_output {
+                    let _ = fs::remove_file(path);
+                }
+                return Err("Worker не вернул завершённый результат".to_string());
+            };
+            if let Err(error) = validate_scanner_result(&operation, &event) {
+                if let Some(path) = &preview_output {
+                    let _ = fs::remove_file(path);
+                }
+                return Err(error);
+            }
+            return Ok(event);
         }
         thread::sleep(Duration::from_millis(60));
     }
@@ -838,16 +1687,42 @@ async fn scanner_run(
 ) -> Result<Value, String> {
     let workspace = state.workspace.clone();
     let jobs = state.scanner_jobs.clone();
-    tauri::async_runtime::spawn_blocking(move || run_scanner_worker(app, workspace, jobs, job_id, operation, config))
-        .await.map_err(|error| error.to_string())?
+    tauri::async_runtime::spawn_blocking(move || {
+        run_scanner_worker(app, workspace, jobs, job_id, operation, config)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
 fn scanner_cancel(state: State<'_, AppState>, job_id: String) -> Result<(), String> {
-    let jobs = state.scanner_jobs.lock().map_err(|_| "Не удалось открыть список задач".to_string())?;
-    let token = jobs.get(&job_id).ok_or_else(|| "Задача уже завершена".to_string())?;
+    let jobs = state
+        .scanner_jobs
+        .lock()
+        .map_err(|_| "Не удалось открыть список задач".to_string())?;
+    let token = jobs
+        .get(&job_id)
+        .ok_or_else(|| "Задача уже завершена".to_string())?;
     token.store(true, Ordering::Relaxed);
     Ok(())
+}
+
+#[tauri::command]
+fn delete_runtime_file(state: State<'_, AppState>, path: String) -> Result<(), String> {
+    let candidate = PathBuf::from(path);
+    let canonical = candidate
+        .canonicalize()
+        .map_err(|_| "Временный файл уже удалён".to_string())?;
+    let runtime = state
+        .workspace
+        .root
+        .join("runtime-cache")
+        .canonicalize()
+        .map_err(|error| error.to_string())?;
+    if !canonical.starts_with(&runtime) || !canonical.is_file() {
+        return Err("Разрешено удалять только временные файлы приложения".to_string());
+    }
+    fs::remove_file(canonical).map_err(|error| error.to_string())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -859,6 +1734,7 @@ pub fn run() {
         .manage(AppState {
             workspace: Arc::new(workspace),
             scanner_jobs: Arc::new(Mutex::new(HashMap::new())),
+            maintenance: Arc::new(Mutex::new(())),
         })
         .invoke_handler(tauri::generate_handler![
             workspace_info,
@@ -870,6 +1746,10 @@ pub fn run() {
             record_history,
             upsert_record,
             archive_record,
+            save_draft,
+            read_draft,
+            clear_draft,
+            delete_record,
             copy_attachment,
             write_text_file,
             read_text_file,
@@ -878,6 +1758,7 @@ pub fn run() {
             restore_backup,
             scanner_run,
             scanner_cancel,
+            delete_runtime_file,
         ])
         .run(tauri::generate_context!())
         .expect("SBK Tools could not start");
@@ -890,13 +1771,17 @@ mod tests {
     #[test]
     fn xlsx_round_trip_preserves_unicode_cells() {
         let path = std::env::temp_dir().join(format!("sbk-tools-{}.xlsx", Uuid::new_v4()));
-        write_xlsx(path.to_string_lossy().into_owned(), SpreadsheetData {
-            sheet_name: Some("Договоры".to_string()),
-            rows: vec![
-                vec!["Номер".to_string(), "Заказчик".to_string()],
-                vec!["18/24".to_string(), "АО Энергосеть".to_string()],
-            ],
-        }).expect("xlsx write");
+        write_xlsx(
+            path.to_string_lossy().into_owned(),
+            SpreadsheetData {
+                sheet_name: Some("Договоры".to_string()),
+                rows: vec![
+                    vec!["Номер".to_string(), "Заказчик".to_string()],
+                    vec!["18/24".to_string(), "АО Энергосеть".to_string()],
+                ],
+            },
+        )
+        .expect("xlsx write");
         let restored = read_xlsx(path.to_string_lossy().into_owned()).expect("xlsx read");
         assert_eq!(restored.sheet_name.as_deref(), Some("Договоры"));
         assert_eq!(restored.rows[1][1], "АО Энергосеть");
@@ -913,10 +1798,146 @@ mod tests {
             [],
         ).expect("insert");
         let staff = open_database(&root, "staff").expect("staff db");
-        let count: i64 = staff.query_row("SELECT COUNT(*) FROM records", [], |row| row.get(0)).expect("count");
+        let count: i64 = staff
+            .query_row("SELECT COUNT(*) FROM records", [], |row| row.get(0))
+            .expect("count");
         assert_eq!(count, 0);
         drop(calculator);
         drop(staff);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn backup_uses_consistent_sqlite_snapshot_and_checksums() {
+        let root = std::env::temp_dir().join(format!("sbk-tools-backup-{}", Uuid::new_v4()));
+        ensure_workspace(&root).expect("workspace");
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(root.join(".workspace.lock"))
+            .expect("lock");
+        let workspace = Workspace {
+            root: root.clone(),
+            portable: false,
+            writable: true,
+            _lock: lock,
+        };
+        let connection = open_database(&root, "calculator").expect("database");
+        connection
+            .execute(
+                "INSERT INTO records(id, title, payload, archived, created_at, updated_at) VALUES ('calc', 'Тест', '{}', 0, 'now', 'now')",
+                [],
+            )
+            .expect("insert");
+        drop(connection);
+
+        let info = create_backup_impl(&workspace, Some("calculator".to_string())).expect("backup");
+        let file = File::open(&info.path).expect("backup file");
+        let mut archive = zip::ZipArchive::new(file).expect("zip");
+        let manifest: BackupManifest = {
+            let mut entry = archive.by_name("manifest.json").expect("manifest");
+            let mut text = String::new();
+            entry.read_to_string(&mut text).expect("read manifest");
+            serde_json::from_str(&text).expect("parse manifest")
+        };
+        assert_eq!(manifest.backup_format_version, 2);
+        assert_eq!(manifest.modules, vec!["calculator"]);
+        let expected = manifest
+            .files
+            .get("calculator/data.sqlite3")
+            .expect("database checksum");
+        let restore_stage = root.join("runtime-cache").join("restore-test");
+        fs::create_dir_all(restore_stage.join("calculator")).expect("restore stage");
+        let extracted = restore_stage.join("calculator").join("data.sqlite3");
+        {
+            let mut entry = archive
+                .by_name("calculator/data.sqlite3")
+                .expect("database entry");
+            let mut output = File::create(&extracted).expect("output");
+            std::io::copy(&mut entry, &mut output).expect("extract");
+        }
+        assert_eq!(sha256_file(&extracted).expect("hash"), expected.sha256);
+        validate_sqlite_files(&restore_stage, &["calculator".to_string()])
+            .expect("snapshot integrity");
+        let restored = Connection::open(&extracted).expect("open snapshot");
+        let count: i64 = restored
+            .query_row("SELECT COUNT(*) FROM records", [], |row| row.get(0))
+            .expect("query snapshot");
+        assert_eq!(count, 1);
+        drop(restored);
+        drop(workspace);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn backup_path_allowlist_rejects_traversal_and_other_modules() {
+        let modules = HashSet::from(["calculator".to_string()]);
+        assert!(valid_archive_path(
+            Path::new("calculator/data.sqlite3"),
+            &modules
+        ));
+        assert!(valid_archive_path(
+            Path::new("attachments/calculator/id/file.pdf"),
+            &modules
+        ));
+        assert!(!valid_archive_path(Path::new("../escape"), &modules));
+        assert!(!valid_archive_path(
+            Path::new("staff/data.sqlite3"),
+            &modules
+        ));
+    }
+
+    #[test]
+    fn database_v1_migrates_to_v2_without_losing_records() {
+        let root = std::env::temp_dir().join(format!("sbk-tools-migration-{}", Uuid::new_v4()));
+        ensure_workspace(&root).expect("workspace");
+        let path = root.join("calculator").join("data.sqlite3");
+        let legacy = Connection::open(&path).expect("legacy database");
+        legacy
+            .execute_batch(
+                "CREATE TABLE records (
+                    id TEXT PRIMARY KEY NOT NULL, title TEXT NOT NULL, payload TEXT NOT NULL,
+                    archived INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+                );
+                CREATE TABLE history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, record_id TEXT NOT NULL,
+                    action TEXT NOT NULL, snapshot TEXT, created_at TEXT NOT NULL
+                );
+                INSERT INTO records VALUES ('legacy', 'Старый расчёт', '{}', 0, 'now', 'now');
+                PRAGMA user_version = 1;",
+            )
+            .expect("legacy schema");
+        drop(legacy);
+
+        let migrated = open_database(&root, "calculator").expect("migration");
+        let version: i64 = migrated
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("version");
+        let records: i64 = migrated
+            .query_row("SELECT COUNT(*) FROM records", [], |row| row.get(0))
+            .expect("records");
+        migrated
+            .execute(
+                "INSERT INTO drafts(key, payload, updated_at) VALUES ('current', '{}', 'now')",
+                [],
+            )
+            .expect("draft table");
+        assert_eq!(version, 2);
+        assert_eq!(records, 1);
+        let migration_backups = fs::read_dir(root.join("backups"))
+            .expect("backups")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("before-migration-calculator-")
+            })
+            .count();
+        assert_eq!(migration_backups, 1);
+        drop(migrated);
         let _ = fs::remove_dir_all(root);
     }
 }

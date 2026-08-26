@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from PIL import Image
+from PIL import Image, ImageOps
 
 from scandocument.models import FacsimilePlacement
 
@@ -22,7 +22,8 @@ def _remove_light_background(image: Image.Image) -> Image.Image:
 
 def apply_facsimile(page: Image.Image, placement: FacsimilePlacement) -> Image.Image:
     base = page.convert("RGBA")
-    stamp = Image.open(placement.image_path).convert("RGBA")
+    with Image.open(placement.image_path) as source:
+        stamp = ImageOps.exif_transpose(source).convert("RGBA")
     if placement.remove_light_background:
         stamp = _remove_light_background(stamp)
 

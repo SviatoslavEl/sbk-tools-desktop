@@ -6,6 +6,7 @@
   "ocrEnabled": false,
   "facsimile": {
     "imagePath": "src-tauri/icons/icon.png",
+    "application": "current",
     "x": 0.65,
     "y": 0.72,
     "width": 0.18,

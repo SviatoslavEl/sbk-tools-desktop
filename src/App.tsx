@@ -1,13 +1,14 @@
 import { useState } from "react";
 import "./App.css";
 import { Dialog } from "./components/Dialog";
+import { Archive } from "./modules/archive/Archive";
 import { Calculator } from "./modules/calculator/Calculator";
 import { ContractsRegistry } from "./modules/contracts/Contracts";
 import { Scanner } from "./modules/scanner/Scanner";
 import { About, Settings } from "./modules/settings/Settings";
 import { StaffRegistry } from "./modules/staff/Staff";
 
-type ToolId = "calculator" | "scanner" | "contracts" | "staff" | "settings" | "about";
+type ToolId = "calculator" | "scanner" | "contracts" | "staff" | "archive" | "settings" | "about";
 
 const tools: Array<{ id: ToolId; icon: string; label: string }> = [
   { id: "calculator", icon: "₽", label: "Тендерный калькулятор" },
@@ -21,6 +22,7 @@ const toolTitles: Record<ToolId, [string, string]> = {
   scanner: ["Сканирование документов", "Выберите файл, пресет и сохраните новый PDF"],
   contracts: ["Опыт по договорам", "Самостоятельный реестр исполнения, оплат и актов"],
   staff: ["Кадры", "Люди, основания сотрудничества и подтверждающие документы"],
+  archive: ["Архив", "Восстановление и окончательное удаление записей"],
   settings: ["Настройки", "Рабочая папка, интерфейс и резервные копии"],
   about: ["О программе", "Версия, приватность и лицензии компонентов"],
 };
@@ -30,6 +32,7 @@ const helpText: Record<ToolId, string> = {
   scanner: "Обычный сценарий требует трёх действий: выбрать документ, выбрать пресет и сохранить новый PDF. Исходный файл не перезаписывается.",
   contracts: "Стадия исполнения, состояние оплаты и состояние актов — независимые поля. Двойной щелчок по строке открывает карточку.",
   staff: "Основание сотрудничества хранится отдельно от должности и статуса. Дипломы, сертификаты и договоры добавляются повторяемыми записями.",
+  archive: "Архивные расчёты, договоры и кадровые карточки можно восстановить. Окончательное удаление также удаляет историю и связанные файлы.",
   settings: "Резервная копия включает базы и вложения. Перед восстановлением приложение автоматически создаёт страховочную копию текущих данных.",
   about: "Все инструменты работают локально и не обмениваются бизнес-данными друг с другом.",
 };
@@ -57,7 +60,7 @@ function App() {
       <button className="collapse-button" type="button" aria-label={collapsed ? "Развернуть навигацию" : "Свернуть навигацию"} onClick={() => updateCollapsed(!collapsed)}>{collapsed ? "›" : "‹"}</button>
       <p className="nav-caption">ИНСТРУМЕНТЫ</p>
       <nav className="tool-nav">{tools.map((tool) => <button key={tool.id} title={collapsed ? tool.label : undefined} className={activeTool === tool.id ? "active" : ""} onClick={() => selectTool(tool.id)} type="button"><span className="nav-icon" aria-hidden="true">{tool.icon}</span><span className="nav-label">{tool.label}</span></button>)}</nav>
-      <nav className="settings-nav"><button title={collapsed ? "Настройки" : undefined} className={activeTool === "settings" ? "active" : ""} onClick={() => selectTool("settings")} type="button"><span className="nav-icon" aria-hidden="true">⚙</span><span className="nav-label">Настройки</span></button><button title={collapsed ? "О программе" : undefined} className={activeTool === "about" ? "active" : ""} onClick={() => selectTool("about")} type="button"><span className="nav-icon" aria-hidden="true">i</span><span className="nav-label">О программе</span></button></nav>
+      <nav className="settings-nav"><button title={collapsed ? "Архив" : undefined} className={activeTool === "archive" ? "active" : ""} onClick={() => selectTool("archive")} type="button"><span className="nav-icon" aria-hidden="true">⌫</span><span className="nav-label">Архив</span></button><button title={collapsed ? "Настройки" : undefined} className={activeTool === "settings" ? "active" : ""} onClick={() => selectTool("settings")} type="button"><span className="nav-icon" aria-hidden="true">⚙</span><span className="nav-label">Настройки</span></button><button title={collapsed ? "О программе" : undefined} className={activeTool === "about" ? "active" : ""} onClick={() => selectTool("about")} type="button"><span className="nav-icon" aria-hidden="true">i</span><span className="nav-label">О программе</span></button></nav>
     </aside>
     <main className="workspace">
       <header className="topbar"><div><h1>{title}</h1><p>{subtitle}</p></div><button className="help-button" type="button" onClick={() => setShowHelp(true)}>?</button></header>
@@ -66,6 +69,7 @@ function App() {
         {activeTool === "scanner" && <Scanner />}
         {activeTool === "contracts" && <ContractsRegistry />}
         {activeTool === "staff" && <StaffRegistry />}
+        {activeTool === "archive" && <Archive />}
         {activeTool === "settings" && <Settings collapsed={collapsed} onCollapsed={updateCollapsed} />}
         {activeTool === "about" && <About />}
       </div>
