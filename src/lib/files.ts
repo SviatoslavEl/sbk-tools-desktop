@@ -17,6 +17,12 @@ export async function chooseOpenPath(
   return typeof result === "string" ? result : null;
 }
 
+export async function chooseOpenPaths(title: string, extensions: string[]): Promise<string[]> {
+  if (!isTauri()) return [];
+  const result = await open({ title, multiple: true, directory: false, filters: [{ name: title, extensions }] });
+  return Array.isArray(result) ? result : typeof result === "string" ? [result] : [];
+}
+
 export async function chooseDirectory(title: string): Promise<string | null> {
   if (!isTauri()) return null;
   const result = await open({ title, multiple: false, directory: true });

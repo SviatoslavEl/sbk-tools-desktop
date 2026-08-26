@@ -94,6 +94,8 @@ struct AttachmentInfo {
     relative_path: String,
     file_name: String,
     size_bytes: u64,
+    sha256: String,
+    mime_type: String,
 }
 
 #[derive(Serialize)]
@@ -102,6 +104,26 @@ struct BackupInfo {
     path: String,
     file_name: String,
     size_bytes: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BackupListItem {
+    path: String,
+    file_name: String,
+    size_bytes: u64,
+    modified_at: String,
+    pinned: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BackupVerification {
+    sha256: String,
+    created_at: String,
+    modules: Vec<String>,
+    files: usize,
+    unpacked_bytes: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -151,8 +173,10 @@ struct SpreadsheetData {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct HistoryEntry {
+    id: i64,
     action: String,
     created_at: String,
+    snapshot: Option<Value>,
 }
 
 fn workspace_pointer_path() -> Result<PathBuf, String> {
@@ -515,18 +539,64 @@ fn record_history(
 ) -> Result<Vec<HistoryEntry>, String> {
     let connection = open_database(&state.workspace.root, &module)?;
     let mut statement = connection.prepare(
-        "SELECT action, created_at FROM history WHERE record_id = ?1 ORDER BY created_at DESC LIMIT 100",
+        "SELECT id, action, created_at, snapshot FROM history WHERE record_id = ?1 ORDER BY created_at DESC LIMIT 100",
     ).map_err(|error| error.to_string())?;
     statement
         .query_map([id], |row| {
             Ok(HistoryEntry {
-                action: row.get(0)?,
-                created_at: row.get(1)?,
+                id: row.get(0)?,
+                action: row.get(1)?,
+                created_at: row.get(2)?,
+                snapshot: row
+                    .get::<_, Option<String>>(3)?
+                    .and_then(|text| serde_json::from_str(&text).ok()),
             })
         })
         .map_err(|error| error.to_string())?
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn restore_history_version(
+    state: State<'_, AppState>,
+    module: String,
+    id: String,
+    history_id: i64,
+) -> Result<StoredRecord, String> {
+    let _maintenance = state
+        .maintenance
+        .lock()
+        .map_err(|_| "Хранилище временно недоступно".to_string())?;
+    let mut connection = open_database(&state.workspace.root, &module)?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+    let snapshot: String = transaction.query_row(
+        "SELECT snapshot FROM history WHERE id = ?1 AND record_id = ?2 AND snapshot IS NOT NULL",
+        params![history_id, id],
+        |row| row.get(0),
+    ).map_err(|_| "Выбранная версия не содержит снимка для восстановления".to_string())?;
+    let current: String = transaction
+        .query_row("SELECT payload FROM records WHERE id = ?1", [&id], |row| {
+            row.get(0)
+        })
+        .map_err(|_| "Запись не найдена".to_string())?;
+    let now = Utc::now().to_rfc3339();
+    transaction
+        .execute(
+            "UPDATE records SET payload = ?1, updated_at = ?2 WHERE id = ?3",
+            params![snapshot, now, id],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction.execute(
+        "INSERT INTO history(record_id, action, snapshot, created_at) VALUES (?1, 'version-restored', ?2, ?3)",
+        params![id, current, now],
+    ).map_err(|error| error.to_string())?;
+    transaction.commit().map_err(|error| error.to_string())?;
+    drop(_maintenance);
+    get_record(state, module, id)?
+        .ok_or_else(|| "Запись не найдена после восстановления".to_string())
 }
 
 #[tauri::command]
@@ -755,6 +825,13 @@ fn copy_attachment(
     if !source.is_file() {
         return Err("Выбранный файл не найден".to_string());
     }
+    const MAX_ATTACHMENT_BYTES: u64 = 100 * 1024 * 1024;
+    let source_size = fs::metadata(&source)
+        .map_err(|error| error.to_string())?
+        .len();
+    if source_size == 0 || source_size > MAX_ATTACHMENT_BYTES {
+        return Err("Размер вложения должен быть больше нуля и не превышать 100 МБ".to_string());
+    }
     let original_name = source
         .file_name()
         .and_then(|name| name.to_str())
@@ -768,8 +845,21 @@ fn copy_attachment(
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
-    fs::copy(&source, &destination)
+    let temporary = destination.with_extension("uploading");
+    fs::copy(&source, &temporary)
         .map_err(|error| format!("Не удалось скопировать вложение: {error}"))?;
+    let copied_size = fs::metadata(&temporary)
+        .map_err(|error| error.to_string())?
+        .len();
+    if copied_size != source_size {
+        let _ = fs::remove_file(&temporary);
+        return Err("Вложение скопировано не полностью".to_string());
+    }
+    let sha256 = sha256_file(&temporary)?;
+    fs::rename(&temporary, &destination).map_err(|error| {
+        let _ = fs::remove_file(&temporary);
+        format!("Не удалось завершить сохранение вложения: {error}")
+    })?;
     let size_bytes = fs::metadata(&destination)
         .map_err(|error| error.to_string())?
         .len();
@@ -777,7 +867,54 @@ fn copy_attachment(
         relative_path: relative.to_string_lossy().replace('\\', "/"),
         file_name: original_name,
         size_bytes,
+        sha256,
+        mime_type: match destination
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "pdf" => "application/pdf",
+            "png" => "image/png",
+            "jpg" | "jpeg" => "image/jpeg",
+            "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            _ => "application/octet-stream",
+        }
+        .to_string(),
     })
+}
+
+#[tauri::command]
+fn delete_attachment(state: State<'_, AppState>, relative_path: String) -> Result<(), String> {
+    let _maintenance = state
+        .maintenance
+        .lock()
+        .map_err(|_| "Хранилище временно недоступно".to_string())?;
+    let relative = Path::new(&relative_path);
+    let parts: Vec<_> = relative.components().collect();
+    if parts.len() < 4
+        || !matches!(parts.first(), Some(Component::Normal(value)) if *value == "attachments")
+        || parts
+            .iter()
+            .any(|part| !matches!(part, Component::Normal(_)))
+    {
+        return Err("Некорректный путь вложения".to_string());
+    }
+    let module = parts
+        .get(1)
+        .and_then(|part| match part {
+            Component::Normal(value) => value.to_str(),
+            _ => None,
+        })
+        .ok_or_else(|| "Некорректный раздел вложения".to_string())?;
+    validated_module(module)?;
+    let candidate = state.workspace.root.join(relative);
+    if candidate.is_file() {
+        fs::remove_file(candidate).map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 fn atomic_write(destination: &Path, bytes: &[u8]) -> Result<(), String> {
@@ -1038,6 +1175,243 @@ fn create_backup(state: State<'_, AppState>, module: Option<String>) -> Result<B
         .lock()
         .map_err(|_| "Хранилище временно недоступно".to_string())?;
     create_backup_impl(&state.workspace, module)
+}
+
+fn pinned_backups(root: &Path) -> HashSet<String> {
+    fs::read_to_string(root.join("backups").join("pinned.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+fn write_pinned_backups(root: &Path, names: &HashSet<String>) -> Result<(), String> {
+    let destination = root.join("backups").join("pinned.json");
+    atomic_write(
+        &destination,
+        serde_json::to_vec_pretty(names)
+            .map_err(|error| error.to_string())?
+            .as_slice(),
+    )
+}
+
+fn safe_backup_name(name: &str) -> Result<&str, String> {
+    if name.is_empty()
+        || name.len() > 240
+        || !name.ends_with(".sbkbackup")
+        || Path::new(name).components().count() != 1
+    {
+        return Err("Некорректное имя резервной копии".to_string());
+    }
+    Ok(name)
+}
+
+#[tauri::command]
+fn list_backups(state: State<'_, AppState>) -> Result<Vec<BackupListItem>, String> {
+    let pinned = pinned_backups(&state.workspace.root);
+    let mut rows = Vec::new();
+    for entry in
+        fs::read_dir(state.workspace.root.join("backups")).map_err(|error| error.to_string())?
+    {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let path = entry.path();
+        if !path.is_file() || path.extension().and_then(|value| value.to_str()) != Some("sbkbackup")
+        {
+            continue;
+        }
+        let metadata = entry.metadata().map_err(|error| error.to_string())?;
+        let file_name = entry.file_name().to_string_lossy().into_owned();
+        let modified = metadata
+            .modified()
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        rows.push(BackupListItem {
+            path: path.to_string_lossy().into_owned(),
+            file_name: file_name.clone(),
+            size_bytes: metadata.len(),
+            modified_at: chrono::DateTime::<Utc>::from(modified).to_rfc3339(),
+            pinned: pinned.contains(&file_name),
+        });
+    }
+    rows.sort_by(|left, right| right.modified_at.cmp(&left.modified_at));
+    Ok(rows)
+}
+
+#[tauri::command]
+fn set_backup_pinned(
+    state: State<'_, AppState>,
+    file_name: String,
+    pinned: bool,
+) -> Result<(), String> {
+    let _maintenance = state
+        .maintenance
+        .lock()
+        .map_err(|_| "Хранилище временно недоступно".to_string())?;
+    let name = safe_backup_name(&file_name)?;
+    if !state.workspace.root.join("backups").join(name).is_file() {
+        return Err("Резервная копия не найдена".to_string());
+    }
+    let mut names = pinned_backups(&state.workspace.root);
+    if pinned {
+        names.insert(name.to_string());
+    } else {
+        names.remove(name);
+    }
+    write_pinned_backups(&state.workspace.root, &names)
+}
+
+#[tauri::command]
+fn delete_backup(state: State<'_, AppState>, file_name: String) -> Result<(), String> {
+    let _maintenance = state
+        .maintenance
+        .lock()
+        .map_err(|_| "Хранилище временно недоступно".to_string())?;
+    let name = safe_backup_name(&file_name)?;
+    if pinned_backups(&state.workspace.root).contains(name) {
+        return Err("Сначала открепите резервную копию".to_string());
+    }
+    let path = state.workspace.root.join("backups").join(name);
+    if path.is_file() {
+        fs::remove_file(path).map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn rotate_backups(state: State<'_, AppState>, keep: usize) -> Result<usize, String> {
+    if !(1..=100).contains(&keep) {
+        return Err("Хранить можно от 1 до 100 незакреплённых копий".to_string());
+    }
+    let _maintenance = state
+        .maintenance
+        .lock()
+        .map_err(|_| "Хранилище временно недоступно".to_string())?;
+    let pinned = pinned_backups(&state.workspace.root);
+    let mut files: Vec<_> = fs::read_dir(state.workspace.root.join("backups"))
+        .map_err(|error| error.to_string())?
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry.path().extension().and_then(|value| value.to_str()) == Some("sbkbackup")
+                && !pinned.contains(&entry.file_name().to_string_lossy().into_owned())
+        })
+        .collect();
+    files.sort_by_key(|entry| {
+        std::cmp::Reverse(
+            entry
+                .metadata()
+                .and_then(|value| value.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+        )
+    });
+    let mut removed = 0;
+    for entry in files.into_iter().skip(keep) {
+        fs::remove_file(entry.path()).map_err(|error| error.to_string())?;
+        removed += 1;
+    }
+    Ok(removed)
+}
+
+#[tauri::command]
+fn verify_backup(state: State<'_, AppState>, path: String) -> Result<BackupVerification, String> {
+    let _maintenance = state
+        .maintenance
+        .lock()
+        .map_err(|_| "Хранилище временно недоступно".to_string())?;
+    const LIMIT: u64 = 2 * 1024 * 1024 * 1024;
+    let archive_size = fs::metadata(&path)
+        .map_err(|error| error.to_string())?
+        .len();
+    if archive_size == 0 || archive_size > LIMIT {
+        return Err("Размер резервной копии превышает безопасный предел".to_string());
+    }
+    let mut archive = zip::ZipArchive::new(File::open(&path).map_err(|error| error.to_string())?)
+        .map_err(|_| "Файл не является резервной копией СБК".to_string())?;
+    let manifest: BackupManifest = {
+        let mut entry = archive
+            .by_name("manifest.json")
+            .map_err(|_| "В резервной копии нет manifest.json".to_string())?;
+        if entry.size() > 1024 * 1024 {
+            return Err("Manifest превышает безопасный предел".to_string());
+        }
+        let mut text = String::new();
+        entry
+            .read_to_string(&mut text)
+            .map_err(|error| error.to_string())?;
+        serde_json::from_str(&text).map_err(|_| "Manifest повреждён".to_string())?
+    };
+    if manifest.product != "sbk-tools-desktop"
+        || manifest.backup_format_version != 2
+        || manifest.schema_version > SCHEMA_VERSION
+    {
+        return Err("Версия или тип резервной копии несовместимы".to_string());
+    }
+    let modules: HashSet<String> = manifest.modules.iter().cloned().collect();
+    if modules.len() != manifest.modules.len()
+        || modules
+            .iter()
+            .any(|module| validated_module(module).is_err())
+    {
+        return Err("Manifest содержит неизвестные или повторяющиеся разделы".to_string());
+    }
+    let stage_path = state
+        .workspace
+        .root
+        .join("runtime-cache")
+        .join(format!("verify-backup-{}", Uuid::new_v4()));
+    fs::create_dir(&stage_path).map_err(|error| error.to_string())?;
+    let _stage = TemporaryDirectory(stage_path.clone());
+    let mut unpacked = 0_u64;
+    let mut found = HashSet::new();
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).map_err(|error| error.to_string())?;
+        if entry.is_dir() || entry.name() == "manifest.json" {
+            continue;
+        }
+        let relative = entry
+            .enclosed_name()
+            .ok_or_else(|| "Опасный путь внутри архива".to_string())?;
+        if !valid_archive_path(&relative, &modules) {
+            return Err("Недопустимый путь внутри резервной копии".to_string());
+        }
+        let name = relative.to_string_lossy().replace('\\', "/");
+        if !found.insert(name.clone()) {
+            return Err("Повторяющийся путь внутри резервной копии".to_string());
+        }
+        unpacked = unpacked
+            .checked_add(entry.size())
+            .ok_or_else(|| "Некорректный размер архива".to_string())?;
+        if unpacked > LIMIT
+            || (entry.compressed_size() > 0 && entry.size() / entry.compressed_size() > 250)
+        {
+            return Err("Небезопасный распакованный размер резервной копии".to_string());
+        }
+        let expected = manifest
+            .files
+            .get(&name)
+            .ok_or_else(|| format!("Файл {name} не объявлен в manifest"))?;
+        if entry.size() != expected.size_bytes {
+            return Err(format!("Размер файла {name} не совпадает"));
+        }
+        let destination = stage_path.join(&relative);
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        }
+        let mut output = File::create(&destination).map_err(|error| error.to_string())?;
+        std::io::copy(&mut entry, &mut output).map_err(|error| error.to_string())?;
+        output.sync_all().map_err(|error| error.to_string())?;
+        if sha256_file(&destination)? != expected.sha256 {
+            return Err(format!("Контрольная сумма файла {name} не совпадает"));
+        }
+    }
+    if found.len() != manifest.files.len() {
+        return Err("Состав резервной копии не совпадает с manifest".to_string());
+    }
+    validate_sqlite_files(&stage_path, &manifest.modules)?;
+    Ok(BackupVerification {
+        sha256: sha256_file(Path::new(&path))?,
+        created_at: manifest.created_at,
+        modules: manifest.modules,
+        files: found.len(),
+        unpacked_bytes: unpacked,
+    })
 }
 
 fn valid_archive_path(path: &Path, modules: &HashSet<String>) -> bool {
@@ -1478,6 +1852,9 @@ fn validate_scanner_result(operation: &str, event: &Value) -> Result<(), String>
     if event.get("type").and_then(Value::as_str) != Some(expected_type) {
         return Err("Worker вернул незавершённый результат".to_string());
     }
+    if event.get("protocolVersion").and_then(Value::as_i64) != Some(2) {
+        return Err("Worker вернул несовместимую версию протокола".to_string());
+    }
     let output = event
         .get("outputPath")
         .and_then(Value::as_str)
@@ -1512,6 +1889,9 @@ fn run_scanner_worker(
 ) -> Result<Value, String> {
     if operation != "preview" && operation != "process" {
         return Err("Неизвестная операция сканера".to_string());
+    }
+    if config.get("protocolVersion").and_then(Value::as_i64) != Some(2) {
+        return Err("Версия протокола сканера несовместима с приложением".to_string());
     }
     Uuid::parse_str(&job_id).map_err(|_| "Некорректный идентификатор задачи".to_string())?;
     let input = config
@@ -1767,6 +2147,7 @@ pub fn run() {
             list_records,
             get_record,
             record_history,
+            restore_history_version,
             upsert_record,
             archive_record,
             save_draft,
@@ -1774,10 +2155,16 @@ pub fn run() {
             clear_draft,
             delete_record,
             copy_attachment,
+            delete_attachment,
             write_text_file,
             read_text_file,
             read_binary_file,
             create_backup,
+            list_backups,
+            set_backup_pinned,
+            delete_backup,
+            rotate_backups,
+            verify_backup,
             restore_backup,
             scanner_run,
             scanner_cancel,

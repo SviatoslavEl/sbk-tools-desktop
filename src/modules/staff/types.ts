@@ -13,6 +13,9 @@ export interface StaffDocument {
   unlimited: boolean;
   relativePath?: string;
   fileName?: string;
+  sizeBytes?: number;
+  sha256?: string;
+  mimeType?: string;
   comment: string;
 }
 

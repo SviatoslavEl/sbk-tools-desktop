@@ -23,6 +23,8 @@ export interface AttachmentInfo {
   relativePath: string;
   fileName: string;
   sizeBytes: number;
+  sha256: string;
+  mimeType: string;
 }
 
 export interface BackupInfo {
@@ -31,14 +33,19 @@ export interface BackupInfo {
   sizeBytes: number;
 }
 
+export interface BackupListItem extends BackupInfo { modifiedAt: string; pinned: boolean }
+export interface BackupVerification { sha256: string; createdAt: string; modules: string[]; files: number; unpackedBytes: number }
+
 export interface SpreadsheetData {
   sheetName?: string;
   rows: string[][];
 }
 
 export interface HistoryEntry {
-  action: "created" | "updated" | "archived" | "restored";
+  id: number;
+  action: "created" | "updated" | "archived" | "restored" | "version-restored";
   createdAt: string;
+  snapshot?: true;
 }
 
 const isTauri = () => "__TAURI_INTERNALS__" in window;
@@ -90,6 +97,11 @@ export async function listRecords<T>(module: ModuleId, includeArchived = false):
 export async function recordHistory(module: ModuleId, id: string): Promise<HistoryEntry[]> {
   if (!isTauri()) return [];
   return invoke<HistoryEntry[]>("record_history", { module, id });
+}
+
+export async function restoreHistoryVersion<T>(module: ModuleId, id: string, historyId: number): Promise<StoredRecord<T>> {
+  if (!isTauri()) throw new Error("История версий доступна в desktop-версии");
+  return invoke<StoredRecord<T>>("restore_history_version", { module, id, historyId });
 }
 
 export async function saveRecord<T>(
@@ -147,6 +159,11 @@ export async function copyAttachment(
   return invoke<AttachmentInfo>("copy_attachment", { sourcePath, module, recordId });
 }
 
+export async function deleteAttachment(relativePath: string): Promise<void> {
+  if (!isTauri()) throw new Error("Вложения доступны в desktop-версии");
+  await invoke("delete_attachment", { relativePath });
+}
+
 export async function writeTextFile(path: string, content: string): Promise<void> {
   if (!isTauri()) {
     const blob = new Blob([content], { type: "text/plain;charset=utf-8" });
@@ -174,6 +191,12 @@ export async function restoreBackup(path: string): Promise<void> {
   if (!isTauri()) throw new Error("Восстановление доступно в desktop-версии");
   await invoke("restore_backup", { path });
 }
+
+export async function listBackups(): Promise<BackupListItem[]> { return isTauri() ? invoke("list_backups") : []; }
+export async function setBackupPinned(fileName: string, pinned: boolean): Promise<void> { if (!isTauri()) return; await invoke("set_backup_pinned", { fileName, pinned }); }
+export async function deleteBackup(fileName: string): Promise<void> { if (!isTauri()) return; await invoke("delete_backup", { fileName }); }
+export async function rotateBackups(keep: number): Promise<number> { if (!isTauri()) return 0; return invoke<number>("rotate_backups", { keep }); }
+export async function verifyBackup(path: string): Promise<BackupVerification> { if (!isTauri()) throw new Error("Проверка доступна в desktop-версии"); return invoke("verify_backup", { path }); }
 
 export async function saveDraft<T>(key: ModuleId, value: T): Promise<void> {
   if (isTauri()) {

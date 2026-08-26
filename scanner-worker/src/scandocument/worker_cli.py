@@ -7,7 +7,7 @@ from pathlib import Path
 
 from PIL import Image
 
-from scandocument.models import ColorMode, EffectSettings, FacsimilePlacement, ProcessRequest
+from scandocument.models import ColorMode, EffectSettings, FacsimilePlacement, ProcessRequest, Redaction
 from scandocument.pipeline import make_preview, process_document
 from scandocument.presets import PRESETS, preset_copy
 from scandocument.tempfiles import SecureWorkspace
@@ -101,40 +101,90 @@ def placement_from(data: dict | None) -> FacsimilePlacement | None:
     return placement
 
 
+def placements_from(config: dict) -> list[FacsimilePlacement]:
+    values = config.get("facsimiles")
+    if values is None:
+        single = placement_from(config.get("facsimile"))
+        return [single] if single else []
+    if not isinstance(values, list) or len(values) > 20:
+        raise ValueError("Можно добавить не более 20 факсимиле.")
+    return [placement for value in values if (placement := placement_from(value)) is not None]
+
+
+def redactions_from(config: dict) -> list[Redaction]:
+    values = config.get("redactions", [])
+    if not isinstance(values, list) or len(values) > 100:
+        raise ValueError("Можно добавить не более 100 областей скрытия.")
+    return [Redaction(
+        pages=[int(page) for page in value.get("pages", [])],
+        x=float(value.get("x", 0)), y=float(value.get("y", 0)),
+        width=float(value.get("width", 0)), height=float(value.get("height", 0)),
+        color=str(value.get("color", "black")),
+    ) for value in values]
+
+
+def validate_protocol(config: dict) -> None:
+    if int(config.get("protocolVersion", 0)) != 2:
+        raise ValueError("Версия протокола сканера несовместима с приложением.")
+
+
 def emit(payload: dict) -> None:
     print(json.dumps(payload, ensure_ascii=False), flush=True)
 
 
 def preview(config: dict) -> int:
+    validate_protocol(config)
     source = Path(config["inputPath"])
     output = Path(config["outputPath"])
     settings = settings_for(config.get("preset", "Офисный скан"), config.get("settings"))
-    placement = placement_from(config.get("facsimile"))
-    _, processed, pages, warnings = make_preview(
+    placements = placements_from(config)
+    original, processed, pages, warnings, page_size = make_preview(
         source, settings, int(config.get("seed", 42)), int(config.get("pageIndex", 0)),
-        facsimile=placement,
+        facsimiles=placements,
     )
-    if placement:
+    for placement in placements:
         placement.validate_for_document(pages)
+    redactions = redactions_from(config)
+    if redactions:
+        from PIL import ImageDraw
+
+        draw = ImageDraw.Draw(processed)
+        for redaction in redactions:
+            redaction.validate_for_document(pages)
+            if int(config.get("pageIndex", 0)) in redaction.pages:
+                draw.rectangle((
+                    round(redaction.x * processed.width), round(redaction.y * processed.height),
+                    round((redaction.x + redaction.width) * processed.width),
+                    round((redaction.y + redaction.height) * processed.height),
+                ), fill=redaction.color)
     output.parent.mkdir(parents=True, exist_ok=True)
+    original_output = output.with_name(f"{output.stem}.original.png")
+    original.thumbnail((1400, 1400), Image.Resampling.LANCZOS)
+    original.save(original_output, "PNG", optimize=True)
     processed.thumbnail((1400, 1400), Image.Resampling.LANCZOS)
     processed.save(output, "PNG", optimize=True)
-    emit({"type": "preview", "outputPath": str(output), "pageCount": pages, "warnings": warnings})
+    estimated = max(source.stat().st_size, pages * settings.dpi * settings.dpi * max(20, settings.jpeg_quality) // 18)
+    emit({"type": "preview", "outputPath": str(output), "originalPath": str(original_output), "pageCount": pages, "warnings": warnings,
+          "estimatedOutputBytes": estimated, "pageSizePoints": page_size, "protocolVersion": 2})
     return 0
 
 
 def process(config: dict) -> int:
+    validate_protocol(config)
     ocr_enabled = bool(config.get("ocrEnabled", False))
     ocr_languages = validate_ocr_languages(config.get("ocrLanguages", "rus+eng")) if ocr_enabled else "rus+eng"
     request = ProcessRequest(
         input_path=Path(config["inputPath"]), output_path=Path(config["outputPath"]),
         settings=settings_for(config.get("preset", "Офисный скан"), config.get("settings")),
         seed=int(config.get("seed", 42)), ocr_enabled=ocr_enabled,
-        ocr_languages=ocr_languages, facsimile=placement_from(config.get("facsimile")),
+        ocr_languages=ocr_languages, facsimiles=placements_from(config),
+        page_order=[int(value) for value in config.get("pageOrder", [])],
+        redactions=redactions_from(config),
     )
-    warnings = process_document(request, lambda event: emit({"type": "progress", "stage": event.stage,
+    warnings, confidence = process_document(request, lambda event: emit({"type": "progress", "stage": event.stage,
         "currentPage": event.current_page, "totalPages": event.total_pages, "percent": event.percent}))
-    emit({"type": "complete", "outputPath": str(request.output_path), "warnings": warnings})
+    emit({"type": "complete", "outputPath": str(request.output_path), "warnings": warnings,
+          "ocrConfidence": confidence, "protocolVersion": 2})
     return 0
 
 

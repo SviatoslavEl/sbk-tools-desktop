@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import threading
 from collections import deque
 from collections.abc import Callable
@@ -92,12 +93,25 @@ def _process_page(
     from scandocument.pdf_engine import image_page_pdf
 
     token.check()
-    if request.facsimile is not None and request.facsimile.applies_to(index):
-        from scandocument.facsimile import apply_facsimile
+    for facsimile in request.facsimiles:
+        if facsimile.applies_to(index):
+            from scandocument.facsimile import apply_facsimile
 
-        image = apply_facsimile(image, request.facsimile)
+            image = apply_facsimile(image, facsimile)
     processed = apply_scan_effect(image, request.settings, request.seed, index)
     del image
+    if request.redactions:
+        from PIL import ImageDraw
+
+        draw = ImageDraw.Draw(processed)
+        for redaction in request.redactions:
+            if index in redaction.pages:
+                bounds = (
+                    round(redaction.x * processed.width), round(redaction.y * processed.height),
+                    round((redaction.x + redaction.width) * processed.width),
+                    round((redaction.y + redaction.height) * processed.height),
+                )
+                draw.rectangle(bounds, fill=redaction.color)
     token.check()
     page_pdf = image_page_pdf(processed, page_size, request.settings.jpeg_quality)
     words = None
@@ -152,13 +166,29 @@ def process_document(
         )
         warnings.extend(info.warnings)
         validate_render_budget(info, request.settings.dpi)
+        estimated_output = max(info.size_bytes, sum(
+            round(width / 72 * request.settings.dpi) * round(height / 72 * request.settings.dpi)
+            for width, height in info.page_sizes_points
+        ) * max(20, request.settings.jpeg_quality) // 180)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        free_bytes = shutil.disk_usage(output.parent).free
+        if free_bytes < estimated_output * 2 + 64 * 1024 * 1024:
+            raise SaveError(
+                f"Недостаточно места: для безопасной обработки требуется около {estimated_output * 2 // 1024 // 1024 + 64} МБ."
+            )
         try:
             document = pdfium.PdfDocument(str(pdf_source))
         except Exception as exc:
             raise ScanDocumentError("Документ не удалось подготовить к обработке.") from exc
-        total = len(document)
-        if request.facsimile is not None:
-            request.facsimile.validate_for_document(total)
+        source_total = len(document)
+        page_order = request.page_order or list(range(source_total))
+        if not page_order or len(set(page_order)) != len(page_order) or any(index < 0 or index >= source_total for index in page_order):
+            raise ScanDocumentError("Порядок страниц содержит повторения или недопустимые номера.")
+        total = len(page_order)
+        for facsimile in request.facsimiles:
+            facsimile.validate_for_document(source_total)
+        for redaction in request.redactions:
+            redaction.validate_for_document(source_total)
         writer = PdfWriter()
         writer.add_metadata({
             "/Producer": "ScanDocument",
@@ -166,19 +196,21 @@ def process_document(
             "/ScanDocumentSeed": str(request.seed),
         })
         try:
-            pending: deque[tuple[int, tuple[float, float], Future]] = deque()
+            pending: deque[tuple[int, int, tuple[float, float], Future]] = deque()
+            confidence_values: list[float] = []
 
             if request.ocr_enabled:
                 from scandocument.ocr import add_invisible_text
 
             def finish_oldest() -> None:
-                index, page_size, future = pending.popleft()
+                position, index, page_size, future = pending.popleft()
                 page_pdf, words, image_size = future.result()
                 token.check()
                 if words is not None:
                     page_pdf = add_invisible_text(page_pdf, words, image_size, page_size)
+                    confidence_values.extend(word.confidence for word in words)
                 append_pdf_page(writer, page_pdf)
-                page_number = index + 1
+                page_number = position + 1
                 _notify(
                     callback, "Страница готова", page_number, total,
                     round(page_number / max(1, total) * 94),
@@ -189,16 +221,17 @@ def process_document(
                 max_workers=worker_count,
                 thread_name_prefix="ScanDocument-page",
             ) as executor:
-                for index in range(total):
+                for position, index in enumerate(page_order):
                     token.check()
-                    page_number = index + 1
-                    start_percent = round(index / max(1, total) * 94)
+                    page_number = position + 1
+                    start_percent = round(position / max(1, total) * 94)
                     _notify(callback, "Растеризация страницы", page_number, total, start_percent)
                     image, page_size = render_page(document, index, request.settings.dpi)
                     token.check()
                     stage = "Обработка страницы и локальное OCR" if request.ocr_enabled else "Обработка страницы"
                     _notify(callback, stage, page_number, total, start_percent)
                     pending.append((
+                        position,
                         index,
                         page_size,
                         executor.submit(
@@ -213,7 +246,7 @@ def process_document(
             _notify(callback, "Сборка итогового PDF", total, total, 97)
             write_atomic(writer, output)
             _notify(callback, "Готово", total, total, 100)
-            return warnings
+            return warnings, (sum(confidence_values) / len(confidence_values) if confidence_values else None)
         except CancelledError:
             output.with_name(f".{output.name}.scandocument-part").unlink(missing_ok=True)
             raise
@@ -233,8 +266,8 @@ def make_preview(
     page_index: int,
     max_dimension: int = 1100,
     cancellation: CancellationToken | None = None,
-    facsimile=None,
-) -> tuple[Image.Image, Image.Image, int, list[str]]:
+    facsimiles=None,
+) -> tuple[Image.Image, Image.Image, int, list[str], tuple[float, float]]:
     import pypdfium2 as pdfium
 
     from scandocument.filters import apply_scan_effect
@@ -272,7 +305,7 @@ def make_preview(
             original, _ = render_page(document, index, int(dpi))
             token.check()
             source_for_processing = original.copy()
-            if facsimile is not None:
+            for facsimile in facsimiles or []:
                 facsimile.validate_for_document(len(document))
                 if facsimile.applies_to(index):
                     from scandocument.facsimile import apply_facsimile
@@ -280,6 +313,6 @@ def make_preview(
                     source_for_processing = apply_facsimile(source_for_processing, facsimile)
             processed = apply_scan_effect(source_for_processing, settings, seed, index)
             token.check()
-            return original, processed, len(document), info.warnings
+            return original, processed, len(document), info.warnings, (float(width), float(height))
         finally:
             document.close()

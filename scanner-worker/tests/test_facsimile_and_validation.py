@@ -8,7 +8,8 @@ from pathlib import Path
 import pytest
 
 from scandocument.errors import CorruptDocumentError, DocumentTooLargeError, UnsupportedFormatError
-from scandocument.models import DocumentInfo, FacsimilePlacement
+from scandocument.models import DocumentInfo, FacsimilePlacement, Redaction
+from scandocument.worker_cli import validate_protocol
 from scandocument.tempfiles import SecureWorkspace
 from scandocument.validation import detect_kind, validate_ocr_languages, validate_render_budget
 
@@ -31,6 +32,14 @@ def test_facsimile_all_is_the_only_mode_without_pages(tmp_path: Path) -> None:
     item.validate_for_document(2)
     assert item.applies_to(0)
     assert item.applies_to(1)
+
+
+def test_redaction_and_protocol_are_strict() -> None:
+    Redaction([0], 0.1, 0.1, 0.5, 0.2).validate_for_document(1)
+    with pytest.raises(ValueError, match="внутри страницы"):
+        Redaction([0], 0.8, 0.1, 0.5, 0.2).validate_for_document(1)
+    with pytest.raises(ValueError, match="протокола"):
+        validate_protocol({"protocolVersion": 1})
 
 
 def test_ocr_languages_are_limited_to_bundled_models() -> None:

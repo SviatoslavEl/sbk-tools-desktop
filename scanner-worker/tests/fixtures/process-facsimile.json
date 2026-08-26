@@ -1,4 +1,5 @@
 {
+  "protocolVersion": 2,
   "inputPath": "scanner-worker/tests/fixtures/simple.pdf",
   "outputPath": "scanner-worker/tests/output/processed-facsimile.pdf",
   "preset": "Офисный скан",

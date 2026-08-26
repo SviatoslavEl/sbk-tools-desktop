@@ -107,6 +107,25 @@ class FacsimilePlacement:
 
 
 @dataclass(slots=True)
+class Redaction:
+    pages: list[int]
+    x: float
+    y: float
+    width: float
+    height: float
+    color: str = "black"
+
+    def validate_for_document(self, page_count: int) -> None:
+        if not self.pages or any(page < 0 or page >= page_count for page in self.pages):
+            raise ValueError("Диапазон скрытия выходит за пределы документа.")
+        if self.color not in {"black", "white"}:
+            raise ValueError("Для скрытия доступна только чёрная или белая заливка.")
+        values = (self.x, self.y, self.width, self.height)
+        if not all(0 <= value <= 1 for value in values) or self.width <= 0 or self.height <= 0 or self.x + self.width > 1 or self.y + self.height > 1:
+            raise ValueError("Область скрытия должна находиться внутри страницы.")
+
+
+@dataclass(slots=True)
 class ProcessRequest:
     input_path: Path
     output_path: Path
@@ -114,7 +133,9 @@ class ProcessRequest:
     seed: int
     ocr_enabled: bool = False
     ocr_languages: str = "rus+eng"
-    facsimile: FacsimilePlacement | None = None
+    facsimiles: list[FacsimilePlacement] = field(default_factory=list)
+    page_order: list[int] = field(default_factory=list)
+    redactions: list[Redaction] = field(default_factory=list)
 
 
 @dataclass(slots=True)

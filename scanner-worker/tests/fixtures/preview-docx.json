@@ -1,4 +1,5 @@
 {
+  "protocolVersion": 2,
   "inputPath": "scanner-worker/tests/fixtures/simple.docx",
   "outputPath": "scanner-worker/tests/output/preview-docx.png",
   "preset": "Офисный скан",

@@ -3,7 +3,7 @@ import { ConfirmDialog } from "../../components/Dialog";
 import { useRecords } from "../../hooks/useRecords";
 import packageInfo from "../../../package.json";
 import { chooseDirectory, chooseOpenPath } from "../../lib/files";
-import { createBackup, getWorkspaceInfo, restoreBackup, setWorkspaceLocation, type BackupInfo, type WorkspaceInfo } from "../../lib/storage";
+import { createBackup, deleteBackup, getWorkspaceInfo, listBackups, restoreBackup, rotateBackups, setBackupPinned, setWorkspaceLocation, verifyBackup, type BackupInfo, type BackupListItem, type WorkspaceInfo } from "../../lib/storage";
 
 interface AppSettings { expiryDays: 30 | 60 | 90; collapsedSidebar: boolean }
 
@@ -12,8 +12,11 @@ export function Settings({ collapsed, onCollapsed }: { collapsed: boolean; onCol
   const [workspace, setWorkspace] = useState<WorkspaceInfo | null>(null);
   const [message, setMessage] = useState("");
   const [restorePath, setRestorePath] = useState("");
+  const [backups, setBackups] = useState<BackupListItem[]>([]);
+  const [retention, setRetention] = useState(10);
   const expiryDays = store.records.find((record) => record.title === "application")?.payload.expiryDays || 60;
-  useEffect(() => { void getWorkspaceInfo().then(setWorkspace); }, []);
+  const reloadBackups = () => void listBackups().then(setBackups).catch(() => setBackups([]));
+  useEffect(() => { void getWorkspaceInfo().then(setWorkspace); reloadBackups(); }, []);
 
   const saveSettings = async (patch: Partial<AppSettings>) => {
     const existing = store.records.find((record) => record.title === "application");
@@ -24,8 +27,10 @@ export function Settings({ collapsed, onCollapsed }: { collapsed: boolean; onCol
     try {
       const result: BackupInfo = await createBackup();
       setMessage(`Резервная копия создана: ${result.fileName} (${(result.sizeBytes / 1024 / 1024).toFixed(1)} МБ)`);
+      reloadBackups();
     } catch (reason) { setMessage(`Ошибка: ${String(reason)}`); }
   };
+  const verify = async (path: string) => { setMessage("Проверяем manifest, контрольные суммы и базы…"); try { const result = await verifyBackup(path); setMessage(`Проверка PASS: ${result.files} файлов, ${(result.unpackedBytes / 1024 / 1024).toFixed(1)} МБ, SHA-256 ${result.sha256}.`); } catch (reason) { setMessage(`Проверка FAIL: ${String(reason)}`); } };
   const selectRestore = async () => {
     const path = await chooseOpenPath("Выберите резервную копию", ["sbkbackup"]);
     if (path) setRestorePath(path);
@@ -47,9 +52,9 @@ export function Settings({ collapsed, onCollapsed }: { collapsed: boolean; onCol
   return <div className="settings-grid">
     <section className="surface"><div className="surface-title"><h2>Рабочая папка</h2><span className={`status ${workspace?.writable ? "success" : "danger"}`}>{workspace?.writable ? "✓ Доступна для записи" : "Проверяем…"}</span></div><div className="surface-body"><div className="settings-row"><span>Режим хранения</span><strong>{workspace?.portable ? "Рядом с приложением" : "Выбранная папка"}</strong></div><div className="settings-row path-row"><span>Путь</span><strong>{workspace?.root || "Определяем…"}</strong></div><div className="settings-row"><span>Версия базы</span><strong>{workspace?.schemaVersion || "—"}</strong></div><div className="settings-row"><span>Свободно</span><strong>{workspace?.freeSpaceBytes ? `${(workspace.freeSpaceBytes / 1024 / 1024 / 1024).toFixed(1)} ГБ` : "—"}</strong></div><button className="secondary" type="button" onClick={() => void selectWorkspace()}>Выбрать другую папку</button><p className="help-text">Папку ProductData можно переносить вместе с приложением. Перед сменой расположения создайте резервную копию; переключение произойдёт после перезапуска.</p></div></section>
     <section className="surface"><div className="surface-title"><h2>Интерфейс</h2></div><div className="surface-body settings-form"><label className="checkbox-row"><input type="checkbox" checked={collapsed} onChange={(event) => { onCollapsed(event.target.checked); void saveSettings({ collapsedSidebar: event.target.checked }); }} /> Сворачивать навигацию до значков</label><label>Предупреждать об истечении документов<select value={expiryDays} onChange={(event) => void saveSettings({ expiryDays: Number(event.target.value) as AppSettings["expiryDays"] })}><option value="30">за 30 дней</option><option value="60">за 60 дней</option><option value="90">за 90 дней</option></select></label></div></section>
-    <section className="surface"><div className="surface-title"><h2>Резервное копирование</h2></div><div className="surface-body settings-actions"><p>Копия содержит отдельные базы всех инструментов и сохранённые вложения.</p><button className="primary" type="button" onClick={() => void backup()}>Создать резервную копию</button><button className="secondary" type="button" onClick={() => void selectRestore()}>Восстановить из копии</button>{message && <div className={`notice ${message.startsWith("Ошибка") || message.startsWith("Восстановление не") ? "error" : "success"}`}>{message}</div>}</div></section>
+    <section className="surface backup-surface"><div className="surface-title"><h2>Резервное копирование</h2><span>{backups.length} копий</span></div><div className="surface-body settings-actions"><p>Копия содержит отдельные базы всех инструментов и сохранённые вложения.</p><div className="button-row"><button className="primary" type="button" onClick={() => void backup()}>Создать резервную копию</button><button className="secondary" type="button" onClick={() => void selectRestore()}>Проверить / восстановить файл</button></div><div className="retention-row"><label>Хранить незакреплённых копий<input type="number" min="1" max="100" value={retention} onChange={(event) => setRetention(Number(event.target.value))} /></label><button className="secondary small" type="button" onClick={async () => { const removed = await rotateBackups(retention); setMessage(`Ротация завершена: удалено ${removed}. Закреплённые копии сохранены.`); reloadBackups(); }}>Применить ротацию</button></div><div className="backup-list">{backups.map((item) => <div key={item.fileName}><span><strong>{item.pinned ? "★ " : ""}{item.fileName}</strong><small>{new Date(item.modifiedAt).toLocaleString("ru-RU")} · {(item.sizeBytes / 1024 / 1024).toFixed(1)} МБ</small></span><div className="button-row"><button className="link-button" type="button" onClick={() => void verify(item.path)}>Проверить</button><button className="link-button" type="button" onClick={async () => { await setBackupPinned(item.fileName, !item.pinned); reloadBackups(); }}>{item.pinned ? "Открепить" : "Закрепить"}</button><button className="link-button danger" disabled={item.pinned} type="button" onClick={async () => { if (!window.confirm(`Удалить резервную копию ${item.fileName}?`)) return; await deleteBackup(item.fileName); reloadBackups(); }}>Удалить</button></div></div>)}</div>{message && <div className={`notice ${message.startsWith("Ошибка") || message.startsWith("Восстановление не") || message.startsWith("Проверка FAIL") ? "error" : "success"}`}>{message}</div>}</div></section>
     <section className="surface"><div className="surface-title"><h2>Изоляция данных</h2></div><div className="surface-body"><ul className="plain-list"><li>Калькулятор: отдельная база и экспорт расчётов.</li><li>Сканер: отдельные задания и шаблоны факсимиле.</li><li>Опыт по договорам: самостоятельный реестр.</li><li>Кадры: отдельный реестр и собственные документы.</li><li>Закупки: отдельная база; связи создаются только явным снимком пользователя.</li></ul></div></section>
-    {restorePath && <ConfirmDialog title="Восстановить данные из копии?" message="Текущее состояние сначала будет сохранено в страховочную резервную копию, затем данные выбранного архива заменят записи приложения." confirmLabel="Восстановить" onClose={() => setRestorePath("")} onConfirm={() => void restore()} />}
+    {restorePath && <ConfirmDialog title="Проверить и восстановить данные из копии?" message="Перед изменением данных архив будет полностью проверен. Текущее состояние сохранится в страховочную копию." confirmLabel="Проверить и восстановить" onClose={() => setRestorePath("")} onConfirm={() => void restore()} />}
   </div>;
 }
 
