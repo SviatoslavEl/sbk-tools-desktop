@@ -1851,12 +1851,14 @@ fn scanner_worker_command() -> Result<(Command, bool), String> {
     } else {
         "sbk-scanner-worker"
     };
-    let mut candidates = vec![
+    let candidates = vec![
         executable
             .parent()
             .unwrap_or(Path::new("."))
             .join(binary_name),
     ];
+    #[cfg(target_os = "macos")]
+    let mut candidates = candidates;
     #[cfg(target_os = "macos")]
     if let Some(resources) = executable
         .ancestors()
