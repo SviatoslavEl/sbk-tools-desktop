@@ -288,6 +288,23 @@ tbody tr:hover .sticky-cell { background: #f6fbf7; }
 .empty-inline { padding: 18px; color: #64776b; background: #f4f8f5; border: 1px dashed #bfd3c4; border-radius: 9px; text-align: center; font-size: 11px; }
 .import-summary { display: flex; justify-content: space-between; margin-bottom: 12px; color: #64776b; font-size: 11px; }
 .import-report { padding: 10px; color: #5d4a23; background: #fff3d9; border-radius: 8px; white-space: pre-wrap; font: 11px/1.5 ui-monospace, monospace; }
+.validation-summary { display: block; margin-top: 4px; color: #9a5c08; }
+.procurement-drawer { width: min(980px, calc(100vw - 90px)); grid-template-rows: auto auto 1fr auto; }
+.editor-card { display: grid; gap: 8px; margin: 10px 0; padding: 12px; border: 1px solid #d4e3d7; border-radius: 10px; background: #f8fbf9; }
+.checklist-row { display: grid; grid-template-columns: 24px minmax(220px, 1fr) minmax(130px, .5fr) 145px 40px; gap: 7px; align-items: center; margin: 8px 0; }
+.checklist-row > input:not([type="checkbox"]), .link-group select { width: 100%; min-height: 38px; padding: 7px 9px; color: #173c2a; background: #fff; border: 1px solid #bfd0c2; border-radius: 8px; }
+.checklist-row > input[type="checkbox"] { width: 18px; height: 18px; accent-color: #2f9845; }
+.price-row { grid-template-columns: 160px 160px minmax(200px, 1fr) 40px; }
+.loss-row { color: #8d2830; background: #fff0f0; }
+.link-group { margin-bottom: 20px; }
+.snapshot-list { display: grid; gap: 7px; margin: 8px 0; }
+.snapshot-list > div { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 9px 11px; background: #f4f8f5; border-radius: 8px; }
+.snapshot-list span, .snapshot-list strong, .snapshot-list small { display: block; }
+.snapshot-list small { color: #65786b; }
+.document-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
+.dashboard-grid { display: grid; grid-template-columns: repeat(3, minmax(260px, 1fr)); gap: 14px; }
+.dashboard-card.has-alert { border-color: #e2c27f; }
+.dashboard-list { margin: 0; padding-left: 18px; color: #53685a; font-size: 11px; line-height: 1.7; }
 
 @media (max-width: 1180px) {
   .calculator-layout { grid-template-columns: 1fr; }
@@ -295,6 +312,7 @@ tbody tr:hover .sticky-cell { background: #f6fbf7; }
   .form-grid { grid-template-columns: 1fr 1fr; }
   .scanner-layout { grid-template-columns: 300px minmax(500px, 1fr); }
   .registry-toolbar .toolbar-actions { width: 100%; margin-left: 0; }
+  .dashboard-grid { grid-template-columns: repeat(2, minmax(260px, 1fr)); }
 }
 
 @media (prefers-reduced-motion: no-preference) {

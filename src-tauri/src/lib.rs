@@ -23,19 +23,21 @@ use walkdir::WalkDir;
 use zip::write::SimpleFileOptions;
 
 const SCHEMA_VERSION: i64 = 2;
-const MODULES: [&str; 5] = [
+const MODULES: [&str; 6] = [
     "settings",
     "calculator",
     "scanner",
     "contract-experience",
     "staff",
+    "procurement",
 ];
-const WORKSPACE_DIRS: [&str; 10] = [
+const WORKSPACE_DIRS: [&str; 11] = [
     "settings",
     "calculator",
     "scanner",
     "contract-experience",
     "staff",
+    "procurement",
     "attachments",
     "backups",
     "logs",
