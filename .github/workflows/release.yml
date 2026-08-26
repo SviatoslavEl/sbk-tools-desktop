@@ -36,6 +36,11 @@ jobs:
         working-directory: scanner-worker
       - run: python -m ruff check .
         working-directory: scanner-worker
+      - name: Prepare sidecar placeholder for Tauri metadata checks
+        run: |
+          touch src-tauri/binaries/sbk-scanner-worker-x86_64-unknown-linux-gnu
+          chmod +x src-tauri/binaries/sbk-scanner-worker-x86_64-unknown-linux-gnu
+          mkdir -p src-tauri/runtime-resources/resources
       - run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
       - run: cargo test --manifest-path src-tauri/Cargo.toml --all-targets
       - run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
