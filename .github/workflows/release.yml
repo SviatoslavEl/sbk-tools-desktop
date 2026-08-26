@@ -60,6 +60,8 @@ jobs:
 
   build:
     needs: quality-gate
+    env:
+      ARTIFACT_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('2.0.0-test.{0}', github.run_number) }}
     strategy:
       fail-fast: false
       matrix:
@@ -228,7 +230,7 @@ jobs:
             codesign --force --deep --sign - --timestamp=none "$APP"
           fi
           codesign --verify --deep --strict "$APP"
-          ZIP="release-artifacts/SBK-Tools-${{ github.ref_name }}-${{ matrix.target }}.app.zip"
+          ZIP="release-artifacts/SBK-Tools-${ARTIFACT_VERSION}-${{ matrix.target }}.app.zip"
           ditto -c -k --sequesterRsrc --keepParent "$APP" "$ZIP"
           if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
             xcrun notarytool submit "$ZIP" --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" --wait
@@ -257,7 +259,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $version = '${{ github.ref_name }}'.TrimStart('v')
+          $version = $env:ARTIFACT_VERSION.TrimStart('v')
           ./scripts/package_windows_portable.ps1 -Target '${{ matrix.target }}' -Version $version
       - name: Sign and verify Windows release launcher
         if: runner.os == 'Windows' && startsWith(github.ref, 'refs/tags/v')
