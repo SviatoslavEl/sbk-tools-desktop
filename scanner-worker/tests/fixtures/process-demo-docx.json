@@ -1,0 +1,8 @@
+{
+  "protocolVersion": 2,
+  "inputPath": "demo-data/Демо_закупка_лабораторного_оборудования.docx",
+  "outputPath": "scanner-worker/tests/output/processed-demo-docx.pdf",
+  "preset": "Офисный скан",
+  "seed": 42,
+  "ocrEnabled": false
+}

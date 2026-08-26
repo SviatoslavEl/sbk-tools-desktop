@@ -1,6 +1,6 @@
 param(
     [string]$Target = "x86_64-pc-windows-msvc",
-    [string]$Version = "2.2.0"
+    [string]$Version = "2.2.1"
 )
 
 $ErrorActionPreference = "Stop"
@@ -20,9 +20,10 @@ Copy-Item -Recurse (Join-Path $Root "src-tauri\webview2-runtime") (Join-Path $Pa
 Copy-Item (Join-Path $Root "LICENSE") $Payload
 Copy-Item (Join-Path $Root "THIRD_PARTY_LICENSES.md") $Payload
 
-$Archive = Join-Path $Stage "payload.zip"
-Compress-Archive -Path (Join-Path $Payload "*") -DestinationPath $Archive -CompressionLevel Optimal
-$env:SBK_PAYLOAD_ZIP = $Archive
+$Archive = Join-Path $Stage "payload.tar.zst"
+python (Join-Path $Root "scripts\create_payload_archive.py") --root $Payload --output $Archive
+if ($LASTEXITCODE -ne 0) { throw "Windows payload compression failed" }
+$env:SBK_PAYLOAD_TAR_ZST = $Archive
 cargo build --manifest-path (Join-Path $Root "windows-launcher\Cargo.toml") --release --target $Target --target-dir $LauncherTarget
 if ($LASTEXITCODE -ne 0) { throw "Windows one-file launcher build failed" }
 

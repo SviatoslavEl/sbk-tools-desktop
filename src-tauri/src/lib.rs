@@ -2001,18 +2001,29 @@ fn configure_scanner_process_group(command: &mut Command) {
 }
 
 #[cfg(not(unix))]
-fn configure_scanner_process_group(_command: &mut Command) {}
+fn configure_scanner_process_group(command: &mut Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+}
 
 fn terminate_scanner_tree(child: &mut Child) {
     let pid = child.id();
     #[cfg(windows)]
     {
-        let _ = Command::new("taskkill")
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let mut taskkill = Command::new("taskkill");
+        taskkill
             .args(["/PID", &pid.to_string(), "/T", "/F"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .status();
+            .creation_flags(CREATE_NO_WINDOW);
+        let _ = taskkill.status();
     }
     #[cfg(unix)]
     {

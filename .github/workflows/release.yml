@@ -58,11 +58,15 @@ jobs:
         with:
           name: SBK-Tools-SBOM
           path: release-artifacts/SBK-Tools.cyclonedx.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: SBK-Tools-Demo-Files
+          path: demo-data/
 
   build:
     needs: quality-gate
     env:
-      ARTIFACT_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('2.2.0-test.{0}', github.run_number) }}
+      ARTIFACT_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('2.2.1-test.{0}', github.run_number) }}
     strategy:
       fail-fast: false
       matrix:
@@ -70,9 +74,6 @@ jobs:
           - platform: macos-15
             target: aarch64-apple-darwin
             args: --target aarch64-apple-darwin
-          - platform: macos-15-intel
-            target: x86_64-apple-darwin
-            args: --target x86_64-apple-darwin
           - platform: windows-latest
             target: x86_64-pc-windows-msvc
             args: --target x86_64-pc-windows-msvc
@@ -152,8 +153,8 @@ jobs:
             WORKER="src-tauri/binaries/sbk-scanner-worker-${{ matrix.target }}"
           fi
           python scripts/generate_runtime_manifest.py --root src-tauri/runtime-resources --worker "$WORKER"
-      - name: Require Apple release credentials
-        if: runner.os == 'macOS' && startsWith(github.ref, 'refs/tags/v')
+      - name: Require Apple signing and notarization credentials
+        if: runner.os == 'macOS'
         shell: bash
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
@@ -167,7 +168,7 @@ jobs:
             test -n "${!name}" || { echo "Missing required secret: $name"; exit 1; }
           done
       - name: Import Developer ID certificate
-        if: runner.os == 'macOS' && startsWith(github.ref, 'refs/tags/v')
+        if: runner.os == 'macOS'
         shell: bash
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
@@ -196,11 +197,14 @@ jobs:
           SCANDOCUMENT_RESOURCE_ROOT=src-tauri/runtime-resources "$WORKER" process --config scanner-worker/tests/fixtures/process.json
           SCANDOCUMENT_RESOURCE_ROOT=src-tauri/runtime-resources "$WORKER" preview --config scanner-worker/tests/fixtures/preview-docx.json
           SCANDOCUMENT_RESOURCE_ROOT=src-tauri/runtime-resources "$WORKER" process --config scanner-worker/tests/fixtures/process-docx.json
+          SCANDOCUMENT_RESOURCE_ROOT=src-tauri/runtime-resources "$WORKER" process --config scanner-worker/tests/fixtures/process-demo-docx.json
           SCANDOCUMENT_RESOURCE_ROOT=src-tauri/runtime-resources "$WORKER" process --config scanner-worker/tests/fixtures/process-ocr.json
           SCANDOCUMENT_RESOURCE_ROOT=src-tauri/runtime-resources "$WORKER" process --config scanner-worker/tests/fixtures/process-facsimile.json
       - name: Build macOS app for manual verification
         if: runner.os == 'macOS' && !startsWith(github.ref, 'refs/tags/v')
         shell: bash
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
         run: npm run tauri build -- ${{ matrix.args }}
       - name: Build and attach signed macOS release bundles
         if: runner.os == 'macOS' && startsWith(github.ref, 'refs/tags/v')
@@ -211,7 +215,7 @@ jobs:
         with:
           tagName: v__VERSION__
           releaseName: СБК Инструменты v__VERSION__
-          releaseBody: Portable open-source desktop release for Windows and macOS.
+          releaseBody: Portable open-source desktop release for Windows x64 and macOS Apple Silicon.
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}
@@ -229,20 +233,15 @@ jobs:
         run: |
           APP="src-tauri/target/${{ matrix.target }}/release/bundle/macos/СБК Инструменты.app"
           mkdir -p release-artifacts
-          if [[ "${{ github.ref }}" != refs/tags/v* ]]; then
-            codesign --force --deep --sign - --timestamp=none "$APP"
-          fi
           codesign --verify --deep --strict "$APP"
           ZIP="release-artifacts/SBK-Tools-${ARTIFACT_VERSION}-${{ matrix.target }}.app.zip"
           ditto -c -k --sequesterRsrc --keepParent "$APP" "$ZIP"
-          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
-            xcrun notarytool submit "$ZIP" --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" --wait
-            xcrun stapler staple "$APP"
-            codesign --verify --deep --strict "$APP"
-            spctl --assess --type execute --verbose=4 "$APP"
-            rm "$ZIP"
-            ditto -c -k --sequesterRsrc --keepParent "$APP" "$ZIP"
-          fi
+          xcrun notarytool submit "$ZIP" --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" --wait
+          xcrun stapler staple "$APP"
+          codesign --verify --deep --strict "$APP"
+          spctl --assess --type execute --verbose=4 "$APP"
+          rm "$ZIP"
+          ditto -c -k --sequesterRsrc --keepParent "$APP" "$ZIP"
           shasum -a 256 "$ZIP" > "$ZIP.sha256"
       - name: Upload portable macOS app
         if: runner.os == 'macOS'

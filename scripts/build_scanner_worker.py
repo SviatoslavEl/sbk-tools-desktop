@@ -28,7 +28,7 @@ def main() -> None:
     executable = "sbk-scanner-worker.exe" if platform.system() == "Windows" else "sbk-scanner-worker"
     command = [
         args.python, "-m", "nuitka", "--onefile", "--assume-yes-for-downloads",
-        "--onefile-tempdir-spec={CACHE_DIR}/SBKTools/ScannerWorker/2.2.0",
+        "--onefile-tempdir-spec={CACHE_DIR}/SBKTools/ScannerWorker/2.2.1",
         "--onefile-cache-mode=cached",
         f"--output-dir={output}", f"--output-filename={executable}",
         "--include-package=scandocument", "--include-package=PIL", "--include-package=numpy",
@@ -37,6 +37,8 @@ def main() -> None:
         "--include-module=reportlab.pdfbase.ttfonts", "--include-package-data=pypdfium2",
         "--nofollow-import-to=reportlab.lib.testutils,reportlab.graphics.testshapes,numpy.conftest,numpy.tests,numpy.typing.tests,pypdf.tests,docx.tests",
     ]
+    if platform.system() == "Windows":
+        command.append("--windows-console-mode=disable")
     resources = worker / "resources"
     command.append(str(worker / "src/scandocument/worker_cli.py"))
     subprocess.run(command, cwd=root, check=True)

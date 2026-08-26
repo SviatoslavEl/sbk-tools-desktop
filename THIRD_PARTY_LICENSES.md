@@ -6,8 +6,9 @@
 |---|---|---|
 | Tauri и плагины Tauri | desktop-оболочка | Apache-2.0 / MIT |
 | Microsoft Edge WebView2 Fixed Version Runtime | встроенный Windows webview | Microsoft Edge WebView2 Runtime license; разрешено распространение только как части приложения |
+| Microsoft Visual C++ Redistributable | app-local библиотеки для LibreOffice на чистой Windows | Microsoft Visual Studio licensing terms; распространяется только как часть приложения |
 | React, React DOM, Vite | пользовательский интерфейс | MIT |
-| Rust и crates.io зависимости | локальный host, SQLite, архивы, XLSX | лицензии отдельных пакетов; преимущественно Apache-2.0 / MIT |
+| Rust и crates.io зависимости, включая zstd | локальный host, SQLite, архивы, XLSX | лицензии отдельных пакетов; преимущественно Apache-2.0 / MIT / BSD-3-Clause |
 | Python | runtime worker | Python Software Foundation License |
 | NumPy | обработка изображений | BSD-3-Clause |
 | Pillow | обработка изображений | HPND |
@@ -20,4 +21,4 @@
 | LibreOffice | локальная конвертация DOCX | MPL-2.0 / LGPL-3.0-or-later |
 | SQLite | локальные базы | Public Domain |
 
-LibreOffice, Tesseract и WebView2 запускаются как самостоятельные локальные компоненты. Ссылки и контрольные суммы загрузок закреплены в `scripts/stage_libreoffice.py` и release workflow. WebView2 не распространяется отдельно от приложения и не используется не по назначению.
+LibreOffice, Tesseract и WebView2 запускаются как самостоятельные локальные компоненты. Ссылки и контрольные суммы загрузок закреплены в `scripts/stage_libreoffice.py` и release workflow. Библиотеки Microsoft Visual C++ копируются из официальной среды сборки как поддерживаемый app-local runtime. WebView2 и runtime Microsoft не распространяются отдельно от приложения и не используются не по назначению.

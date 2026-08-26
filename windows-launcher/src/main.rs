@@ -1,7 +1,7 @@
 #![windows_subsystem = "windows"]
 
-use std::fs::{self, File};
-use std::io::{Cursor, Write};
+use std::fs;
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use uuid::Uuid;
@@ -11,7 +11,7 @@ use windows_sys::Win32::System::Threading::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
 
-static PAYLOAD: &[u8] = include_bytes!(env!("SBK_PAYLOAD_ZIP"));
+static PAYLOAD: &[u8] = include_bytes!(env!("SBK_PAYLOAD_TAR_ZST"));
 const PREFIX: &str = "SBKTools-runtime-";
 
 fn process_alive(pid: u32) -> bool {
@@ -51,24 +51,18 @@ fn cleanup_stale(base: &Path) {
 
 fn unpack(destination: &Path) -> Result<(), String> {
     let cursor = Cursor::new(PAYLOAD);
-    let mut archive =
-        zip::ZipArchive::new(cursor).map_err(|_| "Встроенные компоненты повреждены".to_string())?;
-    for index in 0..archive.len() {
-        let mut entry = archive.by_index(index).map_err(|error| error.to_string())?;
-        let relative = entry
-            .enclosed_name()
-            .ok_or_else(|| "Встроенный архив содержит опасный путь".to_string())?;
-        let target = destination.join(relative);
-        if entry.is_dir() {
-            fs::create_dir_all(&target).map_err(|error| error.to_string())?;
-            continue;
+    let decoder = zstd::stream::read::Decoder::new(cursor)
+        .map_err(|_| "Встроенные компоненты повреждены".to_string())?;
+    let mut archive = tar::Archive::new(decoder);
+    let entries = archive.entries().map_err(|error| error.to_string())?;
+    for entry in entries {
+        let mut entry = entry.map_err(|error| error.to_string())?;
+        if !entry
+            .unpack_in(destination)
+            .map_err(|error| error.to_string())?
+        {
+            return Err("Встроенный архив содержит опасный путь".to_string());
         }
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-        }
-        let mut output = File::create(&target).map_err(|error| error.to_string())?;
-        std::io::copy(&mut entry, &mut output).map_err(|error| error.to_string())?;
-        output.flush().map_err(|error| error.to_string())?;
     }
     Ok(())
 }

@@ -245,10 +245,18 @@ def convert_docx_to_pdf(
     soffice = find_soffice()
     if soffice:
         from scandocument.office_engine import convert_with_office
-
-        return convert_with_office(
-            source, destination, soffice, destination.parent, cancelled,
-        )
+        try:
+            return convert_with_office(
+                source, destination, soffice, destination.parent, cancelled,
+            )
+        except DocxConversionError:
+            warnings = _convert_docx_with_basic_layout(source, destination)
+            warnings.insert(
+                0,
+                "Офисный движок не запустился; применён автономный совместимый режим DOCX. "
+                "Проверьте переносы страниц в предварительном просмотре.",
+            )
+            return warnings
     if cancelled and cancelled():
         from scandocument.errors import CancelledError
 

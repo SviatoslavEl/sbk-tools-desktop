@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import os
 import platform
 import shutil
 import subprocess
@@ -24,6 +25,29 @@ PACKAGES = {
         "f15ba07bfcb0186986cf3171063506f5d207c11f8cc051ba0d135209e9e915f9",
     ),
 }
+
+
+def stage_windows_cpp_runtime(destination: Path) -> None:
+    """Bundle the supported app-local MSVC runtime required on clean Windows systems."""
+    candidates: list[Path] = []
+    configured = os.environ.get("VCToolsRedistDir")
+    if configured:
+        candidates.extend(Path(configured).glob("x64/Microsoft.VC*.CRT"))
+    program_files = Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
+    candidates.extend(
+        program_files.glob("Microsoft Visual Studio/2022/*/VC/Redist/MSVC/*/x64/Microsoft.VC*.CRT")
+    )
+    runtime = next((path for path in sorted(candidates, reverse=True) if path.is_dir()), None)
+    if runtime is None:
+        raise SystemExit("Microsoft Visual C++ app-local runtime was not found")
+    program = destination / "program"
+    copied = 0
+    for library in runtime.glob("*.dll"):
+        shutil.copy2(library, program / library.name)
+        copied += 1
+    if copied == 0:
+        raise SystemExit(f"No app-local runtime DLLs found in {runtime}")
+    print(f"Staged {copied} Microsoft Visual C++ app-local runtime DLLs", flush=True)
 
 
 def digest(path: Path) -> str:
@@ -82,6 +106,7 @@ def main() -> None:
             if destination.exists():
                 shutil.rmtree(destination)
             shutil.copytree(source, destination)
+            stage_windows_cpp_runtime(destination)
 
 
 if __name__ == "__main__":
