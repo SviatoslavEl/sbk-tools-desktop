@@ -33,12 +33,15 @@ def apply_facsimile(page: Image.Image, placement: FacsimilePlacement) -> Image.I
     if placement.opacity < 1:
         alpha = stamp.getchannel("A").point(lambda value: round(value * max(0.05, placement.opacity)))
         stamp.putalpha(alpha)
-    if placement.rotation:
-        stamp = stamp.rotate(-placement.rotation, expand=True, resample=Image.Resampling.BICUBIC)
-
     left = round(base.width * max(0.0, min(1.0, placement.x)))
     top = round(base.height * max(0.0, min(1.0, placement.y)))
-    left = max(0, min(base.width - stamp.width, left))
-    top = max(0, min(base.height - stamp.height, top))
+    if placement.rotation:
+        original_width, original_height = stamp.size
+        stamp = stamp.rotate(-placement.rotation, expand=True, resample=Image.Resampling.BICUBIC)
+        # x/y identify the unrotated top-left corner in the UI. Compensating
+        # for Pillow's expanded bounding box keeps the visual centre fixed and
+        # matches CSS transform-origin: center center.
+        left += round((original_width - stamp.width) / 2)
+        top += round((original_height - stamp.height) / 2)
     base.alpha_composite(stamp, (left, top))
     return base.convert("RGB")

@@ -1,0 +1,114 @@
+import type { FacsimilePageSelection } from "./facsimilePages";
+
+export interface FacsimilePlacementPayload {
+  imagePath: string;
+  imageUrl: string;
+  fileName: string;
+  x: number;
+  y: number;
+  width: number;
+  rotation: number;
+  opacity: number;
+  removeLightBackground: boolean;
+  application: FacsimilePageSelection["application"];
+  pages: number[];
+}
+
+export interface EditableFacsimile {
+  imagePath: string;
+  imageUrl: string;
+  fileName: string;
+  x: number;
+  y: number;
+  width: number;
+  rotation: number;
+  opacity: number;
+  removeLightBackground: boolean;
+}
+
+export function buildFacsimilePlacement(
+  facsimile: EditableFacsimile,
+  selection: FacsimilePageSelection,
+): FacsimilePlacementPayload {
+  return {
+    imagePath: facsimile.imagePath,
+    imageUrl: facsimile.imageUrl,
+    fileName: facsimile.fileName,
+    x: facsimile.x,
+    y: facsimile.y,
+    width: facsimile.width,
+    rotation: facsimile.rotation,
+    opacity: facsimile.opacity,
+    removeLightBackground: facsimile.removeLightBackground,
+    application: selection.application,
+    pages: selection.pages,
+  };
+}
+
+export function facsimileAppliesTo(placement: FacsimilePlacementPayload, pageIndex: number): boolean {
+  return placement.application === "all" || placement.pages.includes(pageIndex);
+}
+
+export function facsimileOverlayStyle(placement: FacsimilePlacementPayload) {
+  return {
+    left: `${placement.x * 100}%`,
+    top: `${placement.y * 100}%`,
+    width: `${placement.width * 100}%`,
+    transform: `rotate(${placement.rotation}deg)`,
+    transformOrigin: "center center",
+  } as const;
+}
+
+export interface PreviewCacheKeyInput {
+  inputPath: string;
+  preset: string;
+  pageIndex: number;
+  dpi: number;
+  quality: number;
+  pageRotation: number;
+  redactions: unknown[];
+}
+
+export function previewCacheKey(input: PreviewCacheKeyInput): string {
+  return JSON.stringify([
+    input.inputPath,
+    input.preset,
+    input.pageIndex,
+    input.dpi,
+    input.quality,
+    input.pageRotation,
+    input.redactions,
+  ]);
+}
+
+export class BoundedPreviewCache<T> {
+  private readonly values = new Map<string, T>();
+
+  constructor(private readonly limit = 8) {}
+
+  get(key: string): T | undefined {
+    const value = this.values.get(key);
+    if (value === undefined) return undefined;
+    this.values.delete(key);
+    this.values.set(key, value);
+    return value;
+  }
+
+  set(key: string, value: T): void {
+    this.values.delete(key);
+    this.values.set(key, value);
+    while (this.values.size > this.limit) {
+      const oldest = this.values.keys().next().value;
+      if (oldest === undefined) break;
+      this.values.delete(oldest);
+    }
+  }
+
+  clear(): void {
+    this.values.clear();
+  }
+
+  get size(): number {
+    return this.values.size;
+  }
+}

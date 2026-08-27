@@ -141,25 +141,13 @@ def preview(config: dict) -> int:
     placements = placements_from(config)
     original, processed, pages, warnings, page_size = make_preview(
         source, settings, int(config.get("seed", 42)), int(config.get("pageIndex", 0)),
-        facsimiles=placements,
+        preview_cache_dir=Path(config["previewCacheDir"]) if config.get("previewCacheDir") else None,
     )
     for placement in placements:
         placement.validate_for_document(pages)
-    redactions = redactions_from(config)
-    if redactions:
-        from PIL import ImageDraw
-
-        draw = ImageDraw.Draw(processed)
-        for redaction in redactions:
-            redaction.validate_for_document(pages)
-            if int(config.get("pageIndex", 0)) in redaction.pages:
-                draw.rectangle((
-                    round(redaction.x * processed.width), round(redaction.y * processed.height),
-                    round((redaction.x + redaction.width) * processed.width),
-                    round((redaction.y + redaction.height) * processed.height),
-                ), fill=redaction.color)
     rotations = {int(key): int(value) for key, value in config.get("pageRotations", {}).items()}
-    rotation = rotations.get(int(config.get("pageIndex", 0)), 0)
+    page_index = int(config.get("pageIndex", 0))
+    rotation = rotations.get(page_index, 0)
     if rotation not in {0, 90, 180, 270}:
         raise ValueError("Поворот страницы должен быть 0, 90, 180 или 270 градусов.")
     if rotation:
@@ -167,6 +155,25 @@ def preview(config: dict) -> int:
         processed = processed.rotate(-rotation, expand=True)
         if rotation in {90, 270}:
             page_size = (page_size[1], page_size[0])
+    if placements:
+        from scandocument.facsimile import apply_facsimile
+
+        for placement in placements:
+            if placement.applies_to(page_index):
+                processed = apply_facsimile(processed, placement)
+    redactions = redactions_from(config)
+    if redactions:
+        from PIL import ImageDraw
+
+        draw = ImageDraw.Draw(processed)
+        for redaction in redactions:
+            redaction.validate_for_document(pages)
+            if page_index in redaction.pages:
+                draw.rectangle((
+                    round(redaction.x * processed.width), round(redaction.y * processed.height),
+                    round((redaction.x + redaction.width) * processed.width),
+                    round((redaction.y + redaction.height) * processed.height),
+                ), fill=redaction.color)
     output.parent.mkdir(parents=True, exist_ok=True)
     original_output = output.with_name(f"{output.stem}.original.png")
     original.thumbnail((1400, 1400), Image.Resampling.LANCZOS)

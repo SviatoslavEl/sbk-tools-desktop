@@ -94,13 +94,17 @@ def _process_page(
     from scandocument.pdf_engine import image_page_pdf
 
     token.check()
+    processed = apply_scan_effect(image, request.settings, request.seed, index)
+    del image
+    if rotation:
+        processed = processed.rotate(-rotation, expand=True)
+        if rotation in {90, 270}:
+            page_size = (page_size[1], page_size[0])
     for facsimile in request.facsimiles:
         if facsimile.applies_to(index):
             from scandocument.facsimile import apply_facsimile
 
-            image = apply_facsimile(image, facsimile)
-    processed = apply_scan_effect(image, request.settings, request.seed, index)
-    del image
+            processed = apply_facsimile(processed, facsimile)
     if request.redactions:
         from PIL import ImageDraw
 
@@ -113,10 +117,6 @@ def _process_page(
                     round((redaction.y + redaction.height) * processed.height),
                 )
                 draw.rectangle(bounds, fill=redaction.color)
-    if rotation:
-        processed = processed.rotate(-rotation, expand=True)
-        if rotation in {90, 270}:
-            page_size = (page_size[1], page_size[0])
     token.check()
     page_pdf = image_page_pdf(processed, page_size, request.settings.jpeg_quality)
     words = None
@@ -282,7 +282,7 @@ def make_preview(
     page_index: int,
     max_dimension: int = 1100,
     cancellation: CancellationToken | None = None,
-    facsimiles=None,
+    preview_cache_dir: Path | None = None,
 ) -> tuple[Image.Image, Image.Image, int, list[str], tuple[float, float]]:
     import pypdfium2 as pdfium
 
@@ -297,8 +297,40 @@ def make_preview(
         if kind == "docx":
             from scandocument.docx_engine import convert_docx_to_pdf
 
-            pdf_source = workspace / "preview.pdf"
-            prepared_warnings = convert_docx_to_pdf(source, pdf_source, lambda: token.cancelled)
+            if preview_cache_dir is not None:
+                import hashlib
+                import json
+
+                metadata = source.stat()
+                key = hashlib.sha256(
+                    f"{source.resolve()}\0{metadata.st_size}\0{metadata.st_mtime_ns}".encode("utf-8")
+                ).hexdigest()
+                preview_cache_dir.mkdir(parents=True, exist_ok=True)
+                cached_pdf = preview_cache_dir / f"{key}.pdf"
+                cached_warnings = preview_cache_dir / f"{key}.warnings.json"
+                if not cached_pdf.is_file():
+                    staged_pdf = workspace / f"{key}.pdf"
+                    prepared_warnings = convert_docx_to_pdf(source, staged_pdf, lambda: token.cancelled)
+                    token.check()
+                    try:
+                        staged_pdf.replace(cached_pdf)
+                    except OSError:
+                        if not cached_pdf.is_file():
+                            raise
+                    cached_warnings.write_text(
+                        json.dumps(prepared_warnings, ensure_ascii=False),
+                        encoding="utf-8",
+                    )
+                else:
+                    try:
+                        stored = json.loads(cached_warnings.read_text(encoding="utf-8"))
+                        prepared_warnings = [str(value) for value in stored] if isinstance(stored, list) else []
+                    except (OSError, ValueError, TypeError):
+                        prepared_warnings = []
+                pdf_source = cached_pdf
+            else:
+                pdf_source = workspace / "preview.pdf"
+                prepared_warnings = convert_docx_to_pdf(source, pdf_source, lambda: token.cancelled)
         else:
             prepared_warnings = []
         token.check()
@@ -320,14 +352,7 @@ def make_preview(
             page.close()
             original, _ = render_page(document, index, int(dpi))
             token.check()
-            source_for_processing = original.copy()
-            for facsimile in facsimiles or []:
-                facsimile.validate_for_document(len(document))
-                if facsimile.applies_to(index):
-                    from scandocument.facsimile import apply_facsimile
-
-                    source_for_processing = apply_facsimile(source_for_processing, facsimile)
-            processed = apply_scan_effect(source_for_processing, settings, seed, index)
+            processed = apply_scan_effect(original.copy(), settings, seed, index)
             token.check()
             return original, processed, len(document), info.warnings, (float(width), float(height))
         finally:

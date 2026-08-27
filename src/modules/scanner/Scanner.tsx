@@ -6,6 +6,14 @@ import { useRecords } from "../../hooks/useRecords";
 import { chooseDirectory, chooseOpenPath, chooseOpenPaths, chooseSavePath } from "../../lib/files";
 import { copyAttachment, getWorkspaceInfo } from "../../lib/storage";
 import { parseFacsimilePages } from "./facsimilePages";
+import {
+  BoundedPreviewCache,
+  buildFacsimilePlacement,
+  facsimileAppliesTo,
+  facsimileOverlayStyle,
+  previewCacheKey,
+  type FacsimilePlacementPayload,
+} from "./facsimilePreview";
 
 const presets = [
   ["Оригинал", "Минимальная обработка"], ["Офисный скан", "Естественный офисный вид"],
@@ -32,6 +40,14 @@ interface ScannerRecord { kind: "facsimile-template" | "processing-journal"; rel
 interface RedactionState { id: string; page: number; x: number; y: number; width: number; height: number; color: "black" | "white"; }
 
 interface ProgressState { stage: string; currentPage: number; totalPages: number; percent: number }
+interface PreviewResult {
+  previewUrl: string;
+  originalUrl: string;
+  pageCount: number;
+  warnings: string[];
+  estimatedOutputBytes: number;
+  pageSizePoints?: [number, number];
+}
 
 const initialFacsimile = (path: string, url: string, fileName: string): FacsimileState => ({
   imagePath: path, imageUrl: url, fileName, x: 0.62, y: 0.72, width: 0.22, rotation: 0, opacity: 1,
@@ -53,6 +69,7 @@ export function Scanner() {
   const [fullscreen, setFullscreen] = useState(false);
   const [batchPaths, setBatchPaths] = useState<string[]>([]);
   const [previewAspect, setPreviewAspect] = useState(0.707);
+  const [previewZoom, setPreviewZoom] = useState(1);
   const [previewing, setPreviewing] = useState(false);
   const [ocrEnabled, setOcrEnabled] = useState(false);
   const [ocrLanguages, setOcrLanguages] = useState("rus+eng");
@@ -60,8 +77,7 @@ export function Scanner() {
   const [dpi, setDpi] = useState(200);
   const [quality, setQuality] = useState(84);
   const [facsimile, setFacsimile] = useState<FacsimileState | null>(null);
-  const [savedFacsimiles, setSavedFacsimiles] = useState<Record<string, unknown>[]>([]);
-  const [facsimilePreviewCommitted, setFacsimilePreviewCommitted] = useState(false);
+  const [savedFacsimiles, setSavedFacsimiles] = useState<FacsimilePlacementPayload[]>([]);
   const [progress, setProgress] = useState<ProgressState | null>(null);
   const [activeJob, setActiveJob] = useState("");
   const [error, setError] = useState("");
@@ -76,8 +92,7 @@ export function Scanner() {
   const dragging = useRef(false);
   const latestPreviewJob = useRef("");
   const activeJobRef = useRef("");
-  const stageRef = useRef<HTMLDivElement | null>(null);
-  const [facsimileRevision, setFacsimileRevision] = useState(0);
+  const previewCache = useRef(new BoundedPreviewCache<PreviewResult>(8));
   const journal = templates.records.filter((record) => record.payload.kind === "processing-journal").slice(0, 10);
 
   useEffect(() => {
@@ -97,37 +112,58 @@ export function Scanner() {
     }
   }, [facsimile, pageIndex, pageCount]);
 
-  const workerFacsimile = facsimile && facsimileSelection.selection ? {
-    imagePath: facsimile.imagePath, x: facsimile.x, y: facsimile.y, width: facsimile.width,
-    rotation: facsimile.rotation, opacity: facsimile.opacity,
-    removeLightBackground: facsimile.removeLightBackground,
-    application: facsimileSelection.selection.application,
-    pages: facsimileSelection.selection.pages,
-  } : null;
+  const workerFacsimile = facsimile && facsimileSelection.selection
+    ? buildFacsimilePlacement(facsimile, facsimileSelection.selection)
+    : null;
 
-  const makePreview = async (path = inputPath, selectedPreset = preset, selectedPage = pageIndex, includeFacsimile = true, rotations = pageRotations) => {
+  const applyPreview = (result: PreviewResult) => {
+    setPageCount(result.pageCount);
+    setPageOrder((current) => current.length && current.every((index) => index < result.pageCount)
+      ? current
+      : Array.from({ length: result.pageCount }, (_, index) => index));
+    setEstimatedOutputBytes(result.estimatedOutputBytes);
+    setPageSizeMm(result.pageSizePoints
+      ? result.pageSizePoints.map((value) => value * 25.4 / 72) as [number, number]
+      : null);
+    setPreviewUrl(result.previewUrl);
+    setOriginalUrl(result.originalUrl);
+    setWarnings(result.warnings);
+  };
+
+  const makePreview = async (path = inputPath, selectedPreset = preset, selectedPage = pageIndex, rotations = pageRotations) => {
     if (!path) return;
+    const pageRedactions = redactions
+      .filter((entry) => entry.page === selectedPage)
+      .map((entry) => ({ pages: [entry.page], x: entry.x, y: entry.y, width: entry.width, height: entry.height, color: entry.color }));
+    const cacheKey = previewCacheKey({
+      inputPath: path,
+      preset: selectedPreset,
+      pageIndex: selectedPage,
+      dpi,
+      quality,
+      pageRotation: rotations[selectedPage] || 0,
+      redactions: pageRedactions,
+    });
+    const cached = previewCache.current.get(cacheKey);
+    if (cached) {
+      if (latestPreviewJob.current) void invoke("scanner_cancel", { jobId: latestPreviewJob.current }).catch(() => undefined);
+      latestPreviewJob.current = `cache-${crypto.randomUUID()}`;
+      applyPreview(cached);
+      setPreviewing(false);
+      setError("");
+      return;
+    }
     setPreviewing(true); setError("");
     if (latestPreviewJob.current) void invoke("scanner_cancel", { jobId: latestPreviewJob.current }).catch(() => undefined);
     const jobId = crypto.randomUUID();
     latestPreviewJob.current = jobId;
-    let previewFacsimile = null;
-    if (includeFacsimile && facsimile) {
-      try {
-        const selected = parseFacsimilePages(facsimile.applyTo, facsimile.pageRange, selectedPage, pageCount);
-        previewFacsimile = { imagePath: facsimile.imagePath, x: facsimile.x, y: facsimile.y, width: facsimile.width, rotation: facsimile.rotation, opacity: facsimile.opacity, removeLightBackground: facsimile.removeLightBackground, application: selected.application, pages: selected.pages };
-      } catch { /* The visible range error blocks export; keep the previous preview. */ }
-    }
     try {
       const response = await invoke<{ outputPath: string; originalPath?: string; pageCount: number; warnings?: string[]; estimatedOutputBytes?: number; pageSizePoints?: [number, number] }>("scanner_run", {
-        jobId, operation: "preview", config: { protocolVersion: 2, inputPath: path, preset: selectedPreset, pageIndex: selectedPage, seed: 42, settings: { dpi, jpeg_quality: quality }, facsimiles: [...savedFacsimiles, ...(previewFacsimile ? [previewFacsimile] : [])], pageRotations: rotations, redactions: redactions.map((entry) => ({ pages: [entry.page], x: entry.x, y: entry.y, width: entry.width, height: entry.height, color: entry.color })) },
+        jobId, operation: "preview", config: { protocolVersion: 2, inputPath: path, preset: selectedPreset, pageIndex: selectedPage, seed: 42, settings: { dpi, jpeg_quality: quality }, pageRotations: rotations, redactions: pageRedactions },
       });
       if (latestPreviewJob.current !== jobId) return;
-      setPageCount(response.pageCount);
-      setPageOrder((current) => current.length && current.every((index) => index < response.pageCount) ? current : Array.from({ length: response.pageCount }, (_, index) => index));
-      setEstimatedOutputBytes(response.estimatedOutputBytes || 0);
-      setPageSizeMm(response.pageSizePoints ? response.pageSizePoints.map((value) => value * 25.4 / 72) as [number, number] : null);
       let url = "";
+      let original = "";
       try {
         url = await invoke<string>("read_binary_file", { path: response.outputPath, maxBytes: 24 * 1024 * 1024 });
       } finally {
@@ -136,11 +172,19 @@ export function Scanner() {
       if (latestPreviewJob.current !== jobId) return;
       setPreviewUrl(url);
       if (response.originalPath) {
-        try { setOriginalUrl(await invoke<string>("read_binary_file", { path: response.originalPath, maxBytes: 24 * 1024 * 1024 })); }
+        try { original = await invoke<string>("read_binary_file", { path: response.originalPath, maxBytes: 24 * 1024 * 1024 }); }
         finally { void invoke("delete_runtime_file", { path: response.originalPath }).catch(() => undefined); }
       }
-      setWarnings(response.warnings || []);
-      setFacsimilePreviewCommitted(Boolean(previewFacsimile));
+      const result: PreviewResult = {
+        previewUrl: url,
+        originalUrl: original,
+        pageCount: response.pageCount,
+        warnings: response.warnings || [],
+        estimatedOutputBytes: response.estimatedOutputBytes || 0,
+        pageSizePoints: response.pageSizePoints,
+      };
+      previewCache.current.set(cacheKey, result);
+      applyPreview(result);
     } catch (reason) { if (latestPreviewJob.current === jobId) setError(String(reason)); }
     finally { if (latestPreviewJob.current === jobId) setPreviewing(false); }
   };
@@ -148,8 +192,9 @@ export function Scanner() {
   const chooseDocument = async () => {
     const path = await chooseOpenPath("Выберите PDF или DOCX", ["pdf", "docx"]);
     if (!path) return;
-    setInputPath(path); setDocumentName(path.split(/[\\/]/).pop() || path); setPageIndex(0); setPageOrder([]); setPageRotations({}); setResultPath(""); setWarnings([]); setFacsimile(null); setSavedFacsimiles([]); setRedactions([]); setOcrConfidence(null); setOcrText(""); setLowConfidenceWords([]); setFacsimilePreviewCommitted(false);
-    await makePreview(path, preset, 0, false);
+    previewCache.current.clear();
+    setInputPath(path); setDocumentName(path.split(/[\\/]/).pop() || path); setPageIndex(0); setPageOrder([]); setPageRotations({}); setResultPath(""); setWarnings([]); setFacsimile(null); setSavedFacsimiles([]); setRedactions([]); setOcrConfidence(null); setOcrText(""); setLowConfidenceWords([]); setPreviewZoom(1);
+    await makePreview(path, preset, 0, {});
   };
   const chooseBatch = async () => {
     const paths = await chooseOpenPaths("Выберите PDF и DOCX для пакета", ["pdf", "docx"]);
@@ -176,7 +221,7 @@ export function Scanner() {
     const path = await chooseOpenPath("Выберите факсимиле", ["png", "jpg", "jpeg"]);
     if (!path) return;
     const imageUrl = await invoke<string>("read_binary_file", { path, maxBytes: 12 * 1024 * 1024 });
-    setFacsimile(initialFacsimile(path, imageUrl, path.split(/[\\/]/).pop() || "Факсимиле")); setFacsimilePreviewCommitted(false);
+    setFacsimile(initialFacsimile(path, imageUrl, path.split(/[\\/]/).pop() || "Факсимиле"));
   };
 
   const useTemplate = async (template: ScannerRecord) => {
@@ -185,7 +230,7 @@ export function Scanner() {
     const separator = workspace.root.includes("\\") ? "\\" : "/";
     const path = `${workspace.root}${separator}${template.relativePath.replace(/\//g, separator)}`;
     const imageUrl = await invoke<string>("read_binary_file", { path, maxBytes: 12 * 1024 * 1024 });
-    setFacsimile(initialFacsimile(path, imageUrl, template.fileName)); setFacsimilePreviewCommitted(false);
+    setFacsimile(initialFacsimile(path, imageUrl, template.fileName));
   };
 
   const saveFacsimileTemplate = async () => {
@@ -221,7 +266,6 @@ export function Scanner() {
     const x = Math.max(0, Math.min(1 - facsimile.width, (event.clientX - bounds.left) / bounds.width - facsimile.width / 2));
     const y = Math.max(0, Math.min(0.94, (event.clientY - bounds.top) / bounds.height - 0.04));
     setFacsimile({ ...facsimile, x, y });
-    setFacsimilePreviewCommitted(false);
   };
 
   const nudge = (event: KeyboardEvent<HTMLDivElement>) => {
@@ -229,7 +273,12 @@ export function Scanner() {
     const step = event.shiftKey ? 0.01 : 0.002;
     const delta = { ArrowLeft: [-step, 0], ArrowRight: [step, 0], ArrowUp: [0, -step], ArrowDown: [0, step] }[event.key];
     if (!delta) return;
-    event.preventDefault(); setFacsimile({ ...facsimile, x: Math.max(0, Math.min(1 - facsimile.width, facsimile.x + delta[0])), y: Math.max(0, Math.min(0.95, facsimile.y + delta[1])) }); setFacsimilePreviewCommitted(false); setFacsimileRevision((value) => value + 1);
+    event.preventDefault();
+    setFacsimile({
+      ...facsimile,
+      x: Math.max(0, Math.min(1 - facsimile.width, facsimile.x + delta[0])),
+      y: Math.max(0, Math.min(0.95, facsimile.y + delta[1])),
+    });
   };
   const moveCurrentPage = (direction: -1 | 1) => setPageOrder((current) => {
     const position = current.indexOf(pageIndex); const target = position + direction;
@@ -244,38 +293,43 @@ export function Scanner() {
   const rotateCurrentPage = (degrees: -90 | 90) => setPageRotations((current) => {
     const next = ((current[pageIndex] || 0) + degrees + 360) % 360;
     const rotations = { ...current, [pageIndex]: next };
-    void makePreview(inputPath, preset, pageIndex, true, rotations);
+    void makePreview(inputPath, preset, pageIndex, rotations);
     return rotations;
   });
 
-  useEffect(() => {
-    if (facsimileRevision > 0 && inputPath && facsimileSelection.selection) void makePreview();
-    // makePreview intentionally uses the latest component state after dragging ends.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [facsimileRevision]);
-
   const visibleOnCurrentPage = facsimile && facsimileSelection.selection
     && (facsimileSelection.selection.application === "all" || facsimileSelection.selection.pages.includes(pageIndex));
+  const visibleSavedFacsimiles = savedFacsimiles.filter((placement) => facsimileAppliesTo(placement, pageIndex));
   return <div className="scanner-layout">
     <section className="surface scanner-controls"><div className="surface-title"><h2>Настройки</h2></div><div className="surface-body scanner-control-stack">
       <button className="primary full-width" type="button" onClick={() => void chooseDocument()}>{inputPath ? "Заменить файл" : "Выбрать PDF или DOCX"}</button><button className="secondary full-width" type="button" onClick={() => void chooseBatch()}>Пакетная обработка</button>{batchPaths.length > 0 && <div className="notice success"><span>Выбрано файлов: {batchPaths.length}</span><button className="primary small" type="button" onClick={() => void processBatch()}>Обработать пакет в папку</button></div>}{documentName && <p className="selected-file">▧ {documentName}</p>}
       <div><h3>Пресет</h3><div className="preset-grid">{presets.map(([name, description]) => <button key={name} className={preset === name ? "selected" : ""} type="button" onClick={() => { setPreset(name); void makePreview(inputPath, name, pageIndex); }}><strong>{name}</strong><small>{description}</small></button>)}</div></div>
-      <div className="control-divider" /><div><div className="inline-heading"><h3>Факсимиле</h3>{facsimile && <button className="link-button danger" type="button" onClick={() => { setFacsimile(null); setFacsimilePreviewCommitted(false); void makePreview(inputPath, preset, pageIndex, false); }}>Удалить</button>}</div>{!facsimile ? <><button className="secondary full-width" type="button" onClick={() => void chooseFacsimile()}>Добавить факсимиле</button>{templates.records.filter((record) => record.payload.kind === "facsimile-template").length > 0 && <select aria-label="Шаблон факсимиле" defaultValue="" onChange={(event) => { const template = templates.records.find((record) => record.id === event.target.value); if (template) void useTemplate(template.payload); }}><option value="">Выбрать сохранённый шаблон</option>{templates.records.filter((record) => record.payload.kind === "facsimile-template").map((record) => <option key={record.id} value={record.id}>{record.title}</option>)}</select>}</> : <div className="facsimile-controls"><strong>{facsimile.fileName}</strong><label>Применить<select value={facsimile.applyTo} onChange={(event) => { setFacsimile({ ...facsimile, applyTo: event.target.value as FacsimileState["applyTo"] }); setFacsimilePreviewCommitted(false); setFacsimileRevision((value) => value + 1); }}><option value="current">к текущей странице</option><option value="range">к диапазону</option><option value="all">ко всем страницам</option></select></label>{facsimile.applyTo === "range" && <label>Страницы<input aria-invalid={!!facsimileSelection.error} value={facsimile.pageRange} placeholder="1-3, 5" onChange={(event) => { setFacsimile({ ...facsimile, pageRange: event.target.value }); setFacsimilePreviewCommitted(false); }} onBlur={() => setFacsimileRevision((value) => value + 1)} />{facsimileSelection.error && <small className="field-error">{facsimileSelection.error}</small>}</label>}<label>Размер <input type="range" min="8" max="60" value={facsimile.width * 100} onChange={(event) => { setFacsimile({ ...facsimile, width: Number(event.target.value) / 100 }); setFacsimilePreviewCommitted(false); }} onPointerUp={() => setFacsimileRevision((value) => value + 1)} /> {Math.round(facsimile.width * 100)}%{pageSizeMm ? ` · ${(pageSizeMm[0] * facsimile.width).toFixed(1)} мм` : ""}</label><label>Поворот <input type="range" min="-180" max="180" value={facsimile.rotation} onChange={(event) => { setFacsimile({ ...facsimile, rotation: Number(event.target.value) }); setFacsimilePreviewCommitted(false); }} onPointerUp={() => setFacsimileRevision((value) => value + 1)} /> {facsimile.rotation}°</label><label>Прозрачность <input type="range" min="10" max="100" value={facsimile.opacity * 100} onChange={(event) => { setFacsimile({ ...facsimile, opacity: Number(event.target.value) / 100 }); setFacsimilePreviewCommitted(false); }} onPointerUp={() => setFacsimileRevision((value) => value + 1)} /> {Math.round(facsimile.opacity * 100)}%</label><label className="checkbox-row"><input type="checkbox" checked={facsimile.removeLightBackground} onChange={(event) => { setFacsimile({ ...facsimile, removeLightBackground: event.target.checked }); setFacsimilePreviewCommitted(false); setFacsimileRevision((value) => value + 1); }} /> Удалить светлый фон</label><button className="secondary small" type="button" onClick={() => void saveFacsimileTemplate()}>Сохранить как шаблон</button></div>}</div>
-      {savedFacsimiles.length > 0 && <div className="notice success"><span>Зафиксировано факсимиле: {savedFacsimiles.length}</span><button className="link-button danger" type="button" onClick={() => { setSavedFacsimiles([]); void makePreview(inputPath, preset, pageIndex, false); }}>Удалить зафиксированные</button></div>}{facsimile && workerFacsimile && <button className="secondary full-width" type="button" onClick={async () => { if (facsimile.applyTo === "all" && pageCount > 1 && !window.confirm(`Зафиксировать факсимиле на всех ${pageCount} страницах?`)) return; setSavedFacsimiles((current) => [...current, workerFacsimile]); setFacsimile(null); setFacsimilePreviewCommitted(false); await chooseFacsimile(); }}>Зафиксировать и добавить ещё</button>}
+      <div className="control-divider" /><div><div className="inline-heading"><h3>Факсимиле</h3>{facsimile && <button className="link-button danger" type="button" onClick={() => setFacsimile(null)}>Удалить</button>}</div>{!facsimile ? <><button className="secondary full-width" type="button" onClick={() => void chooseFacsimile()}>Добавить факсимиле</button>{templates.records.filter((record) => record.payload.kind === "facsimile-template").length > 0 && <select aria-label="Шаблон факсимиле" defaultValue="" onChange={(event) => { const template = templates.records.find((record) => record.id === event.target.value); if (template) void useTemplate(template.payload); }}><option value="">Выбрать сохранённый шаблон</option>{templates.records.filter((record) => record.payload.kind === "facsimile-template").map((record) => <option key={record.id} value={record.id}>{record.title}</option>)}</select>}</> : <div className="facsimile-controls"><strong>{facsimile.fileName}</strong><label>Применить<select value={facsimile.applyTo} onChange={(event) => setFacsimile({ ...facsimile, applyTo: event.target.value as FacsimileState["applyTo"] })}><option value="current">к текущей странице</option><option value="range">к диапазону</option><option value="all">ко всем страницам</option></select></label>{facsimile.applyTo === "range" && <label>Страницы<input aria-invalid={!!facsimileSelection.error} value={facsimile.pageRange} placeholder="1-3, 5" onChange={(event) => setFacsimile({ ...facsimile, pageRange: event.target.value })} />{facsimileSelection.error && <small className="field-error">{facsimileSelection.error}</small>}</label>}<label>Размер <input type="range" min="8" max="60" value={facsimile.width * 100} onChange={(event) => setFacsimile({ ...facsimile, width: Number(event.target.value) / 100 })} /> {Math.round(facsimile.width * 100)}%{pageSizeMm ? ` · ${(pageSizeMm[0] * facsimile.width).toFixed(1)} мм` : ""}</label><label>Поворот <input type="range" min="-180" max="180" value={facsimile.rotation} onChange={(event) => setFacsimile({ ...facsimile, rotation: Number(event.target.value) })} /> {facsimile.rotation}°</label><label>Прозрачность <input type="range" min="10" max="100" value={facsimile.opacity * 100} onChange={(event) => setFacsimile({ ...facsimile, opacity: Number(event.target.value) / 100 })} /> {Math.round(facsimile.opacity * 100)}%</label><label className="checkbox-row"><input type="checkbox" checked={facsimile.removeLightBackground} onChange={(event) => setFacsimile({ ...facsimile, removeLightBackground: event.target.checked })} /> Удалить светлый фон</label><button className="secondary small" type="button" onClick={() => void saveFacsimileTemplate()}>Сохранить как шаблон</button></div>}</div>
+      {savedFacsimiles.length > 0 && <div className="notice success"><span>Зафиксировано факсимиле: {savedFacsimiles.length}</span><button className="link-button danger" type="button" onClick={() => setSavedFacsimiles([])}>Удалить зафиксированные</button></div>}{facsimile && workerFacsimile && <button className="secondary full-width" type="button" onClick={async () => { if (facsimile.applyTo === "all" && pageCount > 1 && !window.confirm(`Зафиксировать факсимиле на всех ${pageCount} страницах?`)) return; setSavedFacsimiles((current) => [...current, workerFacsimile]); setFacsimile(null); await chooseFacsimile(); }}>Зафиксировать и добавить ещё</button>}
       <div className="control-divider" /><label className="checkbox-row"><input type="checkbox" checked={ocrEnabled} onChange={(event) => setOcrEnabled(event.target.checked)} /> Поисковый OCR</label>{ocrEnabled && <label>Языки OCR<select value={ocrLanguages} onChange={(event) => setOcrLanguages(event.target.value)}><option value="rus+eng">Русский + английский</option><option value="rus">Русский</option><option value="eng">Английский</option></select></label>}<label className="checkbox-row"><input type="checkbox" checked={pdfaEnabled} onChange={(event) => setPdfaEnabled(event.target.checked)} /> Архивный PDF/A-2b</label>
       <details><summary>Точная настройка</summary><label>Разрешение<select value={dpi} onChange={(event) => setDpi(Number(event.target.value))}><option value="150">150 dpi</option><option value="200">200 dpi</option><option value="300">300 dpi</option></select></label><label>Качество PDF<input type="range" min="55" max="100" value={quality} onChange={(event) => setQuality(Number(event.target.value))} /> {quality}%</label><button className="secondary small" type="button" onClick={() => { setDpi(200); setQuality(84); }}>Вернуть значения пресета</button></details>
       <details><summary>Журнал обработки · {journal.length}</summary>{journal.length === 0 ? <p className="help-text">Записей пока нет.</p> : <div className="journal-list">{journal.map((record) => <div key={record.id}><strong>{record.payload.status === "completed" ? "✓" : "!"} {record.title}</strong><span>{record.payload.inputType} · {record.payload.pageCount || 0} стр. · {record.payload.durationMs ? `${(record.payload.durationMs / 1000).toFixed(1)} с` : "—"}</span>{record.payload.appliedOperations?.length ? <small>{record.payload.appliedOperations.join(" · ")}</small> : null}{record.payload.outputSha256 ? <small title={record.payload.outputSha256}>SHA-256: {record.payload.outputSha256.slice(0, 16)}…</small> : null}</div>)}</div>}</details>
       <div className="control-divider" /><div><div className="inline-heading"><h3>Безвозвратное скрытие</h3><button className="secondary small" type="button" disabled={!inputPath} onClick={() => setRedactions((current) => [...current, { id: crypto.randomUUID(), page: pageIndex, x: .15, y: .15, width: .3, height: .08, color: "black" }])}>Добавить область</button></div><p className="help-text">Область закрашивается до OCR и не попадает в текстовый слой.</p>{redactions.map((entry) => <div className="redaction-row" key={entry.id}><strong>Стр. {entry.page + 1}</strong><label>X, %<input type="number" min="0" max="99" value={Math.round(entry.x * 100)} onChange={(event) => setRedactions((current) => current.map((item) => item.id === entry.id ? { ...item, x: Number(event.target.value) / 100 } : item))} /></label><label>Y, %<input type="number" min="0" max="99" value={Math.round(entry.y * 100)} onChange={(event) => setRedactions((current) => current.map((item) => item.id === entry.id ? { ...item, y: Number(event.target.value) / 100 } : item))} /></label><label>Ширина, %<input type="number" min="1" max="100" value={Math.round(entry.width * 100)} onChange={(event) => setRedactions((current) => current.map((item) => item.id === entry.id ? { ...item, width: Number(event.target.value) / 100 } : item))} /></label><label>Высота, %<input type="number" min="1" max="100" value={Math.round(entry.height * 100)} onChange={(event) => setRedactions((current) => current.map((item) => item.id === entry.id ? { ...item, height: Number(event.target.value) / 100 } : item))} /></label><select aria-label="Цвет скрытия" value={entry.color} onChange={(event) => setRedactions((current) => current.map((item) => item.id === entry.id ? { ...item, color: event.target.value as RedactionState["color"] } : item))}><option value="black">Чёрный</option><option value="white">Белый</option></select><button className="icon-button danger" type="button" onClick={() => setRedactions((current) => current.filter((item) => item.id !== entry.id))}>×</button></div>)}</div>
     </div></section>
-    <section className={`surface preview-panel ${fullscreen ? "fullscreen-preview" : ""}`}><div className="surface-title"><h2>Предпросмотр</h2><div className="button-row">{originalUrl && <button className="secondary small" type="button" onClick={() => setShowOriginal((value) => !value)}>{showOriginal ? "Показать обработку" : "Показать оригинал"}</button>}<button className="secondary small" type="button" onClick={() => setFullscreen((value) => !value)}>{fullscreen ? "Закрыть полный экран" : "На весь экран"}</button><span>{pageCount ? `Страница ${pageIndex + 1} из ${pageCount}` : "Файл не выбран"} · {preset}</span></div></div>
-      {inputPath && <div className="page-editor"><span>Итоговый порядок ({pageOrder.length}):</span><div>{pageOrder.map((sourceIndex) => <button key={sourceIndex} className={sourceIndex === pageIndex ? "active" : ""} type="button" onClick={() => { setPageIndex(sourceIndex); void makePreview(inputPath, preset, sourceIndex); }}>{sourceIndex + 1}{pageRotations[sourceIndex] ? ` · ${pageRotations[sourceIndex]}°` : ""}</button>)}</div><button className="secondary small" type="button" onClick={() => moveCurrentPage(-1)}>← Раньше</button><button className="secondary small" type="button" onClick={() => moveCurrentPage(1)}>Позже →</button><button className="secondary small" type="button" onClick={() => rotateCurrentPage(-90)}>↶ 90°</button><button className="secondary small" type="button" onClick={() => rotateCurrentPage(90)}>↷ 90°</button><button className="secondary small danger" type="button" onClick={deleteCurrentPage}>Удалить страницу</button><button className="link-button" type="button" onClick={() => { setPageOrder(Array.from({ length: pageCount }, (_, index) => index)); setPageRotations({}); }}>Сбросить</button></div>}
-      {!inputPath ? <div className="drop-empty" onClick={() => void chooseDocument()}><span>▧</span><h2>Выберите документ</h2><p>PDF или DOCX до 200 МБ. Исходный файл не изменяется.</p><button className="primary" type="button">Выбрать файл</button></div> : <div className="preview-workspace">{pageCount > 1 && <aside className="page-strip" aria-label="Страницы">{pageOrder.map((sourceIndex) => <button key={sourceIndex} className={pageIndex === sourceIndex ? "active" : ""} type="button" onClick={() => { setPageIndex(sourceIndex); void makePreview(inputPath, preset, sourceIndex); }}><span>{sourceIndex + 1}</span></button>)}</aside>}<div className="document-stage" ref={stageRef} onPointerMove={moveFacsimile} onPointerUp={() => { if (dragging.current) setFacsimileRevision((value) => value + 1); dragging.current = false; }}><div className="document-page real-preview" style={{ aspectRatio: String(previewAspect) }}>{previewing ? <div className="preview-loader">Обновляем страницу…</div> : previewUrl ? <img className="page-image" src={showOriginal && originalUrl ? originalUrl : previewUrl} alt={`${showOriginal ? "Оригинал" : "Обработка"} страницы ${pageIndex + 1}`} onLoad={(event) => setPreviewAspect(event.currentTarget.naturalWidth / Math.max(1, event.currentTarget.naturalHeight))} /> : null}{!showOriginal && visibleOnCurrentPage && <div className="facsimile real" role="button" tabIndex={0} aria-label="Факсимиле: перемещайте стрелками" style={{ left: `${facsimile.x * 100}%`, top: `${facsimile.y * 100}%`, width: `${facsimile.width * 100}%`, transform: `rotate(${facsimile.rotation}deg)` }} onKeyDown={nudge} onPointerDown={(event) => { dragging.current = true; setFacsimilePreviewCommitted(false); event.currentTarget.setPointerCapture(event.pointerId); }}><img src={facsimile.imageUrl} alt="Факсимиле" style={{ opacity: facsimilePreviewCommitted ? 0 : facsimile.opacity }} /></div>}</div></div></div>}
+    <section className={`surface preview-panel ${fullscreen ? "fullscreen-preview" : ""}`}><div className="surface-title"><h2>Предпросмотр</h2><div className="button-row">{originalUrl && <button className="secondary small" type="button" onClick={() => setShowOriginal((value) => !value)}>{showOriginal ? "Показать обработку" : "Показать оригинал"}</button>}<button className="secondary small" type="button" disabled={previewZoom <= .5} aria-label="Уменьшить масштаб" onClick={() => setPreviewZoom((value) => Math.max(.5, Number((value - .25).toFixed(2))))}>−</button><button className="secondary small zoom-value" type="button" title="Сбросить масштаб" onClick={() => setPreviewZoom(1)}>{Math.round(previewZoom * 100)}%</button><button className="secondary small" type="button" disabled={previewZoom >= 2} aria-label="Увеличить масштаб" onClick={() => setPreviewZoom((value) => Math.min(2, Number((value + .25).toFixed(2))))}>+</button><button className="secondary small" type="button" onClick={() => setFullscreen((value) => !value)}>{fullscreen ? "Закрыть полный экран" : "На весь экран"}</button><span>{pageCount ? `Страница ${pageIndex + 1} из ${pageCount}` : "Файл не выбран"} · {preset}</span></div></div>
+      {inputPath && <div className="page-editor"><span>Итоговый порядок ({pageOrder.length}):</span><div>{pageOrder.map((sourceIndex) => <button key={sourceIndex} className={sourceIndex === pageIndex ? "active" : ""} type="button" onClick={() => { setPageIndex(sourceIndex); void makePreview(inputPath, preset, sourceIndex); }}>{sourceIndex + 1}{pageRotations[sourceIndex] ? ` · ${pageRotations[sourceIndex]}°` : ""}</button>)}</div><button className="secondary small" type="button" onClick={() => moveCurrentPage(-1)}>← Раньше</button><button className="secondary small" type="button" onClick={() => moveCurrentPage(1)}>Позже →</button><button className="secondary small" type="button" onClick={() => rotateCurrentPage(-90)}>↶ 90°</button><button className="secondary small" type="button" onClick={() => rotateCurrentPage(90)}>↷ 90°</button><button className="secondary small danger" type="button" onClick={deleteCurrentPage}>Удалить страницу</button><button className="link-button" type="button" onClick={() => { const rotations = {}; setPageOrder(Array.from({ length: pageCount }, (_, index) => index)); setPageRotations(rotations); void makePreview(inputPath, preset, pageIndex, rotations); }}>Сбросить</button></div>}
+      {!inputPath ? <div className="drop-empty" onClick={() => void chooseDocument()}><span>▧</span><h2>Выберите документ</h2><p>PDF или DOCX до 200 МБ. Исходный файл не изменяется.</p><button className="primary" type="button">Выбрать файл</button></div> : <div className="preview-workspace">
+        {pageCount > 1 && <aside className="page-strip" aria-label="Страницы">{pageOrder.map((sourceIndex) => <button key={sourceIndex} className={pageIndex === sourceIndex ? "active" : ""} type="button" onClick={() => { setPageIndex(sourceIndex); void makePreview(inputPath, preset, sourceIndex); }}><span>{sourceIndex + 1}</span></button>)}</aside>}
+        <div className="document-stage">
+          <div className="document-page real-preview" style={{ aspectRatio: String(previewAspect), width: `${72 * previewZoom}%`, maxWidth: `${720 * previewZoom}px` }} onPointerMove={moveFacsimile} onPointerUp={() => { dragging.current = false; }}>
+            {previewUrl && <img className="page-image" src={showOriginal && originalUrl ? originalUrl : previewUrl} alt={`${showOriginal ? "Оригинал" : "Обработка"} страницы ${pageIndex + 1}`} onLoad={(event) => setPreviewAspect(event.currentTarget.naturalWidth / Math.max(1, event.currentTarget.naturalHeight))} />}
+            {previewing && <div className="preview-loader">Обновляем страницу…</div>}
+            {!showOriginal && visibleSavedFacsimiles.map((placement, index) => <div className="facsimile real saved" key={`${placement.imagePath}-${index}`} style={facsimileOverlayStyle(placement)}><img src={placement.imageUrl} alt="Зафиксированное факсимиле" style={{ opacity: placement.opacity, mixBlendMode: placement.removeLightBackground ? "multiply" : "normal" }} /></div>)}
+            {!showOriginal && visibleOnCurrentPage && workerFacsimile && <div className="facsimile real" role="button" tabIndex={0} aria-label="Факсимиле: перемещайте стрелками" style={facsimileOverlayStyle(workerFacsimile)} onKeyDown={nudge} onPointerDown={(event) => { dragging.current = true; event.currentTarget.setPointerCapture(event.pointerId); }}><img src={facsimile.imageUrl} alt="Факсимиле" style={{ opacity: facsimile.opacity, mixBlendMode: facsimile.removeLightBackground ? "multiply" : "normal" }} /></div>}
+          </div>
+        </div>
+      </div>}
       {error && <div className="scanner-error"><strong>Не удалось обработать документ</strong><span>{error}</span><div><button className="secondary" type="button" onClick={() => void makePreview()}>Повторить</button>{ocrEnabled && <button className="secondary" type="button" onClick={() => setOcrEnabled(false)}>Без OCR</button>}<button className="secondary" type="button" onClick={() => void chooseDocument()}>Другой файл</button></div></div>}
       {warnings.length > 0 && <div className="notice warning"><strong>Проверьте результат</strong>{warnings.map((warning) => <span key={warning}>{warning}</span>)}</div>}
       {inputPath && <div className="scanner-estimate"><span>Оценка результата: {estimatedOutputBytes ? `≈ ${(estimatedOutputBytes / 1024 / 1024).toFixed(1)} МБ` : "рассчитывается"}</span>{pageSizeMm && <span>Страница: {pageSizeMm[0].toFixed(1)} × {pageSizeMm[1].toFixed(1)} мм</span>}{ocrConfidence != null && <span>Средняя уверенность OCR: {ocrConfidence.toFixed(1)}%</span>}</div>}
       {ocrText && <details className="ocr-result"><summary>Распознанный текст · сомнительных слов: {lowConfidenceWords.length}</summary><textarea readOnly rows={10} value={ocrText} aria-label="Распознанный текст" />{lowConfidenceWords.length > 0 && <div className="low-confidence-list">{lowConfidenceWords.slice(0, 100).map((word, index) => <span key={`${word.page}-${index}`} title={`Страница ${word.page}`}>{word.text} · {word.confidence.toFixed(0)}%</span>)}</div>}<p className="help-text">Текст показывается только в текущем окне и не записывается в журнал обработки.</p></details>}
       {progress && <div className="progress-panel"><div><strong>{progress.stage}</strong><span>{progress.totalPages ? `Страница ${progress.currentPage} из ${progress.totalPages}` : ""}</span></div><progress max="100" value={progress.percent} /><strong>{progress.percent}%</strong>{activeJob && <button className="secondary" type="button" onClick={() => void cancel()}>Отменить</button>}</div>}
-      {resultPath ? <div className="ready-panel"><div><strong>✓ PDF готов</strong><span>{resultPath}</span></div><button className="secondary" type="button" onClick={() => void openPath(resultPath)}>Открыть PDF</button><button className="secondary" type="button" onClick={() => void openPath(resultPath.replace(/[\\/][^\\/]+$/, ""))}>Открыть папку</button><button className="primary" type="button" onClick={() => { setInputPath(""); setPreviewUrl(""); setPageCount(0); setResultPath(""); setWarnings([]); setProgress(null); }}>Другой файл</button></div> : <div className="actionbar"><span>{facsimileSelection.error || (facsimile ? "Предпросмотр обновляется тем же worker, что и итоговый PDF" : "Выберите пресет и сохраните новый PDF")}</span><button className="primary" disabled={!inputPath || !!activeJob || !!facsimileSelection.error} type="button" onClick={() => void processDocument()}>Сохранить PDF</button></div>}
+      {resultPath ? <div className="ready-panel"><div><strong>✓ PDF готов</strong><span>{resultPath}</span></div><button className="secondary" type="button" onClick={() => void openPath(resultPath)}>Открыть PDF</button><button className="secondary" type="button" onClick={() => void openPath(resultPath.replace(/[\\/][^\\/]+$/, ""))}>Открыть папку</button><button className="primary" type="button" onClick={() => { setInputPath(""); setPreviewUrl(""); setPageCount(0); setResultPath(""); setWarnings([]); setProgress(null); previewCache.current.clear(); }}>Другой файл</button></div> : <div className="actionbar"><span>{facsimileSelection.error || (facsimile ? "Факсимиле перемещается и поворачивается мгновенно, без повторной загрузки документа" : "Выберите пресет и сохраните новый PDF")}</span><button className="primary" disabled={!inputPath || !!activeJob || !!facsimileSelection.error} type="button" onClick={() => void processDocument()}>Сохранить PDF</button></div>}
     </section>
   </div>;
 }

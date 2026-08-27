@@ -2580,12 +2580,18 @@ fn run_scanner_worker(
     if operation == "preview" {
         let preview_dir = workspace.root.join("runtime-cache").join("previews");
         fs::create_dir_all(&preview_dir).map_err(|error| error.to_string())?;
+        let source_cache = workspace
+            .root
+            .join("runtime-cache")
+            .join("scanner-source-cache");
+        fs::create_dir_all(&source_cache).map_err(|error| error.to_string())?;
         config["outputPath"] = Value::String(
             preview_dir
                 .join(format!("{job_id}.png"))
                 .to_string_lossy()
                 .into_owned(),
         );
+        config["previewCacheDir"] = Value::String(source_cache.to_string_lossy().into_owned());
     } else if operation == "process" {
         let output = config
             .get("outputPath")

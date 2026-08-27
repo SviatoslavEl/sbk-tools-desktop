@@ -11,6 +11,7 @@ from PIL import Image
 from pypdf import PdfReader
 
 from scandocument.errors import CorruptDocumentError, DocumentTooLargeError, UnsupportedFormatError
+from scandocument.facsimile import apply_facsimile
 from scandocument.models import DocumentInfo, EffectSettings, FacsimilePlacement, ProcessRequest, Redaction
 from scandocument.pdf_engine import configure_pdfa_2b
 from scandocument.pipeline import CancellationToken, _process_page
@@ -37,6 +38,42 @@ def test_facsimile_all_is_the_only_mode_without_pages(tmp_path: Path) -> None:
     item.validate_for_document(2)
     assert item.applies_to(0)
     assert item.applies_to(1)
+
+
+def _non_white_bounds(image: Image.Image) -> tuple[int, int, int, int]:
+    pixels = image.convert("RGB")
+    points = [
+        (x, y)
+        for y in range(pixels.height)
+        for x in range(pixels.width)
+        if pixels.getpixel((x, y)) != (255, 255, 255)
+    ]
+    assert points
+    xs, ys = zip(*points, strict=True)
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+@pytest.mark.parametrize("angle", [-90, 45, 90, 180])
+def test_facsimile_rotation_keeps_visual_centre_and_changes_orientation(tmp_path: Path, angle: int) -> None:
+    stamp_path = tmp_path / "asymmetric-stamp.png"
+    stamp = Image.new("RGBA", (80, 20), (210, 20, 20, 255))
+    for x in range(12):
+        for y in range(20):
+            stamp.putpixel((x, y), (10, 60, 220, 255))
+    stamp.save(stamp_path)
+    base = Image.new("RGB", (300, 300), "white")
+    unrotated = apply_facsimile(base, FacsimilePlacement(stamp_path, "all", x=.4, y=.4, width=.2))
+    rotated = apply_facsimile(base, FacsimilePlacement(stamp_path, "all", x=.4, y=.4, width=.2, rotation=angle))
+    normal_bounds = _non_white_bounds(unrotated)
+    rotated_bounds = _non_white_bounds(rotated)
+    normal_centre = ((normal_bounds[0] + normal_bounds[2]) / 2, (normal_bounds[1] + normal_bounds[3]) / 2)
+    rotated_centre = ((rotated_bounds[0] + rotated_bounds[2]) / 2, (rotated_bounds[1] + rotated_bounds[3]) / 2)
+    assert rotated_centre == pytest.approx(normal_centre, abs=1.5)
+    if abs(angle) == 90:
+        assert rotated_bounds[3] - rotated_bounds[1] > rotated_bounds[2] - rotated_bounds[0]
+    if abs(angle) == 180:
+        assert rotated_bounds[2] - rotated_bounds[0] > rotated_bounds[3] - rotated_bounds[1]
+    assert rotated.tobytes() != unrotated.tobytes()
 
 
 def test_redaction_and_protocol_are_strict() -> None:
