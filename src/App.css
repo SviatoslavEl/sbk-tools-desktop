@@ -175,7 +175,7 @@ summary { cursor: pointer; }
 details label { display: block; margin-top: 10px; }
 .control-divider { height: 1px; margin: 16px 0; background: #dce8df; }
 .checkbox-row { display: flex; align-items: center; gap: 8px; margin-top: 15px; }
-.checkbox-row input { width: 18px; height: 18px; accent-color: #2f9845; }
+.checkbox-row input { flex: 0 0 18px; width: 18px; height: 18px; margin: 0; accent-color: #2f9845; }
 .preview-workspace { display: grid; grid-template-columns: 58px minmax(0, 1fr); min-height: 610px; }
 .page-strip { overflow: auto; padding: 8px; background: #eef5f0; border-right: 1px solid #d2e1d5; }
 .page-strip button { width: 40px; height: 52px; margin-bottom: 7px; border: 1px solid #b9cdbc; border-radius: 5px; color: #5b7061; background: #fff; }
@@ -307,6 +307,10 @@ tbody tr:hover .sticky-cell { background: #f6fbf7; }
 .drawer-body h3 { margin: 20px 0 10px; padding-bottom: 6px; border-bottom: 1px solid #e0eae2; font-size: 13px; }
 .drawer-body h3:first-child { margin-top: 0; }
 .drawer-body > label { display: block; margin-top: 12px; }
+.drawer-body > label.checkbox-row { display: flex; margin-top: 15px; }
+.compact-card { display: grid; gap: 9px; margin-top: 12px; padding: 13px; overflow: visible; }
+.compact-card .checkbox-row { margin: 0; }
+.compact-card small { color: #64776b; line-height: 1.45; }
 .drawer-tabs { display: flex; overflow-x: auto; padding: 8px 12px; gap: 4px; border-bottom: 1px solid #e0eae2; }
 .drawer-tabs button { min-height: 35px; padding: 6px 9px; border: 0; border-radius: 7px; color: #53685a; background: transparent; white-space: nowrap; font-size: 10px; }
 .drawer-tabs button.active { color: #1f6e30; background: #dff3e3; font-weight: 700; }
@@ -397,6 +401,23 @@ tbody tr:hover .sticky-cell { background: #f6fbf7; }
   .dashboard-grid { grid-template-columns: repeat(2, minmax(260px, 1fr)); }
   .calendar-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .recommendation-panel { grid-template-columns: repeat(3, minmax(120px, 1fr)); }
+}
+
+@media (max-width: 760px) {
+  html, body, #root { min-width: 0; }
+  .app-shell, .sidebar-collapsed.app-shell { grid-template-columns: 64px minmax(0, 1fr); }
+  .sidebar, .sidebar-collapsed .sidebar { padding-inline: 7px; }
+  .brand, .sidebar-collapsed .brand { padding-inline: 3px; }
+  .brand-text, .nav-label, .nav-caption { display: none; }
+  .tool-nav button, .settings-nav button { justify-content: center; }
+  .topbar { padding: 12px 14px; }
+  .topbar p, .saved-status { display: none; }
+  .tool-content { padding: 12px; }
+  .dashboard-grid, .stats-row, .calendar-stats, .result-column, .form-grid, .form-grid.compact, .mapping-grid, .recommendation-panel { grid-template-columns: 1fr; }
+  .module-toolbar, .record-switcher, .portable-export-row { align-items: stretch; flex-direction: column; }
+  .record-switcher label { min-width: 0; }
+  .scanner-layout { grid-template-columns: minmax(0, 1fr); }
+  .detail-drawer, .detail-drawer.wide-drawer, .procurement-drawer { width: calc(100vw - 64px); }
 }
 
 @media (prefers-reduced-motion: no-preference) {

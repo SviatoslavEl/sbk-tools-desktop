@@ -33,13 +33,13 @@ export function daysTo(date: string, now = new Date()): number | null {
 
 export function qualificationScore(staff: StaffData, schedule: TenderScheduleData): number {
   if (staff.status !== "Работает") return 0;
-  const wanted = schedule.requiredSkills.map((value) => value.trim().toLowerCase()).filter(Boolean);
-  const available = [...staff.skills, staff.qualification, staff.role, staff.grade].join(" ").toLowerCase();
+  const wanted = (schedule.requiredSkills || []).map((value) => value.trim().toLowerCase()).filter(Boolean);
+  const available = [...(staff.skills || []), staff.qualification || "", staff.role || "", staff.grade || ""].join(" ").toLowerCase();
   const skillScore = wanted.length ? wanted.filter((skill) => available.includes(skill)).length / wanted.length * 55 : 40;
   const requiredYears = minimumExperience[schedule.complexity];
-  const experienceScore = requiredYears === 0 ? 30 : Math.min(30, staff.experienceYears / requiredYears * 30);
+  const experienceScore = requiredYears === 0 ? 30 : Math.min(30, (staff.experienceYears || 0) / requiredYears * 30);
   const disclosureScore = staff.disclosureAllowed ? 10 : 0;
-  const qualificationBonus = staff.qualification.trim() ? 5 : 0;
+  const qualificationBonus = staff.qualification?.trim() ? 5 : 0;
   return Math.round(Math.min(100, skillScore + experienceScore + disclosureScore + qualificationBonus));
 }
 

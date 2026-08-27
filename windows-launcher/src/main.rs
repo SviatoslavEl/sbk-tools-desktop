@@ -4,8 +4,16 @@ use std::fs;
 use std::io::Cursor;
 use std::path::Path;
 use std::process::Command;
+#[cfg(windows)]
+use std::{mem::size_of, os::windows::io::AsRawHandle, process::Child};
 use uuid::Uuid;
 use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+#[cfg(windows)]
+use windows_sys::Win32::System::JobObjects::{
+    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+    SetInformationJobObject,
+};
 use windows_sys::Win32::System::Threading::{
     GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
 };
@@ -13,6 +21,34 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBo
 
 static PAYLOAD: &[u8] = include_bytes!(env!("SBK_PAYLOAD_TAR_ZST"));
 const PREFIX: &str = "SBKTools-runtime-";
+
+#[cfg(windows)]
+fn create_kill_job(child: &Child) -> Result<isize, String> {
+    unsafe {
+        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if job.is_null() {
+            return Err("Не удалось создать контейнер процесса".to_string());
+        }
+        let mut information: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        information.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let configured = SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &information as *const _ as *const _,
+            size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        );
+        if configured == 0 {
+            CloseHandle(job);
+            return Err("Не удалось настроить контейнер процесса".to_string());
+        }
+        let assigned = AssignProcessToJobObject(job, child.as_raw_handle() as *mut _);
+        if assigned == 0 {
+            CloseHandle(job);
+            return Err("Не удалось привязать приложение к контейнеру процесса".to_string());
+        }
+        Ok(job as isize)
+    }
+}
 
 fn process_alive(pid: u32) -> bool {
     unsafe {
@@ -78,12 +114,25 @@ fn run() -> Result<i32, String> {
         return Err(error);
     }
     let executable = runtime.join("SBK-Tools.exe");
-    let status = Command::new(&executable)
+    let mut child = Command::new(&executable)
         .current_dir(&runtime)
         .spawn()
-        .map_err(|error| format!("Не удалось запустить приложение: {error}"))?
-        .wait()
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| format!("Не удалось запустить приложение: {error}"))?;
+    #[cfg(windows)]
+    let job = match create_kill_job(&child) {
+        Ok(job) => job,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = fs::remove_dir_all(&runtime);
+            return Err(error);
+        }
+    };
+    let status = child.wait().map_err(|error| error.to_string())?;
+    #[cfg(windows)]
+    unsafe {
+        CloseHandle(job as *mut _);
+    }
     let code = status.code().unwrap_or(1);
     let _ = fs::remove_dir_all(&runtime);
     Ok(code)

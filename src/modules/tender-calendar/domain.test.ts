@@ -23,6 +23,13 @@ describe("tender calendar planning", () => {
     expect(recommendStaff([novice, expert], [], schedule)[0].staffId).toBe("expert");
   });
 
+  it("supports a legacy staff record without a skills array", () => {
+    const schedule = { ...emptyTenderSchedule(), preparationStart: "2026-09-01", internalDeadline: "2026-09-05" };
+    const legacy = staffRecord("legacy", { qualification: "Менеджер", experienceYears: 3 });
+    delete (legacy.payload as Partial<StaffData>).skills;
+    expect(() => recommendStaff([legacy], [], schedule)).not.toThrow();
+  });
+
   it("detects daily overload across tenders", () => {
     const base = { ...emptyTenderSchedule(), preparationStart: "2026-09-01", internalDeadline: "2026-09-02" };
     const assignment = (hours: number) => ({ id: crypto.randomUUID(), staffId: "manager", role: "Менеджер" as const, startDate: "2026-09-01", endDate: "2026-09-02", plannedHours: hours, comment: "" });
