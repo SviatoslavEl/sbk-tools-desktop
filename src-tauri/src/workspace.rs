@@ -21,6 +21,8 @@ const WORKSPACE_DIRS: [&str; 13] = [
 pub(crate) struct Workspace {
     pub(crate) root: PathBuf,
     pub(crate) portable: bool,
+    pub(crate) configured: bool,
+    pub(crate) warning: Option<String>,
     pub(crate) writable: bool,
     pub(crate) _lock: File,
 }
@@ -39,44 +41,46 @@ pub(crate) fn workspace_pointer_path() -> Result<PathBuf, String> {
         .ok_or_else(|| "Не удалось определить папку настроек системы".to_string())
 }
 
-fn adjacent_product_directory() -> Result<PathBuf, String> {
+fn product_directory() -> Result<(PathBuf, bool, bool), String> {
     if let Some(override_path) = std::env::var_os("SBK_TOOLS_WORKSPACE") {
-        return Ok(PathBuf::from(override_path));
-    }
-
-    let executable = std::env::current_exe()
-        .map_err(|error| format!("Не удалось определить расположение приложения: {error}"))?;
-
-    #[cfg(target_os = "macos")]
-    {
-        if let Some(parent) = executable
-            .ancestors()
-            .find(|path| path.extension().is_some_and(|extension| extension == "app"))
-            .and_then(Path::parent)
-        {
-            return Ok(parent.join("ProductData"));
-        }
-    }
-
-    executable
-        .parent()
-        .map(|parent| parent.join("ProductData"))
-        .ok_or_else(|| "Не удалось определить папку portable-данных".to_string())
-}
-
-fn product_directory() -> Result<(PathBuf, bool), String> {
-    if let Some(override_path) = std::env::var_os("SBK_TOOLS_WORKSPACE") {
-        return Ok((PathBuf::from(override_path), false));
+        return Ok((PathBuf::from(override_path), false, true));
     }
     if let Ok(content) = workspace_pointer_path()
         .and_then(|pointer| fs::read_to_string(pointer).map_err(|error| error.to_string()))
     {
         let selected = PathBuf::from(content.trim());
         if !content.trim().is_empty() {
-            return Ok((selected, false));
+            return Ok((selected, false, true));
         }
     }
-    adjacent_product_directory().map(|path| (path, true))
+    if let Some(local) =
+        dirs::data_local_dir().map(|path| path.join("SBKTools").join("ProductData"))
+        && local.is_dir()
+    {
+        return Ok((local, false, true));
+    }
+    if let Ok(executable) = std::env::current_exe()
+        && let Some(parent) = executable.parent()
+    {
+        let adjacent = parent.join("ProductData");
+        if adjacent.is_dir() {
+            return Ok((adjacent, true, true));
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(app_parent) = executable
+            .ancestors()
+            .find(|path| path.extension().is_some_and(|extension| extension == "app"))
+            .and_then(Path::parent)
+        {
+            let adjacent_to_app = app_parent.join("ProductData");
+            if adjacent_to_app.is_dir() {
+                return Ok((adjacent_to_app, true, true));
+            }
+        }
+    }
+    dirs::data_local_dir()
+        .map(|path| (path.join("SBKTools").join("first-run"), false, false))
+        .ok_or_else(|| "Не удалось подготовить первый запуск".to_string())
 }
 
 pub(crate) fn ensure_workspace(root: &Path) -> Result<(), String> {
@@ -94,9 +98,17 @@ pub(crate) fn ensure_workspace(root: &Path) -> Result<(), String> {
 }
 
 pub(crate) fn open_workspace() -> Result<Workspace, String> {
-    let (preferred, mut portable) = product_directory()?;
+    let (preferred, mut portable, mut configured) = product_directory()?;
     let mut root = preferred.clone();
+    let mut warning = None;
     if ensure_workspace(&root).is_err() {
+        if configured {
+            warning = Some(format!(
+                "Ранее выбранная рабочая папка {} сейчас недоступна. Выберите её снова или укажите другую папку.",
+                preferred.display()
+            ));
+            configured = false;
+        }
         root = dirs::data_local_dir()
             .ok_or_else(|| {
                 format!(
@@ -105,7 +117,7 @@ pub(crate) fn open_workspace() -> Result<Workspace, String> {
                 )
             })?
             .join("SBKTools")
-            .join("ProductData");
+            .join("first-run");
         portable = false;
         ensure_workspace(&root)?;
     }
@@ -141,6 +153,8 @@ pub(crate) fn open_workspace() -> Result<Workspace, String> {
     Ok(Workspace {
         root,
         portable,
+        configured,
+        warning,
         writable,
         _lock: lock,
     })

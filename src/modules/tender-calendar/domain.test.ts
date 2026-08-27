@@ -3,10 +3,16 @@ import type { StoredRecord } from "../../lib/storage";
 import { emptyStaff, type StaffData } from "../staff/types";
 import { datesBetween, qualificationScore, recommendStaff, staffLoad } from "./domain";
 import { emptyTenderSchedule, type TenderScheduleData } from "./types";
+import { suggestedInternalDeadline } from "./TenderCalendar";
 
 const staffRecord = (id: string, patch: Partial<StaffData>): StoredRecord<StaffData> => ({ id, title: id, payload: { ...emptyStaff(), fullName: id, role: "Менеджер", status: "Работает", ...patch }, archived: false, createdAt: "", updatedAt: "" });
 
 describe("tender calendar planning", () => {
+  it("keeps a minimal same-day tender date sequence valid", () => {
+    const today = new Date().toISOString().slice(0, 10);
+    expect(suggestedInternalDeadline("", today)).toBe(today);
+  });
+
   it("counts only business days", () => expect(datesBetween("2026-08-28", "2026-09-01")).toEqual(["2026-08-28", "2026-08-31", "2026-09-01"]));
 
   it("ranks matching experienced staff above an overloaded novice", () => {

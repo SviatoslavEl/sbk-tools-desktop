@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import "./App.css";
 import { Dialog } from "./components/Dialog";
 import { Archive } from "./modules/archive/Archive";
@@ -10,6 +10,8 @@ import { StaffRegistry } from "./modules/staff/Staff";
 import { Dashboard } from "./modules/dashboard/Dashboard";
 import { ProcurementRegistry } from "./modules/procurement/Procurement";
 import { TenderCalendar } from "./modules/tender-calendar/TenderCalendar";
+import { chooseDirectory } from "./lib/files";
+import { getWorkspaceInfo, quitApplication, setWorkspaceLocation, type WorkspaceInfo } from "./lib/storage";
 
 type ToolId = "dashboard" | "procurement" | "tender-calendar" | "calculator" | "scanner" | "contracts" | "staff" | "archive" | "settings" | "about";
 
@@ -50,6 +52,19 @@ const helpText: Record<ToolId, string> = {
 };
 
 function App() {
+  const [workspace, setWorkspace] = useState<WorkspaceInfo | null>(null);
+  const [workspaceError, setWorkspaceError] = useState("");
+  const [workspaceReady, setWorkspaceReady] = useState("");
+  useEffect(() => { void getWorkspaceInfo().then(setWorkspace).catch((reason) => setWorkspaceError(String(reason))); }, []);
+  const chooseFirstWorkspace = async () => {
+    const selected = await chooseDirectory("Выберите рабочую папку СБК Инструменты");
+    if (!selected) return;
+    try {
+      const root = await setWorkspaceLocation(selected);
+      setWorkspaceReady(root);
+      setWorkspaceError("");
+    } catch (reason) { setWorkspaceError(String(reason)); }
+  };
   const [activeTool, setActiveTool] = useState<ToolId>(() => {
     const saved = localStorage.getItem("sbk-tools:last-tool") as ToolId | null;
     return saved && Object.prototype.hasOwnProperty.call(toolTitles, saved) ? saved : "dashboard";
@@ -66,6 +81,8 @@ function App() {
   };
   const [title, subtitle] = toolTitles[activeTool];
 
+  if (!workspace) return <div className="startup-screen"><div className="startup-card"><div className="brand-mark large">СБК</div><h1>Подготавливаем рабочее пространство</h1><p>{workspaceError || "Проверяем папку данных…"}</p></div></div>;
+  if (!workspace.configured) return <div className="startup-screen"><div className="startup-card"><div className="brand-mark large">СБК</div><h1>Где будем работать?</h1><p>Выберите постоянную папку. В ней появится каталог <strong>ProductData</strong> с отдельными базами договоров, кадров и календаря, а также папками вложений и экспорта.</p>{workspace.warning && <div className="notice warning"><strong>Рабочая папка недоступна</strong><span>{workspace.warning}</span></div>}{workspaceError && <div className="notice error">{workspaceError}</div>}{workspaceReady ? <><div className="notice success"><strong>Рабочая папка создана</strong><span>{workspaceReady}</span></div><p>Чтобы открыть новые базы, приложение сейчас закроется. Запустите его ещё раз.</p><button className="primary" type="button" onClick={() => void quitApplication()}>Закрыть приложение</button></> : <><button className="primary" type="button" onClick={() => void chooseFirstWorkspace()}>Выбрать папку</button><p className="help-text">Папку можно разместить в Документах, общей рабочей папке или на USB-накопителе. Права администратора не нужны.</p></>}</div></div>;
   return <div className={`app-shell ${collapsed ? "sidebar-collapsed" : ""}`}>
     <aside className="sidebar" aria-label="Инструменты">
       <div className="brand"><div className="brand-mark">СБК</div><div className="brand-text"><strong>Инструменты</strong><span>Рабочее пространство</span></div></div>

@@ -2,7 +2,7 @@
 
 use std::fs;
 use std::io::Cursor;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 use uuid::Uuid;
 use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
@@ -77,17 +77,9 @@ fn run() -> Result<i32, String> {
         let _ = fs::remove_dir_all(&runtime);
         return Err(error);
     }
-    let local_data = std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| temp.clone())
-        .join("SBKTools")
-        .join("ProductData");
-    fs::create_dir_all(&local_data)
-        .map_err(|error| format!("Не удалось открыть папку данных: {error}"))?;
     let executable = runtime.join("SBK-Tools.exe");
     let status = Command::new(&executable)
         .current_dir(&runtime)
-        .env("SBK_TOOLS_WORKSPACE", &local_data)
         .spawn()
         .map_err(|error| format!("Не удалось запустить приложение: {error}"))?
         .wait()

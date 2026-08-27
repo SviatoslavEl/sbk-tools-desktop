@@ -14,6 +14,8 @@ export interface StoredRecord<T = unknown> {
 export interface WorkspaceInfo {
   root: string;
   portable: boolean;
+  configured: boolean;
+  warning?: string;
   writable: boolean;
   schemaVersion: number;
   freeSpaceBytes: number;
@@ -76,6 +78,7 @@ export async function getWorkspaceInfo(): Promise<WorkspaceInfo> {
   return {
     root: "ProductData (режим предпросмотра)",
     portable: true,
+    configured: true,
     writable: true,
     schemaVersion: 1,
     freeSpaceBytes: 0,
@@ -87,10 +90,23 @@ export async function setWorkspaceLocation(path: string): Promise<string> {
   return invoke<string>("set_workspace_location", { path });
 }
 
+export async function quitApplication(): Promise<void> {
+  if (isTauri()) await invoke("quit_application");
+}
+
 export async function readXlsx(path: string): Promise<SpreadsheetData> {
   if (!isTauri()) throw new Error("Импорт XLSX доступен в desktop-версии");
   return invoke<SpreadsheetData>("read_xlsx", { path });
 }
+
+export async function readDocxTable(path: string): Promise<SpreadsheetData> {
+  if (!isTauri()) throw new Error("Импорт DOCX доступен в desktop-версии");
+  return invoke<SpreadsheetData>("read_docx_table", { path });
+}
+
+export interface ContractReportData { title: string; criteria: string; rows: Array<{ legalEntity: string; number: string; date: string; customer: string; subject: string; amount: string; amountValue: number | null; period: string }> }
+export async function writeContractReportDocx(path: string, data: ContractReportData): Promise<void> { if (!isTauri()) throw new Error("Экспорт DOCX доступен в desktop-версии"); await invoke("write_contract_report_docx", { path, data }); }
+export async function writeContractReportPdf(path: string, data: ContractReportData): Promise<void> { if (!isTauri()) throw new Error("Экспорт PDF доступен в desktop-версии"); await invoke("write_contract_report_pdf", { path, data }); }
 
 export async function writeXlsx(path: string, data: SpreadsheetData): Promise<void> {
   if (!isTauri()) throw new Error("Экспорт XLSX доступен в desktop-версии");

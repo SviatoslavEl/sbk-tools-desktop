@@ -403,3 +403,13 @@ tbody tr:hover .sticky-cell { background: #f6fbf7; }
   .dialog, .detail-drawer { animation: appear .14s ease-out; }
   @keyframes appear { from { opacity: 0; transform: translateY(5px); } }
 }
+.startup-screen { min-height: 100vh; display: grid; place-items: center; padding: 32px; background: linear-gradient(145deg, #f3f7f4, #e4eee7); }
+.startup-card { width: min(560px, 100%); padding: 36px; border-radius: 24px; background: #fff; box-shadow: 0 24px 70px rgba(18, 64, 39, .16); display: grid; gap: 18px; }
+.startup-card h1, .startup-card p { margin: 0; }
+.department-group-row td {
+  background: #eaf4eb;
+  color: #1f6d3b;
+  font-weight: 800;
+  letter-spacing: .03em;
+  text-transform: uppercase;
+}

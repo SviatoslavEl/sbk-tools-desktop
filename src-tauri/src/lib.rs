@@ -6,6 +6,7 @@ use chacha20poly1305::{
     aead::{Aead, KeyInit, Payload},
 };
 use chrono::Utc;
+use quick_xml::{Reader as XmlReader, events::Event};
 use rusqlite::{Connection, DatabaseName, OptionalExtension, params};
 use rust_xlsxwriter::{Format, Workbook};
 use serde::{Deserialize, Serialize};
@@ -51,6 +52,8 @@ struct AppState {
 struct WorkspaceInfo {
     root: String,
     portable: bool,
+    configured: bool,
+    warning: Option<String>,
     writable: bool,
     schema_version: i64,
     free_space_bytes: u64,
@@ -203,6 +206,26 @@ struct SpreadsheetData {
     rows: Vec<Vec<String>>,
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ContractReportRow {
+    legal_entity: String,
+    number: String,
+    date: String,
+    customer: String,
+    subject: String,
+    amount: String,
+    period: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ContractReportData {
+    title: String,
+    criteria: String,
+    rows: Vec<ContractReportRow>,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct HistoryEntry {
@@ -229,6 +252,8 @@ fn workspace_info(state: State<'_, AppState>) -> Result<WorkspaceInfo, String> {
     Ok(WorkspaceInfo {
         root: state.workspace.root.to_string_lossy().into_owned(),
         portable: state.workspace.portable,
+        configured: state.workspace.configured,
+        warning: state.workspace.warning.clone(),
         writable: state.workspace.writable,
         schema_version: SCHEMA_VERSION,
         free_space_bytes: fs2::available_space(&state.workspace.root).unwrap_or(0),
@@ -250,6 +275,9 @@ fn set_workspace_location(path: String) -> Result<String, String> {
         selected.join("ProductData")
     };
     ensure_workspace(&root)?;
+    for module in ["contract-experience", "staff", "tender-calendar"] {
+        drop(open_database(&root, module)?);
+    }
     let probe = root.join(".write-probe");
     fs::write(&probe, b"ok")
         .and_then(|_| fs::remove_file(&probe))
@@ -263,23 +291,148 @@ fn set_workspace_location(path: String) -> Result<String, String> {
 }
 
 #[tauri::command]
+fn quit_application(app: AppHandle) {
+    app.exit(0);
+}
+
+#[tauri::command]
 fn read_xlsx(path: String) -> Result<SpreadsheetData, String> {
     let mut workbook = open_workbook_auto(&path)
         .map_err(|error| format!("Не удалось открыть Excel-файл: {error}"))?;
-    let sheet_name = workbook
-        .sheet_names()
-        .first()
-        .cloned()
-        .ok_or_else(|| "В книге нет листов".to_string())?;
-    let range = workbook
-        .worksheet_range(&sheet_name)
-        .map_err(|error| format!("Не удалось прочитать лист: {error}"))?;
-    let rows = range
-        .rows()
-        .map(|row| row.iter().map(|cell| cell.to_string()).collect())
-        .collect();
+    let sheet_names = workbook.sheet_names().to_vec();
+    let mut selected: Option<(String, Vec<Vec<String>>, usize)> = None;
+    for sheet_name in sheet_names {
+        let range = workbook
+            .worksheet_range(&sheet_name)
+            .map_err(|error| format!("Не удалось прочитать лист {sheet_name}: {error}"))?;
+        let rows: Vec<Vec<String>> = range
+            .rows()
+            .map(|row| row.iter().map(|cell| cell.to_string()).collect())
+            .collect();
+        if rows.is_empty() {
+            continue;
+        }
+        let header_index = rows
+            .iter()
+            .take(12)
+            .position(|row| {
+                let normalized: Vec<String> =
+                    row.iter().map(|cell| cell.trim().to_lowercase()).collect();
+                normalized.iter().any(|cell| cell == "фио")
+                    || (normalized.iter().any(|cell| cell == "номер")
+                        && normalized.iter().any(|cell| cell == "заказчик"))
+            })
+            .unwrap_or(0);
+        let score = if rows[header_index]
+            .iter()
+            .any(|cell| cell.trim().eq_ignore_ascii_case("фио"))
+        {
+            3
+        } else if sheet_name.eq_ignore_ascii_case("реестр") {
+            2
+        } else {
+            1
+        };
+        if selected
+            .as_ref()
+            .is_none_or(|(_, _, current)| score > *current)
+        {
+            selected = Some((
+                sheet_name,
+                rows.into_iter().skip(header_index).collect(),
+                score,
+            ));
+        }
+    }
+    let (sheet_name, rows, _) =
+        selected.ok_or_else(|| "В книге нет заполненных листов".to_string())?;
     Ok(SpreadsheetData {
         sheet_name: Some(sheet_name),
+        rows,
+    })
+}
+
+#[tauri::command]
+fn read_docx_table(path: String) -> Result<SpreadsheetData, String> {
+    let file = File::open(&path).map_err(|error| format!("Не удалось открыть DOCX: {error}"))?;
+    let mut archive =
+        zip::ZipArchive::new(file).map_err(|error| format!("DOCX повреждён: {error}"))?;
+    let mut document = archive
+        .by_name("word/document.xml")
+        .map_err(|_| "В DOCX отсутствует основная часть документа".to_string())?;
+    let mut xml = String::new();
+    document
+        .read_to_string(&mut xml)
+        .map_err(|error| format!("Не удалось прочитать DOCX: {error}"))?;
+    let mut reader = XmlReader::from_str(&xml);
+    reader.config_mut().trim_text(false);
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    let mut row: Vec<String> = Vec::new();
+    let mut cell = String::new();
+    let mut in_table = false;
+    let mut table_depth = 0_usize;
+    let mut in_cell = false;
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(event)) => match event.local_name().as_ref() {
+                b"tbl" => {
+                    table_depth += 1;
+                    if table_depth == 1 {
+                        in_table = true;
+                    }
+                }
+                b"tr" if in_table && table_depth == 1 => row = Vec::new(),
+                b"tc" if in_table && table_depth == 1 => {
+                    cell.clear();
+                    in_cell = true;
+                }
+                b"p" if in_cell && !cell.is_empty() && !cell.ends_with('\n') => cell.push('\n'),
+                b"tab" if in_cell => cell.push('\t'),
+                b"br" if in_cell => cell.push('\n'),
+                _ => {}
+            },
+            Ok(Event::Empty(event)) => match event.local_name().as_ref() {
+                b"tab" if in_cell => cell.push('\t'),
+                b"br" if in_cell => cell.push('\n'),
+                _ => {}
+            },
+            Ok(Event::Text(text)) if in_cell => {
+                let decoded = reader
+                    .decoder()
+                    .decode(text.as_ref())
+                    .map_err(|error| error.to_string())?;
+                cell.push_str(
+                    &quick_xml::escape::unescape(&decoded).map_err(|error| error.to_string())?,
+                );
+            }
+            Ok(Event::End(event)) => match event.local_name().as_ref() {
+                b"tc" if in_table && table_depth == 1 => {
+                    row.push(cell.trim().to_string());
+                    in_cell = false;
+                }
+                b"tr" if in_table && table_depth == 1 => {
+                    if row.iter().any(|value| !value.is_empty()) {
+                        rows.push(std::mem::take(&mut row));
+                    }
+                }
+                b"tbl" => {
+                    if table_depth == 1 {
+                        break;
+                    }
+                    table_depth = table_depth.saturating_sub(1);
+                }
+                _ => {}
+            },
+            Ok(Event::Eof) => break,
+            Err(error) => return Err(format!("Не удалось разобрать таблицу DOCX: {error}")),
+            _ => {}
+        }
+    }
+    if rows.len() < 2 {
+        return Err("В DOCX не найдена таблица с данными".to_string());
+    }
+    Ok(SpreadsheetData {
+        sheet_name: Some("Таблица DOCX".to_string()),
         rows,
     })
 }
@@ -293,7 +446,28 @@ fn write_xlsx(path: String, data: SpreadsheetData) -> Result<(), String> {
             .set_name(name)
             .map_err(|error| error.to_string())?;
     }
-    let header = Format::new().set_bold().set_background_color("#DCEFD8");
+    let header = Format::new()
+        .set_bold()
+        .set_font_color("#FFFFFF")
+        .set_background_color("#1F6D3B")
+        .set_text_wrap();
+    let body = Format::new().set_text_wrap();
+    let numeric_columns: HashSet<usize> = data
+        .rows
+        .first()
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .filter_map(|(index, value)| {
+            let normalized = value.to_lowercase();
+            (normalized.contains("сумма")
+                || normalized.contains("стоимость")
+                || normalized.contains("оплачено")
+                || normalized.contains("ставка")
+                || normalized.contains("стаж"))
+            .then_some(index)
+        })
+        .collect();
     for (row_index, row) in data.rows.iter().enumerate() {
         for (column_index, value) in row.iter().enumerate() {
             let row_number =
@@ -304,17 +478,275 @@ fn write_xlsx(path: String, data: SpreadsheetData) -> Result<(), String> {
                 worksheet
                     .write_string_with_format(row_number, column_number, value, &header)
                     .map_err(|error| error.to_string())?;
+            } else if numeric_columns.contains(&column_index) {
+                if let Ok(number) = value.replace(' ', "").replace(',', ".").parse::<f64>() {
+                    worksheet
+                        .write_number_with_format(row_number, column_number, number, &body)
+                        .map_err(|error| error.to_string())?;
+                } else {
+                    worksheet
+                        .write_string_with_format(row_number, column_number, value, &body)
+                        .map_err(|error| error.to_string())?;
+                }
             } else {
                 worksheet
-                    .write_string(row_number, column_number, value)
+                    .write_string_with_format(row_number, column_number, value, &body)
                     .map_err(|error| error.to_string())?;
             }
         }
     }
-    worksheet.autofit();
+    worksheet
+        .set_freeze_panes(1, 0)
+        .map_err(|error| error.to_string())?;
+    let columns = data.rows.iter().map(Vec::len).max().unwrap_or(0);
+    for column in 0..columns {
+        let width = data
+            .rows
+            .iter()
+            .filter_map(|row| row.get(column))
+            .map(|value| {
+                value
+                    .lines()
+                    .map(|line| line.chars().count())
+                    .max()
+                    .unwrap_or(0)
+            })
+            .max()
+            .unwrap_or(10)
+            .clamp(10, 45) as f64
+            + 2.0;
+        worksheet
+            .set_column_width(
+                u16::try_from(column).map_err(|_| "Слишком много колонок".to_string())?,
+                width,
+            )
+            .map_err(|error| error.to_string())?;
+    }
     workbook
         .save(path)
         .map_err(|error| format!("Не удалось сохранить Excel-файл: {error}"))
+}
+
+fn xml_text(value: &str) -> String {
+    quick_xml::escape::escape(value).into_owned()
+}
+
+fn docx_paragraph(value: &str, bold: bool, size: u16, color: &str, after: u16) -> String {
+    let weight = if bold { "<w:b/>" } else { "" };
+    format!(
+        "<w:p><w:pPr><w:spacing w:after=\"{after}\"/></w:pPr><w:r><w:rPr>{weight}<w:color w:val=\"{color}\"/><w:sz w:val=\"{size}\"/></w:rPr><w:t xml:space=\"preserve\">{}</w:t></w:r></w:p>",
+        xml_text(value)
+    )
+}
+
+#[tauri::command]
+fn write_contract_report_docx(path: String, data: ContractReportData) -> Result<(), String> {
+    let file = File::create(&path).map_err(|error| format!("Не удалось создать DOCX: {error}"))?;
+    let mut archive = zip::ZipWriter::new(file);
+    let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/></Types>"#;
+    let rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#;
+    let document_rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>"#;
+    let styles = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/><w:rPr><w:rFonts w:ascii="Arial" w:hAnsi="Arial" w:cs="Arial"/><w:sz w:val="20"/></w:rPr></w:style></w:styles>"#;
+    let mut body = String::new();
+    body.push_str(&docx_paragraph(&data.title, true, 34, "1F6D3B", 180));
+    if !data.criteria.trim().is_empty() {
+        body.push_str(&docx_paragraph(
+            &format!("Критерии: {}", data.criteria),
+            false,
+            20,
+            "555555",
+            80,
+        ));
+    }
+    body.push_str(&docx_paragraph(
+        &format!("Подобрано договоров: {}", data.rows.len()),
+        true,
+        20,
+        "333333",
+        220,
+    ));
+    for (index, row) in data.rows.iter().enumerate() {
+        body.push_str(&docx_paragraph(
+            &format!("{}. Договор {} от {}", index + 1, row.number, row.date),
+            true,
+            23,
+            "1F6D3B",
+            80,
+        ));
+        body.push_str(&docx_paragraph(
+            &format!("Юрлицо-исполнитель: {}", row.legal_entity),
+            false,
+            20,
+            "222222",
+            40,
+        ));
+        body.push_str(&docx_paragraph(
+            &format!("Заказчик: {}", row.customer),
+            false,
+            20,
+            "222222",
+            40,
+        ));
+        body.push_str(&docx_paragraph(
+            &format!("Предмет: {}", row.subject),
+            false,
+            20,
+            "222222",
+            40,
+        ));
+        body.push_str(&docx_paragraph(
+            &format!("Стоимость: {}. Период: {}", row.amount, row.period),
+            false,
+            20,
+            "222222",
+            200,
+        ));
+    }
+    let document = format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>{body}<w:sectPr><w:pgSz w:w="11906" w:h="16838"/><w:pgMar w:top="1134" w:right="1134" w:bottom="1134" w:left="1134"/></w:sectPr></w:body></w:document>"#
+    );
+    for (name, contents) in [
+        ("[Content_Types].xml", content_types),
+        ("_rels/.rels", rels),
+        ("word/_rels/document.xml.rels", document_rels),
+        ("word/styles.xml", styles),
+        ("word/document.xml", document.as_str()),
+    ] {
+        archive
+            .start_file(name, options)
+            .map_err(|error| error.to_string())?;
+        archive
+            .write_all(contents.as_bytes())
+            .map_err(|error| error.to_string())?;
+    }
+    archive
+        .finish()
+        .map_err(|error| format!("Не удалось завершить DOCX: {error}"))?;
+    Ok(())
+}
+
+fn wrap_report_text(value: &str, width: usize) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut line = String::new();
+    for word in value.split_whitespace() {
+        if !line.is_empty() && line.chars().count() + word.chars().count() + 1 > width {
+            result.push(std::mem::take(&mut line));
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+    if !line.is_empty() {
+        result.push(line);
+    }
+    if result.is_empty() {
+        result.push(String::new());
+    }
+    result
+}
+
+fn pdf_safe_text(value: &str) -> String {
+    value.replace('₽', "руб.").replace(['—', '–', '‑'], "-")
+}
+
+#[tauri::command]
+fn write_contract_report_pdf(path: String, data: ContractReportData) -> Result<(), String> {
+    use printpdf::{Color, Mm, PdfDocument, Rgb};
+    let (document, first_page, first_layer) =
+        PdfDocument::new(&data.title, Mm(210.0), Mm(297.0), "Подбор договоров");
+    let font = document
+        .add_external_font(std::io::Cursor::new(
+            include_bytes!("../runtime-resources/resources/fonts/NotoSans-Regular.ttf").as_slice(),
+        ))
+        .map_err(|error| format!("Не удалось встроить шрифт: {error}"))?;
+    let mut page = first_page;
+    let mut layer = first_layer;
+    let mut y = 280.0_f32;
+    let write_lines = |lines: Vec<String>,
+                       size: f32,
+                       y: &mut f32,
+                       page: &mut printpdf::PdfPageIndex,
+                       layer: &mut printpdf::PdfLayerIndex| {
+        for line in lines {
+            if *y < 18.0 {
+                let created = document.add_page(Mm(210.0), Mm(297.0), "Подбор договоров");
+                *page = created.0;
+                *layer = created.1;
+                *y = 280.0;
+            }
+            document.get_page(*page).get_layer(*layer).use_text(
+                pdf_safe_text(&line),
+                size,
+                Mm(15.0),
+                Mm(*y),
+                &font,
+            );
+            *y -= if size >= 15.0 { 8.0 } else { 5.5 };
+        }
+    };
+    document
+        .get_page(page)
+        .get_layer(layer)
+        .set_fill_color(Color::Rgb(Rgb::new(0.12, 0.43, 0.23, None)));
+    write_lines(
+        wrap_report_text(&data.title, 60),
+        17.0,
+        &mut y,
+        &mut page,
+        &mut layer,
+    );
+    document
+        .get_page(page)
+        .get_layer(layer)
+        .set_fill_color(Color::Rgb(Rgb::new(0.10, 0.10, 0.10, None)));
+    write_lines(
+        wrap_report_text(&format!("Критерии: {}", data.criteria), 90),
+        9.5,
+        &mut y,
+        &mut page,
+        &mut layer,
+    );
+    write_lines(
+        vec![format!("Подобрано договоров: {}", data.rows.len())],
+        10.0,
+        &mut y,
+        &mut page,
+        &mut layer,
+    );
+    y -= 3.0;
+    for (index, row) in data.rows.iter().enumerate() {
+        write_lines(
+            wrap_report_text(
+                &format!("{}. Договор {} от {}", index + 1, row.number, row.date),
+                75,
+            ),
+            11.0,
+            &mut y,
+            &mut page,
+            &mut layer,
+        );
+        for text in [
+            format!("Юрлицо-исполнитель: {}", row.legal_entity),
+            format!("Заказчик: {}", row.customer),
+            format!("Предмет: {}", row.subject),
+            format!("Стоимость: {}. Период: {}", row.amount, row.period),
+        ] {
+            write_lines(
+                wrap_report_text(&text, 95),
+                9.0,
+                &mut y,
+                &mut page,
+                &mut layer,
+            );
+        }
+        y -= 3.0;
+    }
+    let file = File::create(path).map_err(|error| format!("Не удалось создать PDF: {error}"))?;
+    document
+        .save(&mut std::io::BufWriter::new(file))
+        .map_err(|error| format!("Не удалось сохранить PDF: {error}"))
 }
 
 #[tauri::command]
@@ -2379,6 +2811,10 @@ fn delete_runtime_file(state: State<'_, AppState>, path: String) -> Result<(), S
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let workspace = open_workspace().expect("SBK Tools workspace could not be opened");
+    for module in ["contract-experience", "staff", "tender-calendar"] {
+        open_database(&workspace.root, module)
+            .unwrap_or_else(|error| panic!("SBK Tools could not initialize {module}: {error}"));
+    }
     intelligence::recover_interrupted_jobs(&workspace.root)
         .expect("SBK Tools intelligence queue could not be recovered");
     tauri::Builder::default()
@@ -2400,8 +2836,12 @@ pub fn run() {
             analysis_job_list,
             analysis_job_cancel,
             set_workspace_location,
+            quit_application,
             read_xlsx,
+            read_docx_table,
             write_xlsx,
+            write_contract_report_docx,
+            write_contract_report_pdf,
             list_records,
             get_record,
             record_history,
@@ -2451,8 +2891,16 @@ mod tests {
             SpreadsheetData {
                 sheet_name: Some("Договоры".to_string()),
                 rows: vec![
-                    vec!["Номер".to_string(), "Заказчик".to_string()],
-                    vec!["18/24".to_string(), "АО Энергосеть".to_string()],
+                    vec![
+                        "Номер".to_string(),
+                        "Заказчик".to_string(),
+                        "Стоимость".to_string(),
+                    ],
+                    vec![
+                        "18/24".to_string(),
+                        "АО Энергосеть".to_string(),
+                        "72000".to_string(),
+                    ],
                 ],
             },
         )
@@ -2460,6 +2908,12 @@ mod tests {
         let restored = read_xlsx(path.to_string_lossy().into_owned()).expect("xlsx read");
         assert_eq!(restored.sheet_name.as_deref(), Some("Договоры"));
         assert_eq!(restored.rows[1][1], "АО Энергосеть");
+        let mut workbook = open_workbook_auto(&path).expect("open typed workbook");
+        let range = workbook.worksheet_range("Договоры").expect("typed sheet");
+        assert!(matches!(
+            range.get((1, 2)),
+            Some(calamine::Data::Float(72000.0))
+        ));
         let _ = fs::remove_file(path);
     }
 
@@ -2502,6 +2956,8 @@ mod tests {
         let workspace = Workspace {
             root: root.clone(),
             portable: false,
+            configured: true,
+            warning: None,
             writable: true,
             _lock: lock,
         };
@@ -2706,5 +3162,85 @@ mod tests {
         assert!(source.is_file());
         assert!(!root.join(final_relative).exists());
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn contract_selection_exports_valid_docx_and_pdf() {
+        let requested_root = std::env::var_os("SBK_REPORT_TEST_OUTPUT").map(PathBuf::from);
+        let root = requested_root.clone().unwrap_or_else(|| {
+            std::env::temp_dir().join(format!("sbk-tools-report-{}", Uuid::new_v4()))
+        });
+        fs::create_dir_all(&root).expect("temp");
+        let report = ContractReportData {
+            title: "Подбор опыта для закупки".to_string(),
+            criteria: "информационная безопасность".to_string(),
+            rows: vec![ContractReportRow {
+                legal_entity: "ООО СБК".to_string(),
+                number: "42".to_string(),
+                date: "01.05.2026".to_string(),
+                customer: "Заказчик".to_string(),
+                subject: "Аудит информационной безопасности".to_string(),
+                amount: "1 000 000 ₽".to_string(),
+                period: "2025—2026".to_string(),
+            }],
+        };
+        let docx = root.join("report.docx");
+        write_contract_report_docx(
+            docx.to_string_lossy().into_owned(),
+            ContractReportData {
+                title: report.title.clone(),
+                criteria: report.criteria.clone(),
+                rows: report
+                    .rows
+                    .iter()
+                    .map(|row| ContractReportRow {
+                        legal_entity: row.legal_entity.clone(),
+                        number: row.number.clone(),
+                        date: row.date.clone(),
+                        customer: row.customer.clone(),
+                        subject: row.subject.clone(),
+                        amount: row.amount.clone(),
+                        period: row.period.clone(),
+                    })
+                    .collect(),
+            },
+        )
+        .expect("docx");
+        let mut archive = zip::ZipArchive::new(File::open(&docx).expect("open docx")).expect("zip");
+        let mut xml = String::new();
+        archive
+            .by_name("word/document.xml")
+            .expect("document xml")
+            .read_to_string(&mut xml)
+            .expect("read");
+        assert!(xml.contains("ООО СБК"));
+        let pdf = root.join("report.pdf");
+        write_contract_report_pdf(pdf.to_string_lossy().into_owned(), report).expect("pdf");
+        assert!(fs::read(&pdf).expect("read pdf").starts_with(b"%PDF"));
+        if requested_root.is_none() {
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn supplied_registry_files_are_supported_when_requested() {
+        let Some(docx) = std::env::var_os("SBK_TEST_CONTRACT_DOCX") else {
+            return;
+        };
+        let contract_table = read_docx_table(PathBuf::from(docx).to_string_lossy().into_owned())
+            .expect("contract DOCX");
+        assert_eq!(contract_table.rows.len(), 95);
+        assert!(
+            contract_table.rows[0]
+                .iter()
+                .any(|cell| cell.contains("Название организации"))
+        );
+        let Some(xlsx) = std::env::var_os("SBK_TEST_STAFF_XLSX") else {
+            return;
+        };
+        let staff_table =
+            read_xlsx(PathBuf::from(xlsx).to_string_lossy().into_owned()).expect("staff XLSX");
+        assert!(staff_table.rows.len() >= 27);
+        assert!(staff_table.rows[0].iter().any(|cell| cell.trim() == "ФИО"));
     }
 }

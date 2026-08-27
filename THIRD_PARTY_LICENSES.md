@@ -16,6 +16,7 @@
 | pypdfium2 / PDFium | рендеринг PDF | Apache-2.0 / BSD-3-Clause и notices Chromium/PDFium |
 | python-docx | чтение DOCX | MIT |
 | ReportLab | генерация PDF | BSD-3-Clause |
+| Noto Sans | встроенный шрифт кириллицы для PDF-выгрузок | SIL Open Font License 1.1 |
 | Tesseract OCR | распознавание текста | Apache-2.0 |
 | tessdata / tessdata_fast | языковые модели OCR | Apache-2.0 |
 | LibreOffice | локальная конвертация DOCX | MPL-2.0 / LGPL-3.0-or-later |

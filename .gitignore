@@ -24,6 +24,13 @@ scanner-worker/dist/
 src-tauri/binaries/*
 !src-tauri/binaries/.gitkeep
 src-tauri/runtime-resources/
+!src-tauri/runtime-resources/
+src-tauri/runtime-resources/*
+!src-tauri/runtime-resources/resources/
+src-tauri/runtime-resources/resources/*
+!src-tauri/runtime-resources/resources/fonts/
+src-tauri/runtime-resources/resources/fonts/*
+!src-tauri/runtime-resources/resources/fonts/NotoSans-Regular.ttf
 scanner-worker/tests/output/
 tmp/
 portable-stage/

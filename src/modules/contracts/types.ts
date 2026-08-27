@@ -1,8 +1,9 @@
 export const contractStages = ["Подготовка", "Заключён", "Исполняется", "Выполнен", "Приостановлен", "Расторгнут", "Закрыт"] as const;
-export const paymentStatuses = ["Не выставлено", "Ожидается", "Частично оплачено", "Полностью оплачено", "Просрочено", "Не применяется"] as const;
-export const actsStatuses = ["Не требуются", "Не подготовлены", "Подготовлены", "Направлены", "Подписаны частично", "Подписаны полностью", "Есть замечания"] as const;
+export const paymentStatuses = ["Не указано", "Не выставлено", "Ожидается", "Частично оплачено", "Полностью оплачено", "Просрочено", "Не применяется"] as const;
+export const actsStatuses = ["Не указано", "Не требуются", "Не подготовлены", "Подготовлены", "Направлены", "Подписаны частично", "Подписаны полностью", "Есть замечания"] as const;
 
 export interface ContractData {
+  performingLegalEntity: string;
   number: string;
   date: string;
   customer: string;
@@ -27,10 +28,15 @@ export interface ContractData {
   contact: string;
   reviewAvailable: boolean;
   disclosureAllowed: boolean;
+  discloseCustomer: boolean;
+  discloseNumber: boolean;
+  discloseSubject: boolean;
+  discloseAmount: boolean;
   notes: string;
 }
 
 export const emptyContract = (): ContractData => ({
+  performingLegalEntity: "",
   number: "",
   date: new Date().toISOString().slice(0, 10),
   customer: "",
@@ -47,6 +53,6 @@ export const emptyContract = (): ContractData => ({
   paymentActualDate: "",
   nextImportantDate: "",
   responsible: "",
-  contact: "", reviewAvailable: false, disclosureAllowed: false,
+  contact: "", reviewAvailable: false, disclosureAllowed: false, discloseCustomer: false, discloseNumber: false, discloseSubject: false, discloseAmount: false,
   notes: "",
 });

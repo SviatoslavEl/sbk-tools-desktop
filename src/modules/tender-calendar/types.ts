@@ -25,7 +25,8 @@ export interface TenderMilestone {
 }
 
 export interface TenderScheduleData {
-  schemaVersion: 1;
+  schemaVersion: 2;
+  source: "procurement" | "manual";
   procurementId: string;
   procurementTitle: string;
   customer: string;
@@ -53,7 +54,8 @@ export const emptyMilestone = (): TenderMilestone => ({
 });
 
 export const emptyTenderSchedule = (): TenderScheduleData => ({
-  schemaVersion: 1,
+  schemaVersion: 2,
+  source: "manual",
   procurementId: "",
   procurementTitle: "",
   customer: "",
