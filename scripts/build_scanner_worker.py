@@ -44,7 +44,7 @@ def main() -> None:
         "--include-package=pypdf", "--include-package=pypdfium2", "--include-package=docx",
         "--include-module=reportlab.pdfgen.canvas", "--include-module=reportlab.pdfbase.pdfmetrics",
         "--include-module=reportlab.pdfbase.ttfonts", "--include-package-data=pypdfium2",
-        "--nofollow-import-to=reportlab.lib.testutils,reportlab.graphics.testshapes,numpy.conftest,numpy.tests,numpy.typing.tests,pypdf.tests,docx.tests",
+        "--nofollow-import-to=reportlab.lib.testutils,reportlab.graphics.testshapes,numpy.conftest,numpy.tests,numpy.testing,numpy.typing.tests,pypdf.tests,docx.tests,tkinter,_tkinter",
     ]
     if platform.system() == "Windows":
         command.append("--windows-console-mode=disable")

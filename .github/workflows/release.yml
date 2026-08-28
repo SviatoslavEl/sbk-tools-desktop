@@ -99,7 +99,7 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         shell: bash
         run: python scripts/check_versions.py --tag='${{ github.ref_name }}'
-      - run: python -m pip install -e scanner-worker Nuitka==2.7.6 ordered-set==4.1.0 zstandard==0.23.0
+      - run: python -m pip install -e scanner-worker Nuitka==2.8.10 ordered-set==4.1.0 zstandard==0.23.0
       - name: Build scanner sidecar
         run: python scripts/build_scanner_worker.py --target ${{ matrix.target }}
       - name: Stage macOS OCR runtime
