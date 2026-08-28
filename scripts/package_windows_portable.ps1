@@ -11,15 +11,28 @@ $Output = Join-Path $Root "release-artifacts"
 $ReleaseDir = Join-Path $Root "src-tauri\target\$Target\release"
 $LauncherTarget = Join-Path $Stage "launcher-target"
 
-function Assert-AsInvoker([string]$Executable, [string]$Label) {
+function Get-ManifestTool {
     $windowsKits = Join-Path ${env:ProgramFiles(x86)} "Windows Kits\10\bin"
     $manifestTool = Get-ChildItem -Path $windowsKits -Filter "mt.exe" -File -Recurse -ErrorAction SilentlyContinue |
         Where-Object { $_.FullName -match '\\x64\\mt\.exe$' } |
         Sort-Object LastWriteTime -Descending |
         Select-Object -First 1
     if (-not $manifestTool) { throw "Windows SDK manifest tool (mt.exe, x64) not found" }
+    return $manifestTool.FullName
+}
+
+$ManifestTool = Get-ManifestTool
+
+function Set-AsInvoker([string]$Executable) {
+    $manifest = Join-Path $Root "scripts\windows-as-invoker.manifest"
+    if (-not (Test-Path $manifest -PathType Leaf)) { throw "asInvoker manifest not found" }
+    & $ManifestTool -nologo -manifest $manifest "-outputresource:$Executable;#1"
+    if ($LASTEXITCODE -ne 0) { throw "Failed to embed asInvoker manifest" }
+}
+
+function Assert-AsInvoker([string]$Executable, [string]$Label) {
     $manifest = Join-Path $Stage "$Label.manifest"
-    & $manifestTool.FullName -nologo "-inputresource:$Executable;#1" "-out:$manifest"
+    & $ManifestTool -nologo "-inputresource:$Executable;#1" "-out:$manifest"
     if ($LASTEXITCODE -ne 0) { throw "Failed to extract $Label manifest" }
     $text = Get-Content -Raw $manifest
     if ($text -notmatch 'requestedExecutionLevel' -or $text -notmatch 'level="asInvoker"') {
@@ -27,6 +40,9 @@ function Assert-AsInvoker([string]$Executable, [string]$Label) {
     }
     if ($text -match 'requireAdministrator|highestAvailable') {
         throw "$Label unexpectedly requests elevation"
+    }
+    if ($text -notmatch 'uiAccess="false"') {
+        throw "$Label unexpectedly requests UI access"
     }
 }
 
@@ -38,6 +54,7 @@ Copy-Item -Recurse (Join-Path $Root "src-tauri\runtime-resources") (Join-Path $P
 Copy-Item -Recurse (Join-Path $Root "src-tauri\webview2-runtime") (Join-Path $Payload "webview2-runtime")
 Copy-Item (Join-Path $Root "LICENSE") $Payload
 Copy-Item (Join-Path $Root "THIRD_PARTY_LICENSES.md") $Payload
+Set-AsInvoker (Join-Path $Payload "SBK-Tools.exe")
 Assert-AsInvoker (Join-Path $Payload "SBK-Tools.exe") "inner-application"
 
 $Archive = Join-Path $Stage "payload.tar.zst"
