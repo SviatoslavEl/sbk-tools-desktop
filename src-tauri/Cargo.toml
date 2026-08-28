@@ -1,6 +1,6 @@
 [package]
 name = "sbk-tools-desktop"
-version = "2.4.0"
+version = "2.4.1"
 description = "Portable desktop toolkit for tenders, documents, contracts and staff"
 authors = ["Sviatoslav"]
 license = "GPL-3.0-only"
