@@ -1,10 +1,15 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   BoundedPreviewCache,
+  applyGeometryToPages,
   buildFacsimilePlacement,
+  buildFacsimilePlacements,
   facsimileAppliesTo,
+  facsimileGeometry,
   facsimileOverlayStyle,
   previewCacheKey,
+  suppressLabelActivation,
+  updateFacsimileGeometry,
 } from "./facsimilePreview";
 
 const editable = {
@@ -42,6 +47,44 @@ describe("facsimile preview model", () => {
     expect(facsimileAppliesTo(range, 3)).toBe(true);
     expect(facsimileAppliesTo(range, 2)).toBe(false);
     expect(facsimileAppliesTo(all, 99)).toBe(true);
+  });
+
+  it("keeps independent geometry for pages in an all-page placement", () => {
+    const perPage = updateFacsimileGeometry(editable, 1, { x: 0.72, rotation: 90, opacity: 0.4 });
+    const placements = buildFacsimilePlacements(perPage, { application: "all", pages: [] }, 3);
+    expect(placements).toHaveLength(2);
+    expect(placements.flatMap((placement) => placement.pages)).toEqual([0, 2, 1]);
+    expect(placements.find((placement) => placement.pages.includes(1))).toMatchObject({ x: 0.72, rotation: 90, opacity: 0.4 });
+    expect(facsimileGeometry(perPage, 0)).toMatchObject({ x: 0.21, rotation: -73, opacity: 0.64 });
+  });
+
+  it("groups equal page geometry and can copy the current page to a range", () => {
+    const first = updateFacsimileGeometry(editable, 1, { width: 0.5, rotation: 30 });
+    const copied = applyGeometryToPages(first, 1, [1, 3, 4]);
+    const placements = buildFacsimilePlacements(copied, { application: "explicitPages", pages: [1, 3, 4] }, 5);
+    expect(placements).toHaveLength(1);
+    expect(placements[0]).toMatchObject({ application: "explicitPages", pages: [1, 3, 4], width: 0.5, rotation: 30 });
+  });
+
+  it("uses a compact all-page payload while every page has the same geometry", () => {
+    const placements = buildFacsimilePlacements(editable, { application: "all", pages: [] }, 50);
+    expect(placements).toHaveLength(1);
+    expect(placements[0]).toMatchObject({ application: "all", pages: [] });
+  });
+
+  it("keeps an info-button click from activating its surrounding checkbox label", () => {
+    const event = { preventDefault: vi.fn(), stopPropagation: vi.fn() };
+    suppressLabelActivation(event);
+    expect(event.preventDefault).toHaveBeenCalledOnce();
+    expect(event.stopPropagation).toHaveBeenCalledOnce();
+  });
+
+  it("supports one logical editable facsimile with unique geometry on 200 pages", () => {
+    let logical = editable;
+    for (let page = 0; page < 200; page += 1) logical = updateFacsimileGeometry(logical, page, { rotation: page, x: page / 1000 });
+    const placements = buildFacsimilePlacements(logical, { application: "all", pages: [] }, 200);
+    expect(placements).toHaveLength(200);
+    expect(facsimileGeometry(logical, 199)).toMatchObject({ rotation: 199, x: 0.199 });
   });
 
   it("does not include facsimile movement or angle in the document preview cache key", () => {

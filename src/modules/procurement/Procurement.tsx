@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { ConfirmDialog } from "../../components/Dialog";
 import { useRecords } from "../../hooks/useRecords";
 import { chooseSavePath, exportText } from "../../lib/files";
@@ -10,6 +10,9 @@ import { buildRebidSteps, complianceSummary, daysUntil, procurementWarnings, sug
 import { anonymousCalculationBody, documentHtml, experienceReferenceBody, html, money, safeBase, summaryBody, teamListBody, workAllocationBody } from "./documents";
 import { complianceStatuses, emptyChecklist, emptyPartner, emptyPriceRound, emptyProcurement, emptyRequirement, evidenceKinds, normalizeProcurement, procurementStatuses, type ProcurementData, type SnapshotLink } from "./types";
 import { Stage2Workspace } from "./Stage2Workspace";
+import { demoProcurements } from "./demo";
+
+const demoSeedTitle = "demo-procurements-v1";
 
 function snapshot(sourceModule: SnapshotLink["sourceModule"], record: StoredRecord<unknown>): SnapshotLink {
   return { id: crypto.randomUUID(), sourceModule, sourceId: record.id, title: record.title, capturedAt: new Date().toISOString(), snapshot: structuredClone(record.payload) as Record<string, unknown> };
@@ -17,14 +20,31 @@ function snapshot(sourceModule: SnapshotLink["sourceModule"], record: StoredReco
 
 export function ProcurementRegistry() {
   const store = useRecords<ProcurementData>("procurement");
+  const demoSettings = useRecords<{ seededAt: string }>("settings");
   const [search, setSearch] = useState("");
   const [status, setStatus] = useState("");
   const [editing, setEditing] = useState<StoredRecord<ProcurementData> | "new" | null>(null);
   const [archiving, setArchiving] = useState<StoredRecord<ProcurementData> | null>(null);
+  const [seedingDemos, setSeedingDemos] = useState(false);
+  const addDemos = async () => {
+    if (seedingDemos) return;
+    setSeedingDemos(true);
+    try {
+      const existingIds = new Set(store.records.map((record) => record.id));
+      for (const demo of demoProcurements()) if (!existingIds.has(demo.id)) await store.save(demo.item.name, demo.item, demo.id);
+      const marker = demoSettings.records.find((record) => record.title === demoSeedTitle);
+      await demoSettings.save(demoSeedTitle, { seededAt: new Date().toISOString() }, marker?.id);
+    } finally { setSeedingDemos(false); }
+  };
+  useEffect(() => {
+    if (!store.loading && !demoSettings.loading && !demoSettings.records.some((record) => record.title === demoSeedTitle)) void addDemos();
+  // The marker is stored in the current workspace, so a newly selected workspace gets its own demos.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [store.loading, demoSettings.loading]);
   const filtered = store.records.filter((record) => [record.payload.name, record.payload.customer, record.payload.subject, record.payload.platform].join(" ").toLowerCase().includes(search.toLowerCase()) && (!status || record.payload.status === status));
   const urgent = store.records.filter((record) => { const days = daysUntil(record.payload.submissionDeadline); return days != null && days >= 0 && days <= 7 && !["Подана", "Победа", "Проигрыш", "Отменена"].includes(record.payload.status); }).length;
   return <div className="module-stack"><div className="stats-row"><div className="stat"><span>Закупок</span><strong>{store.records.length}</strong></div><div className="stat"><span>Срок ≤ 7 дней</span><strong>{urgent}</strong></div><div className="stat"><span>Подано / победы</span><strong>{store.records.filter((record) => ["Подана", "Победа"].includes(record.payload.status)).length}</strong></div></div>
-    <div className="registry-toolbar"><label className="search-box"><span>Поиск</span><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Название, заказчик, предмет" /></label><label><span>Статус</span><select value={status} onChange={(event) => setStatus(event.target.value)}><option value="">Все</option>{procurementStatuses.map((value) => <option key={value}>{value}</option>)}</select></label><div className="toolbar-actions"><button className="primary" type="button" onClick={() => setEditing("new")}>Добавить закупку</button></div></div>
+    <div className="registry-toolbar"><label className="search-box"><span>Поиск</span><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Название, заказчик, предмет" /></label><label><span>Статус</span><select value={status} onChange={(event) => setStatus(event.target.value)}><option value="">Все</option>{procurementStatuses.map((value) => <option key={value}>{value}</option>)}</select></label><div className="toolbar-actions"><button className="secondary" type="button" disabled={seedingDemos} onClick={() => void addDemos()}>{seedingDemos ? "Добавляем…" : "Добавить демо"}</button><button className="primary" type="button" onClick={() => setEditing("new")}>Добавить закупку</button></div></div>
     <div className="surface table-surface"><div className="table-scroll"><table><thead><tr><th>Закупка</th><th>Заказчик</th><th>Предмет</th><th>НМЦ</th><th>Площадка</th><th>Подача</th><th>Статус</th><th>Матрица</th><th /></tr></thead><tbody>{filtered.map((record) => { const item = record.payload; const deadline = daysUntil(item.submissionDeadline); const compliance = complianceSummary(item.requirements); return <tr key={record.id}><td className="sticky-cell"><button className="link-button" type="button" onClick={() => setEditing(record)}><strong>{item.name}</strong><small>{record.updatedAt.slice(0, 10)}</small></button></td><td>{item.customer}</td><td className="wide-cell">{item.subject}</td><td>{money(item.nmc)}</td><td>{item.platform || "—"}</td><td><span className={`status ${deadline != null && deadline < 0 ? "danger" : deadline != null && deadline <= 7 ? "warning" : "neutral"}`}>{item.submissionDeadline || "—"}{deadline != null ? ` · ${deadline < 0 ? "просрочено" : `${deadline} дн.`}` : ""}</span></td><td>{item.status}</td><td>{compliance.confirmed} из {compliance.total}</td><td><button className="icon-button danger" type="button" onClick={() => setArchiving(record)}>×</button></td></tr>; })}</tbody></table></div>{!store.loading && filtered.length === 0 && <div className="empty-state"><span className="empty-icon">◆</span><h2>{store.records.length ? "Ничего не найдено" : "Создайте первую закупку"}</h2><p>Требования, расчёты, команда, документы и переторжка будут собраны в одной карточке.</p>{!store.records.length && <button className="primary" type="button" onClick={() => setEditing("new")}>Добавить закупку</button>}</div>}</div>
     {editing && <ProcurementEditor record={editing === "new" ? undefined : editing} onClose={() => setEditing(null)} onSave={async (item, id) => { const saved = await store.save(item.name, item, id); setEditing(saved); }} />}
     {archiving && <ConfirmDialog title="Переместить закупку в архив?" message={archiving.payload.name} confirmLabel="В архив" onClose={() => setArchiving(null)} onConfirm={() => { void store.archive(archiving.id); setArchiving(null); }} />}

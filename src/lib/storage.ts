@@ -228,6 +228,10 @@ export async function createBackup(module?: ModuleId): Promise<BackupInfo> {
   if (!isTauri()) throw new Error("Резервные копии доступны в desktop-версии");
   return invoke<BackupInfo>("create_backup", { module: module || null });
 }
+export async function createRegistryArchive(module: ModuleId, path: string, recordIds?: string[]): Promise<BackupInfo> {
+  if (!isTauri()) throw new Error("Архив со вложениями доступен в desktop-версии");
+  return invoke<BackupInfo>("create_registry_archive", { module, path, recordIds: recordIds || null });
+}
 export async function createEncryptedBackup(password: string, module?: ModuleId): Promise<BackupInfo> { if (!isTauri()) throw new Error("Зашифрованные копии доступны в desktop-версии"); return invoke("create_encrypted_backup", { module: module || null, password }); }
 export async function verifyEncryptedBackup(path: string, password: string): Promise<BackupVerification> { if (!isTauri()) throw new Error("Проверка доступна в desktop-версии"); return invoke("verify_encrypted_backup", { path, password }); }
 export async function restoreEncryptedBackup(path: string, password: string): Promise<void> { if (!isTauri()) throw new Error("Восстановление доступно в desktop-версии"); await invoke("restore_encrypted_backup", { path, password }); }

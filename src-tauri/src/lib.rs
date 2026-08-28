@@ -1247,6 +1247,15 @@ fn safe_file_name(name: &str) -> String {
     }
 }
 
+fn valid_attachment_session_id(value: &str) -> bool {
+    Uuid::parse_str(value).is_ok()
+        || (value.starts_with("demo-procurement-")
+            && value.len() <= 80
+            && value.chars().all(|character| {
+                character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
+            }))
+}
+
 #[tauri::command]
 fn copy_attachment(
     state: State<'_, AppState>,
@@ -1275,7 +1284,7 @@ fn copy_attachment(
         .and_then(|name| name.to_str())
         .map(safe_file_name)
         .unwrap_or_else(|| "file".to_string());
-    if Uuid::parse_str(&record_id).is_err() {
+    if !valid_attachment_session_id(&record_id) {
         return Err("Некорректный идентификатор сессии вложений".to_string());
     }
     let relative = PathBuf::from("attachment-staging")
@@ -1338,7 +1347,7 @@ fn discard_staged_attachments(
         .lock()
         .map_err(|_| "Хранилище временно недоступно".to_string())?;
     validated_module(&module)?;
-    if Uuid::parse_str(&record_id).is_err() {
+    if !valid_attachment_session_id(&record_id) {
         return Err("Некорректный идентификатор сессии вложений".to_string());
     }
     let directory = state
@@ -1651,6 +1660,141 @@ fn create_backup(state: State<'_, AppState>, module: Option<String>) -> Result<B
         .lock()
         .map_err(|_| "Хранилище временно недоступно".to_string())?;
     create_backup_impl(&state.workspace, module)
+}
+
+fn create_registry_archive_impl(
+    workspace: &Workspace,
+    module: &str,
+    destination: &Path,
+    record_ids: Option<&HashSet<String>>,
+) -> Result<BackupInfo, String> {
+    let module = validated_module(module)?;
+    if destination.extension().and_then(|value| value.to_str()) != Some("zip") {
+        return Err("Архив реестра должен иметь расширение .zip".to_string());
+    }
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let connection = open_database(&workspace.root, module)?;
+    let mut statement = connection
+        .prepare("SELECT id, title, payload, archived, created_at, updated_at FROM records WHERE archived = 0 ORDER BY title")
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([], parse_record)
+        .map_err(|error| error.to_string())?;
+    let mut records = Vec::new();
+    for row in rows {
+        let record = row.map_err(|error| error.to_string())?;
+        if record_ids.is_none_or(|ids| ids.contains(&record.id)) {
+            records.push(record);
+        }
+    }
+    if records.is_empty() {
+        return Err("В выбранном наборе нет записей для экспорта".to_string());
+    }
+
+    let temporary = destination.with_extension("zip.part");
+    let result = (|| {
+        let file = File::create(&temporary).map_err(|error| error.to_string())?;
+        let mut archive = zip::ZipWriter::new(file);
+        let options =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        archive
+            .start_file("README.txt", options)
+            .map_err(|error| error.to_string())?;
+        archive.write_all("Экспорт СБК Инструменты. Записи находятся в records.json, все прикреплённые документы — в папке attachments.\n".as_bytes()).map_err(|error| error.to_string())?;
+        archive
+            .start_file("records.json", options)
+            .map_err(|error| error.to_string())?;
+        archive
+            .write_all(
+                serde_json::to_string_pretty(&records)
+                    .map_err(|error| error.to_string())?
+                    .as_bytes(),
+            )
+            .map_err(|error| error.to_string())?;
+
+        let mut included = HashSet::new();
+        for record in &records {
+            for relative_path in attachments::managed_paths(&record.payload) {
+                if !included.insert(relative_path.clone()) {
+                    continue;
+                }
+                let relative = Path::new(&relative_path);
+                let parts: Vec<_> = relative.components().collect();
+                let valid = parts.len() >= 4
+                    && matches!(parts.first(), Some(Component::Normal(value)) if *value == "attachments")
+                    && matches!(parts.get(1), Some(Component::Normal(value)) if *value == module)
+                    && parts
+                        .iter()
+                        .all(|part| matches!(part, Component::Normal(_)));
+                if !valid {
+                    return Err(format!("Некорректный путь вложения: {relative_path}"));
+                }
+                let source = workspace.root.join(relative);
+                if !source.is_file() {
+                    return Err(format!("Прикреплённый файл не найден: {relative_path}"));
+                }
+                let metadata = fs::symlink_metadata(&source).map_err(|error| error.to_string())?;
+                let attachments_root = workspace.root.join("attachments").join(module);
+                let canonical_root = attachments_root
+                    .canonicalize()
+                    .map_err(|error| error.to_string())?;
+                let canonical_source = source.canonicalize().map_err(|error| error.to_string())?;
+                if metadata.file_type().is_symlink()
+                    || !canonical_source.starts_with(&canonical_root)
+                {
+                    return Err(format!(
+                        "Символические ссылки во вложениях запрещены: {relative_path}"
+                    ));
+                }
+                archive
+                    .start_file(relative_path.replace('\\', "/"), options)
+                    .map_err(|error| error.to_string())?;
+                let mut input = File::open(source).map_err(|error| error.to_string())?;
+                std::io::copy(&mut input, &mut archive).map_err(|error| error.to_string())?;
+            }
+        }
+        let completed = archive.finish().map_err(|error| error.to_string())?;
+        completed.sync_all().map_err(|error| error.to_string())?;
+        if destination.exists() {
+            fs::remove_file(destination).map_err(|error| error.to_string())?;
+        }
+        fs::rename(&temporary, destination).map_err(|error| error.to_string())
+    })();
+    let _ = fs::remove_file(&temporary);
+    result?;
+    Ok(BackupInfo {
+        path: destination.to_string_lossy().into_owned(),
+        file_name: destination
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("export.zip")
+            .to_string(),
+        size_bytes: fs::metadata(destination)
+            .map_err(|error| error.to_string())?
+            .len(),
+    })
+}
+
+#[tauri::command]
+fn create_registry_archive(
+    state: State<'_, AppState>,
+    module: String,
+    path: String,
+    record_ids: Option<Vec<String>>,
+) -> Result<BackupInfo, String> {
+    let _maintenance = state
+        .maintenance
+        .lock()
+        .map_err(|_| "Хранилище временно недоступно".to_string())?;
+    let selected = record_ids.map(|values| values.into_iter().collect::<HashSet<_>>());
+    create_registry_archive_impl(
+        &state.workspace,
+        &module,
+        &PathBuf::from(path),
+        selected.as_ref(),
+    )
 }
 
 const ENCRYPTED_BACKUP_MAGIC: &[u8; 8] = b"SBKENC02";
@@ -2868,6 +3012,7 @@ pub fn run() {
             read_text_file,
             read_binary_file,
             create_backup,
+            create_registry_archive,
             create_encrypted_backup,
             verify_encrypted_backup,
             restore_encrypted_backup,
@@ -2888,6 +3033,18 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attachment_sessions_accept_uuid_and_legacy_demo_ids_only() {
+        assert!(valid_attachment_session_id(&Uuid::new_v4().to_string()));
+        assert!(valid_attachment_session_id(
+            "demo-procurement-security-audit"
+        ));
+        assert!(!valid_attachment_session_id(
+            "demo-procurement-../../secret"
+        ));
+        assert!(!valid_attachment_session_id("ordinary-record-id"));
+    }
 
     #[test]
     fn xlsx_round_trip_preserves_unicode_cells() {
@@ -3011,6 +3168,112 @@ mod tests {
         assert_eq!(count, 1);
         drop(restored);
         drop(workspace);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn registry_archive_contains_records_and_every_referenced_attachment() {
+        let root = std::env::temp_dir().join(format!("sbk-tools-export-{}", Uuid::new_v4()));
+        ensure_workspace(&root).expect("workspace");
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(root.join(".workspace.lock"))
+            .expect("lock");
+        let workspace = Workspace {
+            root: root.clone(),
+            portable: false,
+            configured: true,
+            warning: None,
+            writable: true,
+            _lock: lock,
+        };
+        let relative = "attachments/staff/person/certificate.pdf";
+        let attachment = root.join(relative);
+        fs::create_dir_all(attachment.parent().expect("attachment parent"))
+            .expect("attachment directory");
+        fs::write(&attachment, b"certificate").expect("attachment");
+        let excluded_relative = "attachments/staff/other/private.pdf";
+        let excluded_attachment = root.join(excluded_relative);
+        fs::create_dir_all(excluded_attachment.parent().expect("excluded parent"))
+            .expect("excluded directory");
+        fs::write(&excluded_attachment, b"private").expect("excluded attachment");
+        let connection = open_database(&root, "staff").expect("database");
+        connection.execute(
+            "INSERT INTO records(id, title, payload, archived, created_at, updated_at) VALUES ('person', 'Иванов', ?1, 0, 'now', 'now')",
+            [serde_json::json!({"documents": [{"relativePath": relative}]}).to_string()],
+        ).expect("insert");
+        connection.execute(
+            "INSERT INTO records(id, title, payload, archived, created_at, updated_at) VALUES ('other', 'Петров', ?1, 0, 'now', 'now')",
+            [serde_json::json!({"documents": [{"relativePath": excluded_relative}]}).to_string()],
+        ).expect("insert excluded");
+        drop(connection);
+        let destination = root.join("exports").join("staff.zip");
+        let selected = HashSet::from(["person".to_string()]);
+        create_registry_archive_impl(&workspace, "staff", &destination, Some(&selected))
+            .expect("archive");
+        let mut archive =
+            zip::ZipArchive::new(File::open(&destination).expect("open archive")).expect("zip");
+        let records: Vec<Value> = {
+            let mut entry = archive.by_name("records.json").expect("records");
+            let mut text = String::new();
+            entry.read_to_string(&mut text).expect("records text");
+            serde_json::from_str(&text).expect("records json")
+        };
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["id"], "person");
+        assert!(archive.by_name(relative).is_ok());
+        assert!(archive.by_name(excluded_relative).is_err());
+        drop(archive);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_archive_rejects_attachment_symlink_outside_workspace() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!("sbk-tools-export-link-{}", Uuid::new_v4()));
+        ensure_workspace(&root).expect("workspace");
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(root.join(".workspace.lock"))
+            .expect("lock");
+        let workspace = Workspace {
+            root: root.clone(),
+            portable: false,
+            configured: true,
+            warning: None,
+            writable: true,
+            _lock: lock,
+        };
+        let outside = root.with_extension("secret.txt");
+        fs::write(&outside, b"secret").expect("outside file");
+        let relative = "attachments/staff/person/linked.pdf";
+        let attachment = root.join(relative);
+        fs::create_dir_all(attachment.parent().expect("attachment parent"))
+            .expect("attachment directory");
+        symlink(&outside, &attachment).expect("symlink");
+        let connection = open_database(&root, "staff").expect("database");
+        connection.execute(
+            "INSERT INTO records(id, title, payload, archived, created_at, updated_at) VALUES (?1, ?2, ?3, 0, ?4, ?4)",
+            params!["person", "Person", serde_json::json!({ "documents": [{ "relativePath": relative }] }).to_string(), "now"],
+        ).expect("record");
+        drop(connection);
+        let result =
+            create_registry_archive_impl(&workspace, "staff", &root.join("export.zip"), None);
+        let error = match result {
+            Ok(_) => panic!("symlink must fail"),
+            Err(error) => error,
+        };
+        assert!(error.contains("Символические ссылки"));
+        assert!(!root.join("export.zip.part").exists());
+        let _ = fs::remove_file(outside);
         let _ = fs::remove_dir_all(root);
     }
 

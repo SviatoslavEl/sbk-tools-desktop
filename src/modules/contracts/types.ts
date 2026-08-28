@@ -2,6 +2,18 @@ export const contractStages = ["Подготовка", "Заключён", "Ис
 export const paymentStatuses = ["Не указано", "Не выставлено", "Ожидается", "Частично оплачено", "Полностью оплачено", "Просрочено", "Не применяется"] as const;
 export const actsStatuses = ["Не указано", "Не требуются", "Не подготовлены", "Подготовлены", "Направлены", "Подписаны частично", "Подписаны полностью", "Есть замечания"] as const;
 
+export interface ContractDocument {
+  id: string;
+  type: "Договор" | "Акт" | "Отзыв" | "Сертификат" | "Иное";
+  name: string;
+  relativePath?: string;
+  fileName?: string;
+  sizeBytes?: number;
+  sha256?: string;
+  mimeType?: string;
+  comment: string;
+}
+
 export interface ContractData {
   performingLegalEntity: string;
   number: string;
@@ -32,8 +44,13 @@ export interface ContractData {
   discloseNumber: boolean;
   discloseSubject: boolean;
   discloseAmount: boolean;
+  documents: ContractDocument[];
   notes: string;
 }
+
+export const emptyContractDocument = (): ContractDocument => ({
+  id: crypto.randomUUID(), type: "Договор", name: "", comment: "",
+});
 
 export const emptyContract = (): ContractData => ({
   performingLegalEntity: "",
@@ -53,6 +70,6 @@ export const emptyContract = (): ContractData => ({
   paymentActualDate: "",
   nextImportantDate: "",
   responsible: "",
-  contact: "", reviewAvailable: false, disclosureAllowed: false, discloseCustomer: false, discloseNumber: false, discloseSubject: false, discloseAmount: false,
+  contact: "", reviewAvailable: false, disclosureAllowed: false, discloseCustomer: false, discloseNumber: false, discloseSubject: false, discloseAmount: false, documents: [],
   notes: "",
 });

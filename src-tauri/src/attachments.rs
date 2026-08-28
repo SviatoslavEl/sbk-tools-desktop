@@ -18,21 +18,32 @@ pub struct AttachmentAudit {
 
 fn collect_attachment_paths(value: &Value, result: &mut HashSet<String>) {
     match value {
-        Value::String(text) if text.starts_with("attachments/") => {
-            result.insert(text.replace('\\', "/"));
-        }
         Value::Array(values) => {
             for value in values {
                 collect_attachment_paths(value, result);
             }
         }
         Value::Object(values) => {
-            for value in values.values() {
+            if let Some(Value::String(text)) = values.get("relativePath")
+                && text.starts_with("attachments/")
+            {
+                result.insert(text.replace('\\', "/"));
+            }
+            for (key, value) in values {
+                if key == "relativePath" {
+                    continue;
+                }
                 collect_attachment_paths(value, result);
             }
         }
         _ => {}
     }
+}
+
+pub fn managed_paths(value: &Value) -> HashSet<String> {
+    let mut result = HashSet::new();
+    collect_attachment_paths(value, &mut result);
+    result
 }
 
 fn collect_json_column(
@@ -137,7 +148,8 @@ mod tests {
     fn recursively_collects_only_managed_attachment_paths() {
         let value = serde_json::json!({
             "document": { "relativePath": "attachments/staff/a/file.pdf" },
-            "other": ["not-an-attachment", "attachments/calculator/b/table.xlsx"]
+            "notes": "attachments/calculator/b/not-a-real-file.xlsx",
+            "other": [{"relativePath": "attachments/calculator/b/table.xlsx"}]
         });
         let mut result = HashSet::new();
         collect_attachment_paths(&value, &mut result);

@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { applyImportReviewOverrides, clearImportRowIssues, replaceImportReviewRow } from "./importReview";
+import { applyImportReviewOverrides, buildImportReviewOverride, clearImportRowIssues, importProblemRows, missingImportFields, replaceImportReviewRow } from "./importReview";
+import { normalizeStaffData } from "../modules/staff/Staff";
+import type { StaffData } from "../modules/staff/types";
 
 describe("поштучное дополнение импорта", () => {
   it("изменяет только выбранную запись", () => {
@@ -24,8 +26,42 @@ describe("поштучное дополнение импорта", () => {
     ]);
   });
 
+  it("сохраняет только действительно изменённые вручную поля", () => {
+    const baseline = { name: "Анна", company: "Из файла", role: "Аудитор" };
+    const edited = { ...baseline, company: "ООО СБК" };
+    const override = buildImportReviewOverride(baseline, edited);
+    expect(override).toEqual({ company: "ООО СБК" });
+    expect(applyImportReviewOverrides([{ ...baseline, role: "Ведущий аудитор" }], new Map([[0, override]]))).toEqual([
+      { name: "Анна", company: "ООО СБК", role: "Ведущий аудитор" },
+    ]);
+  });
+
+  it("возвращает только отсутствующие поля и только проблемные строки", () => {
+    const required = [
+      { key: "company", label: "Юрлицо", missing: (item: { company: string; role: string }) => !item.company.trim() },
+      { key: "role", label: "Должность", missing: (item: { company: string; role: string }) => !item.role.trim() },
+    ];
+    const rows = [{ company: "", role: "Аудитор" }, { company: "ООО СБК", role: "" }, { company: "ООО СБК", role: "Аудитор" }];
+    expect(missingImportFields(rows[0], required)).toEqual([{ key: "company", label: "Юрлицо" }]);
+    expect(importProblemRows(rows, (item) => missingImportFields(item, required).map((field) => field.label)).map(({ index, issues }) => ({ index, issues }))).toEqual([
+      { index: 0, issues: ["Юрлицо"] },
+      { index: 1, issues: ["Должность"] },
+    ]);
+  });
+
   it("снимает ошибки только с подтверждённой исходной строки", () => {
     const issues = ["Строка 2: нет ФИО", "Строка 3: нет отдела", "Общая ошибка файла"];
     expect(clearImportRowIssues(issues, 2)).toEqual(["Строка 3: нет отдела", "Общая ошибка файла"]);
+  });
+
+  it("нормализует legacy-карточку до поиска, списка и экспорта", () => {
+    const legacy = { fullName: "Иванов Иван", role: "Аудитор", basis: "Трудовой договор", status: "Работает" } as StaffData;
+    const normalized = normalizeStaffData(legacy);
+    expect(normalized.documents).toEqual([]);
+    expect(normalized.skills).toEqual([]);
+    expect(normalized.competencies).toEqual([]);
+    expect(normalized.industries).toEqual([]);
+    expect(normalized.organizationalAssignments).toHaveLength(1);
+    expect(normalized.organizationalAssignments[0].position).toBe("Аудитор");
   });
 });

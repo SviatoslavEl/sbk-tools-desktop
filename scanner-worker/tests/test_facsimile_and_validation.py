@@ -15,7 +15,7 @@ from scandocument.facsimile import apply_facsimile
 from scandocument.models import DocumentInfo, EffectSettings, FacsimilePlacement, ProcessRequest, Redaction
 from scandocument.pdf_engine import configure_pdfa_2b
 from scandocument.pipeline import CancellationToken, _process_page
-from scandocument.worker_cli import validate_protocol
+from scandocument.worker_cli import placements_from, validate_protocol
 from scandocument.tempfiles import SecureWorkspace
 from scandocument.validation import detect_kind, validate_ocr_languages, validate_render_budget
 
@@ -38,6 +38,19 @@ def test_facsimile_all_is_the_only_mode_without_pages(tmp_path: Path) -> None:
     item.validate_for_document(2)
     assert item.applies_to(0)
     assert item.applies_to(1)
+
+
+def test_worker_accepts_individual_facsimile_geometry_for_200_pages(tmp_path: Path) -> None:
+    stamp = tmp_path / "stamp.png"
+    Image.new("RGBA", (8, 4), "black").save(stamp)
+    values = [{
+        "imagePath": str(stamp), "application": "current", "pages": [page],
+        "x": page / 1000, "y": 0.2, "width": 0.1, "rotation": page - 100, "opacity": 0.8,
+    } for page in range(200)]
+    placements = placements_from({"facsimiles": values})
+    assert len(placements) == 200
+    assert placements[199].pages == [199]
+    assert placements[199].rotation == 99
 
 
 def _non_white_bounds(image: Image.Image) -> tuple[int, int, int, int]:

@@ -1,0 +1,50 @@
+.scanner-info {
+  position: relative;
+  display: inline-grid;
+  width: 18px;
+  height: 18px;
+  margin-left: 4px;
+  place-items: center;
+  color: #286b3a;
+  background: #eef7f0;
+  border: 1px solid #9fc8a8;
+  border-radius: 50%;
+  font-size: 11px;
+  font-style: normal;
+  font-weight: 800;
+  font-family: inherit;
+  padding: 0;
+  cursor: help;
+}
+
+.scanner-info-text {
+  position: absolute;
+  left: 24px;
+  top: -8px;
+  z-index: 20;
+  display: none;
+  width: min(310px, 70vw);
+  padding: 9px 11px;
+  color: #173c2a;
+  background: #fff;
+  border: 1px solid #b9d1be;
+  border-radius: 8px;
+  box-shadow: 0 7px 22px rgba(35, 72, 45, .18);
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1.4;
+}
+
+.scanner-info:hover .scanner-info-text,
+.scanner-info:focus .scanner-info-text,
+.scanner-info:focus-within .scanner-info-text { display: block; }
+
+.facsimile-saved-list { display: grid; gap: 5px; margin-top: 7px; }
+.facsimile-saved-row { display: flex; align-items: center; justify-content: space-between; gap: 7px; }
+.facsimile-saved-row > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.facsimile.real.saved { pointer-events: auto; cursor: pointer; }
+
+.output-page-selection { display: flex; align-items: end; gap: 9px; padding: 9px 13px; color: #607468; background: #f7faf8; border-bottom: 1px solid #dbe7de; font-size: 11px; flex-wrap: wrap; }
+.output-page-selection label { display: grid; gap: 3px; }
+.output-page-selection select, .output-page-selection input { min-height: 34px; padding: 6px 8px; color: #173c2a; background: #fff; border: 1px solid #bfd0c2; border-radius: 7px; }
+.output-page-selection span { align-self: center; }

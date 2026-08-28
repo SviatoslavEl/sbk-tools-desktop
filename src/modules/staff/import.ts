@@ -25,6 +25,15 @@ export const staffImportFields: Array<[StaffImportField, string, string[]]> = [
 
 const normalized = (value: string) => value.toLowerCase().trim().replace(/\s+/g, " ");
 const lines = (value: string) => value.split(/\r?\n|;/).map((entry) => entry.trim()).filter((entry) => entry && !/^не указано$/i.test(entry));
+const certificateValidity = (status: string) => {
+  if (/бессроч/u.test(status.toLowerCase())) return { unlimited: true, expiresDate: "" };
+  const iso = status.match(/\b(20\d{2})-(\d{2})-(\d{2})\b/);
+  if (iso) return { unlimited: false, expiresDate: iso[0] };
+  const russian = status.match(/\b(\d{2})\.(\d{2})\.(20\d{2})\b/);
+  if (russian) return { unlimited: false, expiresDate: `${russian[3]}-${russian[2]}-${russian[1]}` };
+  const year = status.match(/\b(20\d{2})\b/);
+  return { unlimited: false, expiresDate: year ? `${year[1]}-12-31` : "" };
+};
 
 export function detectStaffMapping(headers: string[]): StaffImportMapping {
   return Object.fromEntries(staffImportFields.map(([key, , aliases]) => [key, headers.findIndex((header) => aliases.some((alias) => normalized(header) === normalized(alias))) ])) as StaffImportMapping;
@@ -50,7 +59,7 @@ export function mapStaffRows(rows: string[][], mapping: StaffImportMapping, defa
     const experienceYears = Number(rawExperience.replace(",", ".")) || Number(rawExperience.match(/\d+(?:[.,]\d+)?/)?.[0]?.replace(",", ".")) || 0;
     const certificateNames = lines(value(row, "certificates"));
     const certificateStatuses = lines(value(row, "certificateStatuses"));
-    const documents = certificateNames.map((name, index) => ({ ...emptyStaffDocument("certificate"), type: "Сертификат", name, comment: certificateStatuses[index] || "Срок действия не указан" }));
+    const documents = certificateNames.map((name, index) => { const comment = certificateStatuses[index] || "Срок действия не указан"; return { ...emptyStaffDocument("certificate"), type: "Сертификат", name, comment, ...certificateValidity(comment) }; });
     const education = value(row, "education");
     if (education && !/^не указано$/i.test(education)) documents.push({ ...emptyStaffDocument("education"), type: "Образование", name: education });
     const basis = cooperationBases.includes(rawBasis as never) ? rawBasis as StaffData["basis"] : "Иное";

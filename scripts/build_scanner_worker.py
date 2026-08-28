@@ -28,7 +28,7 @@ def main() -> None:
     executable = "sbk-scanner-worker.exe" if platform.system() == "Windows" else "sbk-scanner-worker"
     command = [
         args.python, "-m", "nuitka", "--onefile", "--assume-yes-for-downloads",
-        "--onefile-tempdir-spec={CACHE_DIR}/SBKTools/ScannerWorker/2.3.1",
+        "--onefile-tempdir-spec={CACHE_DIR}/SBKTools/ScannerWorker/2.4.0",
         "--onefile-cache-mode=cached",
         f"--output-dir={output}", f"--output-filename={executable}",
         "--include-package=scandocument", "--include-package=PIL", "--include-package=numpy",

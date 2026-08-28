@@ -11,7 +11,7 @@ from scandocument.models import ColorMode, EffectSettings, FacsimilePlacement, P
 from scandocument.pipeline import make_preview, process_document
 from scandocument.presets import PRESETS, preset_copy
 from scandocument.tempfiles import SecureWorkspace
-from scandocument.validation import validate_ocr_languages
+from scandocument.validation import MAX_PAGES, validate_ocr_languages
 from scandocument.extraction import extract_document
 
 
@@ -107,8 +107,8 @@ def placements_from(config: dict) -> list[FacsimilePlacement]:
     if values is None:
         single = placement_from(config.get("facsimile"))
         return [single] if single else []
-    if not isinstance(values, list) or len(values) > 20:
-        raise ValueError("Можно добавить не более 20 факсимиле.")
+    if not isinstance(values, list) or len(values) > MAX_PAGES:
+        raise ValueError(f"Можно передать не более {MAX_PAGES} вариантов геометрии факсимиле.")
     return [placement for value in values if (placement := placement_from(value)) is not None]
 
 
