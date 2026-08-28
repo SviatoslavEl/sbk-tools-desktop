@@ -43,6 +43,18 @@ use workspace::{
     workspace_pointer_path,
 };
 
+const GUI_READY_TOKEN_ENV: &str = "SBK_ONEFILE_GUI_READY_TOKEN";
+
+fn gui_ready_marker_path_for(token: &str, temp: &Path) -> Option<PathBuf> {
+    let token = Uuid::parse_str(token).ok()?;
+    Some(temp.join(format!("SBKTools-ready-{}.marker", token.hyphenated())))
+}
+
+fn gui_ready_marker_path() -> Option<PathBuf> {
+    let token = std::env::var(GUI_READY_TOKEN_ENV).ok()?;
+    gui_ready_marker_path_for(&token, &std::env::temp_dir())
+}
+
 #[derive(Clone)]
 struct AppState {
     workspace: Arc<Workspace>,
@@ -3529,6 +3541,17 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             start_runtime_verification(app.handle());
+            if let Some(marker) = gui_ready_marker_path() {
+                let window = app.get_webview_window("main").ok_or_else(|| {
+                    std::io::Error::other("SBK Tools main window was not created")
+                })?;
+                if !window.is_visible()? {
+                    return Err(
+                        std::io::Error::other("SBK Tools main window is not visible").into(),
+                    );
+                }
+                fs::write(marker, b"ready\n")?;
+            }
             Ok(())
         })
         .manage(AppState {
@@ -3594,6 +3617,19 @@ pub fn run() {
 mod tests {
     use super::*;
     use crate::workspace::ensure_workspace;
+
+    #[test]
+    fn gui_ready_marker_accepts_only_uuid_tokens() {
+        let token = Uuid::new_v4();
+        let temp = std::env::temp_dir();
+        let path = gui_ready_marker_path_for(&token.to_string(), &temp).expect("valid token");
+        assert!(path.starts_with(&temp));
+        assert_eq!(
+            path.file_name().unwrap().to_string_lossy(),
+            format!("SBKTools-ready-{token}.marker")
+        );
+        assert!(gui_ready_marker_path_for("not-a-token", &temp).is_none());
+    }
 
     fn company_directory_value(company_id: &str, name: &str) -> Value {
         serde_json::json!({

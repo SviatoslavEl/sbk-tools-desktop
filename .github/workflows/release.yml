@@ -298,23 +298,62 @@ jobs:
           if ((Get-ChildItem $isolated -Force).Count -ne 1) { throw 'Final EXE created required adjacent files' }
 
           $startedAt = Get-Date
+          $readyToken = [guid]::NewGuid().ToString()
+          $readyMarker = Join-Path $env:TEMP "SBKTools-ready-$readyToken.marker"
+          $errorMarker = Join-Path $env:TEMP "SBKTools-ready-$readyToken.error"
+          Remove-Item $readyMarker, $errorMarker -Force -ErrorAction SilentlyContinue
+          $env:SBK_ONEFILE_GUI_READY_TOKEN = $readyToken
           $launcher = Start-Process -FilePath $portable -PassThru
+          Remove-Item Env:SBK_ONEFILE_GUI_READY_TOKEN
           $windowReady = $false
-          $deadline = (Get-Date).AddSeconds(45)
+          $application = $null
+          $runtime = $null
+          $deadline = (Get-Date).AddSeconds(240)
           while ((Get-Date) -lt $deadline) {
-            $application = Get-Process -Name 'SBK-Tools' -ErrorAction SilentlyContinue |
-              Where-Object { $_.StartTime -ge $startedAt } |
-              Select-Object -First 1
-            if ($application) {
-              $application.Refresh()
-              if ($application.MainWindowHandle -ne 0) { $windowReady = $true; break }
+            if (Test-Path $errorMarker) {
+              $launchError = Get-Content -Raw $errorMarker
+              Stop-Process -Id $launcher.Id -Force -ErrorAction SilentlyContinue
+              Remove-Item $readyMarker, $errorMarker -Force -ErrorAction SilentlyContinue
+              throw "Final EXE launch error: $launchError"
+            }
+            $launcher.Refresh()
+            if ($launcher.HasExited) {
+              Remove-Item $readyMarker, $errorMarker -Force -ErrorAction SilentlyContinue
+              throw "Final EXE exited before opening the application: $($launcher.ExitCode)"
+            }
+            if (-not $runtime) {
+              $runtime = Get-ChildItem $env:TEMP -Directory -Filter "SBKTools-runtime-$($launcher.Id)-*" -ErrorAction SilentlyContinue |
+                Sort-Object LastWriteTime -Descending |
+                Select-Object -First 1
+            }
+            if ((Test-Path $readyMarker) -and $runtime) {
+              $innerPath = Join-Path $runtime.FullName 'SBK-Tools.exe'
+              $applicationInfo = Get-CimInstance Win32_Process | Where-Object {
+                $_.ExecutablePath -and [string]::Equals($_.ExecutablePath, $innerPath, [System.StringComparison]::OrdinalIgnoreCase)
+              } | Select-Object -First 1
+              if ($applicationInfo) {
+                $application = Get-Process -Id $applicationInfo.ProcessId -ErrorAction SilentlyContinue
+                if ($application) {
+                  $application.Refresh()
+                  Write-Host "GUI ready: PID=$($application.Id), MainWindowHandle=$($application.MainWindowHandle), runtime=$($runtime.FullName)"
+                  $windowReady = $true
+                  break
+                }
+              }
             }
             Start-Sleep -Milliseconds 500
           }
           if (-not $windowReady) {
+            Write-Host "GUI readiness marker exists: $(Test-Path $readyMarker)"
+            Write-Host "Runtime: $($runtime.FullName)"
+            Get-CimInstance Win32_Process | Where-Object {
+              $_.ExecutablePath -and $runtime -and $_.ExecutablePath.StartsWith($runtime.FullName, [System.StringComparison]::OrdinalIgnoreCase)
+            } | Select-Object ProcessId, ParentProcessId, Name, ExecutablePath | Format-Table -AutoSize
             Stop-Process -Id $launcher.Id -Force -ErrorAction SilentlyContinue
+            Remove-Item $readyMarker, $errorMarker -Force -ErrorAction SilentlyContinue
             throw 'Final EXE did not open its application window'
           }
+          Remove-Item $readyMarker, $errorMarker -Force -ErrorAction SilentlyContinue
 
           $crashedPid = $launcher.Id
           Stop-Process -Id $crashedPid -Force

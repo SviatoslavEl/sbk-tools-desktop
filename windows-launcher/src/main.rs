@@ -23,6 +23,19 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBo
 
 static PAYLOAD: &[u8] = include_bytes!(env!("SBK_PAYLOAD_TAR_ZST"));
 const PREFIX: &str = "SBKTools-runtime-";
+const GUI_READY_TOKEN_ENV: &str = "SBK_ONEFILE_GUI_READY_TOKEN";
+
+fn ci_error_marker_path() -> Option<PathBuf> {
+    let token = std::env::var(GUI_READY_TOKEN_ENV).ok()?;
+    let token = Uuid::parse_str(&token).ok()?;
+    Some(std::env::temp_dir().join(format!("SBKTools-ready-{}.error", token.hyphenated())))
+}
+
+fn write_ci_error(message: &str) {
+    if let Some(path) = ci_error_marker_path() {
+        let _ = fs::write(path, message.as_bytes());
+    }
+}
 
 fn runtime_pid(name: &str) -> Option<u32> {
     name.strip_prefix(PREFIX)?
@@ -249,8 +262,14 @@ fn run() -> Result<i32, String> {
 
 fn main() {
     let code = match run() {
-        Ok(code) => code,
+        Ok(code) => {
+            if code != 0 {
+                write_ci_error(&format!("Inner application exited with code {code}"));
+            }
+            code
+        }
         Err(message) => {
+            write_ci_error(&message);
             let title: Vec<u16> = "СБК Инструменты — ошибка запуска\0"
                 .encode_utf16()
                 .collect();
@@ -280,5 +299,13 @@ mod tests {
         assert_eq!(runtime_pid("SBKTools-runtime-42-deadbeef"), Some(42));
         assert_eq!(runtime_pid("SBKTools-runtime-nope-deadbeef"), None);
         assert_eq!(runtime_pid("unrelated-42-deadbeef"), None);
+    }
+
+    #[test]
+    fn diagnostic_marker_requires_uuid_token() {
+        assert!(Uuid::parse_str("not-a-token").is_err());
+        let token = Uuid::new_v4();
+        let name = format!("SBKTools-ready-{}.error", token.hyphenated());
+        assert!(!name.contains('/') && !name.contains('\\'));
     }
 }
