@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   archiveRecord,
   listRecords,
@@ -11,21 +11,29 @@ export function useRecords<T>(module: ModuleId) {
   const [records, setRecords] = useState<StoredRecord<T>[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const generation = useRef(0);
 
   const reload = useCallback(async () => {
+    const currentGeneration = ++generation.current;
     setLoading(true);
     try {
-      setRecords(await listRecords<T>(module));
-      setError(null);
+      const next = await listRecords<T>(module);
+      if (currentGeneration === generation.current) {
+        setRecords(next);
+        setError(null);
+      }
     } catch (reason) {
-      setError(String(reason));
+      if (currentGeneration === generation.current) setError(String(reason));
     } finally {
-      setLoading(false);
+      if (currentGeneration === generation.current) setLoading(false);
     }
   }, [module]);
 
   useEffect(() => {
     void reload();
+    const refresh = () => void reload();
+    window.addEventListener("sbk-workspace-refresh", refresh);
+    return () => window.removeEventListener("sbk-workspace-refresh", refresh);
   }, [reload]);
 
   const save = useCallback(async (title: string, payload: T, id?: string) => {

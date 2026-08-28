@@ -26,10 +26,19 @@ def main() -> None:
     output = worker / "dist"
     output.mkdir(parents=True, exist_ok=True)
     executable = "sbk-scanner-worker.exe" if platform.system() == "Windows" else "sbk-scanner-worker"
+    onefile_temp = (
+        "{PROGRAM_DIR}/.scanner-worker-{PID}-{TIME}"
+        if platform.system() == "Windows"
+        else "{TEMP}/ScanDocument-worker-{PID}-{TIME}"
+    )
     command = [
         args.python, "-m", "nuitka", "--onefile", "--assume-yes-for-downloads",
-        "--onefile-tempdir-spec={CACHE_DIR}/SBKTools/ScannerWorker/2.4.1",
-        "--onefile-cache-mode=cached",
+        # Nuitka removes this unique directory on normal exit.  On Windows it
+        # lives inside the outer launcher's runtime, so crash recovery removes
+        # it on the next start.  A signed macOS bundle is read-only, therefore
+        # macOS uses the system temp instead of modifying the app bundle.
+        f"--onefile-tempdir-spec={onefile_temp}",
+        "--onefile-cache-mode=temporary",
         f"--output-dir={output}", f"--output-filename={executable}",
         "--include-package=scandocument", "--include-package=PIL", "--include-package=numpy",
         "--include-package=pypdf", "--include-package=pypdfium2", "--include-package=docx",

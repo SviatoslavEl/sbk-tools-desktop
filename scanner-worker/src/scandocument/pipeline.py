@@ -6,13 +6,14 @@ import threading
 from collections import deque
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from scandocument.errors import CancelledError, SaveError, ScanDocumentError
-from scandocument.models import ProcessRequest, ProgressEvent
+from scandocument.models import Annotation, FacsimilePlacement, ProcessRequest, ProgressEvent, Redaction
 from scandocument.tempfiles import SecureWorkspace
-from scandocument.validation import detect_kind, inspect_document, validate_render_budget
+from scandocument.validation import detect_kind, inspect_document, validate_preview_limits, validate_render_budget
 
 if TYPE_CHECKING:
     from PIL import Image
@@ -20,6 +21,24 @@ if TYPE_CHECKING:
 ProgressCallback = Callable[[ProgressEvent], None]
 PAGE_WORKERS = 2
 GIB = 1024**3
+
+
+def _validate_docx_conversion_space(source: Path, destinations: list[Path]) -> None:
+    # Bundled Writer creates an isolated input copy and a converted PDF.  Keep a
+    # conservative reserve before starting it, especially for multi-hundred-MB DOCX.
+    required = source.stat().st_size * 2 + 256 * 1024 * 1024
+    checked: set[tuple[int, int]] = set()
+    for destination in destinations:
+        destination.mkdir(parents=True, exist_ok=True)
+        stats = destination.stat()
+        volume = (stats.st_dev, stats.st_ino if os.name == "nt" else 0)
+        if volume in checked:
+            continue
+        checked.add(volume)
+        if shutil.disk_usage(destination).free < required:
+            raise SaveError(
+                f"Недостаточно временного места для DOCX: требуется около {required // 1024 // 1024} МБ."
+            )
 
 
 class CancellationToken:
@@ -88,10 +107,14 @@ def _process_page(
     rotation: int,
     workspace: Path,
     token: CancellationToken,
+    target_page_bytes: int | None = None,
+    page_facsimiles: list[FacsimilePlacement] | None = None,
+    page_redactions: list[Redaction] | None = None,
+    page_annotations: list[Annotation] | None = None,
 ) -> tuple[bytes, list[Any] | None, tuple[int, int]]:
     from scandocument.filters import apply_scan_effect
     from scandocument.ocr import recognize_words
-    from scandocument.pdf_engine import image_page_pdf
+    from scandocument.pdf_engine import _jpeg_for_budget
 
     token.check()
     processed = apply_scan_effect(image, request.settings, request.seed, index)
@@ -100,25 +123,36 @@ def _process_page(
         processed = processed.rotate(-rotation, expand=True)
         if rotation in {90, 270}:
             page_size = (page_size[1], page_size[0])
-    for facsimile in request.facsimiles:
-        if facsimile.applies_to(index):
+    for facsimile in page_facsimiles if page_facsimiles is not None else request.facsimiles:
+        if page_facsimiles is not None or facsimile.applies_to(index):
             from scandocument.facsimile import apply_facsimile
 
-            processed = apply_facsimile(processed, facsimile)
-    if request.redactions:
+            x, y = facsimile.position_for_page(index)
+            processed = apply_facsimile(processed, replace(facsimile, x=x, y=y))
+    active_redactions = page_redactions if page_redactions is not None else request.redactions
+    if active_redactions:
         from PIL import ImageDraw
 
         draw = ImageDraw.Draw(processed)
-        for redaction in request.redactions:
-            if index in redaction.pages:
+        for redaction in active_redactions:
+            if page_redactions is not None or index in redaction.pages:
                 bounds = (
                     round(redaction.x * processed.width), round(redaction.y * processed.height),
                     round((redaction.x + redaction.width) * processed.width),
                     round((redaction.y + redaction.height) * processed.height),
                 )
                 draw.rectangle(bounds, fill=redaction.color)
+    active_annotations = page_annotations if page_annotations is not None else request.annotations
+    if active_annotations:
+        from scandocument.annotations import apply_annotations
+
+        processed = apply_annotations(processed, active_annotations, index)
     token.check()
-    page_pdf = image_page_pdf(processed, page_size, request.settings.jpeg_quality)
+    page_jpeg = _jpeg_for_budget(
+        processed,
+        request.settings.jpeg_quality,
+        target_page_bytes,
+    )
     words = None
     if request.ocr_enabled:
         ocr_dir = workspace / f"ocr-{index:05d}"
@@ -132,7 +166,7 @@ def _process_page(
     image_size = processed.size
     del processed
     token.check()
-    return page_pdf, words, image_size
+    return page_jpeg, words, image_size
 
 
 def process_document(
@@ -141,9 +175,7 @@ def process_document(
     cancellation: CancellationToken | None = None,
 ) -> tuple[list[str], float | None, str, list[dict[str, Any]]]:
     import pypdfium2 as pdfium
-    from pypdf import PdfWriter
-
-    from scandocument.pdf_engine import append_pdf_page, configure_pdfa_2b, render_page, write_atomic
+    from scandocument.pdf_engine import StreamingPdfWriter, render_page
 
     token = cancellation or CancellationToken()
     warnings: list[str] = []
@@ -160,6 +192,7 @@ def process_document(
             from scandocument.docx_engine import convert_docx_to_pdf
 
             token.check()
+            _validate_docx_conversion_space(source, [workspace])
             _notify(callback, "Подготовка DOCX", 0, 1, 2)
             pdf_source = workspace / "converted.pdf"
             prepared_warnings = convert_docx_to_pdf(source, pdf_source, lambda: token.cancelled)
@@ -171,10 +204,15 @@ def process_document(
         )
         warnings.extend(info.warnings)
         validate_render_budget(info, request.settings.dpi)
-        estimated_output = max(info.size_bytes, sum(
+        total_render_pixels = sum(
             round(width / 72 * request.settings.dpi) * round(height / 72 * request.settings.dpi)
             for width, height in info.page_sizes_points
-        ) * max(20, request.settings.jpeg_quality) // 180)
+        )
+        estimated_output = max(1, total_render_pixels * max(20, request.settings.jpeg_quality) // 420)
+        if request.compression_target_ratio is not None:
+            ratio = max(0.25, min(1.0, request.compression_target_ratio))
+            attainable_floor = max(info.page_count * 8_192, total_render_pixels * 55 // 420)
+            estimated_output = max(attainable_floor, min(estimated_output, round(info.size_bytes * ratio)))
         output.parent.mkdir(parents=True, exist_ok=True)
         free_bytes = shutil.disk_usage(output.parent).free
         if free_bytes < estimated_output * 2 + 64 * 1024 * 1024:
@@ -197,32 +235,52 @@ def process_document(
             facsimile.validate_for_document(source_total)
         for redaction in request.redactions:
             redaction.validate_for_document(source_total)
-        writer = PdfWriter()
-        writer.add_metadata({
-            "/Producer": "ScanDocument",
-            "/Title": output.stem,
-            "/ScanDocumentSeed": str(request.seed),
-        })
+        for annotation in request.annotations:
+            annotation.validate_for_document(source_total)
+
+        all_page_facsimiles: list[FacsimilePlacement] = []
+        facsimiles_by_page: dict[int, list[FacsimilePlacement]] = {}
+        for item in request.facsimiles:
+            if item.application == "all":
+                all_page_facsimiles.append(item)
+            else:
+                for page_index in item.pages:
+                    facsimiles_by_page.setdefault(page_index, []).append(item)
+        redactions_by_page: dict[int, list[Redaction]] = {}
+        for item in request.redactions:
+            for page_index in item.pages:
+                redactions_by_page.setdefault(page_index, []).append(item)
+        annotations_by_page: dict[int, list[Annotation]] = {}
+        for item in request.annotations:
+            for page_index in item.pages:
+                annotations_by_page.setdefault(page_index, []).append(item)
+        writer = StreamingPdfWriter(output, output.stem, request.seed, request.pdfa_enabled)
         try:
             pending: deque[tuple[int, int, tuple[float, float], Future]] = deque()
-            confidence_values: list[float] = []
-            recognized_pages: list[str] = []
+            confidence_sum = 0.0
+            confidence_count = 0
+            recognized_parts: list[str] = []
+            recognized_chars = 0
             low_confidence_words: list[dict[str, Any]] = []
 
-            if request.ocr_enabled:
-                from scandocument.ocr import add_invisible_text
-
             def finish_oldest() -> None:
+                nonlocal confidence_sum, confidence_count, recognized_chars
                 position, index, page_size, future = pending.popleft()
-                page_pdf, words, image_size = future.result()
+                page_jpeg, words, image_size = future.result()
                 token.check()
+                if request.page_rotations.get(index, 0) in {90, 270}:
+                    page_size = (page_size[1], page_size[0])
                 if words is not None:
-                    page_pdf = add_invisible_text(page_pdf, words, image_size, page_size)
-                    confidence_values.extend(word.confidence for word in words)
-                    recognized_pages.append(" ".join(word.text for word in words))
+                    confidence_sum += sum(word.confidence for word in words)
+                    confidence_count += len(words)
+                    if recognized_chars < 200_000:
+                        page_text = " ".join(word.text for word in words)
+                        remaining = 200_000 - recognized_chars
+                        recognized_parts.append(page_text[:remaining])
+                        recognized_chars += min(len(page_text), remaining)
                     low_confidence_words.extend({"page": position + 1, "text": word.text, "confidence": word.confidence}
                                                 for word in words if word.confidence < 50 and len(low_confidence_words) < 200)
-                append_pdf_page(writer, page_pdf)
+                writer.add_page(page_jpeg, page_size, image_size, words)
                 page_number = position + 1
                 _notify(
                     callback, "Страница готова", page_number, total,
@@ -230,6 +288,18 @@ def process_document(
                 )
 
             worker_count = _page_worker_count(request, total)
+            target_total_bytes = None
+            if request.compression_target_ratio is not None:
+                target_total_bytes = max(
+                    total * 8_192,
+                    round(info.size_bytes * max(0.25, min(1.0, request.compression_target_ratio))),
+                )
+            selected_pixels = [
+                max(1, round(info.page_sizes_points[index][0] / 72 * request.settings.dpi)
+                    * round(info.page_sizes_points[index][1] / 72 * request.settings.dpi))
+                for index in page_order
+            ]
+            total_selected_pixels = max(1, sum(selected_pixels))
             with ThreadPoolExecutor(
                 max_workers=worker_count,
                 thread_name_prefix="ScanDocument-page",
@@ -249,6 +319,11 @@ def process_document(
                         page_size,
                         executor.submit(
                             _process_page, image, request, index, page_size, request.page_rotations.get(index, 0), workspace, token,
+                            (round(target_total_bytes * selected_pixels[position] / total_selected_pixels)
+                             if target_total_bytes is not None else None),
+                            [*all_page_facsimiles, *facsimiles_by_page.get(index, [])],
+                            redactions_by_page.get(index, []),
+                            annotations_by_page.get(index, []),
                         ),
                     ))
                     if len(pending) >= worker_count:
@@ -257,20 +332,21 @@ def process_document(
                     finish_oldest()
             token.check()
             _notify(callback, "Сборка итогового PDF", total, total, 97)
-            if request.pdfa_enabled:
-                configure_pdfa_2b(writer)
-            write_atomic(writer, output)
+            writer.finish()
             _notify(callback, "Готово", total, total, 100)
-            recognized_text = "\n\n".join(recognized_pages)[:200_000]
-            return warnings, (sum(confidence_values) / len(confidence_values) if confidence_values else None), recognized_text, low_confidence_words
+            recognized_text = "\n\n".join(recognized_parts)[:200_000]
+            return warnings, (confidence_sum / confidence_count if confidence_count else None), recognized_text, low_confidence_words
         except CancelledError:
-            output.with_name(f".{output.name}.scandocument-part").unlink(missing_ok=True)
+            writer.abort()
             raise
         except OSError as exc:
-            output.with_name(f".{output.name}.scandocument-part").unlink(missing_ok=True)
+            writer.abort()
             if getattr(exc, "errno", None) == 28:
                 raise SaveError("Недостаточно места на диске. Освободите место и повторите.") from exc
             raise SaveError("Не удалось записать итоговый PDF в выбранную папку.") from exc
+        except Exception:
+            writer.abort()
+            raise
         finally:
             document.close()
 
@@ -296,6 +372,11 @@ def make_preview(
         pdf_source = source
         if kind == "docx":
             from scandocument.docx_engine import convert_docx_to_pdf
+
+            conversion_destinations = [workspace]
+            if preview_cache_dir is not None:
+                conversion_destinations.append(preview_cache_dir)
+            _validate_docx_conversion_space(source, conversion_destinations)
 
             if preview_cache_dir is not None:
                 import hashlib
@@ -334,13 +415,6 @@ def make_preview(
         else:
             prepared_warnings = []
         token.check()
-        info = inspect_document(
-            source,
-            cancelled=lambda: token.cancelled,
-            prepared_docx_pdf=pdf_source if kind == "docx" else None,
-            prepared_docx_warnings=prepared_warnings,
-        )
-        validate_render_budget(info, min(144, settings.dpi))
         document = pdfium.PdfDocument(str(pdf_source))
         try:
             index = int(page_index)
@@ -350,10 +424,16 @@ def make_preview(
             width, height = page.get_size()
             dpi = min(144, max(72, 72 * max_dimension / max(width, height)))
             page.close()
+            warnings = prepared_warnings + validate_preview_limits(
+                source.stat().st_size,
+                len(document),
+                (float(width), float(height)),
+                int(dpi),
+            )
             original, _ = render_page(document, index, int(dpi))
             token.check()
             processed = apply_scan_effect(original.copy(), settings, seed, index)
             token.check()
-            return original, processed, len(document), info.warnings, (float(width), float(height))
+            return original, processed, len(document), warnings, (float(width), float(height))
         finally:
             document.close()

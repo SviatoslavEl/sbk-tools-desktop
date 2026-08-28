@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState, type Dispatch, type SetStateAction } from
 import { useRecords } from "../../hooks/useRecords";
 import { exportText, importText } from "../../lib/files";
 import { clearDraft, readDraft, saveDraft } from "../../lib/storage";
+import { useWorkspaceAccess } from "../../lib/workspaceAccess";
 import { calculate, competitorComparablePrice, priceScenarios, recommendPrice } from "./engine";
 import {
   initialCalculatorData,
@@ -59,6 +60,7 @@ function NumberField({ value, onChange, min, max, suffix }: {
 }
 
 export function Calculator() {
+  const workspaceAccess = useWorkspaceAccess();
   const saved = useRecords<CalculatorData>("calculator");
   const [data, setData] = useState<CalculatorData>(() => restoredCalculatorData(null));
   const [draftReady, setDraftReady] = useState(false);
@@ -80,7 +82,20 @@ export function Calculator() {
   }, []);
 
   useEffect(() => {
-    if (!draftReady) return;
+    if (workspaceAccess.editor) return;
+    let generation = 0;
+    const refresh = () => {
+      const current = ++generation;
+      void readDraft<unknown>("calculator", recordId || "new").then((draft) => {
+        if (current === generation && draft) setData(restoredCalculatorData(draft));
+      });
+    };
+    window.addEventListener("sbk-workspace-refresh", refresh);
+    return () => { generation += 1; window.removeEventListener("sbk-workspace-refresh", refresh); };
+  }, [workspaceAccess.editor, recordId]);
+
+  useEffect(() => {
+    if (!draftReady || !workspaceAccess.editor) return;
     setSavedStatus("Сохраняем черновик…");
     const timer = window.setTimeout(() => {
       void saveDraft("calculator", data, recordId || "new")
@@ -88,7 +103,7 @@ export function Calculator() {
         .catch(() => setSavedStatus("Черновик не сохранён"));
     }, 450);
     return () => window.clearTimeout(timer);
-  }, [data, draftReady, recordId]);
+  }, [data, draftReady, recordId, workspaceAccess.editor]);
 
   const update = <K extends keyof CalculatorData>(key: K, value: CalculatorData[K]) =>
     setData((current) => ({ ...current, [key]: value }));

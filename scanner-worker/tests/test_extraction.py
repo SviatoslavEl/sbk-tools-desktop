@@ -3,7 +3,8 @@ import zipfile
 
 import pytest
 
-from scandocument.extraction import extract_document
+from scandocument.extraction import MAX_SOURCE_BYTES, _validate_source, extract_document
+from scandocument.errors import DocumentTooLargeError
 
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -22,6 +23,30 @@ def test_docx_extraction_keeps_paragraph_locators():
     assert result["mimeType"].endswith("wordprocessingml.document")
     assert any(fragment.get("section", "").startswith("Абзац") for fragment in result["fragments"])
     assert result["extractedText"].strip()
+
+
+def test_extraction_accepts_one_gib_boundary_and_rejects_one_byte_more(tmp_path: Path):
+    boundary = tmp_path / "boundary.pdf"
+    with boundary.open("wb") as stream:
+        stream.write(b"%PDF-")
+        stream.seek(MAX_SOURCE_BYTES - 1)
+        stream.write(b"\0")
+    assert _validate_source(boundary)[0] == MAX_SOURCE_BYTES
+    with boundary.open("ab") as stream:
+        stream.write(b"\0")
+    with pytest.raises(ValueError, match="1 ГБ"):
+        _validate_source(boundary)
+
+
+def test_extraction_rejects_docx_zip_bomb_like_scanner_paths(tmp_path: Path):
+    source = FIXTURES / "simple.docx"
+    hostile = tmp_path / "hostile.docx"
+    with zipfile.ZipFile(source) as existing, zipfile.ZipFile(hostile, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for entry in existing.infolist():
+            archive.writestr(entry, existing.read(entry.filename))
+        archive.writestr("word/ignored-bomb.bin", b"A" * (5 * 1024 * 1024))
+    with pytest.raises(DocumentTooLargeError, match="коэффициент сжатия"):
+        extract_document(hostile)
 
 
 def test_magic_mismatch_is_rejected(tmp_path: Path):

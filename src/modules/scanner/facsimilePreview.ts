@@ -12,6 +12,9 @@ export interface FacsimilePlacementPayload {
   removeLightBackground: boolean;
   application: FacsimilePageSelection["application"];
   pages: number[];
+  region?: [number, number, number, number];
+  randomizeInRegion?: boolean;
+  randomSeed?: number;
 }
 
 export interface EditableFacsimile {
@@ -24,6 +27,9 @@ export interface EditableFacsimile {
   rotation: number;
   opacity: number;
   removeLightBackground: boolean;
+  placementMode?: "manual" | "region" | "random-region";
+  region?: [number, number, number, number];
+  randomSeed?: number;
 }
 
 export type FacsimileGeometry = Pick<EditableFacsimile, "x" | "y" | "width" | "rotation" | "opacity" | "removeLightBackground">;
@@ -77,6 +83,9 @@ export function buildFacsimilePlacements(
   selection: FacsimilePageSelection,
   pageCount: number,
 ): FacsimilePlacementPayload[] {
+  if (selection.application === "all" && Object.keys(facsimile.pageGeometries || {}).length === 0) {
+    return [buildFacsimilePlacement(facsimile, { application: "all", pages: [] })];
+  }
   const pages = selectedFacsimilePages(selection, pageCount);
   if (!pages.length) return [];
   const groups = new Map<string, { geometry: FacsimileGeometry; pages: number[] }>();
@@ -123,7 +132,29 @@ export function buildFacsimilePlacement(
     removeLightBackground: facsimile.removeLightBackground,
     application: selection.application,
     pages: selection.pages,
+    region: facsimile.placementMode && facsimile.placementMode !== "manual" ? facsimile.region : undefined,
+    randomizeInRegion: facsimile.placementMode === "random-region",
+    randomSeed: facsimile.randomSeed,
   };
+}
+
+export function positionFacsimileInRegion(
+  placement: FacsimilePlacementPayload,
+  pageIndex: number,
+): FacsimilePlacementPayload {
+  if (!placement.region) return placement;
+  const [rx, ry, rw, rh] = placement.region;
+  const maxX = Math.max(rx, rx + rw - placement.width);
+  const maxY = Math.max(ry, ry + rh - Math.min(placement.width, rh));
+  if (!placement.randomizeInRegion) {
+    return { ...placement, x: Math.min(Math.max(placement.x, rx), maxX), y: Math.min(Math.max(placement.y, ry), maxY) };
+  }
+  const fraction = (salt: number) => {
+    let value = (Math.imul(placement.randomSeed || 42, 1_664_525) + Math.imul(pageIndex + 1, 1_013_904_223) + salt) >>> 0;
+    value = (value ^ (value >>> 16)) >>> 0;
+    return value / 0xFFFFFFFF;
+  };
+  return { ...placement, x: rx + (maxX - rx) * fraction(0), y: ry + (maxY - ry) * fraction(0x9E3779B9) };
 }
 
 export function facsimileAppliesTo(placement: FacsimilePlacementPayload, pageIndex: number): boolean {
@@ -148,6 +179,8 @@ export interface PreviewCacheKeyInput {
   quality: number;
   pageRotation: number;
   redactions: unknown[];
+  annotations?: unknown[];
+  compressionMode?: string;
 }
 
 export function previewCacheKey(input: PreviewCacheKeyInput): string {
@@ -159,6 +192,8 @@ export function previewCacheKey(input: PreviewCacheKeyInput): string {
     input.quality,
     input.pageRotation,
     input.redactions,
+    input.annotations,
+    input.compressionMode,
   ]);
 }
 

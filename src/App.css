@@ -245,6 +245,12 @@ details label { display: block; margin-top: 10px; }
 .registry-toolbar > label { min-width: 150px; }
 .registry-toolbar .search-box { flex: 1; min-width: 260px; }
 .registry-toolbar .toolbar-actions { margin-left: auto; }
+.company-relation { display: block; max-width: 360px; margin: 2px 0; color: #53685a; }
+.company-editor-drawer { z-index: 110; }
+.company-role-row { display: flex; gap: 22px; flex-wrap: wrap; }
+.company-affiliation-row { display: grid; grid-template-columns: minmax(150px, .8fr) minmax(180px, 1fr) minmax(150px, 1fr) 40px; gap: 8px; align-items: center; }
+.company-affiliation-row select, .company-affiliation-row input { width: 100%; min-height: 40px; padding: 8px 10px; color: #173c2a; background: #fff; border: 1px solid #bfd0c2; border-radius: 8px; }
+@media (max-width: 780px) { .company-affiliation-row { grid-template-columns: 1fr; } }
 .registry-toolbar input, .registry-toolbar select { min-height: 40px; padding: 8px 11px; color: #173c2a; background: #fff; border: 1px solid #bfd0c2; border-radius: 8px; }
 .checkbox-filter { min-height: 40px; display: flex; align-items: center; gap: 6px; padding: 8px; background: #fff; border: 1px solid #bfd0c2; border-radius: 8px; }
 .checkbox-filter input { width: 18px; height: 18px; }

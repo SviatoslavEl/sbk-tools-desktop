@@ -18,7 +18,17 @@ export function Dashboard() {
   const calculations = useRecords<CalculatorData>("calculator");
   const [workspace, setWorkspace] = useState<WorkspaceInfo | null>(null);
   const [hasDraft, setHasDraft] = useState(false);
-  useEffect(() => { void getWorkspaceInfo().then(setWorkspace); void readDraft<CalculatorData>("calculator", "new").then((draft) => setHasDraft(Boolean(draft))); }, []);
+  useEffect(() => {
+    let generation = 0;
+    const refresh = () => {
+      const current = ++generation;
+      void getWorkspaceInfo().then((value) => { if (current === generation) setWorkspace(value); });
+      void readDraft<CalculatorData>("calculator", "new").then((draft) => { if (current === generation) setHasDraft(Boolean(draft)); });
+    };
+    refresh();
+    window.addEventListener("sbk-workspace-refresh", refresh);
+    return () => { generation += 1; window.removeEventListener("sbk-workspace-refresh", refresh); };
+  }, []);
   const deadlines = procurements.records.map((record) => ({ title: record.payload.name, date: record.payload.submissionDeadline, days: daysUntil(record.payload.submissionDeadline), status: record.payload.status })).filter((row) => row.days != null && row.days >= 0 && row.days <= 7 && !["Подана", "Победа", "Проигрыш", "Отменена"].includes(row.status)).sort((a, b) => (a.days || 0) - (b.days || 0));
   const overdue = contracts.records.filter((record) => record.payload.paymentStatus === "Просрочено" || (record.payload.paymentPlannedDate && record.payload.paymentPlannedDate < new Date().toISOString().slice(0, 10) && !["Полностью оплачено", "Не применяется"].includes(record.payload.paymentStatus)));
   const unsignedActs = contracts.records.filter((record) => !["Не требуются", "Подписаны полностью"].includes(record.payload.actsStatus) && ["Выполнен", "Закрыт"].includes(record.payload.stage));

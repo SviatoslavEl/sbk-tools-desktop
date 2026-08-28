@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::Path;
 
-use crate::database::open_database;
+use crate::database::{open_database, open_database_read_only};
 
 pub(crate) const INTELLIGENCE_SCHEMA_VERSION: &str = "1.0";
 pub(crate) const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
@@ -277,7 +277,7 @@ pub(crate) fn list_analysis_jobs(
     if procurement_id.is_empty() {
         return Err("Не указана закупка".to_string());
     }
-    let connection = open_database(root, "procurement")?;
+    let connection = open_database_read_only(root, "procurement")?;
     let mut statement = connection.prepare(
         "SELECT id, request_id, capability, procurement_id, status, attempts, cancellation_requested, created_at, started_at, finished_at, error_code FROM analysis_jobs WHERE procurement_id = ?1 ORDER BY created_at DESC LIMIT 200",
     ).map_err(|error| error.to_string())?;

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { archiveRecord, deleteRecord, listRecords, type ModuleId, type StoredRecord } from "../../lib/storage";
+import { useWorkspaceAccess } from "../../lib/workspaceAccess";
 
 const sections: Array<{ module: ModuleId; title: string }> = [
   { module: "calculator", title: "Расчёты" },
@@ -12,6 +13,7 @@ const sections: Array<{ module: ModuleId; title: string }> = [
 type ArchiveData = Partial<Record<ModuleId, StoredRecord[]>>;
 
 export function Archive() {
+  const workspaceAccess = useWorkspaceAccess();
   const [data, setData] = useState<ArchiveData>({});
   const [error, setError] = useState("");
   const [busy, setBusy] = useState("");
@@ -41,6 +43,7 @@ export function Archive() {
   };
 
   return <div className="archive-grid">
+    {!workspaceAccess.editor && <div className="notice warning"><strong>Режим просмотра</strong><span>{workspaceAccess.message}</span></div>}
     {error && <div className="notice error">{error}</div>}
     {sections.map(({ module, title }) => <section className="surface" key={module}>
       <div className="surface-title"><h2>{title}</h2><span>{data[module]?.length || 0}</span></div>
@@ -48,8 +51,8 @@ export function Archive() {
         {!data[module]?.length && <div className="empty-inline">В архиве нет записей.</div>}
         {data[module]?.map((record) => <div className="archive-row" key={record.id}>
           <div><strong>{record.title}</strong><span>Архивировано или изменено: {new Date(record.updatedAt).toLocaleString("ru-RU")}</span></div>
-          <button className="secondary small" disabled={busy === record.id} type="button" onClick={() => void restore(module, record)}>Восстановить</button>
-          <button className="secondary small danger" disabled={busy === record.id} type="button" onClick={() => void remove(module, record)}>Удалить навсегда</button>
+          {workspaceAccess.editor && <button className="secondary small" disabled={busy === record.id} type="button" onClick={() => void restore(module, record)}>Восстановить</button>}
+          {workspaceAccess.editor && <button className="secondary small danger" disabled={busy === record.id} type="button" onClick={() => void remove(module, record)}>Удалить навсегда</button>}
         </div>)}
       </div>
     </section>)}

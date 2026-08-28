@@ -97,21 +97,23 @@ def _ensure_windows_runtime(component: str) -> None:
 
 def cleanup_stale_onefile_dirs() -> None:
     """Remove private payload directories left by a terminated one-file process."""
-    if platform.system().lower() != "windows":
-        return
     current = bundle_root().resolve()
     temp_root = Path(tempfile.gettempdir()).resolve()
-    for child in temp_root.glob("ScanDocument-onefile-*"):
-        try:
-            if child.resolve() == current or not child.is_dir():
+    prefixes = ("ScanDocument-onefile-", "ScanDocument-worker-")
+    for prefix in prefixes:
+        for child in temp_root.glob(f"{prefix}*"):
+            try:
+                if child.resolve() == current or not child.is_dir():
+                    continue
+                remainder = child.name.removeprefix(prefix).split("-", 1)
+                if len(remainder) != 2 or not remainder[1].isdigit():
+                    continue
+                pid = int(remainder[0])
+                if process_is_alive(pid):
+                    continue
+                shutil.rmtree(child, ignore_errors=True)
+            except (OSError, ValueError):
                 continue
-            pid_text = child.name.removeprefix("ScanDocument-onefile-").split("-", 1)[0]
-            pid = int(pid_text)
-            if process_is_alive(pid):
-                continue
-            shutil.rmtree(child, ignore_errors=True)
-        except (OSError, ValueError):
-            continue
 
 
 def find_font(*, bold: bool = False, italic: bool = False) -> Path | None:

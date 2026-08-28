@@ -8,6 +8,7 @@ import {
   facsimileGeometry,
   facsimileOverlayStyle,
   previewCacheKey,
+  positionFacsimileInRegion,
   suppressLabelActivation,
   updateFacsimileGeometry,
 } from "./facsimilePreview";
@@ -72,6 +73,23 @@ describe("facsimile preview model", () => {
     expect(placements[0]).toMatchObject({ application: "all", pages: [] });
   });
 
+  it("uses deterministic per-page positions inside a selected region", () => {
+    const placement = buildFacsimilePlacement({
+      ...editable,
+      placementMode: "random-region" as const,
+      region: [0.1, 0.2, 0.6, 0.5] as [number, number, number, number],
+      randomSeed: 77,
+    }, { application: "all", pages: [] });
+    const first = positionFacsimileInRegion(placement, 0);
+    const repeated = positionFacsimileInRegion(placement, 0);
+    const second = positionFacsimileInRegion(placement, 1);
+    expect(first).toMatchObject(repeated);
+    expect(first.x).toBeGreaterThanOrEqual(0.1);
+    expect(first.x + first.width).toBeLessThanOrEqual(0.7);
+    expect(first.y).toBeGreaterThanOrEqual(0.2);
+    expect(second.x).not.toBe(first.x);
+  });
+
   it("keeps an info-button click from activating its surrounding checkbox label", () => {
     const event = { preventDefault: vi.fn(), stopPropagation: vi.fn() };
     suppressLabelActivation(event);
@@ -79,12 +97,12 @@ describe("facsimile preview model", () => {
     expect(event.stopPropagation).toHaveBeenCalledOnce();
   });
 
-  it("supports one logical editable facsimile with unique geometry on 200 pages", () => {
+  it("supports one logical editable facsimile with unique geometry on 5000 pages", () => {
     let logical = editable;
-    for (let page = 0; page < 200; page += 1) logical = updateFacsimileGeometry(logical, page, { rotation: page, x: page / 1000 });
-    const placements = buildFacsimilePlacements(logical, { application: "all", pages: [] }, 200);
-    expect(placements).toHaveLength(200);
-    expect(facsimileGeometry(logical, 199)).toMatchObject({ rotation: 199, x: 0.199 });
+    for (let page = 0; page < 5_000; page += 1) logical = updateFacsimileGeometry(logical, page, { rotation: page % 360, x: page / 10_000 });
+    const placements = buildFacsimilePlacements(logical, { application: "all", pages: [] }, 5_000);
+    expect(placements).toHaveLength(5_000);
+    expect(facsimileGeometry(logical, 4_999)).toMatchObject({ rotation: 319, x: 0.4999 });
   });
 
   it("does not include facsimile movement or angle in the document preview cache key", () => {

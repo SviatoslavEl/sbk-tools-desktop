@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
+import re
 from typing import Any
 
 
@@ -87,6 +88,9 @@ class FacsimilePlacement:
     opacity: float = 1.0
     pages: list[int] = field(default_factory=list)
     remove_light_background: bool = False
+    region: tuple[float, float, float, float] | None = None
+    randomize_in_region: bool = False
+    random_seed: int = 42
 
     def applies_to(self, page_index: int) -> bool:
         return self.application == "all" or page_index in self.pages
@@ -97,13 +101,36 @@ class FacsimilePlacement:
         if self.application == "all":
             if self.pages:
                 raise ValueError("Режим всех страниц не должен содержать скрытый диапазон.")
-            return
-        if not self.pages:
-            raise ValueError("Пустой диапазон факсимиле запрещён.")
-        if self.application == "current" and len(self.pages) != 1:
-            raise ValueError("Для текущей страницы должен быть передан ровно один номер.")
-        if any(page < 0 or page >= page_count for page in self.pages):
-            raise ValueError("Диапазон факсимиле выходит за пределы документа.")
+        else:
+            if not self.pages:
+                raise ValueError("Пустой диапазон факсимиле запрещён.")
+            if self.application == "current" and len(self.pages) != 1:
+                raise ValueError("Для текущей страницы должен быть передан ровно один номер.")
+            if any(page < 0 or page >= page_count for page in self.pages):
+                raise ValueError("Диапазон факсимиле выходит за пределы документа.")
+        if self.region is not None:
+            rx, ry, rw, rh = self.region
+            if rw <= 0 or rh <= 0 or min(rx, ry, rw, rh) < 0 or rx + rw > 1 or ry + rh > 1:
+                raise ValueError("Область факсимиле должна находиться внутри страницы.")
+
+    def position_for_page(self, page_index: int) -> tuple[float, float]:
+        """Return a deterministic position constrained to the configured region."""
+        if self.region is None:
+            return self.x, self.y
+        rx, ry, rw, rh = self.region
+        max_x = max(rx, rx + rw - self.width)
+        # The stamp height depends on its aspect ratio, so reserve a conservative
+        # square height here and clamp precisely when compositing.
+        max_y = max(ry, ry + rh - min(self.width, rh))
+        if not self.randomize_in_region:
+            return min(max(self.x, rx), max_x), min(max(self.y, ry), max_y)
+
+        def fraction(salt: int) -> float:
+            value = (int(self.random_seed) * 1_664_525 + (page_index + 1) * 1_013_904_223 + salt) & 0xFFFFFFFF
+            value ^= value >> 16
+            return (value & 0xFFFFFFFF) / 0xFFFFFFFF
+
+        return rx + (max_x - rx) * fraction(0), ry + (max_y - ry) * fraction(0x9E3779B9)
 
 
 @dataclass(slots=True)
@@ -126,6 +153,30 @@ class Redaction:
 
 
 @dataclass(slots=True)
+class Annotation:
+    kind: str
+    pages: list[int]
+    x: float
+    y: float
+    width: float
+    height: float
+    color: str = "#ffd84d"
+    intensity: float = 0.6
+
+    def validate_for_document(self, page_count: int) -> None:
+        if self.kind not in {"marker", "stroke", "blur", "print_blur"}:
+            raise ValueError("Неизвестный инструмент обработки страницы.")
+        if not re.fullmatch(r"#[0-9a-fA-F]{6}", self.color):
+            raise ValueError("Цвет инструмента должен быть указан в формате #RRGGBB.")
+        if not self.pages or any(page < 0 or page >= page_count for page in self.pages):
+            raise ValueError("Диапазон инструмента выходит за пределы документа.")
+        values = (self.x, self.y, self.width, self.height)
+        if not all(0 <= value <= 1 for value in values) or self.width <= 0 or self.height <= 0 or self.x + self.width > 1 or self.y + self.height > 1:
+            raise ValueError("Область инструмента должна находиться внутри страницы.")
+        self.intensity = max(0.05, min(1.0, float(self.intensity)))
+
+
+@dataclass(slots=True)
 class ProcessRequest:
     input_path: Path
     output_path: Path
@@ -137,7 +188,9 @@ class ProcessRequest:
     page_order: list[int] = field(default_factory=list)
     page_rotations: dict[int, int] = field(default_factory=dict)
     redactions: list[Redaction] = field(default_factory=list)
+    annotations: list[Annotation] = field(default_factory=list)
     pdfa_enabled: bool = False
+    compression_target_ratio: float | None = None
 
 
 @dataclass(slots=True)

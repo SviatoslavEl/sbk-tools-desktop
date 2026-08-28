@@ -33,12 +33,15 @@ mod database;
 mod intelligence;
 mod workspace;
 use attachments::AttachmentAudit;
-use database::{MODULES, SCHEMA_VERSION, open_database, validated_module};
+use database::{MODULES, SCHEMA_VERSION, open_database, open_database_read_only, validated_module};
 use intelligence::{
     DisabledProvider, IntelligenceProvider, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES,
     ProviderConfiguration, validate_provider_configuration,
 };
-use workspace::{Workspace, ensure_workspace, open_workspace, workspace_pointer_path};
+use workspace::{
+    Workspace, open_workspace, prepare_workspace_location, validate_workspace_layout,
+    workspace_pointer_path,
+};
 
 #[derive(Clone)]
 struct AppState {
@@ -55,6 +58,8 @@ struct WorkspaceInfo {
     configured: bool,
     warning: Option<String>,
     writable: bool,
+    editor: bool,
+    access_message: String,
     schema_version: i64,
     free_space_bytes: u64,
 }
@@ -102,6 +107,11 @@ fn analysis_job_cancel(
     procurement_id: String,
     job_id: String,
 ) -> Result<(), String> {
+    let _maintenance = state
+        .maintenance
+        .lock()
+        .map_err(|_| "Хранилище временно недоступно".to_string())?;
+    state.workspace.require_editor()?;
     intelligence::cancel_analysis_job(&state.workspace.root, &procurement_id, &job_id)
 }
 
@@ -249,12 +259,22 @@ fn parse_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredRecord> {
 
 #[tauri::command]
 fn workspace_info(state: State<'_, AppState>) -> Result<WorkspaceInfo, String> {
+    let editor = state.workspace.is_editor();
+    let access_message = if editor {
+        state.workspace.access_message.clone()
+    } else if state.workspace.writable {
+        "Только просмотр и экспорт: редактор уже работает с общей папкой или блокировка была потеряна. Для повторного получения доступа перезапустите приложение.".to_string()
+    } else {
+        "Только просмотр и экспорт: файловая система не разрешает запись.".to_string()
+    };
     Ok(WorkspaceInfo {
         root: state.workspace.root.to_string_lossy().into_owned(),
         portable: state.workspace.portable,
         configured: state.workspace.configured,
         warning: state.workspace.warning.clone(),
         writable: state.workspace.writable,
+        editor,
+        access_message,
         schema_version: SCHEMA_VERSION,
         free_space_bytes: fs2::available_space(&state.workspace.root).unwrap_or(0),
     })
@@ -266,27 +286,47 @@ fn set_workspace_location(path: String) -> Result<String, String> {
     if selected.as_os_str().is_empty() {
         return Err("Выберите папку".to_string());
     }
+    configure_workspace_location(&selected, &workspace_pointer_path()?)
+}
+
+fn configure_workspace_location(selected: &Path, pointer: &Path) -> Result<String, String> {
     let root = if selected
         .file_name()
         .is_some_and(|name| name == "ProductData")
     {
-        selected
+        selected.to_path_buf()
     } else {
         selected.join("ProductData")
     };
-    ensure_workspace(&root)?;
-    for module in ["contract-experience", "staff", "tender-calendar"] {
-        drop(open_database(&root, module)?);
+    let existing = validate_workspace_layout(&root).is_ok();
+    let _provisional_lease = prepare_workspace_location(&root)?;
+    if !existing {
+        for module in MODULES {
+            drop(open_database(&root, module)?);
+        }
+    } else {
+        for module in MODULES {
+            let connection = open_database_read_only(&root, module)?;
+            let version: i64 = connection
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .map_err(|error| error.to_string())?;
+            if version > SCHEMA_VERSION {
+                return Err(format!(
+                    "База раздела {module} создана более новой версией приложения"
+                ));
+            }
+            let integrity: String = connection
+                .query_row("PRAGMA quick_check", [], |row| row.get(0))
+                .map_err(|error| error.to_string())?;
+            if integrity != "ok" {
+                return Err(format!("База раздела {module} повреждена: {integrity}"));
+            }
+        }
     }
-    let probe = root.join(".write-probe");
-    fs::write(&probe, b"ok")
-        .and_then(|_| fs::remove_file(&probe))
-        .map_err(|error| format!("Выбранная папка недоступна для записи: {error}"))?;
-    let pointer = workspace_pointer_path()?;
     if let Some(parent) = pointer.parent() {
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
-    fs::write(&pointer, root.to_string_lossy().as_bytes()).map_err(|error| error.to_string())?;
+    fs::write(pointer, root.to_string_lossy().as_bytes()).map_err(|error| error.to_string())?;
     Ok(root.to_string_lossy().into_owned())
 }
 
@@ -755,7 +795,7 @@ fn list_records(
     module: String,
     include_archived: Option<bool>,
 ) -> Result<Vec<StoredRecord>, String> {
-    let connection = open_database(&state.workspace.root, &module)?;
+    let connection = open_database_read_only(&state.workspace.root, &module)?;
     let sql = if include_archived.unwrap_or(false) {
         "SELECT id, title, payload, archived, created_at, updated_at FROM records ORDER BY updated_at DESC"
     } else {
@@ -775,7 +815,7 @@ fn get_record(
     module: String,
     id: String,
 ) -> Result<Option<StoredRecord>, String> {
-    let connection = open_database(&state.workspace.root, &module)?;
+    let connection = open_database_read_only(&state.workspace.root, &module)?;
     connection
         .query_row(
             "SELECT id, title, payload, archived, created_at, updated_at FROM records WHERE id = ?1",
@@ -792,7 +832,7 @@ fn record_history(
     module: String,
     id: String,
 ) -> Result<Vec<HistoryEntry>, String> {
-    let connection = open_database(&state.workspace.root, &module)?;
+    let connection = open_database_read_only(&state.workspace.root, &module)?;
     let mut statement = connection.prepare(
         "SELECT id, action, created_at, snapshot FROM history WHERE record_id = ?1 ORDER BY created_at DESC LIMIT 100",
     ).map_err(|error| error.to_string())?;
@@ -819,6 +859,7 @@ fn restore_history_version(
     id: String,
     history_id: i64,
 ) -> Result<StoredRecord, String> {
+    state.workspace.require_editor()?;
     let _maintenance = state
         .maintenance
         .lock()
@@ -862,6 +903,7 @@ fn upsert_record(
     title: String,
     mut payload: Value,
 ) -> Result<StoredRecord, String> {
+    state.workspace.require_editor()?;
     let _maintenance = state
         .maintenance
         .lock()
@@ -1028,6 +1070,7 @@ fn configured_history_limit(root: &Path) -> i64 {
 
 #[tauri::command]
 fn prune_history(state: State<'_, AppState>, limit: i64) -> Result<usize, String> {
+    state.workspace.require_editor()?;
     if !(10..=1000).contains(&limit) {
         return Err("Хранить можно от 10 до 1000 изменений на запись".to_string());
     }
@@ -1059,6 +1102,7 @@ fn import_records_atomic(
     module: String,
     records: Vec<ImportRecord>,
 ) -> Result<usize, String> {
+    state.workspace.require_editor()?;
     if records.is_empty() || records.len() > 10_000 {
         return Err("Пакет должен содержать от 1 до 10 000 записей".to_string());
     }
@@ -1097,6 +1141,476 @@ fn import_records_atomic(
     Ok(count)
 }
 
+const COMPANY_DIRECTORY_DRAFT_KEY: &str = "company-directory-v1";
+
+fn validate_company_directory_payload(directory: &Value) -> Result<(), String> {
+    let companies = directory
+        .get("companies")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Справочник компаний повреждён: отсутствует список компаний".to_string())?;
+    if companies.len() > 100_000 {
+        return Err("Справочник компаний превышает допустимый размер".to_string());
+    }
+    let mut ids = HashSet::new();
+    let mut names: HashMap<String, Option<String>> = HashMap::new();
+    let mut inns = HashSet::new();
+    for company in companies {
+        let id = company
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let name = company
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let normalized_name: String = name
+            .to_lowercase()
+            .replace('ё', "е")
+            .chars()
+            .map(|character| {
+                if character.is_alphanumeric() {
+                    character
+                } else {
+                    ' '
+                }
+            })
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let inn: String = company
+            .get("inn")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .chars()
+            .filter(char::is_ascii_digit)
+            .collect();
+        let conflicting_name = names.get(&normalized_name).is_some_and(|previous_inn| {
+            inn.is_empty()
+                || previous_inn.as_deref().is_none_or(str::is_empty)
+                || previous_inn.as_deref() == Some(inn.as_str())
+        });
+        if Uuid::parse_str(id).is_err()
+            || name.trim().is_empty()
+            || !ids.insert(id)
+            || conflicting_name
+            || (!inn.is_empty() && !inns.insert(inn.clone()))
+        {
+            return Err(
+                "Справочник компаний содержит некорректную или повторяющуюся карточку".to_string(),
+            );
+        }
+        names.entry(normalized_name).or_insert_with(|| {
+            if inn.is_empty() {
+                None
+            } else {
+                Some(inn.clone())
+            }
+        });
+    }
+    let valid_types = [
+        "Головная компания",
+        "Дочерняя компания",
+        "Филиал",
+        "Компания группы",
+        "Иная связь",
+    ];
+    let mut parents: HashMap<String, HashSet<String>> = HashMap::new();
+    for company in companies {
+        let id = company
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let mut structural_targets: HashMap<&str, &str> = HashMap::new();
+        for relation in company
+            .get("affiliations")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let target = relation
+                .get("targetCompanyId")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let relation_type = relation
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if !ids.contains(target) || target == id || !valid_types.contains(&relation_type) {
+                return Err("Справочник компаний содержит некорректную связь".to_string());
+            }
+            if matches!(
+                relation_type,
+                "Головная компания" | "Дочерняя компания" | "Филиал"
+            ) {
+                if let Some(previous) = structural_targets.insert(target, relation_type)
+                    && previous != relation_type
+                {
+                    return Err("Справочник компаний содержит противоречивые связи".to_string());
+                }
+                let (child, parent) = if relation_type == "Головная компания" {
+                    (id, target)
+                } else {
+                    (target, id)
+                };
+                parents
+                    .entry(child.to_string())
+                    .or_default()
+                    .insert(parent.to_string());
+            }
+        }
+    }
+    fn has_cycle(
+        id: &str,
+        parents: &HashMap<String, HashSet<String>>,
+        visiting: &mut HashSet<String>,
+        visited: &mut HashSet<String>,
+    ) -> bool {
+        if visiting.contains(id) {
+            return true;
+        }
+        if visited.contains(id) {
+            return false;
+        }
+        visiting.insert(id.to_string());
+        if parents
+            .get(id)
+            .into_iter()
+            .flatten()
+            .any(|parent| has_cycle(parent, parents, visiting, visited))
+        {
+            return true;
+        }
+        visiting.remove(id);
+        visited.insert(id.to_string());
+        false
+    }
+    let mut visiting = HashSet::new();
+    let mut visited = HashSet::new();
+    if ids
+        .iter()
+        .any(|id| has_cycle(id, &parents, &mut visiting, &mut visited))
+    {
+        return Err("Связи компаний образуют цикл".to_string());
+    }
+    Ok(())
+}
+
+fn write_company_directory(
+    transaction: &rusqlite::Transaction<'_>,
+    directory: &Value,
+    now: &str,
+) -> Result<(), String> {
+    validate_company_directory_payload(directory)?;
+    transaction
+        .execute(
+            "INSERT INTO drafts(key, payload, updated_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(key) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at",
+            params![
+                COMPANY_DIRECTORY_DRAFT_KEY,
+                serde_json::to_string(directory).map_err(|error| error.to_string())?,
+                now
+            ],
+        )
+        .map_err(|error| format!("Не удалось сохранить справочник компаний: {error}"))?;
+    Ok(())
+}
+
+fn validate_contract_company_references(
+    records: &[ImportRecord],
+    directory: &Value,
+) -> Result<(), String> {
+    let company_ids: HashSet<&str> = directory
+        .get("companies")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|company| company.get("id").and_then(Value::as_str))
+        .collect();
+    for record in records {
+        for field in ["performingLegalEntityId", "customerCompanyId"] {
+            let id = record
+                .payload
+                .get(field)
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if !id.is_empty() && !company_ids.contains(id) {
+                return Err(format!(
+                    "Договор {} ссылается на отсутствующую компанию",
+                    record.id
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn import_contract_bundle_transaction(
+    connection: &mut rusqlite::Connection,
+    records: Vec<ImportRecord>,
+    directory: &Value,
+) -> Result<usize, String> {
+    if records.is_empty() || records.len() > 10_000 {
+        return Err("Пакет должен содержать от 1 до 10 000 договоров".to_string());
+    }
+    let mut ids = HashSet::new();
+    if records.iter().any(|record| {
+        record.title.trim().is_empty()
+            || Uuid::parse_str(&record.id).is_err()
+            || !ids.insert(record.id.clone())
+    }) {
+        return Err("Пакет содержит пустое название или повторяющийся идентификатор".to_string());
+    }
+    validate_company_directory_payload(directory)?;
+    validate_contract_company_references(&records, directory)?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+    let now = Utc::now().to_rfc3339();
+    for record in records {
+        let payload = serde_json::to_string(&record.payload).map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "INSERT INTO records(id, title, payload, archived, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 0, ?4, ?4)",
+                params![record.id, record.title.trim(), payload, now],
+            )
+            .map_err(|error| format!("Пакет договоров и справочник не сохранены: {error}"))?;
+        transaction
+            .execute(
+                "INSERT INTO history(record_id, action, snapshot, created_at) VALUES (?1, 'created', NULL, ?2)",
+                params![record.id, now],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    write_company_directory(&transaction, directory, &now)?;
+    let count = ids.len();
+    transaction
+        .commit()
+        .map_err(|error| format!("Пакет договоров и справочник не сохранены: {error}"))?;
+    Ok(count)
+}
+
+#[tauri::command]
+fn import_contracts_with_company_directory_atomic(
+    state: State<'_, AppState>,
+    records: Vec<ImportRecord>,
+    directory: Value,
+) -> Result<usize, String> {
+    state.workspace.require_editor()?;
+    let _maintenance = state
+        .maintenance
+        .lock()
+        .map_err(|_| "Хранилище временно недоступно".to_string())?;
+    let mut connection = open_database(&state.workspace.root, "contract-experience")?;
+    import_contract_bundle_transaction(&mut connection, records, &directory)
+}
+
+fn update_contract_bundle_transaction(
+    connection: &mut rusqlite::Connection,
+    records: Vec<ImportRecord>,
+    directory: &Value,
+    history_limit: i64,
+) -> Result<usize, String> {
+    if records.len() > 10_000 {
+        return Err("За одно изменение можно обновить не более 10 000 договоров".to_string());
+    }
+    let mut ids = HashSet::new();
+    if records.iter().any(|record| {
+        record.title.trim().is_empty()
+            || Uuid::parse_str(&record.id).is_err()
+            || !ids.insert(record.id.clone())
+    }) {
+        return Err(
+            "Изменение содержит пустое название или повторяющийся идентификатор".to_string(),
+        );
+    }
+    validate_company_directory_payload(directory)?;
+    validate_contract_company_references(&records, directory)?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+    let now = Utc::now().to_rfc3339();
+    for record in records {
+        let previous: Option<String> = transaction
+            .query_row(
+                "SELECT payload FROM records WHERE id = ?1 AND archived = 0",
+                [&record.id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let previous =
+            previous.ok_or_else(|| format!("Связанный договор {} не найден", record.id))?;
+        let payload = serde_json::to_string(&record.payload).map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "UPDATE records SET title = ?1, payload = ?2, updated_at = ?3 WHERE id = ?4 AND archived = 0",
+                params![record.title.trim(), payload, now, record.id],
+            )
+            .map_err(|error| format!("Не удалось обновить связанные договоры: {error}"))?;
+        transaction
+            .execute(
+                "INSERT INTO history(record_id, action, snapshot, created_at) VALUES (?1, 'updated', ?2, ?3)",
+                params![record.id, previous, now],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "DELETE FROM history WHERE record_id = ?1 AND id NOT IN
+                 (SELECT id FROM history WHERE record_id = ?1 ORDER BY id DESC LIMIT ?2)",
+                params![record.id, history_limit],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    write_company_directory(&transaction, directory, &now)?;
+    let count = ids.len();
+    transaction
+        .commit()
+        .map_err(|error| format!("Изменение компаний и договоров отменено: {error}"))?;
+    Ok(count)
+}
+
+#[tauri::command]
+fn update_contracts_and_company_directory_atomic(
+    state: State<'_, AppState>,
+    records: Vec<ImportRecord>,
+    directory: Value,
+) -> Result<usize, String> {
+    state.workspace.require_editor()?;
+    let _maintenance = state
+        .maintenance
+        .lock()
+        .map_err(|_| "Хранилище временно недоступно".to_string())?;
+    let history_limit = configured_history_limit(&state.workspace.root);
+    let mut connection = open_database(&state.workspace.root, "contract-experience")?;
+    update_contract_bundle_transaction(&mut connection, records, &directory, history_limit)
+}
+
+fn save_contract_bundle_transaction(
+    connection: &mut Connection,
+    record_id: &str,
+    title: &str,
+    payload: &Value,
+    directory: &Value,
+    history_limit: i64,
+) -> Result<(), String> {
+    if title.trim().is_empty() {
+        return Err("Укажите название договора".to_string());
+    }
+    validate_company_directory_payload(directory)?;
+    validate_contract_company_references(
+        &[ImportRecord {
+            id: record_id.to_string(),
+            title: title.to_string(),
+            payload: payload.clone(),
+        }],
+        directory,
+    )?;
+    let now = Utc::now().to_rfc3339();
+    let payload_text = serde_json::to_string(payload).map_err(|error| error.to_string())?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+    let previous: Option<String> = transaction
+        .query_row(
+            "SELECT payload FROM records WHERE id = ?1",
+            [record_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute(
+            "INSERT INTO records(id, title, payload, archived, created_at, updated_at)
+             VALUES (?1, ?2, ?3, 0, ?4, ?4)
+             ON CONFLICT(id) DO UPDATE SET title = excluded.title, payload = excluded.payload,
+                 archived = 0, updated_at = excluded.updated_at",
+            params![record_id, title.trim(), payload_text, now],
+        )
+        .map_err(|error| format!("Не удалось сохранить договор: {error}"))?;
+    transaction
+        .execute(
+            "INSERT INTO history(record_id, action, snapshot, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                record_id,
+                if previous.is_some() {
+                    "updated"
+                } else {
+                    "created"
+                },
+                previous,
+                now
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute(
+            "DELETE FROM history WHERE record_id = ?1 AND id NOT IN
+             (SELECT id FROM history WHERE record_id = ?1 ORDER BY id DESC LIMIT ?2)",
+            params![record_id, history_limit],
+        )
+        .map_err(|error| error.to_string())?;
+    write_company_directory(&transaction, directory, &now)?;
+    transaction
+        .commit()
+        .map_err(|error| format!("Договор и справочник компаний не сохранены: {error}"))
+}
+
+#[tauri::command]
+fn save_contract_with_company_directory_atomic(
+    state: State<'_, AppState>,
+    id: Option<String>,
+    title: String,
+    mut payload: Value,
+    directory: Value,
+) -> Result<StoredRecord, String> {
+    state.workspace.require_editor()?;
+    let _maintenance = state
+        .maintenance
+        .lock()
+        .map_err(|_| "Хранилище временно недоступно".to_string())?;
+    let record_id = id.unwrap_or_else(|| Uuid::new_v4().to_string());
+    let history_limit = configured_history_limit(&state.workspace.root);
+    let mut attachment_moves = Vec::new();
+    finalize_staged_attachments(
+        &mut payload,
+        &state.workspace.root,
+        "contract-experience",
+        &record_id,
+        &mut attachment_moves,
+    )?;
+    let mut connection = open_database(&state.workspace.root, "contract-experience")?;
+    let result = save_contract_bundle_transaction(
+        &mut connection,
+        &record_id,
+        &title,
+        &payload,
+        &directory,
+        history_limit,
+    );
+    if let Err(error) = result {
+        rollback_attachment_moves(&attachment_moves);
+        return Err(error);
+    }
+    let staging_session = state
+        .workspace
+        .root
+        .join("attachment-staging")
+        .join("contract-experience")
+        .join(safe_file_name(&record_id));
+    if staging_session.is_dir() {
+        let _ = fs::remove_dir_all(staging_session);
+    }
+    connection
+        .query_row(
+            "SELECT id, title, payload, archived, created_at, updated_at FROM records WHERE id = ?1",
+            [&record_id],
+            parse_record,
+        )
+        .map_err(|error| error.to_string())
+}
+
 #[tauri::command]
 fn archive_record(
     state: State<'_, AppState>,
@@ -1104,6 +1618,7 @@ fn archive_record(
     id: String,
     archived: bool,
 ) -> Result<(), String> {
+    state.workspace.require_editor()?;
     let _maintenance = state
         .maintenance
         .lock()
@@ -1135,6 +1650,7 @@ fn save_draft(
     key: String,
     payload: Value,
 ) -> Result<(), String> {
+    state.workspace.require_editor()?;
     if key.trim().is_empty() || key.len() > 100 {
         return Err("Некорректный ключ черновика".to_string());
     }
@@ -1163,7 +1679,7 @@ fn read_draft(
     module: String,
     key: String,
 ) -> Result<Option<Value>, String> {
-    let connection = open_database(&state.workspace.root, &module)?;
+    let connection = open_database_read_only(&state.workspace.root, &module)?;
     let payload: Option<String> = connection
         .query_row("SELECT payload FROM drafts WHERE key = ?1", [key], |row| {
             row.get(0)
@@ -1179,6 +1695,7 @@ fn read_draft(
 
 #[tauri::command]
 fn clear_draft(state: State<'_, AppState>, module: String, key: String) -> Result<(), String> {
+    state.workspace.require_editor()?;
     let _maintenance = state
         .maintenance
         .lock()
@@ -1192,6 +1709,7 @@ fn clear_draft(state: State<'_, AppState>, module: String, key: String) -> Resul
 
 #[tauri::command]
 fn delete_record(state: State<'_, AppState>, module: String, id: String) -> Result<(), String> {
+    state.workspace.require_editor()?;
     let _maintenance = state
         .maintenance
         .lock()
@@ -1263,6 +1781,7 @@ fn copy_attachment(
     module: String,
     record_id: String,
 ) -> Result<AttachmentInfo, String> {
+    state.workspace.require_editor()?;
     let _maintenance = state
         .maintenance
         .lock()
@@ -1342,6 +1861,7 @@ fn discard_staged_attachments(
     module: String,
     record_id: String,
 ) -> Result<(), String> {
+    state.workspace.require_editor()?;
     let _maintenance = state
         .maintenance
         .lock()
@@ -1364,6 +1884,7 @@ fn discard_staged_attachments(
 
 #[tauri::command]
 fn delete_attachment(state: State<'_, AppState>, relative_path: String) -> Result<(), String> {
+    state.workspace.require_editor()?;
     let _maintenance = state
         .maintenance
         .lock()
@@ -1395,6 +1916,9 @@ fn delete_attachment(state: State<'_, AppState>, relative_path: String) -> Resul
 
 #[tauri::command]
 fn audit_attachments(state: State<'_, AppState>, remove: bool) -> Result<AttachmentAudit, String> {
+    if remove {
+        state.workspace.require_editor()?;
+    }
     let _maintenance = state
         .maintenance
         .lock()
@@ -1511,6 +2035,19 @@ fn collect_backup_files(
     Ok(())
 }
 
+struct PartialBackup {
+    path: PathBuf,
+    committed: bool,
+}
+
+impl Drop for PartialBackup {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
 fn create_backup_impl(workspace: &Workspace, module: Option<String>) -> Result<BackupInfo, String> {
     let selected_modules: Vec<&str> = match module.as_deref() {
         Some(name) => vec![validated_module(name)?],
@@ -1574,6 +2111,10 @@ fn create_backup_impl(workspace: &Workspace, module: Option<String>) -> Result<B
     );
     let destination = workspace.root.join("backups").join(&file_name);
     let temporary = destination.with_extension("sbkbackup.part");
+    let mut partial = PartialBackup {
+        path: temporary.clone(),
+        committed: false,
+    };
     let mut backup_files = Vec::new();
     for name in &selected_modules {
         collect_backup_files(&snapshot_path.join(name), name, &mut backup_files)?;
@@ -1626,10 +2167,8 @@ fn create_backup_impl(workspace: &Workspace, module: Option<String>) -> Result<B
     }
     let completed = archive.finish().map_err(|error| error.to_string())?;
     completed.sync_all().map_err(|error| error.to_string())?;
-    if let Err(error) = fs::rename(&temporary, &destination) {
-        let _ = fs::remove_file(&temporary);
-        return Err(error.to_string());
-    }
+    fs::rename(&temporary, &destination).map_err(|error| error.to_string())?;
+    partial.committed = true;
     let size_bytes = fs::metadata(&destination)
         .map_err(|error| error.to_string())?
         .len();
@@ -1655,6 +2194,7 @@ fn create_backup_impl(workspace: &Workspace, module: Option<String>) -> Result<B
 
 #[tauri::command]
 fn create_backup(state: State<'_, AppState>, module: Option<String>) -> Result<BackupInfo, String> {
+    state.workspace.require_editor()?;
     let _maintenance = state
         .maintenance
         .lock()
@@ -1675,7 +2215,7 @@ fn create_registry_archive_impl(
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
-    let connection = open_database(&workspace.root, module)?;
+    let connection = open_database_read_only(&workspace.root, module)?;
     let mut statement = connection
         .prepare("SELECT id, title, payload, archived, created_at, updated_at FROM records WHERE archived = 0 ORDER BY title")
         .map_err(|error| error.to_string())?;
@@ -1885,6 +2425,7 @@ fn create_encrypted_backup(
     module: Option<String>,
     password: String,
 ) -> Result<BackupInfo, String> {
+    state.workspace.require_editor()?;
     let _maintenance = state
         .maintenance
         .lock()
@@ -1931,6 +2472,7 @@ fn restore_encrypted_backup(
     path: String,
     password: String,
 ) -> Result<(), String> {
+    state.workspace.require_editor()?;
     let directory = state
         .workspace
         .root
@@ -2010,6 +2552,7 @@ fn set_backup_pinned(
     file_name: String,
     pinned: bool,
 ) -> Result<(), String> {
+    state.workspace.require_editor()?;
     let _maintenance = state
         .maintenance
         .lock()
@@ -2029,6 +2572,7 @@ fn set_backup_pinned(
 
 #[tauri::command]
 fn delete_backup(state: State<'_, AppState>, file_name: String) -> Result<(), String> {
+    state.workspace.require_editor()?;
     let _maintenance = state
         .maintenance
         .lock()
@@ -2050,6 +2594,7 @@ fn rotate_backups(
     keep: usize,
     max_age_days: u64,
 ) -> Result<usize, String> {
+    state.workspace.require_editor()?;
     if !(1..=100).contains(&keep) {
         return Err("Хранить можно от 1 до 100 незакреплённых копий".to_string());
     }
@@ -2060,8 +2605,12 @@ fn rotate_backups(
         .maintenance
         .lock()
         .map_err(|_| "Хранилище временно недоступно".to_string())?;
-    let pinned = pinned_backups(&state.workspace.root);
-    let mut files: Vec<_> = fs::read_dir(state.workspace.root.join("backups"))
+    rotate_backups_impl(&state.workspace.root, keep, max_age_days)
+}
+
+fn rotate_backups_impl(root: &Path, keep: usize, max_age_days: u64) -> Result<usize, String> {
+    let pinned = pinned_backups(root);
+    let mut files: Vec<_> = fs::read_dir(root.join("backups"))
         .map_err(|error| error.to_string())?
         .filter_map(Result::ok)
         .filter(|entry| {
@@ -2263,6 +2812,7 @@ fn rollback_workspace_swaps(swaps: &[(PathBuf, PathBuf, bool)]) {
 
 #[tauri::command]
 fn restore_backup(state: State<'_, AppState>, path: String) -> Result<(), String> {
+    state.workspace.require_editor()?;
     let _maintenance = state
         .maintenance
         .lock()
@@ -2961,12 +3511,19 @@ fn delete_runtime_file(state: State<'_, AppState>, path: String) -> Result<(), S
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let workspace = open_workspace().expect("SBK Tools workspace could not be opened");
-    for module in ["contract-experience", "staff", "tender-calendar"] {
-        open_database(&workspace.root, module)
-            .unwrap_or_else(|error| panic!("SBK Tools could not initialize {module}: {error}"));
+    for module in MODULES {
+        if workspace.is_editor() {
+            open_database(&workspace.root, module)
+                .unwrap_or_else(|error| panic!("SBK Tools could not initialize {module}: {error}"));
+        } else {
+            open_database_read_only(&workspace.root, module)
+                .unwrap_or_else(|error| panic!("SBK Tools could not read {module}: {error}"));
+        }
     }
-    intelligence::recover_interrupted_jobs(&workspace.root)
-        .expect("SBK Tools intelligence queue could not be recovered");
+    if workspace.is_editor() {
+        intelligence::recover_interrupted_jobs(&workspace.root)
+            .expect("SBK Tools intelligence queue could not be recovered");
+    }
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
@@ -2998,6 +3555,9 @@ pub fn run() {
             restore_history_version,
             upsert_record,
             import_records_atomic,
+            import_contracts_with_company_directory_atomic,
+            update_contracts_and_company_directory_atomic,
+            save_contract_with_company_directory_atomic,
             archive_record,
             save_draft,
             read_draft,
@@ -3033,6 +3593,296 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workspace::ensure_workspace;
+
+    fn company_directory_value(company_id: &str, name: &str) -> Value {
+        serde_json::json!({
+            "schemaVersion": 1,
+            "companies": [{ "id": company_id, "name": name }]
+        })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_read_only_workspace_can_be_selected_without_writing_into_it() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let parent = std::env::temp_dir().join(format!("sbk-readonly-select-{}", Uuid::new_v4()));
+        let root = parent.join("ProductData");
+        ensure_workspace(&root).expect("workspace");
+        for module in MODULES {
+            drop(open_database(&root, module).expect("database"));
+        }
+        for entry in WalkDir::new(&root).contents_first(true) {
+            let entry = entry.expect("workspace entry");
+            let mode = if entry.file_type().is_dir() {
+                0o555
+            } else {
+                0o444
+            };
+            fs::set_permissions(entry.path(), fs::Permissions::from_mode(mode))
+                .expect("read-only permissions");
+        }
+        let pointer = parent.join("local-config").join("workspace.txt");
+        let selected = configure_workspace_location(&root, &pointer).expect("read-only selection");
+        assert_eq!(PathBuf::from(selected), root);
+        assert_eq!(
+            fs::read_to_string(&pointer).expect("pointer"),
+            root.to_string_lossy()
+        );
+        assert!(!root.join(".write-probe").exists());
+
+        for entry in WalkDir::new(&root).contents_first(true) {
+            let entry = entry.expect("workspace entry");
+            let mode = if entry.file_type().is_dir() {
+                0o755
+            } else {
+                0o644
+            };
+            fs::set_permissions(entry.path(), fs::Permissions::from_mode(mode))
+                .expect("restore permissions");
+        }
+        let _ = fs::remove_dir_all(parent);
+    }
+
+    #[test]
+    fn company_directory_backend_rejects_duplicate_inn_and_broken_affiliations() {
+        let first = Uuid::new_v4().to_string();
+        let second = Uuid::new_v4().to_string();
+        let duplicate_inn = serde_json::json!({ "companies": [
+            { "id": first, "name": "Первая", "inn": "7701" },
+            { "id": second, "name": "Вторая", "inn": "77-01" }
+        ] });
+        assert!(validate_company_directory_payload(&duplicate_inn).is_err());
+
+        let first = Uuid::new_v4().to_string();
+        let second = Uuid::new_v4().to_string();
+        let cycle = serde_json::json!({ "companies": [
+            { "id": first, "name": "Первая", "affiliations": [{ "targetCompanyId": second, "type": "Головная компания" }] },
+            { "id": second, "name": "Вторая", "affiliations": [{ "targetCompanyId": first, "type": "Головная компания" }] }
+        ] });
+        assert!(
+            validate_company_directory_payload(&cycle)
+                .unwrap_err()
+                .contains("цикл")
+        );
+
+        let missing = serde_json::json!({ "companies": [
+            { "id": Uuid::new_v4().to_string(), "name": "Первая", "affiliations": [{ "targetCompanyId": Uuid::new_v4().to_string(), "type": "Иная связь" }] }
+        ] });
+        assert!(
+            validate_company_directory_payload(&missing)
+                .unwrap_err()
+                .contains("связь")
+        );
+    }
+
+    #[test]
+    fn contract_import_and_company_directory_commit_or_rollback_together() {
+        let root = std::env::temp_dir().join(format!("sbk-company-import-{}", Uuid::new_v4()));
+        ensure_workspace(&root).expect("workspace");
+        let mut connection = open_database(&root, "contract-experience").expect("database");
+        let collision = Uuid::new_v4().to_string();
+        connection.execute(
+            "INSERT INTO records(id,title,payload,archived,created_at,updated_at) VALUES (?1,'existing','{}',0,'now','now')",
+            [&collision],
+        ).expect("seed");
+        let first = Uuid::new_v4().to_string();
+        let company_id = Uuid::new_v4().to_string();
+        let result = import_contract_bundle_transaction(
+            &mut connection,
+            vec![
+                ImportRecord {
+                    id: first.clone(),
+                    title: "first".into(),
+                    payload: serde_json::json!({"number":"1"}),
+                },
+                ImportRecord {
+                    id: collision,
+                    title: "collision".into(),
+                    payload: serde_json::json!({"number":"2"}),
+                },
+            ],
+            &company_directory_value(&company_id, "ООО Тест"),
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM records WHERE id = ?1",
+                    [&first],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM drafts WHERE key = ?1",
+                    [COMPANY_DIRECTORY_DRAFT_KEY],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+
+        let successful = Uuid::new_v4().to_string();
+        assert_eq!(
+            import_contract_bundle_transaction(
+                &mut connection,
+                vec![ImportRecord {
+                    id: successful.clone(),
+                    title: "success".into(),
+                    payload: serde_json::json!({"number":"3"})
+                }],
+                &company_directory_value(&company_id, "ООО Тест"),
+            )
+            .expect("atomic import"),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM records WHERE id = ?1",
+                    [&successful],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM drafts WHERE key = ?1",
+                    [COMPANY_DIRECTORY_DRAFT_KEY],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+        drop(connection);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn company_rename_rolls_back_all_contracts_and_directory_on_missing_record() {
+        let root = std::env::temp_dir().join(format!("sbk-company-update-{}", Uuid::new_v4()));
+        ensure_workspace(&root).expect("workspace");
+        let mut connection = open_database(&root, "contract-experience").expect("database");
+        let existing = Uuid::new_v4().to_string();
+        connection.execute(
+            "INSERT INTO records(id,title,payload,archived,created_at,updated_at) VALUES (?1,'old','{\"customer\":\"old\"}',0,'now','now')",
+            [&existing],
+        ).expect("seed");
+        let old_company = Uuid::new_v4().to_string();
+        let transaction = connection.transaction().expect("draft transaction");
+        write_company_directory(
+            &transaction,
+            &company_directory_value(&old_company, "Старое"),
+            "now",
+        )
+        .expect("old directory");
+        transaction.commit().expect("old commit");
+        let missing = Uuid::new_v4().to_string();
+        let new_company = Uuid::new_v4().to_string();
+        let result = update_contract_bundle_transaction(
+            &mut connection,
+            vec![
+                ImportRecord {
+                    id: existing.clone(),
+                    title: "new".into(),
+                    payload: serde_json::json!({"customer":"new"}),
+                },
+                ImportRecord {
+                    id: missing,
+                    title: "missing".into(),
+                    payload: serde_json::json!({}),
+                },
+            ],
+            &company_directory_value(&new_company, "Новое"),
+            100,
+        );
+        assert!(result.is_err());
+        let payload: String = connection
+            .query_row(
+                "SELECT payload FROM records WHERE id = ?1",
+                [&existing],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(payload, "{\"customer\":\"old\"}");
+        let directory: String = connection
+            .query_row(
+                "SELECT payload FROM drafts WHERE key = ?1",
+                [COMPANY_DIRECTORY_DRAFT_KEY],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(directory.contains("Старое"));
+        assert!(!directory.contains("Новое"));
+        drop(connection);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn individual_contract_and_company_directory_roll_back_together() {
+        let root = std::env::temp_dir().join(format!("sbk-company-single-{}", Uuid::new_v4()));
+        ensure_workspace(&root).expect("workspace");
+        let mut connection = open_database(&root, "contract-experience").expect("database");
+        let record_id = Uuid::new_v4().to_string();
+        let company_id = Uuid::new_v4().to_string();
+        connection
+            .execute(
+                "INSERT INTO records(id,title,payload,archived,created_at,updated_at) VALUES (?1,'old','{\"number\":\"old\"}',0,'now','now')",
+                [&record_id],
+            )
+            .expect("seed contract");
+        let transaction = connection.transaction().expect("draft transaction");
+        write_company_directory(
+            &transaction,
+            &company_directory_value(&company_id, "Старое"),
+            "now",
+        )
+        .expect("seed directory");
+        transaction.commit().expect("seed commit");
+        connection
+            .execute_batch(
+                "CREATE TRIGGER reject_directory_update BEFORE UPDATE ON drafts
+                 WHEN NEW.key = 'company-directory-v1'
+                 BEGIN SELECT RAISE(ABORT, 'synthetic directory failure'); END;",
+            )
+            .expect("failure trigger");
+
+        let result = save_contract_bundle_transaction(
+            &mut connection,
+            &record_id,
+            "new",
+            &serde_json::json!({"number":"new", "customerCompanyId": company_id}),
+            &company_directory_value(&company_id, "Новое"),
+            100,
+        );
+        assert!(result.is_err());
+        let payload: String = connection
+            .query_row(
+                "SELECT payload FROM records WHERE id = ?1",
+                [&record_id],
+                |row| row.get(0),
+            )
+            .expect("contract payload");
+        assert_eq!(payload, "{\"number\":\"old\"}");
+        let directory: String = connection
+            .query_row(
+                "SELECT payload FROM drafts WHERE key = ?1",
+                [COMPANY_DIRECTORY_DRAFT_KEY],
+                |row| row.get(0),
+            )
+            .expect("directory");
+        assert!(directory.contains("Старое"));
+        assert!(!directory.contains("Новое"));
+        drop(connection);
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn attachment_sessions_accept_uuid_and_legacy_demo_ids_only() {
@@ -3109,21 +3959,7 @@ mod tests {
     fn backup_uses_consistent_sqlite_snapshot_and_checksums() {
         let root = std::env::temp_dir().join(format!("sbk-tools-backup-{}", Uuid::new_v4()));
         ensure_workspace(&root).expect("workspace");
-        let lock = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(root.join(".workspace.lock"))
-            .expect("lock");
-        let workspace = Workspace {
-            root: root.clone(),
-            portable: false,
-            configured: true,
-            warning: None,
-            writable: true,
-            _lock: lock,
-        };
+        let workspace = Workspace::for_test(root.clone(), true);
         let connection = open_database(&root, "calculator").expect("database");
         connection
             .execute(
@@ -3172,24 +4008,10 @@ mod tests {
     }
 
     #[test]
-    fn registry_archive_contains_records_and_every_referenced_attachment() {
+    fn read_only_viewer_exports_records_and_attachments_outside_workspace() {
         let root = std::env::temp_dir().join(format!("sbk-tools-export-{}", Uuid::new_v4()));
         ensure_workspace(&root).expect("workspace");
-        let lock = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(root.join(".workspace.lock"))
-            .expect("lock");
-        let workspace = Workspace {
-            root: root.clone(),
-            portable: false,
-            configured: true,
-            warning: None,
-            writable: true,
-            _lock: lock,
-        };
+        let workspace = Workspace::for_test(root.clone(), false);
         let relative = "attachments/staff/person/certificate.pdf";
         let attachment = root.join(relative);
         fs::create_dir_all(attachment.parent().expect("attachment parent"))
@@ -3210,7 +4032,7 @@ mod tests {
             [serde_json::json!({"documents": [{"relativePath": excluded_relative}]}).to_string()],
         ).expect("insert excluded");
         drop(connection);
-        let destination = root.join("exports").join("staff.zip");
+        let destination = root.with_extension("viewer-export.zip");
         let selected = HashSet::from(["person".to_string()]);
         create_registry_archive_impl(&workspace, "staff", &destination, Some(&selected))
             .expect("archive");
@@ -3227,6 +4049,7 @@ mod tests {
         assert!(archive.by_name(relative).is_ok());
         assert!(archive.by_name(excluded_relative).is_err());
         drop(archive);
+        fs::remove_file(destination).expect("remove export");
         let _ = fs::remove_dir_all(root);
     }
 
@@ -3237,21 +4060,7 @@ mod tests {
 
         let root = std::env::temp_dir().join(format!("sbk-tools-export-link-{}", Uuid::new_v4()));
         ensure_workspace(&root).expect("workspace");
-        let lock = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(root.join(".workspace.lock"))
-            .expect("lock");
-        let workspace = Workspace {
-            root: root.clone(),
-            portable: false,
-            configured: true,
-            warning: None,
-            writable: true,
-            _lock: lock,
-        };
+        let workspace = Workspace::for_test(root.clone(), true);
         let outside = root.with_extension("secret.txt");
         fs::write(&outside, b"secret").expect("outside file");
         let relative = "attachments/staff/person/linked.pdf";
@@ -3401,6 +4210,38 @@ mod tests {
             fs::read(restored).expect("restored"),
             b"synthetic non-confidential backup"
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn partial_backup_guard_removes_unfinished_plaintext() {
+        let path =
+            std::env::temp_dir().join(format!("sbk-partial-{}.sbkbackup.part", Uuid::new_v4()));
+        fs::write(&path, b"partial confidential backup").expect("partial file");
+        {
+            let _guard = PartialBackup {
+                path: path.clone(),
+                committed: false,
+            };
+        }
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn backup_rotation_keeps_newest_and_all_pinned_copies() {
+        let root = std::env::temp_dir().join(format!("sbk-rotation-{}", Uuid::new_v4()));
+        ensure_workspace(&root).expect("workspace");
+        let backups = root.join("backups");
+        let pinned = "pinned.sbkbackup";
+        fs::write(backups.join("old.sbkbackup"), b"old").expect("old");
+        std::thread::sleep(Duration::from_millis(5));
+        fs::write(backups.join("new.sbkbackup"), b"new").expect("new");
+        fs::write(backups.join(pinned), b"pinned").expect("pinned");
+        write_pinned_backups(&root, &HashSet::from([pinned.to_string()])).expect("pin");
+        assert_eq!(rotate_backups_impl(&root, 1, 3650).expect("rotation"), 1);
+        assert!(!backups.join("old.sbkbackup").exists());
+        assert!(backups.join("new.sbkbackup").exists());
+        assert!(backups.join(pinned).exists());
         let _ = fs::remove_dir_all(root);
     }
 

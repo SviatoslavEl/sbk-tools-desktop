@@ -15,10 +15,12 @@ export interface ContractDocument {
 }
 
 export interface ContractData {
+  performingLegalEntityId: string;
   performingLegalEntity: string;
   number: string;
   date: string;
   customer: string;
+  customerCompanyId: string;
   subject: string;
   industry: string;
   serviceType: string;
@@ -53,10 +55,12 @@ export const emptyContractDocument = (): ContractDocument => ({
 });
 
 export const emptyContract = (): ContractData => ({
+  performingLegalEntityId: "",
   performingLegalEntity: "",
   number: "",
   date: new Date().toISOString().slice(0, 10),
   customer: "",
+  customerCompanyId: "",
   subject: "", industry: "", serviceType: "", standards: [], workScope: "", contractRole: "Генеральный подрядчик",
   amount: 0,
   ourShareAmount: 0,

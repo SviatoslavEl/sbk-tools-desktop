@@ -14,15 +14,65 @@ from scandocument.errors import (
 )
 from scandocument.models import DocumentInfo
 
-MAX_RECOMMENDED_BYTES = 50 * 1024 * 1024
-MAX_FILE_BYTES = 200 * 1024 * 1024
-MAX_PAGES = 500
+MAX_RECOMMENDED_BYTES = 250 * 1024 * 1024
+MAX_FILE_BYTES = 1024 * 1024 * 1024
+MAX_PAGES = 5_000
 MAX_PAGE_POINTS = 14_400
-MAX_TOTAL_PIXELS = 1_200_000_000
+MAX_PAGE_PIXELS = 180_000_000
 PDF_MAGIC = b"%PDF-"
 
 
+def validate_source_size(path: Path) -> int:
+    """Reject an unavailable/oversized source before any parser or converter sees it."""
+    if not path.is_file():
+        raise CorruptDocumentError("Файл не найден или недоступен.")
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        raise CorruptDocumentError("Файл не удалось прочитать. Проверьте доступ к нему.") from exc
+    if size < 1:
+        raise CorruptDocumentError("Документ пуст.")
+    if size > MAX_FILE_BYTES:
+        raise DocumentTooLargeError("Файл больше 1 ГБ. Уменьшите его размер или разделите документ.")
+    return size
+
+
+def validate_docx_archive(path: Path) -> None:
+    """Apply the same zip-bomb/path checks in preview, process and extraction."""
+    try:
+        with zipfile.ZipFile(path) as archive:
+            names = archive.namelist()
+            if "word/document.xml" not in names:
+                raise UnsupportedFormatError("Архив не является документом DOCX.")
+            entries = archive.infolist()
+            if len(entries) > 50_000:
+                raise CorruptDocumentError("DOCX содержит слишком много внутренних файлов.")
+            total_uncompressed = sum(item.file_size for item in entries)
+            if total_uncompressed > 4 * 1024 * 1024 * 1024:
+                raise DocumentTooLargeError("Распакованный DOCX превышает безопасный предел 4 ГБ.")
+            for item in entries:
+                normalized = item.filename.replace("\\", "/")
+                if normalized.startswith("/") or "../" in f"/{normalized}":
+                    raise CorruptDocumentError("DOCX содержит небезопасный внутренний путь.")
+                if item.compress_size and item.file_size / item.compress_size > 500:
+                    raise DocumentTooLargeError("DOCX имеет небезопасно высокий коэффициент сжатия.")
+    except zipfile.BadZipFile as exc:
+        raise CorruptDocumentError("DOCX повреждён или открыт не полностью.") from exc
+
+
+def _pdf_page_sizes(document) -> list[tuple[float, float]]:
+    sizes: list[tuple[float, float]] = []
+    for index in range(len(document)):
+        page = document[index]
+        try:
+            sizes.append(tuple(map(float, page.get_size())))
+        finally:
+            page.close()
+    return sizes
+
+
 def detect_kind(path: Path) -> str:
+    validate_source_size(path)
     suffix = path.suffix.lower()
     if suffix not in {".pdf", ".docx"}:
         raise UnsupportedFormatError("Выберите документ PDF или DOCX.")
@@ -37,24 +87,7 @@ def detect_kind(path: Path) -> str:
             "Содержимое файла не соответствует расширению. Не переименовывайте другой формат в PDF или DOCX."
         )
     if actual == "docx":
-        try:
-            with zipfile.ZipFile(path) as archive:
-                if "word/document.xml" not in archive.namelist():
-                    raise UnsupportedFormatError("Архив не является документом DOCX.")
-                entries = archive.infolist()
-                if len(entries) > 10_000:
-                    raise CorruptDocumentError("DOCX содержит слишком много внутренних файлов.")
-                total_uncompressed = sum(item.file_size for item in entries)
-                if total_uncompressed > 512 * 1024 * 1024:
-                    raise DocumentTooLargeError("Распакованный DOCX превышает безопасный предел 512 МБ.")
-                for item in entries:
-                    normalized = item.filename.replace("\\", "/")
-                    if normalized.startswith("/") or "../" in f"/{normalized}":
-                        raise CorruptDocumentError("DOCX содержит небезопасный внутренний путь.")
-                    if item.compress_size and item.file_size / item.compress_size > 250:
-                        raise DocumentTooLargeError("DOCX имеет небезопасно высокий коэффициент сжатия.")
-        except zipfile.BadZipFile as exc:
-            raise CorruptDocumentError("DOCX повреждён или открыт не полностью.") from exc
+        validate_docx_archive(path)
     return actual
 
 
@@ -66,22 +99,18 @@ def inspect_document(
     prepared_docx_warnings: list[str] | None = None,
 ) -> DocumentInfo:
     source = Path(path).expanduser().resolve()
-    if not source.is_file():
-        raise CorruptDocumentError("Файл не найден или недоступен.")
-    size = source.stat().st_size
+    size = validate_source_size(source)
     kind = detect_kind(source)
     warnings: list[str] = []
     if size > MAX_RECOMMENDED_BYTES:
-        warnings.append("Файл больше рекомендуемых 50 МБ; обработка может занять много времени.")
-    if size > MAX_FILE_BYTES:
-        raise DocumentTooLargeError("Файл больше 200 МБ. Сначала уменьшите его размер.")
+        warnings.append("Файл больше рекомендуемых 250 МБ; обработка будет идти потоково и может занять много времени.")
     if kind == "pdf":
         try:
             import pypdfium2 as pdfium
 
             document = pdfium.PdfDocument(str(source), password=password)
             count = len(document)
-            sizes = [tuple(map(float, document[i].get_size())) for i in range(count)]
+            sizes = _pdf_page_sizes(document)
             document.close()
         except Exception as exc:
             message = str(exc).lower()
@@ -96,7 +125,7 @@ def inspect_document(
                 warnings.extend(prepared_docx_warnings or [])
                 rendered = pdfium.PdfDocument(str(prepared_docx_pdf))
                 count = len(rendered)
-                sizes = [tuple(map(float, rendered[index].get_size())) for index in range(count)]
+                sizes = _pdf_page_sizes(rendered)
                 rendered.close()
             else:
                 from scandocument.docx_engine import convert_docx_to_pdf
@@ -107,7 +136,7 @@ def inspect_document(
                     warnings.extend(convert_docx_to_pdf(source, preview, cancelled))
                     rendered = pdfium.PdfDocument(str(preview))
                     count = len(rendered)
-                    sizes = [tuple(map(float, rendered[index].get_size())) for index in range(count)]
+                    sizes = _pdf_page_sizes(rendered)
                     rendered.close()
         except DocxConversionError:
             raise
@@ -124,16 +153,43 @@ def inspect_document(
     return DocumentInfo(source, kind, size, count, sizes, warnings)
 
 
-def validate_render_budget(info: DocumentInfo, dpi: int) -> None:
+def validate_render_budget(info: DocumentInfo, dpi: int, page_indices: list[int] | None = None) -> None:
     safe_dpi = max(72, int(dpi))
-    total_pixels = sum(
-        round(width / 72 * safe_dpi) * round(height / 72 * safe_dpi)
-        for width, height in info.page_sizes_points
-    )
-    if total_pixels > MAX_TOTAL_PIXELS:
+    indices = page_indices if page_indices is not None else range(len(info.page_sizes_points))
+    if any(
+        round(info.page_sizes_points[index][0] / 72 * safe_dpi)
+        * round(info.page_sizes_points[index][1] / 72 * safe_dpi) > MAX_PAGE_PIXELS
+        for index in indices
+    ):
         raise DocumentTooLargeError(
-            "Документ слишком велик для выбранного DPI. Уменьшите DPI или разделите документ."
+            "Одна из страниц слишком велика для выбранного DPI. Уменьшите DPI."
         )
+
+
+def validate_preview_limits(size_bytes: int, page_count: int, page_size: tuple[float, float], dpi: int) -> list[str]:
+    """Validate only metadata needed for one preview page.
+
+    Unlike full inspection this deliberately does not enumerate every page, so
+    opening a 5,000-page PDF stays close to constant time.
+    """
+    if size_bytes > MAX_FILE_BYTES:
+        raise DocumentTooLargeError("Файл больше 1 ГБ. Уменьшите его размер или разделите документ.")
+    if page_count < 1:
+        raise CorruptDocumentError("Документ не содержит страниц.")
+    if page_count > MAX_PAGES:
+        raise DocumentTooLargeError(f"В документе больше {MAX_PAGES} страниц.")
+    width, height = page_size
+    if width <= 0 or height <= 0 or width > MAX_PAGE_POINTS or height > MAX_PAGE_POINTS:
+        raise DocumentTooLargeError("Документ содержит страницу чрезмерного размера.")
+    pixels = round(width / 72 * max(72, dpi)) * round(height / 72 * max(72, dpi))
+    if pixels > MAX_PAGE_PIXELS:
+        raise DocumentTooLargeError("Страница слишком велика для предпросмотра.")
+    warnings: list[str] = []
+    if size_bytes > MAX_RECOMMENDED_BYTES:
+        warnings.append("Файл больше рекомендуемых 250 МБ; обработка будет идти потоково и может занять много времени.")
+    if page_count > 100:
+        warnings.append("В документе больше рекомендуемых 100 страниц.")
+    return warnings
 
 
 def validate_ocr_languages(value: str) -> str:

@@ -2,8 +2,10 @@
 
 use std::fs;
 use std::io::Cursor;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::thread;
+use std::time::Duration;
 #[cfg(windows)]
 use std::{mem::size_of, os::windows::io::AsRawHandle, process::Child};
 use uuid::Uuid;
@@ -21,6 +23,33 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBo
 
 static PAYLOAD: &[u8] = include_bytes!(env!("SBK_PAYLOAD_TAR_ZST"));
 const PREFIX: &str = "SBKTools-runtime-";
+
+fn runtime_pid(name: &str) -> Option<u32> {
+    name.strip_prefix(PREFIX)?
+        .split('-')
+        .next()?
+        .parse::<u32>()
+        .ok()
+}
+
+fn remove_runtime(runtime: &Path) -> Result<(), String> {
+    let mut last_error = None;
+    for _ in 0..20 {
+        match fs::remove_dir_all(runtime) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => last_error = Some(error),
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    Err(format!(
+        "Не удалось удалить временные компоненты {}: {}",
+        runtime.display(),
+        last_error
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "неизвестная ошибка".to_string())
+    ))
+}
 
 #[cfg(windows)]
 fn create_kill_job(child: &Child) -> Result<isize, String> {
@@ -69,20 +98,90 @@ fn cleanup_stale(base: &Path) {
     };
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
-        let Some(rest) = name.strip_prefix(PREFIX) else {
-            continue;
-        };
-        let Some(pid) = rest
-            .split('-')
-            .next()
-            .and_then(|value| value.parse::<u32>().ok())
-        else {
+        let Some(pid) = runtime_pid(&name) else {
             continue;
         };
         if !process_alive(pid) {
-            let _ = fs::remove_dir_all(entry.path());
+            let _ = remove_runtime(&entry.path());
         }
     }
+}
+
+fn verify_embedded_payload(runtime: &Path) -> Result<(), String> {
+    let required = [
+        "SBK-Tools.exe",
+        "sbk-scanner-worker.exe",
+        "scanner-runtime/resources/ocr/windows/bin/tesseract.exe",
+        "scanner-runtime/resources/ocr/windows/tessdata/eng.traineddata",
+        "scanner-runtime/resources/ocr/windows/tessdata/rus.traineddata",
+        "scanner-runtime/resources/office/windows/program/soffice.exe",
+        "webview2-runtime/Microsoft.WebView2.FixedVersionRuntime.151.0.4129.107.x64/msedgewebview2.exe",
+    ];
+    for relative in required {
+        if !runtime.join(relative).is_file() {
+            return Err(format!("Во встроенном пакете отсутствует {relative}"));
+        }
+    }
+    Ok(())
+}
+
+fn checked_worker(
+    runtime: &Path,
+    working_directory: &Path,
+    arguments: &[&str],
+) -> Result<(), String> {
+    let status = Command::new(runtime.join("sbk-scanner-worker.exe"))
+        .args(arguments)
+        .current_dir(working_directory)
+        .env(
+            "SCANDOCUMENT_RESOURCE_ROOT",
+            runtime.join("scanner-runtime"),
+        )
+        .status()
+        .map_err(|error| format!("Не удалось проверить встроенный модуль сканера: {error}"))?;
+    if !status.success() {
+        return Err(format!(
+            "Встроенный модуль сканера не прошёл проверку: {}",
+            arguments.join(" ")
+        ));
+    }
+    Ok(())
+}
+
+fn run_self_test(runtime: &Path) -> Result<i32, String> {
+    verify_embedded_payload(runtime)?;
+    checked_worker(runtime, runtime, &["info"])?;
+    if let Some(project_root) = std::env::var_os("SBK_ONEFILE_SELF_TEST_ROOT").map(PathBuf::from) {
+        fs::create_dir_all(project_root.join("scanner-worker/tests/output"))
+            .map_err(|error| error.to_string())?;
+        for (operation, config) in [
+            ("extract", "scanner-worker/tests/fixtures/preview.json"),
+            ("preview", "scanner-worker/tests/fixtures/preview.json"),
+            ("preview", "scanner-worker/tests/fixtures/preview-docx.json"),
+            ("process", "scanner-worker/tests/fixtures/process.json"),
+            ("process", "scanner-worker/tests/fixtures/process-docx.json"),
+            ("process", "scanner-worker/tests/fixtures/process-ocr.json"),
+            (
+                "process",
+                "scanner-worker/tests/fixtures/process-facsimile.json",
+            ),
+        ] {
+            checked_worker(runtime, &project_root, &[operation, "--config", config])?;
+        }
+    }
+    let nested_temp_remains = fs::read_dir(runtime)
+        .map_err(|error| error.to_string())?
+        .flatten()
+        .any(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".scanner-worker-")
+        });
+    if nested_temp_remains {
+        return Err("Временные компоненты сканера не удалены после проверки".to_string());
+    }
+    Ok(0)
 }
 
 fn unpack(destination: &Path) -> Result<(), String> {
@@ -104,14 +203,24 @@ fn unpack(destination: &Path) -> Result<(), String> {
 }
 
 fn run() -> Result<i32, String> {
+    let self_test = std::env::args_os().any(|argument| argument == "--self-test");
     let temp = std::env::temp_dir();
     cleanup_stale(&temp);
     let runtime = temp.join(format!("{PREFIX}{}-{}", std::process::id(), Uuid::new_v4()));
     fs::create_dir(&runtime)
         .map_err(|error| format!("Не удалось создать временную папку: {error}"))?;
     if let Err(error) = unpack(&runtime) {
-        let _ = fs::remove_dir_all(&runtime);
+        let _ = remove_runtime(&runtime);
         return Err(error);
+    }
+    if self_test {
+        let result = run_self_test(&runtime);
+        let cleanup = remove_runtime(&runtime);
+        return match (result, cleanup) {
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Ok(code), Ok(())) => Ok(code),
+        };
     }
     let executable = runtime.join("SBK-Tools.exe");
     let mut child = Command::new(&executable)
@@ -124,7 +233,7 @@ fn run() -> Result<i32, String> {
         Err(error) => {
             let _ = child.kill();
             let _ = child.wait();
-            let _ = fs::remove_dir_all(&runtime);
+            let _ = remove_runtime(&runtime);
             return Err(error);
         }
     };
@@ -134,7 +243,7 @@ fn run() -> Result<i32, String> {
         CloseHandle(job as *mut _);
     }
     let code = status.code().unwrap_or(1);
-    let _ = fs::remove_dir_all(&runtime);
+    remove_runtime(&runtime)?;
     Ok(code)
 }
 
@@ -160,4 +269,16 @@ fn main() {
         }
     };
     std::process::exit(code);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_only_exact_runtime_names_with_numeric_pid() {
+        assert_eq!(runtime_pid("SBKTools-runtime-42-deadbeef"), Some(42));
+        assert_eq!(runtime_pid("SBKTools-runtime-nope-deadbeef"), None);
+        assert_eq!(runtime_pid("unrelated-42-deadbeef"), None);
+    }
 }

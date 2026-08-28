@@ -66,7 +66,7 @@ jobs:
   build:
     needs: quality-gate
     env:
-      ARTIFACT_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('2.4.1-test.{0}', github.run_number) }}
+      ARTIFACT_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('2.5.0-test.{0}', github.run_number) }}
     strategy:
       fail-fast: false
       matrix:
@@ -99,7 +99,7 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         shell: bash
         run: python scripts/check_versions.py --tag='${{ github.ref_name }}'
-      - run: python -m pip install -e scanner-worker nuitka ordered-set zstandard
+      - run: python -m pip install -e scanner-worker Nuitka==2.7.6 ordered-set==4.1.0 zstandard==0.23.0
       - name: Build scanner sidecar
         run: python scripts/build_scanner_worker.py --target ${{ matrix.target }}
       - name: Stage macOS OCR runtime
@@ -116,15 +116,18 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          choco install tesseract --no-progress -y
+          choco install tesseract --version=5.5.3.20260724 --no-progress -y
           New-Item -ItemType Directory -Force src-tauri/runtime-resources/resources/ocr/windows/bin | Out-Null
           New-Item -ItemType Directory -Force src-tauri/runtime-resources/resources/ocr/windows/tessdata | Out-Null
           Copy-Item 'C:\Program Files\Tesseract-OCR\*.exe' src-tauri/runtime-resources/resources/ocr/windows/bin/
           Copy-Item 'C:\Program Files\Tesseract-OCR\*.dll' src-tauri/runtime-resources/resources/ocr/windows/bin/
-          Copy-Item 'C:\Program Files\Tesseract-OCR\tessdata\eng.traineddata' src-tauri/runtime-resources/resources/ocr/windows/tessdata/
+          $eng = 'src-tauri/runtime-resources/resources/ocr/windows/tessdata/eng.traineddata'
           $rus = 'src-tauri/runtime-resources/resources/ocr/windows/tessdata/rus.traineddata'
+          Invoke-WebRequest 'https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/4.1.0/eng.traineddata' -OutFile $eng
           Invoke-WebRequest 'https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/4.1.0/rus.traineddata' -OutFile $rus
+          $engHash = (Get-FileHash -Algorithm SHA256 $eng).Hash.ToLowerInvariant()
           $rusHash = (Get-FileHash -Algorithm SHA256 $rus).Hash.ToLowerInvariant()
+          if ($engHash -ne '7d4322bd2a7749724879683fc3912cb542f19906c83bcc1a52132556427170b2') { throw "English OCR model checksum mismatch: $engHash" }
           if ($rusHash -ne 'e16e5e036cce1d9ec2b00063cf8b54472625b9e14d893a169e2b0dedeb4df225') { throw "Russian OCR model checksum mismatch: $rusHash" }
       - name: Stage pinned WebView2 Fixed Runtime
         if: runner.os == 'Windows'
@@ -276,6 +279,57 @@ jobs:
         run: |
           $version = $env:ARTIFACT_VERSION.TrimStart('v')
           ./scripts/package_windows_portable.ps1 -Target '${{ matrix.target }}' -Version $version
+      - name: Test the final one-file Windows executable and crash recovery
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $source = Resolve-Path 'release-artifacts/ScanDocument.exe'
+          $isolated = Join-Path $env:RUNNER_TEMP 'sbk-onefile-smoke'
+          New-Item -ItemType Directory -Force $isolated | Out-Null
+          $portable = Join-Path $isolated 'ScanDocument.exe'
+          Copy-Item $source $portable
+
+          $env:SBK_ONEFILE_SELF_TEST_ROOT = (Resolve-Path '.').Path
+          $selfTest = Start-Process -FilePath $portable -ArgumentList '--self-test' -Wait -PassThru
+          Remove-Item Env:SBK_ONEFILE_SELF_TEST_ROOT
+          if ($selfTest.ExitCode -ne 0) { throw "Final EXE self-test failed: $($selfTest.ExitCode)" }
+          $selfTestRuntime = Get-ChildItem $env:TEMP -Directory -Filter "SBKTools-runtime-$($selfTest.Id)-*" -ErrorAction SilentlyContinue
+          if ($selfTestRuntime) { throw 'Final EXE left temporary components after a normal self-test exit' }
+          if ((Get-ChildItem $isolated -Force).Count -ne 1) { throw 'Final EXE created required adjacent files' }
+
+          $startedAt = Get-Date
+          $launcher = Start-Process -FilePath $portable -PassThru
+          $windowReady = $false
+          $deadline = (Get-Date).AddSeconds(45)
+          while ((Get-Date) -lt $deadline) {
+            $application = Get-Process -Name 'SBK-Tools' -ErrorAction SilentlyContinue |
+              Where-Object { $_.StartTime -ge $startedAt } |
+              Select-Object -First 1
+            if ($application) {
+              $application.Refresh()
+              if ($application.MainWindowHandle -ne 0) { $windowReady = $true; break }
+            }
+            Start-Sleep -Milliseconds 500
+          }
+          if (-not $windowReady) {
+            Stop-Process -Id $launcher.Id -Force -ErrorAction SilentlyContinue
+            throw 'Final EXE did not open its application window'
+          }
+
+          $crashedPid = $launcher.Id
+          Stop-Process -Id $crashedPid -Force
+          Start-Sleep -Seconds 2
+          $leakedChildren = Get-CimInstance Win32_Process | Where-Object {
+            $_.ExecutablePath -like "$env:TEMP\SBKTools-runtime-$crashedPid-*"
+          }
+          if ($leakedChildren) { throw "Background process remains after launcher crash: $($leakedChildren.Name -join ', ')" }
+          $recovery = Start-Process -FilePath $portable -ArgumentList '--self-test' -Wait -PassThru
+          if ($recovery.ExitCode -ne 0) { throw "Final EXE recovery self-test failed: $($recovery.ExitCode)" }
+          $recoveryRuntime = Get-ChildItem $env:TEMP -Directory -Filter "SBKTools-runtime-$($recovery.Id)-*" -ErrorAction SilentlyContinue
+          if ($recoveryRuntime) { throw 'Final EXE left temporary components after recovery self-test' }
+          $stale = Get-ChildItem $env:TEMP -Directory -Filter "SBKTools-runtime-$crashedPid-*" -ErrorAction SilentlyContinue
+          if ($stale) { throw 'Final EXE left its crashed runtime after the next start' }
+          if ((Get-ChildItem $isolated -Force).Count -ne 1) { throw 'Portable folder contains files other than ScanDocument.exe' }
       - name: Sign and verify Windows release launcher when certificate is configured
         if: runner.os == 'Windows' && startsWith(github.ref, 'refs/tags/v')
         shell: pwsh

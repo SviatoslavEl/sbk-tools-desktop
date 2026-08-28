@@ -6,10 +6,12 @@ from pathlib import Path
 from xml.etree import ElementTree as ET
 
 import pypdfium2 as pdfium
-from docx import Document
+from lxml import etree
+
+from scandocument.validation import MAX_FILE_BYTES, validate_docx_archive
 
 
-MAX_SOURCE_BYTES = 250 * 1024 * 1024
+MAX_SOURCE_BYTES = MAX_FILE_BYTES
 MAX_EXTRACTED_CHARS = 20 * 1024 * 1024
 MAX_ZIP_UNPACKED_BYTES = 500 * 1024 * 1024
 MAX_FRAGMENTS = 50_000
@@ -31,7 +33,7 @@ def _validate_source(path: Path) -> tuple[int, bytes]:
         raise ValueError("Документ не найден.")
     size = path.stat().st_size
     if size <= 0 or size > MAX_SOURCE_BYTES:
-        raise ValueError("Размер документа должен быть от 1 байта до 250 МБ.")
+        raise ValueError("Размер документа должен быть от 1 байта до 1 ГБ.")
     with path.open("rb") as stream:
         magic = stream.read(8)
     return size, magic
@@ -72,30 +74,56 @@ def _pdf(path: Path) -> tuple[str, list[dict], list[str]]:
 
 
 def _docx(path: Path) -> tuple[str, list[dict], list[str]]:
+    validate_docx_archive(path)
     with zipfile.ZipFile(path) as archive:
-        total = sum(entry.file_size for entry in archive.infolist())
-        if total > MAX_ZIP_UNPACKED_BYTES:
-            raise ValueError("Распакованный DOCX превышает безопасный предел.")
         names = set(archive.namelist())
         if "word/document.xml" not in names or "[Content_Types].xml" not in names:
             raise ValueError("DOCX повреждён или имеет неподдерживаемую структуру.")
-        if any(name.startswith("../") or "/../" in name for name in names):
-            raise ValueError("DOCX содержит опасные пути.")
-    document = Document(str(path))
-    fragments: list[dict] = []
-    for index, paragraph in enumerate(document.paragraphs, 1):
-        if paragraph.text.strip():
-            fragments.append({"id": f"paragraph-{index}", "locator": f"Абзац {index}", "section": f"Абзац {index}", "text": paragraph.text})
-    for table_index, table in enumerate(document.tables, 1):
-        for row_index, row in enumerate(table.rows, 1):
-            text = "\t".join(cell.text.strip() for cell in row.cells)
-            if text.strip():
-                fragments.append({"id": f"table-{table_index}-row-{row_index}", "locator": f"Таблица {table_index}, строка {row_index}", "section": f"Таблица {table_index}", "text": text})
-    for section_index, section in enumerate(document.sections, 1):
-        for kind, paragraphs in (("Верхний колонтитул", section.header.paragraphs), ("Нижний колонтитул", section.footer.paragraphs)):
-            text = "\n".join(paragraph.text.strip() for paragraph in paragraphs if paragraph.text.strip())
-            if text:
-                fragments.append({"id": f"section-{section_index}-{kind}", "locator": f"Раздел {section_index}: {kind}", "section": f"Раздел {section_index}", "text": text})
+        fragments: list[dict] = []
+        word_ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+        paragraph_tag = f"{{{word_ns}}}p"
+        row_tag = f"{{{word_ns}}}tr"
+        cell_tag = f"{{{word_ns}}}tc"
+        text_tag = f"{{{word_ns}}}t"
+        paragraph_index = 0
+        row_index = 0
+
+        def text_of(element) -> str:
+            return "".join(node.text or "" for node in element.iter(text_tag)).strip()
+
+        with archive.open("word/document.xml") as stream:
+            for _event, element in etree.iterparse(stream, events=("end",), tag=(paragraph_tag, row_tag)):
+                if element.tag == paragraph_tag:
+                    if any(ancestor.tag == row_tag for ancestor in element.iterancestors()):
+                        continue
+                    paragraph_index += 1
+                    text = text_of(element)
+                    if text:
+                        fragments.append({"id": f"paragraph-{paragraph_index}", "locator": f"Абзац {paragraph_index}", "section": f"Абзац {paragraph_index}", "text": text})
+                    element.clear()
+                else:
+                    row_index += 1
+                    values = [text_of(cell) for cell in element.iter(cell_tag)]
+                    text = "\t".join(values).strip()
+                    if text:
+                        fragments.append({"id": f"table-row-{row_index}", "locator": f"Таблица, строка {row_index}", "section": "Таблица", "text": text})
+                    element.clear()
+
+        header_footer_names = sorted(
+            name for name in names
+            if (name.startswith("word/header") or name.startswith("word/footer")) and name.endswith(".xml")
+        )
+        for section_index, name in enumerate(header_footer_names, 1):
+            kind = "Верхний колонтитул" if "/header" in name else "Нижний колонтитул"
+            texts: list[str] = []
+            with archive.open(name) as stream:
+                for _event, element in etree.iterparse(stream, events=("end",), tag=paragraph_tag):
+                    text = text_of(element)
+                    if text:
+                        texts.append(text)
+                    element.clear()
+            if texts:
+                fragments.append({"id": f"section-{section_index}-{kind}", "locator": f"Раздел {section_index}: {kind}", "section": f"Раздел {section_index}", "text": "\n".join(texts)})
     return "application/vnd.openxmlformats-officedocument.wordprocessingml.document", fragments, []
 
 

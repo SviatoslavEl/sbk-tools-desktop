@@ -48,6 +48,7 @@ class SecureWorkspace:
     """Per-operation workspace outside the application and user document folders."""
 
     PREFIX = "ScanDocument-"
+    PENDING_PREFIX = "PendingOutput-"
     STALE_SECONDS = 24 * 60 * 60
 
     def __init__(self) -> None:
@@ -63,6 +64,36 @@ class SecureWorkspace:
         if not root.exists():
             return
         cutoff = (time.time() if now is None else now) - cls.STALE_SECONDS
+        # Output PDF parts live beside the user-selected destination so an
+        # atomic rename is possible. Their exact unique paths are journalled
+        # here before creation, allowing the next launch to clean a hard-killed
+        # worker without scanning or touching unrelated user files.
+        for journal in root.iterdir():
+            try:
+                if not journal.is_file() or not journal.name.startswith(cls.PENDING_PREFIX) or not journal.name.endswith(".journal"):
+                    continue
+                identity = journal.name[len(cls.PENDING_PREFIX):-len(".journal")]
+                pid_text, separator, token = identity.partition("-")
+                if (
+                    not separator or len(token) != 32
+                    or any(character not in "0123456789abcdef" for character in token)
+                ):
+                    if journal.stat().st_mtime < cutoff:
+                        journal.unlink(missing_ok=True)
+                    continue
+                try:
+                    pid = int(pid_text)
+                except ValueError:
+                    pid = -1
+                if pid > 0 and cls._process_alive(pid):
+                    continue
+                candidate = Path(journal.read_text(encoding="utf-8"))
+                expected_suffix = f".scandocument-{pid_text}-{token}.part"
+                if candidate.name.startswith(".") and candidate.name.endswith(expected_suffix):
+                    candidate.unlink(missing_ok=True)
+                journal.unlink(missing_ok=True)
+            except OSError:
+                continue
         for child in root.iterdir():
             try:
                 if not child.is_dir() or not child.name.startswith(cls.PREFIX):
@@ -78,6 +109,24 @@ class SecureWorkspace:
                     shutil.rmtree(child, ignore_errors=True)
             except OSError:
                 continue
+
+    @classmethod
+    def register_output_part(cls, destination: Path) -> tuple[Path, Path]:
+        root = cls.base_dir()
+        root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        token = uuid.uuid4().hex
+        pid = os.getpid()
+        partial = destination.with_name(
+            f".{destination.name}.scandocument-{pid}-{token}.part"
+        )
+        journal = root / f"{cls.PENDING_PREFIX}{pid}-{token}.journal"
+        with journal.open("x", encoding="utf-8") as stream:
+            stream.write(str(partial.resolve()))
+            stream.flush()
+            os.fsync(stream.fileno())
+        if os.name != "nt":
+            journal.chmod(0o600)
+        return partial, journal
 
     @staticmethod
     def _process_alive(pid: int) -> bool:

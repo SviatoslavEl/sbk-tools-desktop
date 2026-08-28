@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-import io
 import os
+import subprocess
+import sys
 import time
+import tracemalloc
 import zipfile
 from pathlib import Path
 
@@ -10,14 +12,16 @@ import pytest
 from PIL import Image
 from pypdf import PdfReader
 
-from scandocument.errors import CorruptDocumentError, DocumentTooLargeError, UnsupportedFormatError
+from scandocument.errors import CancelledError, CorruptDocumentError, DocumentTooLargeError, UnsupportedFormatError
 from scandocument.facsimile import apply_facsimile
-from scandocument.models import DocumentInfo, EffectSettings, FacsimilePlacement, ProcessRequest, Redaction
-from scandocument.pdf_engine import configure_pdfa_2b
-from scandocument.pipeline import CancellationToken, _process_page
-from scandocument.worker_cli import placements_from, validate_protocol
+from scandocument.annotations import apply_annotations
+from scandocument.models import Annotation, DocumentInfo, EffectSettings, FacsimilePlacement, ProcessRequest, Redaction
+from scandocument.ocr import OcrWord
+from scandocument.pdf_engine import StreamingPdfWriter, _jpeg_for_budget, configure_pdfa_2b, image_page_pdf
+from scandocument.pipeline import CancellationToken, _process_page, make_preview, process_document
+from scandocument.worker_cli import estimate_preview_output_bytes, placements_from, validate_protocol
 from scandocument.tempfiles import SecureWorkspace
-from scandocument.validation import detect_kind, validate_ocr_languages, validate_render_budget
+from scandocument.validation import MAX_FILE_BYTES, MAX_PAGES, detect_kind, validate_ocr_languages, validate_preview_limits, validate_render_budget
 
 
 def placement(tmp_path: Path, application: str, pages: list[int]) -> FacsimilePlacement:
@@ -40,17 +44,17 @@ def test_facsimile_all_is_the_only_mode_without_pages(tmp_path: Path) -> None:
     assert item.applies_to(1)
 
 
-def test_worker_accepts_individual_facsimile_geometry_for_200_pages(tmp_path: Path) -> None:
+def test_worker_accepts_individual_facsimile_geometry_for_5000_pages(tmp_path: Path) -> None:
     stamp = tmp_path / "stamp.png"
     Image.new("RGBA", (8, 4), "black").save(stamp)
     values = [{
         "imagePath": str(stamp), "application": "current", "pages": [page],
-        "x": page / 1000, "y": 0.2, "width": 0.1, "rotation": page - 100, "opacity": 0.8,
-    } for page in range(200)]
+        "x": page / 10_000, "y": 0.2, "width": 0.1, "rotation": page - 100, "opacity": 0.8,
+    } for page in range(5_000)]
     placements = placements_from({"facsimiles": values})
-    assert len(placements) == 200
-    assert placements[199].pages == [199]
-    assert placements[199].rotation == 99
+    assert len(placements) == 5_000
+    assert placements[4_999].pages == [4_999]
+    assert placements[4_999].rotation == 4_899
 
 
 def _non_white_bounds(image: Image.Image) -> tuple[int, int, int, int]:
@@ -111,7 +115,7 @@ def test_pdfa_profile_contains_output_intent_and_identification() -> None:
 
 def test_page_rotation_swaps_final_pdf_geometry(tmp_path: Path) -> None:
     request = ProcessRequest(tmp_path / "input.pdf", tmp_path / "output.pdf", EffectSettings(), 42)
-    page_pdf, words, image_size = _process_page(
+    page_jpeg, words, image_size = _process_page(
         Image.new("RGB", (100, 200), "white"),
         request,
         0,
@@ -120,11 +124,60 @@ def test_page_rotation_swaps_final_pdf_geometry(tmp_path: Path) -> None:
         tmp_path,
         CancellationToken(),
     )
-    page = PdfReader(io.BytesIO(page_pdf)).pages[0]
+    writer = StreamingPdfWriter(request.output_path, "rotation", 42)
+    writer.add_page(page_jpeg, (600.0, 300.0), image_size, words)
+    writer.finish()
+    page = PdfReader(request.output_path).pages[0]
     assert float(page.mediabox.width) == 600.0
     assert float(page.mediabox.height) == 300.0
     assert image_size[0] > image_size[1]
     assert words is None
+
+
+def test_streaming_writer_keeps_5000_page_memory_bounded(tmp_path: Path) -> None:
+    jpeg = _jpeg_for_budget(Image.new("RGB", (8, 8), "white"), 70, None)
+    output = tmp_path / "five-thousand.pdf"
+    writer = StreamingPdfWriter(output, "stress", 42)
+    tracemalloc.start()
+    for _ in range(5_000):
+        writer.add_page(jpeg, (100.0, 100.0), (8, 8))
+    _current, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    writer.finish()
+    assert peak < 12 * 1024 * 1024
+    assert len(PdfReader(output).pages) == 5_000
+
+
+def test_streaming_writer_preserves_pdfa_catalog_metadata(tmp_path: Path) -> None:
+    output = tmp_path / "archive.pdf"
+    jpeg = _jpeg_for_budget(Image.new("RGB", (32, 32), "white"), 70, None)
+    writer = StreamingPdfWriter(output, "archive", 42, pdfa=True)
+    writer.add_page(jpeg, (100.0, 100.0), (32, 32))
+    writer.finish()
+    reader = PdfReader(output)
+    root = reader.trailer["/Root"]
+    assert "/OutputIntents" in root
+    metadata = root["/Metadata"].get_object().get_data()
+    assert b"<pdfaid:part>2</pdfaid:part>" in metadata
+    assert b"<pdfaid:conformance>B</pdfaid:conformance>" in metadata
+    assert b"<pdf:Producer>ScanDocument</pdf:Producer>" in metadata
+    assert b'<rdf:li xml:lang="x-default">archive</rdf:li>' in metadata
+    assert len(reader.trailer["/ID"]) == 2
+    assert all(len(identifier.original_bytes) == 16 for identifier in reader.trailer["/ID"])
+
+
+def test_streaming_ocr_uses_multiple_font_banks_beyond_255_characters(tmp_path: Path) -> None:
+    output = tmp_path / "large-unicode-ocr.pdf"
+    jpeg = _jpeg_for_budget(Image.new("RGB", (800, 200), "white"), 70, None)
+    text = "".join(chr(0x4E00 + index) for index in range(320))
+    words = [OcrWord(text, 10, 20, 760, 80, 99.0)]
+    writer = StreamingPdfWriter(output, "unicode", 42)
+    writer.add_page(jpeg, (800.0, 200.0), (800, 200), words)
+    writer.finish()
+    page = PdfReader(output).pages[0]
+    extracted = (page.extract_text() or "").replace("\n", "").strip()
+    assert extracted == text
+    assert len(page["/Resources"]["/Font"]) == 2
 
 
 def test_ocr_languages_are_limited_to_bundled_models() -> None:
@@ -146,6 +199,162 @@ def test_render_budget_rejects_unbounded_work(tmp_path: Path) -> None:
     info = DocumentInfo(tmp_path / "large.pdf", "pdf", 1, 500, [(14_000.0, 14_000.0)] * 500)
     with pytest.raises(DocumentTooLargeError, match="слишком велик"):
         validate_render_budget(info, 300)
+
+
+def test_limits_accept_one_gib_and_five_thousand_normal_pages(tmp_path: Path) -> None:
+    page_size = (595.0, 842.0)
+    info = DocumentInfo(tmp_path / "boundary.pdf", "pdf", MAX_FILE_BYTES, MAX_PAGES, [page_size] * MAX_PAGES)
+    validate_render_budget(info, 300)
+    warnings = validate_preview_limits(MAX_FILE_BYTES, MAX_PAGES, page_size, 144)
+    assert any("250 МБ" in warning for warning in warnings)
+    with pytest.raises(DocumentTooLargeError, match="1 ГБ"):
+        validate_preview_limits(MAX_FILE_BYTES + 1, 1, page_size, 144)
+    with pytest.raises(DocumentTooLargeError, match="5000"):
+        validate_preview_limits(1, MAX_PAGES + 1, page_size, 144)
+
+
+def test_compression_budget_chooses_highest_quality_that_fits() -> None:
+    image = Image.effect_noise((900, 1200), 70).convert("RGB")
+    unrestricted = _jpeg_for_budget(image, 90, None)
+    target = len(unrestricted) // 2
+    compressed = _jpeg_for_budget(image, 90, target)
+    assert len(compressed) < len(unrestricted)
+    assert len(compressed) <= target or len(compressed) == len(_jpeg_for_budget(image, 55, None))
+    regular_pdf = image_page_pdf(image, (595, 842), 90)
+    compressed_pdf = image_page_pdf(image, (595, 842), 90, target_bytes=target)
+    assert len(compressed_pdf) < len(regular_pdf)
+
+
+def test_compression_estimate_does_not_claim_impossible_source_ratio() -> None:
+    image = Image.effect_noise((1100, 900), 70).convert("RGB")
+    estimate = estimate_preview_output_bytes(
+        image, EffectSettings(dpi=200, jpeg_quality=84), (595.0, 842.0), 1, 1_752, .7,
+    )
+    assert estimate > round(1_752 * .7)
+    assert estimate >= len(_jpeg_for_budget(image, 55, None))
+
+
+def test_page_tools_and_print_blur_change_only_selected_page() -> None:
+    source = Image.effect_noise((320, 240), 90).convert("RGB")
+    operations = [
+        Annotation("marker", [0], .05, .05, .35, .12, "#ffd84d", .6),
+        Annotation("stroke", [0], .05, .25, .35, .08, "#202020", .8),
+        Annotation("blur", [0], .05, .4, .35, .15, intensity=.7),
+        Annotation("print_blur", [0], .5, .4, .35, .15, intensity=.9),
+    ]
+    result = apply_annotations(source, operations, 0)
+    assert result.tobytes() != source.tobytes()
+    assert apply_annotations(source, operations, 1).tobytes() == source.tobytes()
+
+
+def test_random_facsimile_position_is_stable_and_inside_region(tmp_path: Path) -> None:
+    item = FacsimilePlacement(
+        tmp_path / "stamp.png", application="all", width=.2,
+        region=(.1, .2, .6, .5), randomize_in_region=True, random_seed=77,
+    )
+    item.validate_for_document(5_000)
+    first = item.position_for_page(0)
+    assert first == item.position_for_page(0)
+    assert first != item.position_for_page(1)
+    assert .1 <= first[0] <= .5
+    assert .2 <= first[1] <= .5
+
+
+def test_rotated_facsimile_never_escapes_selected_region(tmp_path: Path) -> None:
+    stamp_path = tmp_path / "large-stamp.png"
+    Image.new("RGBA", (200, 60), "black").save(stamp_path)
+    placement = FacsimilePlacement(
+        stamp_path, application="all", x=.8, y=.8, width=.5, rotation=45,
+        region=(.2, .25, .35, .3), randomize_in_region=True,
+    )
+    x, y = placement.position_for_page(10)
+    result = apply_facsimile(Image.new("RGB", (400, 400), "white"), FacsimilePlacement(
+        stamp_path, application="all", x=x, y=y, width=.5, rotation=45,
+        region=placement.region,
+    ))
+    left, top, right, bottom = _non_white_bounds(result)
+    assert left >= 80 and top >= 100
+    assert right <= 220 and bottom <= 220
+
+
+def test_real_worker_pipeline_combines_compression_and_page_tools(tmp_path: Path) -> None:
+    source = Path(__file__).parent / "fixtures" / "simple.pdf"
+    output = tmp_path / "compressed-tools.pdf"
+    request = ProcessRequest(
+        source,
+        output,
+        EffectSettings(dpi=150, jpeg_quality=84),
+        42,
+        annotations=[Annotation("print_blur", [0], .1, .1, .2, .1, intensity=.8)],
+        compression_target_ratio=.7,
+    )
+    process_document(request)
+    assert output.is_file()
+    assert len(PdfReader(output).pages) == len(PdfReader(source).pages)
+
+
+def test_cancelled_streaming_process_removes_partial_output(tmp_path: Path) -> None:
+    source = Path(__file__).parent / "fixtures" / "simple.pdf"
+    output = tmp_path / "cancelled.pdf"
+    token = CancellationToken()
+
+    def stop_after_page(event) -> None:
+        if event.stage == "Страница готова":
+            token.cancel()
+
+    with pytest.raises(CancelledError):
+        process_document(
+            ProcessRequest(source, output, EffectSettings(dpi=150), 42),
+            stop_after_page,
+            token,
+        )
+    assert not output.exists()
+    assert not list(tmp_path.glob(f".{output.name}.scandocument-*.part"))
+
+
+def test_next_launch_removes_only_journalled_part_after_hard_kill(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    output = tmp_path / "output.pdf"
+    output.write_bytes(b"existing-result")
+    journal_root = tmp_path / "private-journal"
+    child_code = """
+import sys, time
+from pathlib import Path
+from scandocument.pdf_engine import StreamingPdfWriter
+from scandocument.tempfiles import SecureWorkspace
+SecureWorkspace.base_dir = classmethod(lambda cls: Path(sys.argv[2]))
+writer = StreamingPdfWriter(Path(sys.argv[1]), 'crash', 42)
+writer.add_page(b'\\xff\\xd8\\xff\\xd9', (100.0, 100.0), (1, 1))
+print(writer.temporary, flush=True)
+time.sleep(60)
+"""
+    process = subprocess.Popen(
+        [sys.executable, "-c", child_code, str(output), str(journal_root)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    assert process.stdout is not None
+    partial = Path(process.stdout.readline().strip())
+    assert partial.is_file()
+    process.kill()
+    process.wait(timeout=10)
+
+    unrelated = tmp_path / "unrelated.part"
+    unrelated.write_bytes(b"keep")
+    monkeypatch.setattr(SecureWorkspace, "base_dir", classmethod(lambda cls: journal_root))
+    SecureWorkspace.cleanup_stale()
+    assert output.read_bytes() == b"existing-result"
+    assert not partial.exists()
+    assert unrelated.read_bytes() == b"keep"
+    assert not list(journal_root.glob(f"{SecureWorkspace.PENDING_PREFIX}*.journal"))
+
+
+def test_preview_does_not_run_full_all_page_inspection(monkeypatch: pytest.MonkeyPatch) -> None:
+    source = Path(__file__).parent / "fixtures" / "simple.pdf"
+    monkeypatch.setattr("scandocument.pipeline.inspect_document", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("slow path")))
+    original, processed, pages, _warnings, _size = make_preview(source, EffectSettings(), 42, 0)
+    assert pages == 1
+    assert original.size == processed.size
 
 
 def test_secure_workspace_is_unique_private_and_removed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -1,7 +1,8 @@
 use chrono::Utc;
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 pub(crate) const SCHEMA_VERSION: i64 = 3;
 pub(crate) const MODULES: [&str; 7] = [
@@ -49,9 +50,18 @@ pub(crate) fn open_database(root: &Path, module: &str) -> Result<Connection, Str
     let existed = path.exists();
     let mut connection = Connection::open(&path)
         .map_err(|error| format!("Не удалось открыть базу раздела {module}: {error}"))?;
+    // WAL relies on shared-memory semantics that are unreliable on SMB/NFS.
+    // A rollback journal plus the workspace's single-editor lock is slower but
+    // remains recoverable and visible to read-only clients on network shares.
     connection
-        .pragma_update(None, "journal_mode", "WAL")
+        .pragma_update(None, "journal_mode", "DELETE")
         .map_err(|error| format!("Не удалось включить безопасный журнал: {error}"))?;
+    connection
+        .pragma_update(None, "synchronous", "FULL")
+        .map_err(|error| format!("Не удалось включить надёжную запись: {error}"))?;
+    connection
+        .busy_timeout(Duration::from_secs(8))
+        .map_err(|error| format!("Не удалось настроить ожидание блокировки: {error}"))?;
     connection
         .pragma_update(None, "foreign_keys", "ON")
         .map_err(|error| format!("Не удалось включить связи базы: {error}"))?;
@@ -234,4 +244,82 @@ pub(crate) fn open_database(root: &Path, module: &str) -> Result<Connection, Str
         .execute_batch("PRAGMA wal_autocheckpoint=1000; PRAGMA busy_timeout=5000;")
         .map_err(|error| error.to_string())?;
     Ok(connection)
+}
+
+pub(crate) fn open_database_read_only(root: &Path, module: &str) -> Result<Connection, String> {
+    let path = database_path(root, module)?;
+    let connection = Connection::open_with_flags(
+        &path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| format!("Не удалось открыть базу раздела {module} для чтения: {error}"))?;
+    connection
+        .busy_timeout(Duration::from_secs(8))
+        .map_err(|error| format!("Не удалось настроить ожидание блокировки: {error}"))?;
+    connection
+        .pragma_update(None, "query_only", "ON")
+        .map_err(|error| format!("Не удалось включить режим чтения: {error}"))?;
+    Ok(connection)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    #[test]
+    fn network_safe_database_has_rollback_journal_and_readers_cannot_write() {
+        let root = std::env::temp_dir().join(format!("sbk-network-db-{}", Uuid::new_v4()));
+        fs::create_dir_all(root.join("calculator")).expect("module directory");
+        fs::create_dir_all(root.join("backups")).expect("backup directory");
+        let writer = open_database(&root, "calculator").expect("writer");
+        let mode: String = writer
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .expect("journal mode");
+        assert_eq!(mode.to_ascii_lowercase(), "delete");
+        writer
+            .execute(
+                "INSERT INTO records(id,title,payload,created_at,updated_at) VALUES ('1','one','{}','now','now')",
+                [],
+            )
+            .expect("seed");
+        drop(writer);
+        let reader = open_database_read_only(&root, "calculator").expect("reader");
+        assert_eq!(
+            reader
+                .query_row("SELECT COUNT(*) FROM records", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("read"),
+            1
+        );
+        assert!(reader.execute("DELETE FROM records", []).is_err());
+        drop(reader);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn read_only_open_never_runs_migrations() {
+        let root = std::env::temp_dir().join(format!("sbk-readonly-schema-{}", Uuid::new_v4()));
+        fs::create_dir_all(root.join("staff")).expect("module directory");
+        let database = root.join("staff").join("data.sqlite3");
+        let seed = Connection::open(&database).expect("seed database");
+        seed.execute_batch("CREATE TABLE legacy(value TEXT); PRAGMA user_version = 1;")
+            .expect("legacy schema");
+        drop(seed);
+        let reader = open_database_read_only(&root, "staff").expect("read-only open");
+        let version: i64 = reader
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("schema version");
+        assert_eq!(version, 1);
+        let drafts: i64 = reader
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='drafts'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("drafts query");
+        assert_eq!(drafts, 0);
+        drop(reader);
+        let _ = fs::remove_dir_all(root);
+    }
 }
