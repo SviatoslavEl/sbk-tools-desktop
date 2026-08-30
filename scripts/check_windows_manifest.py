@@ -4,9 +4,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 
-def main() -> None:
-    root = Path(__file__).resolve().parents[1]
-    manifest = root / "scripts" / "windows-as-invoker.manifest"
+def check_manifest(manifest: Path) -> None:
     document = ET.parse(manifest)
 
     common_controls = next(
@@ -31,7 +29,16 @@ def main() -> None:
     }:
         raise SystemExit("Windows manifest must run asInvoker with uiAccess=false")
 
-    print("Windows manifest activates Common Controls v6 and runs asInvoker")
+
+def main() -> None:
+    root = Path(__file__).resolve().parents[1]
+    for manifest in (
+        root / "scripts" / "windows-as-invoker.manifest",
+        root / "windows-launcher" / "app.manifest",
+    ):
+        check_manifest(manifest)
+
+    print("Windows manifests activate Common Controls v6 and run asInvoker")
 
 
 if __name__ == "__main__":
