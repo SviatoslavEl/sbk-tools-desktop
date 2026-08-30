@@ -338,7 +338,6 @@ jobs:
           $launcher = Start-Process -FilePath $portable -PassThru
           Remove-Item Env:SBK_ONEFILE_GUI_READY_TOKEN
           $windowReady = $false
-          $application = $null
           $runtime = $null
           $deadline = (Get-Date).AddSeconds(240)
           while ((Get-Date) -lt $deadline) {
@@ -359,19 +358,12 @@ jobs:
                 Select-Object -First 1
             }
             if ((Test-Path $readyMarker) -and $runtime) {
-              $innerPath = Join-Path $runtime.FullName 'SBK-Tools.exe'
-              $applicationInfo = Get-CimInstance Win32_Process | Where-Object {
-                $_.ExecutablePath -and [string]::Equals($_.ExecutablePath, $innerPath, [System.StringComparison]::OrdinalIgnoreCase)
-              } | Select-Object -First 1
-              if ($applicationInfo) {
-                $application = Get-Process -Id $applicationInfo.ProcessId -ErrorAction SilentlyContinue
-                if ($application) {
-                  $application.Refresh()
-                  Write-Host "GUI ready: PID=$($application.Id), MainWindowHandle=$($application.MainWindowHandle), runtime=$($runtime.FullName)"
-                  $windowReady = $true
-                  break
-                }
-              }
+              # The marker is written by the inner Tauri process only after its
+              # main window exists and reports visible. Hosted Windows runners
+              # may redact the process ExecutablePath, so CIM is diagnostic only.
+              Write-Host "GUI ready marker received: launcher=$($launcher.Id), runtime=$($runtime.FullName)"
+              $windowReady = $true
+              break
             }
             Start-Sleep -Milliseconds 500
           }
