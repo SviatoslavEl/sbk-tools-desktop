@@ -240,7 +240,7 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
 name = "sbk-tools-onefile-launcher"
-version = "2.5.0"
+version = "2.5.1"
 dependencies = [
  "embed-resource",
  "tar",
