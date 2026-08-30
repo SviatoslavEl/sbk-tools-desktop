@@ -132,8 +132,8 @@ export function buildFacsimilePlacement(
     removeLightBackground: facsimile.removeLightBackground,
     application: selection.application,
     pages: selection.pages,
-    region: facsimile.placementMode && facsimile.placementMode !== "manual" ? facsimile.region : undefined,
-    randomizeInRegion: facsimile.placementMode === "random-region",
+    region: selection.application === "all" && facsimile.placementMode && facsimile.placementMode !== "manual" ? facsimile.region : undefined,
+    randomizeInRegion: selection.application === "all" && facsimile.placementMode === "random-region",
     randomSeed: facsimile.randomSeed,
   };
 }

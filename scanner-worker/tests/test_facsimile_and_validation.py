@@ -19,7 +19,7 @@ from scandocument.models import Annotation, DocumentInfo, EffectSettings, Facsim
 from scandocument.ocr import OcrWord
 from scandocument.pdf_engine import StreamingPdfWriter, _jpeg_for_budget, configure_pdfa_2b, image_page_pdf
 from scandocument.pipeline import CancellationToken, _process_page, make_preview, process_document
-from scandocument.worker_cli import estimate_preview_output_bytes, placements_from, validate_protocol
+from scandocument.worker_cli import annotations_from, estimate_preview_output_bytes, placements_from, validate_protocol
 from scandocument.tempfiles import SecureWorkspace
 from scandocument.validation import MAX_FILE_BYTES, MAX_PAGES, detect_kind, validate_ocr_languages, validate_preview_limits, validate_render_budget
 
@@ -225,6 +225,12 @@ def test_compression_budget_chooses_highest_quality_that_fits() -> None:
     assert len(compressed_pdf) < len(regular_pdf)
 
 
+def test_maximum_compression_can_select_120_dpi() -> None:
+    assert EffectSettings(dpi=120, jpeg_quality=55).validated().dpi == 120
+    assert EffectSettings(dpi=130).validated().dpi == 120
+    assert EffectSettings(dpi=145).validated().dpi == 150
+
+
 def test_compression_estimate_does_not_claim_impossible_source_ratio() -> None:
     image = Image.effect_noise((1100, 900), 70).convert("RGB")
     estimate = estimate_preview_output_bytes(
@@ -245,6 +251,25 @@ def test_page_tools_and_print_blur_change_only_selected_page() -> None:
     result = apply_annotations(source, operations, 0)
     assert result.tobytes() != source.tobytes()
     assert apply_annotations(source, operations, 1).tobytes() == source.tobytes()
+
+
+@pytest.mark.parametrize("kind", ["blur", "print_blur"])
+def test_elliptical_blur_changes_only_pixels_inside_ellipse(kind: str) -> None:
+    source = Image.effect_noise((240, 240), 90).convert("RGB")
+    operation = Annotation(kind, [0], .25, .25, .5, .5, intensity=.9, shape="ellipse")
+    result = apply_annotations(source, [operation], 0)
+    for point in ((60, 60), (179, 60), (60, 179), (179, 179)):
+        assert result.getpixel(point) == source.getpixel(point)
+    assert result.getpixel((120, 120)) != source.getpixel((120, 120))
+
+
+def test_worker_protocol_preserves_elliptical_blur_shape() -> None:
+    [annotation] = annotations_from({"annotations": [{
+        "kind": "print_blur", "pages": [0], "x": .1, "y": .2,
+        "width": .3, "height": .15, "intensity": .8, "shape": "ellipse",
+    }]})
+    annotation.validate_for_document(1)
+    assert annotation.shape == "ellipse"
 
 
 def test_random_facsimile_position_is_stable_and_inside_region(tmp_path: Path) -> None:

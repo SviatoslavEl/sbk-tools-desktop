@@ -38,6 +38,32 @@ export function importProblemRows<T>(rows: readonly T[], issuesFor: (item: T, in
   });
 }
 
+export function nextImportProblemIndex(
+  problemIndexes: readonly number[],
+  currentIndex: number,
+): number | null {
+  return (
+    problemIndexes.find((index) => index > currentIndex) ??
+    problemIndexes.find((index) => index !== currentIndex) ??
+    null
+  );
+}
+
+export function currentImportReviewIndex(
+  activeIndex: number | null,
+  problemIndexes: readonly number[],
+  rowCount: number,
+): number | null {
+  if (
+    activeIndex !== null &&
+    Number.isInteger(activeIndex) &&
+    activeIndex >= 0 &&
+    activeIndex < rowCount
+  )
+    return activeIndex;
+  return problemIndexes[0] ?? null;
+}
+
 export function clearImportRowIssues(issues: readonly string[], sourceRowNumber: number): string[] {
   const prefix = `Строка ${sourceRowNumber}:`;
   return issues.filter((issue) => !issue.startsWith(prefix));

@@ -1,6 +1,6 @@
 param(
     [string]$Target = "x86_64-pc-windows-msvc",
-    [string]$Version = "2.5.0"
+    [string]$Version = "2.6.0"
 )
 
 $ErrorActionPreference = "Stop"

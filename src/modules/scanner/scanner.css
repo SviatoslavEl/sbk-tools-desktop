@@ -19,11 +19,11 @@
 
 .scanner-info-text {
   position: absolute;
-  left: 24px;
-  top: -8px;
-  z-index: 20;
+  left: 50%;
+  top: 25px;
+  z-index: 80;
   display: none;
-  width: min(310px, 70vw);
+  width: min(280px, calc(100vw - 32px));
   padding: 9px 11px;
   color: #173c2a;
   background: #fff;
@@ -33,11 +33,18 @@
   font-size: 11px;
   font-weight: 500;
   line-height: 1.4;
+  overflow-wrap: anywhere;
+  white-space: normal;
+  transform: translateX(-50%);
+  text-align: left;
 }
 
 .scanner-info:hover .scanner-info-text,
 .scanner-info:focus .scanner-info-text,
 .scanner-info:focus-within .scanner-info-text { display: block; }
+
+.surface.scanner-controls { position: relative; z-index: 8; overflow: visible; }
+.scanner-controls .surface-body { overflow: visible; }
 
 .facsimile-saved-list { display: grid; gap: 5px; margin-top: 7px; }
 .facsimile-saved-row { display: flex; align-items: center; justify-content: space-between; gap: 7px; }
@@ -56,11 +63,27 @@
 .annotation-buttons { display: flex; flex-wrap: wrap; gap: 6px; }
 .annotation-row { display: grid; grid-template-columns: minmax(110px, 1.4fr) repeat(5, minmax(58px, .7fr)) 38px; gap: 5px; align-items: end; margin: 7px 0; }
 .annotation-row input { width: 100%; min-height: 34px; padding: 5px; color: #173c2a; background: #fff; border: 1px solid #bfd0c2; border-radius: 6px; }
-.annotation-overlay { position: absolute; z-index: 3; pointer-events: none; border-radius: 2px; }
-.annotation-overlay.stroke { height: 0 !important; border-top: 3px solid; }
+.annotation-overlay { position: absolute; z-index: 5; border-radius: 2px; }
+.annotation-overlay.stroke { background: rgba(255,255,255,.01); }
+.annotation-overlay.stroke::before { content: ""; position: absolute; left: 0; right: 0; top: 50%; border-top: 3px solid; border-color: inherit; transform: translateY(-50%); }
 .annotation-overlay.blur { backdrop-filter: blur(6px); border: 1px dashed rgba(47, 91, 61, .45); background: rgba(230, 236, 231, .18); }
 .annotation-overlay.print_blur { backdrop-filter: blur(10px); background: repeating-linear-gradient(45deg, rgba(160, 170, 163, .36) 0 5px, rgba(210, 217, 212, .42) 5px 10px); }
-.facsimile-region { position: absolute; z-index: 2; pointer-events: none; border: 2px dashed rgba(47, 152, 69, .72); background: rgba(47, 152, 69, .06); }
+.annotation-overlay.ellipse { border-radius: 50%; overflow: visible; }
+.redaction-overlay { position: absolute; z-index: 6; border: 1px solid rgba(255,255,255,.75); }
+.redaction-overlay.black { background: rgba(0,0,0,.88); }
+.redaction-overlay.white { background: rgba(255,255,255,.92); border-color: rgba(25,55,34,.55); }
+.facsimile-region { position: absolute; z-index: 4; border: 2px dashed rgba(47, 152, 69, .82); background: rgba(47, 152, 69, .06); }
+.editable-geometry { touch-action: none; cursor: move; }
+.editable-geometry.selected { outline: 2px solid rgba(47, 152, 69, .88); outline-offset: 1px; }
+.drawing-tool-active { cursor: crosshair; }
+.selected-tool { color: #fff; background: #2f9845; border-color: #2f9845; }
+.geometry-handle, .facsimile-resize-handle, .facsimile-rotate-handle { position: absolute; z-index: 12; width: 14px; height: 14px; min-height: 0; padding: 0; border: 2px solid #fff; border-radius: 50%; background: #237f39; box-shadow: 0 1px 4px rgba(10,45,20,.35); touch-action: none; }
+.geometry-handle.nw { left: -8px; top: -8px; cursor: nwse-resize; }
+.geometry-handle.ne { right: -8px; top: -8px; cursor: nesw-resize; }
+.geometry-handle.sw { left: -8px; bottom: -8px; cursor: nesw-resize; }
+.geometry-handle.se { right: -8px; bottom: -8px; cursor: nwse-resize; }
+.facsimile-resize-handle { right: -8px; bottom: -8px; cursor: nwse-resize; }
+.facsimile-rotate-handle { left: 50%; top: 4px; width: 22px; height: 22px; color: #fff; transform: translateX(-50%); cursor: grab; font-size: 12px; line-height: 16px; }
 .estimate-good { color: #1f7335; font-weight: 700; }
 .estimate-warning { color: #a05b16; font-weight: 700; }
 .page-gap { display: inline-grid; place-items: center; min-width: 38px; color: #6b7e70; font-size: 10px; }

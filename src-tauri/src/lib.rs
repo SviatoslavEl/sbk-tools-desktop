@@ -1156,6 +1156,10 @@ fn import_records_atomic(
 const COMPANY_DIRECTORY_DRAFT_KEY: &str = "company-directory-v1";
 
 fn validate_company_directory_payload(directory: &Value) -> Result<(), String> {
+    let requires_scope = directory
+        .get("schemaVersion")
+        .and_then(Value::as_u64)
+        .is_some_and(|version| version >= 2);
     let companies = directory
         .get("companies")
         .and_then(Value::as_array)
@@ -1175,6 +1179,12 @@ fn validate_company_directory_payload(directory: &Value) -> Result<(), String> {
             .get("name")
             .and_then(Value::as_str)
             .unwrap_or_default();
+        let scope = company.get("scope").and_then(Value::as_str);
+        if (requires_scope && scope.is_none())
+            || scope.is_some_and(|scope| !matches!(scope, "internal" | "external"))
+        {
+            return Err("Справочник компаний содержит неизвестный раздел компании".to_string());
+        }
         let normalized_name: String = name
             .to_lowercase()
             .replace('ё', "е")
@@ -1332,12 +1342,23 @@ fn validate_contract_company_references(
     records: &[ImportRecord],
     directory: &Value,
 ) -> Result<(), String> {
-    let company_ids: HashSet<&str> = directory
+    let companies = directory
         .get("companies")
         .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let company_ids: HashSet<&str> = companies
+        .iter()
         .filter_map(|company| company.get("id").and_then(Value::as_str))
+        .collect();
+    let company_scopes: HashMap<&str, &str> = companies
+        .iter()
+        .filter_map(|company| {
+            Some((
+                company.get("id")?.as_str()?,
+                company.get("scope")?.as_str()?,
+            ))
+        })
         .collect();
     for record in records {
         for field in ["performingLegalEntityId", "customerCompanyId"] {
@@ -1349,6 +1370,16 @@ fn validate_contract_company_references(
             if !id.is_empty() && !company_ids.contains(id) {
                 return Err(format!(
                     "Договор {} ссылается на отсутствующую компанию",
+                    record.id
+                ));
+            }
+            if field == "performingLegalEntityId"
+                && company_scopes
+                    .get(id)
+                    .is_some_and(|scope| *scope != "internal")
+            {
+                return Err(format!(
+                    "Договор {} ссылается на внешнюю компанию как на юрлицо-исполнитель",
                     record.id
                 ));
             }
@@ -3115,17 +3146,40 @@ fn verify_packaged_runtime(worker: &Path, runtime_root: &Path) -> Result<(), Str
         .clone()
 }
 
+fn scanner_runtime_candidates(resource_dir: Option<&Path>, executable: &Path) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(resource_dir) = resource_dir {
+        candidates.push(resource_dir.join("scanner-runtime"));
+    }
+    if let Some(executable_dir) = executable.parent() {
+        candidates.push(executable_dir.join("scanner-runtime"));
+        if executable_dir
+            .file_name()
+            .is_some_and(|name| name == "MacOS")
+            && let Some(contents_dir) = executable_dir.parent()
+        {
+            candidates.push(contents_dir.join("Resources").join("scanner-runtime"));
+        }
+    }
+    candidates.dedup();
+    candidates
+}
+
+fn scanner_runtime_root(app: &AppHandle) -> Option<PathBuf> {
+    let resource_dir = app.path().resource_dir().ok();
+    let executable = std::env::current_exe().ok()?;
+    scanner_runtime_candidates(resource_dir.as_deref(), &executable)
+        .into_iter()
+        .find(|candidate| candidate.join("resources").is_dir())
+}
+
 fn start_runtime_verification(app: &AppHandle) {
     let Ok((command, true)) = scanner_worker_command() else {
         return;
     };
-    let Ok(resource_dir) = app.path().resource_dir() else {
+    let Some(runtime) = scanner_runtime_root(app) else {
         return;
     };
-    let runtime = resource_dir.join("scanner-runtime");
-    if !runtime.join("resources").is_dir() {
-        return;
-    }
     let worker = PathBuf::from(command.get_program());
     thread::spawn(move || {
         let _ = verify_packaged_runtime(&worker, &runtime);
@@ -3339,12 +3393,9 @@ fn run_scanner_worker(
     let (mut command, packaged_worker) = scanner_worker_command()?;
     let worker_path = PathBuf::from(command.get_program());
     let mut runtime_root = None;
-    if let Ok(resource_dir) = app.path().resource_dir() {
-        let scanner_runtime = resource_dir.join("scanner-runtime");
-        if scanner_runtime.join("resources").is_dir() {
-            command.env("SCANDOCUMENT_RESOURCE_ROOT", scanner_runtime);
-            runtime_root = Some(resource_dir.join("scanner-runtime"));
-        }
+    if let Some(scanner_runtime) = scanner_runtime_root(&app) {
+        command.env("SCANDOCUMENT_RESOURCE_ROOT", &scanner_runtime);
+        runtime_root = Some(scanner_runtime);
     }
     if packaged_worker {
         let runtime = runtime_root
@@ -3631,6 +3682,30 @@ mod tests {
         assert!(gui_ready_marker_path_for("not-a-token", &temp).is_none());
     }
 
+    #[test]
+    fn scanner_runtime_falls_back_to_bundle_resources() {
+        let executable =
+            Path::new("/Applications/СБК Инструменты.app/Contents/MacOS/СБК Инструменты");
+        let candidates = scanner_runtime_candidates(None, executable);
+        assert!(candidates.contains(&PathBuf::from(
+            "/Applications/СБК Инструменты.app/Contents/Resources/scanner-runtime"
+        )));
+    }
+
+    #[test]
+    fn scanner_runtime_supports_portable_layout() {
+        let executable = Path::new("C:/SBK/SBK-Tools.exe");
+        let candidates =
+            scanner_runtime_candidates(Some(Path::new("C:/SBK/resources")), executable);
+        assert_eq!(
+            candidates,
+            vec![
+                PathBuf::from("C:/SBK/resources/scanner-runtime"),
+                PathBuf::from("C:/SBK/scanner-runtime"),
+            ]
+        );
+    }
+
     fn company_directory_value(company_id: &str, name: &str) -> Value {
         serde_json::json!({
             "schemaVersion": 1,
@@ -3683,6 +3758,24 @@ mod tests {
 
     #[test]
     fn company_directory_backend_rejects_duplicate_inn_and_broken_affiliations() {
+        let missing_scope = serde_json::json!({ "schemaVersion": 2, "companies": [
+            { "id": Uuid::new_v4().to_string(), "name": "Первая" }
+        ] });
+        assert!(
+            validate_company_directory_payload(&missing_scope)
+                .unwrap_err()
+                .contains("раздел")
+        );
+
+        let invalid_scope = serde_json::json!({ "companies": [
+            { "id": Uuid::new_v4().to_string(), "name": "Первая", "scope": "both" }
+        ] });
+        assert!(
+            validate_company_directory_payload(&invalid_scope)
+                .unwrap_err()
+                .contains("раздел")
+        );
+
         let first = Uuid::new_v4().to_string();
         let second = Uuid::new_v4().to_string();
         let duplicate_inn = serde_json::json!({ "companies": [
@@ -3710,6 +3803,28 @@ mod tests {
             validate_company_directory_payload(&missing)
                 .unwrap_err()
                 .contains("связь")
+        );
+    }
+
+    #[test]
+    fn contract_performer_must_belong_to_internal_company_group() {
+        let company_id = Uuid::new_v4().to_string();
+        let record_id = Uuid::new_v4().to_string();
+        let directory = serde_json::json!({ "schemaVersion": 2, "companies": [
+            { "id": company_id, "name": "Внешняя", "scope": "external" }
+        ] });
+        let records = vec![ImportRecord {
+            id: record_id,
+            title: "Договор".to_string(),
+            payload: serde_json::json!({
+                "performingLegalEntityId": company_id,
+                "customerCompanyId": ""
+            }),
+        }];
+        assert!(
+            validate_contract_company_references(&records, &directory)
+                .unwrap_err()
+                .contains("внешнюю компанию")
         );
     }
 

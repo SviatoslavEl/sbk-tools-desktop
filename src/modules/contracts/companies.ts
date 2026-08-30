@@ -4,6 +4,7 @@ import type { ContractData } from "./types";
 export const affiliationTypes = ["Головная компания", "Дочерняя компания", "Филиал", "Компания группы", "Иная связь"] as const;
 
 export type AffiliationType = typeof affiliationTypes[number];
+export type CompanyScope = "internal" | "external";
 
 export interface CompanyAffiliation {
   id: string;
@@ -22,8 +23,7 @@ export interface CompanyCard {
   address: string;
   contact: string;
   notes: string;
-  isOurs: boolean;
-  isCounterparty: boolean;
+  scope: CompanyScope;
   source: "contracts" | "manual";
   affiliations: CompanyAffiliation[];
   createdAt: string;
@@ -31,11 +31,11 @@ export interface CompanyCard {
 }
 
 export interface CompanyDirectoryData {
-  schemaVersion: 1;
+  schemaVersion: 1 | 2;
   companies: CompanyCard[];
 }
 
-export const emptyCompanyDirectory = (): CompanyDirectoryData => ({ schemaVersion: 1, companies: [] });
+export const emptyCompanyDirectory = (): CompanyDirectoryData => ({ schemaVersion: 2, companies: [] });
 
 export const normalizeCompanyName = (value: string) => value
   .trim()
@@ -59,8 +59,7 @@ export const emptyCompany = (now: string = new Date().toISOString(), id: string 
   address: "",
   contact: "",
   notes: "",
-  isOurs: false,
-  isCounterparty: true,
+  scope: "external",
   source: "manual",
   affiliations: [],
   createdAt: now,
@@ -72,13 +71,23 @@ export function normalizeCompanyDirectory(value: CompanyDirectoryData | null | u
   const now = new Date().toISOString();
   const source = value.companies
     .filter((company) => company && typeof company.name === "string" && company.name.trim())
-    .map((company) => ({
-      ...emptyCompany(company.createdAt || now, company.id || crypto.randomUUID()),
-      ...company,
-      name: company.name.trim(),
-      inn: normalizeInn(company.inn || ""),
-      affiliations: Array.isArray(company.affiliations) ? company.affiliations.filter((item) => item?.targetCompanyId) : [],
-    }));
+    .map((company) => {
+      const legacy = company as CompanyCard & { isOurs?: boolean; isCounterparty?: boolean };
+      const { isOurs: _isOurs, isCounterparty: _isCounterparty, ...withoutLegacyRoles } = legacy;
+      const scope: CompanyScope = company.scope === "internal" || company.scope === "external"
+        ? company.scope
+        : legacy.isOurs
+          ? "internal"
+          : "external";
+      return {
+        ...emptyCompany(company.createdAt || now, company.id || crypto.randomUUID()),
+        ...withoutLegacyRoles,
+        scope,
+        name: company.name.trim(),
+        inn: normalizeInn(company.inn || ""),
+        affiliations: Array.isArray(company.affiliations) ? company.affiliations.filter((item) => item?.targetCompanyId) : [],
+      };
+    });
   const companies: CompanyCard[] = [];
   const byName = new Map<string, CompanyCard>();
   const byInn = new Map<string, CompanyCard>();
@@ -102,8 +111,7 @@ export function normalizeCompanyDirectory(value: CompanyDirectoryData | null | u
     existing.address ||= company.address;
     existing.contact ||= company.contact;
     existing.notes ||= company.notes;
-    existing.isOurs ||= company.isOurs;
-    existing.isCounterparty ||= company.isCounterparty;
+    if (company.scope === "internal") existing.scope = "internal";
     if (company.source === "manual") existing.source = "manual";
     existing.affiliations.push(...company.affiliations);
     if (inn) byInn.set(inn, existing);
@@ -119,12 +127,26 @@ export function normalizeCompanyDirectory(value: CompanyDirectoryData | null | u
         return true;
       });
   }
-  return { schemaVersion: 1, companies };
+  return { schemaVersion: 2, companies };
 }
 
 type ContractSource = Pick<ContractData, "performingLegalEntity" | "customer"> & Partial<Pick<ContractData, "performingLegalEntityId" | "customerCompanyId" | "contact">> | StoredRecord<ContractData>;
 
 const contractPayload = (source: ContractSource) => "payload" in source ? source.payload : source;
+
+export function companyUsedAsPerformer(
+  company: Pick<CompanyCard, "id" | "name">,
+  contracts: ContractSource[],
+): boolean {
+  const companyName = normalizeCompanyName(company.name);
+  return contracts.some((source) => {
+    const contract = contractPayload(source);
+    return (
+      contract.performingLegalEntityId === company.id ||
+      normalizeCompanyName(contract.performingLegalEntity || "") === companyName
+    );
+  });
+}
 
 /** Adds only missing cards and roles; explicitly edited card data is never overwritten. */
 export function mergeCompaniesFromContracts(
@@ -143,24 +165,21 @@ export function mergeCompaniesFromContracts(
     if (!name) return;
     const linked = linkedId ? companies.find((company) => company.id === linkedId) : undefined;
     if (linked) {
-      if (role === "ours" && !linked.isOurs) { linked.isOurs = true; linked.updatedAt = now; changed = true; }
-      if (role === "counterparty" && !linked.isCounterparty) { linked.isCounterparty = true; linked.updatedAt = now; changed = true; }
+      if (role === "ours" && linked.scope !== "internal") { linked.scope = "internal"; linked.updatedAt = now; changed = true; }
       if (role === "counterparty" && linked.source === "contracts" && !linked.contact.trim() && contact.trim()) { linked.contact = contact.trim(); linked.updatedAt = now; changed = true; }
       return;
     }
     const key = normalizeCompanyName(name);
     const existing = byName.get(key);
     if (existing) {
-      if (role === "ours" && !existing.isOurs) { existing.isOurs = true; existing.updatedAt = now; changed = true; }
-      if (role === "counterparty" && !existing.isCounterparty) { existing.isCounterparty = true; existing.updatedAt = now; changed = true; }
+      if (role === "ours" && existing.scope !== "internal") { existing.scope = "internal"; existing.updatedAt = now; changed = true; }
       if (role === "counterparty" && existing.source === "contracts" && !existing.contact.trim() && contact.trim()) { existing.contact = contact.trim(); existing.updatedAt = now; changed = true; }
       return;
     }
     const company: CompanyCard = {
       ...emptyCompany(now, idFactory()),
       name,
-      isOurs: role === "ours",
-      isCounterparty: role === "counterparty",
+      scope: role === "ours" ? "internal" : "external",
       source: "contracts",
       contact: role === "counterparty" ? contact.trim() : "",
     };
@@ -174,7 +193,7 @@ export function mergeCompaniesFromContracts(
     include(contract.performingLegalEntity || "", "ours", "", contract.performingLegalEntityId || "");
     include(contract.customer || "", "counterparty", contract.contact || "", contract.customerCompanyId || "");
   }
-  return { directory: { schemaVersion: 1, companies }, changed };
+  return { directory: { schemaVersion: 2, companies }, changed };
 }
 
 export function linkContractToDirectory(contract: ContractData, companies: CompanyCard[]): ContractData {
@@ -231,7 +250,7 @@ export function companyRelationshipLabel(company: CompanyCard, companies: Compan
 export function validateCompany(company: CompanyCard, companies: CompanyCard[]): string[] {
   const errors: string[] = [];
   if (!company.name.trim()) errors.push("Укажите полное название компании.");
-  if (!company.isOurs && !company.isCounterparty) errors.push("Укажите, является компания нашей или контрагентом.");
+  if (company.scope !== "internal" && company.scope !== "external") errors.push("Укажите, относится компания к внутренней группе или к внешним.");
   const companyInn = normalizeInn(company.inn);
   const duplicate = companies.find((item) => item.id !== company.id
     && normalizeCompanyName(item.name) === normalizeCompanyName(company.name)

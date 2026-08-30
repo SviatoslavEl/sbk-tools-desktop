@@ -82,6 +82,20 @@ def download_verified(url: str, destination: Path, expected: str) -> None:
     raise SystemExit("LibreOffice package checksum mismatch after retries")
 
 
+def remove_python_bytecode(root: Path) -> tuple[int, int]:
+    bytecode_files = list(root.rglob("*.pyc")) + list(root.rglob("*.pyo"))
+    for bytecode in bytecode_files:
+        bytecode.unlink()
+    cache_directories = sorted(
+        (path for path in root.rglob("__pycache__") if path.is_dir()),
+        key=lambda path: len(path.parts),
+        reverse=True,
+    )
+    for cache in cache_directories:
+        shutil.rmtree(cache)
+    return len(bytecode_files), len(cache_directories)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Stage pinned LibreOffice runtime")
     parser.add_argument("--target", required=True, choices=PACKAGES)
@@ -103,6 +117,17 @@ def main() -> None:
                 if destination.exists():
                     shutil.rmtree(destination)
                 shutil.copytree(source, destination, symlinks=True)
+                # The LibreOffice image ships timestamp-based Python bytecode
+                # caches whose headers predate the matching sources.  Embedded
+                # Python rewrites them on first use, which would make a signed
+                # application fail its own runtime integrity check.  Package
+                # sources only and disable cache creation in office_engine.py.
+                bytecode_count, cache_count = remove_python_bytecode(destination)
+                print(
+                    f"Removed {bytecode_count} mutable Python bytecode files "
+                    f"and {cache_count} cache directories from the macOS LibreOffice runtime",
+                    flush=True,
+                )
             finally:
                 subprocess.run(["hdiutil", "detach", str(mount)], check=True)
         elif platform.system() == "Windows":

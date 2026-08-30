@@ -40,7 +40,7 @@ class EffectSettings:
     safe_mode: bool = True
 
     def validated(self) -> "EffectSettings":
-        self.dpi = min((150, 200, 300), key=lambda x: abs(x - int(self.dpi)))
+        self.dpi = min((120, 150, 200, 300), key=lambda x: abs(x - int(self.dpi)))
         self.jpeg_quality = max(55, min(100, int(self.jpeg_quality)))
         limit = 1.0 if self.safe_mode else 3.0
         self.max_rotation_deg = max(0.0, min(limit, float(self.max_rotation_deg)))
@@ -162,12 +162,15 @@ class Annotation:
     height: float
     color: str = "#ffd84d"
     intensity: float = 0.6
+    shape: str = "rectangle"
 
     def validate_for_document(self, page_count: int) -> None:
         if self.kind not in {"marker", "stroke", "blur", "print_blur"}:
             raise ValueError("Неизвестный инструмент обработки страницы.")
         if not re.fullmatch(r"#[0-9a-fA-F]{6}", self.color):
             raise ValueError("Цвет инструмента должен быть указан в формате #RRGGBB.")
+        if self.shape not in {"rectangle", "ellipse"}:
+            raise ValueError("Неизвестная форма инструмента обработки страницы.")
         if not self.pages or any(page < 0 or page >= page_count for page in self.pages):
             raise ValueError("Диапазон инструмента выходит за пределы документа.")
         values = (self.x, self.y, self.width, self.height)

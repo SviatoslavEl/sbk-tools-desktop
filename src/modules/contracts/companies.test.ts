@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { emptyContract } from "./types";
-import { buildCompanyDirectoryMigration, companyRelationshipLabel, emptyCompany, emptyCompanyDirectory, linkContractToDirectory, mergeCompaniesFromContracts, normalizeCompanyDirectory, normalizeCompanyName, updateContractCompanyReference, validateCompany, validateCompanyDirectory } from "./companies";
+import { buildCompanyDirectoryMigration, companyRelationshipLabel, companyUsedAsPerformer, emptyCompany, emptyCompanyDirectory, linkContractToDirectory, mergeCompaniesFromContracts, normalizeCompanyDirectory, normalizeCompanyName, updateContractCompanyReference, validateCompany, validateCompanyDirectory } from "./companies";
 import { companyDirectoryRefreshEvent, subscribeCompanyDirectoryRefresh } from "./CompanyDirectory";
 
 describe("справочник компаний", () => {
@@ -13,19 +13,20 @@ describe("справочник компаний", () => {
     const result = mergeCompaniesFromContracts(emptyCompanyDirectory(), contracts, () => `id-${++index}`, "2026-08-28T00:00:00.000Z");
     expect(result.changed).toBe(true);
     expect(result.directory.companies).toHaveLength(2);
-    expect(result.directory.companies.find((item) => normalizeCompanyName(item.name) === "ооо сбк")).toMatchObject({ isOurs: true, isCounterparty: true, source: "contracts" });
-    expect(result.directory.companies.find((item) => item.name === "АО Заказчик")).toMatchObject({ isOurs: false, isCounterparty: true, contact: "Иванов, +7 900 000-00-00" });
+    expect(result.directory.schemaVersion).toBe(2);
+    expect(result.directory.companies.find((item) => normalizeCompanyName(item.name) === "ооо сбк")).toMatchObject({ scope: "internal", source: "contracts" });
+    expect(result.directory.companies.find((item) => item.name === "АО Заказчик")).toMatchObject({ scope: "external", contact: "Иванов, +7 900 000-00-00" });
   });
 
   it("не перезаписывает отредактированную карточку при повторной миграции", () => {
-    const company = { ...emptyCompany("2026-01-01", "our-id"), name: "ООО СБК", inn: "123", isOurs: true, isCounterparty: false, source: "manual" as const };
-    const result = mergeCompaniesFromContracts({ schemaVersion: 1, companies: [company] }, [{ ...emptyContract(), performingLegalEntity: "ООО «СБК»" }], () => "unused");
+    const company = { ...emptyCompany("2026-01-01", "our-id"), name: "ООО СБК", inn: "123", scope: "internal" as const, source: "manual" as const };
+    const result = mergeCompaniesFromContracts({ schemaVersion: 2, companies: [company] }, [{ ...emptyContract(), performingLegalEntity: "ООО «СБК»" }], () => "unused");
     expect(result.changed).toBe(false);
     expect(result.directory.companies[0]).toMatchObject({ inn: "123", source: "manual" });
   });
 
   it("связывает договор с карточками и показывает аффилированность", () => {
-    const head = { ...emptyCompany("2026-01-01", "head"), name: "АО Группа", isOurs: true };
+    const head = { ...emptyCompany("2026-01-01", "head"), name: "АО Группа", scope: "internal" as const };
     const child = { ...emptyCompany("2026-01-01", "child"), name: "ООО Дочка", affiliations: [{ id: "r", targetCompanyId: "head", type: "Головная компания" as const, note: "75%" }] };
     const linked = linkContractToDirectory({ ...emptyContract(), performingLegalEntity: "ООО Дочка", customer: "АО Группа" }, [head, child]);
     expect(linked).toMatchObject({ performingLegalEntityId: "child", customerCompanyId: "head" });
@@ -33,8 +34,8 @@ describe("справочник компаний", () => {
   });
 
   it("сохраняет привязку по id при переименовании карточки", () => {
-    const company = { ...emptyCompany("2026-01-01", "our-id"), name: "Новое название", isOurs: true };
-    const result = mergeCompaniesFromContracts({ schemaVersion: 1, companies: [company] }, [{ ...emptyContract(), performingLegalEntityId: "our-id", performingLegalEntity: "Старое название" }], () => "unexpected");
+    const company = { ...emptyCompany("2026-01-01", "our-id"), name: "Новое название", scope: "internal" as const };
+    const result = mergeCompaniesFromContracts({ schemaVersion: 2, companies: [company] }, [{ ...emptyContract(), performingLegalEntityId: "our-id", performingLegalEntity: "Старое название" }], () => "unexpected");
     expect(result.changed).toBe(false);
     expect(result.directory.companies).toHaveLength(1);
     expect(result.directory.companies[0].name).toBe("Новое название");
@@ -50,7 +51,7 @@ describe("справочник компаний", () => {
   });
 
   it("отклоняет дубликаты и самоссылки", () => {
-    const first = { ...emptyCompany("2026-01-01", "1"), name: "ООО Альфа", isOurs: true, affiliations: [{ id: "r", targetCompanyId: "1", type: "Компания группы" as const, note: "" }] };
+    const first = { ...emptyCompany("2026-01-01", "1"), name: "ООО Альфа", scope: "internal" as const, affiliations: [{ id: "r", targetCompanyId: "1", type: "Компания группы" as const, note: "" }] };
     const duplicate = { ...emptyCompany("2026-01-01", "2"), name: "ООО «Альфа»" };
     expect(validateCompany(first, [first, duplicate])).toEqual(expect.arrayContaining(["Компания с таким названием уже есть в справочнике.", "Компания не может быть связана сама с собой."]));
   });
@@ -69,13 +70,33 @@ describe("справочник компаний", () => {
     expect(namesakes.companies).toHaveLength(2);
   });
 
+  it("безопасно мигрирует старые роли в взаимоисключающие разделы", () => {
+    const base = emptyCompany("2026-01-01", "legacy");
+    const legacyInternal = { ...base, name: "ООО Внутренняя", scope: undefined, isOurs: true, isCounterparty: true };
+    const legacyExternal = { ...base, id: "external", name: "ООО Внешняя", scope: undefined, isOurs: false, isCounterparty: true };
+    const migrated = normalizeCompanyDirectory({ schemaVersion: 1, companies: [legacyInternal, legacyExternal] } as never);
+    expect(migrated.schemaVersion).toBe(2);
+    expect(migrated.companies.map(({ name, scope }) => ({ name, scope }))).toEqual([
+      { name: "ООО Внутренняя", scope: "internal" },
+      { name: "ООО Внешняя", scope: "external" },
+    ]);
+    expect(migrated.companies.some((company) => "isOurs" in company || "isCounterparty" in company)).toBe(false);
+  });
+
   it("при связывании приоритетно использует существующий id, затем имя", () => {
-    const byId = { ...emptyCompany("2026-01-01", "id-company"), name: "Компания по ID", isOurs: true };
-    const byName = { ...emptyCompany("2026-01-01", "name-company"), name: "Совпавшее имя", isOurs: true };
+    const byId = { ...emptyCompany("2026-01-01", "id-company"), name: "Компания по ID", scope: "internal" as const };
+    const byName = { ...emptyCompany("2026-01-01", "name-company"), name: "Совпавшее имя", scope: "internal" as const };
     const linked = linkContractToDirectory({ ...emptyContract(), performingLegalEntityId: "id-company", performingLegalEntity: "Совпавшее имя" }, [byId, byName]);
     expect(linked).toMatchObject({ performingLegalEntityId: "id-company", performingLegalEntity: "Компания по ID" });
     const fallback = linkContractToDirectory({ ...emptyContract(), performingLegalEntityId: "missing", performingLegalEntity: "Совпавшее имя" }, [byId, byName]);
     expect(fallback.performingLegalEntityId).toBe("name-company");
+  });
+
+  it("не позволяет переносить действующее юрлицо-исполнитель во внешние", () => {
+    const company = { ...emptyCompany("2026-01-01", "internal"), name: "ООО Группа", scope: "internal" as const };
+    expect(companyUsedAsPerformer(company, [{ ...emptyContract(), performingLegalEntityId: "internal", performingLegalEntity: "Снимок" }])).toBe(true);
+    expect(companyUsedAsPerformer(company, [{ ...emptyContract(), performingLegalEntity: "ООО «Группа»" }])).toBe(true);
+    expect(companyUsedAsPerformer(company, [{ ...emptyContract(), performingLegalEntity: "ООО Другая" }])).toBe(false);
   });
 
   it("готовит безопасную атомарную миграцию id для старых договоров", () => {

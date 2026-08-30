@@ -180,6 +180,7 @@ details label { display: block; margin-top: 10px; }
 .checkbox-row { display: flex; align-items: center; gap: 8px; margin-top: 15px; }
 .checkbox-row input { flex: 0 0 18px; width: 18px; height: 18px; margin: 0; accent-color: #2f9845; }
 .preview-workspace { display: grid; grid-template-columns: 58px minmax(0, 1fr); min-height: 610px; }
+.preview-workspace.single-page { grid-template-columns: minmax(0, 1fr); }
 .page-strip { overflow: auto; padding: 8px; background: #eef5f0; border-right: 1px solid #d2e1d5; }
 .page-strip button { width: 40px; height: 52px; margin-bottom: 7px; border: 1px solid #b9cdbc; border-radius: 5px; color: #5b7061; background: #fff; }
 .page-strip button.active { color: #1e6930; border: 2px solid #2f9845; font-weight: 700; }

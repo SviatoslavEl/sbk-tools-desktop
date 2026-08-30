@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { applyImportReviewOverrides, buildImportReviewOverride, clearImportRowIssues, importProblemRows, missingImportFields, replaceImportReviewRow } from "./importReview";
+import { applyImportReviewOverrides, buildImportReviewOverride, clearImportRowIssues, currentImportReviewIndex, importProblemRows, missingImportFields, nextImportProblemIndex, replaceImportReviewRow } from "./importReview";
 import { normalizeStaffData } from "../modules/staff/Staff";
 import type { StaffData } from "../modules/staff/types";
 
@@ -52,6 +52,20 @@ describe("поштучное дополнение импорта", () => {
   it("снимает ошибки только с подтверждённой исходной строки", () => {
     const issues = ["Строка 2: нет ФИО", "Строка 3: нет отдела", "Общая ошибка файла"];
     expect(clearImportRowIssues(issues, 2)).toEqual(["Строка 3: нет отдела", "Общая ошибка файла"]);
+  });
+
+  it("переходит к следующей проблемной строке только по явному подтверждению", () => {
+    expect(nextImportProblemIndex([1, 4, 8], 1)).toBe(4);
+    expect(nextImportProblemIndex([1, 8], 4)).toBe(8);
+    expect(nextImportProblemIndex([1], 4)).toBe(1);
+    expect(nextImportProblemIndex([], 4)).toBeNull();
+  });
+
+  it("удерживает активную строку, когда первый введённый символ снимает ошибку пустого поля", () => {
+    expect(currentImportReviewIndex(null, [0, 1], 2)).toBe(0);
+    expect(currentImportReviewIndex(0, [1], 2)).toBe(0);
+    expect(currentImportReviewIndex(0, [], 2)).toBe(0);
+    expect(currentImportReviewIndex(5, [1], 2)).toBe(1);
   });
 
   it("нормализует legacy-карточку до поиска, списка и экспорта", () => {

@@ -67,7 +67,7 @@ jobs:
   build:
     needs: quality-gate
     env:
-      ARTIFACT_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('2.5.2-test.{0}', github.run_number) }}
+      ARTIFACT_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('2.6.0-test.{0}', github.run_number) }}
     strategy:
       fail-fast: false
       matrix:
@@ -148,15 +148,6 @@ jobs:
           if (-not (Test-Path "$runtime/msedgewebview2.exe")) { throw 'WebView2 Fixed Runtime executable is missing' }
       - name: Stage pinned LibreOffice runtime
         run: python scripts/stage_libreoffice.py --target ${{ matrix.target }}
-      - name: Generate trusted runtime manifest
-        shell: bash
-        run: |
-          if [[ "${{ runner.os }}" == "Windows" ]]; then
-            WORKER="src-tauri/binaries/sbk-scanner-worker-${{ matrix.target }}.exe"
-          else
-            WORKER="src-tauri/binaries/sbk-scanner-worker-${{ matrix.target }}"
-          fi
-          python scripts/generate_runtime_manifest.py --root src-tauri/runtime-resources --worker "$WORKER"
       - name: Detect Apple signing and notarization credentials
         id: apple_credentials
         if: runner.os == 'macOS' && startsWith(github.ref, 'refs/tags/v')
@@ -210,6 +201,15 @@ jobs:
           SCANDOCUMENT_RESOURCE_ROOT=src-tauri/runtime-resources "$WORKER" process --config scanner-worker/tests/fixtures/process-demo-docx.json
           SCANDOCUMENT_RESOURCE_ROOT=src-tauri/runtime-resources "$WORKER" process --config scanner-worker/tests/fixtures/process-ocr.json
           SCANDOCUMENT_RESOURCE_ROOT=src-tauri/runtime-resources "$WORKER" process --config scanner-worker/tests/fixtures/process-facsimile.json
+      - name: Generate trusted runtime manifest
+        shell: bash
+        run: |
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            WORKER="src-tauri/binaries/sbk-scanner-worker-${{ matrix.target }}.exe"
+          else
+            WORKER="src-tauri/binaries/sbk-scanner-worker-${{ matrix.target }}"
+          fi
+          python scripts/generate_runtime_manifest.py --root src-tauri/runtime-resources --worker "$WORKER"
       - name: Build macOS app for manual verification
         if: runner.os == 'macOS' && (!startsWith(github.ref, 'refs/tags/v') || steps.apple_credentials.outputs.available != 'true')
         shell: bash
@@ -231,6 +231,26 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: npm run tauri build -- --target '${{ matrix.target }}' --no-bundle
+      - name: Ad-hoc sign macOS app for manual verification
+        if: runner.os == 'macOS' && (!startsWith(github.ref, 'refs/tags/v') || steps.apple_credentials.outputs.available != 'true')
+        shell: bash
+        run: |
+          APP="src-tauri/target/${{ matrix.target }}/release/bundle/macos/СБК Инструменты.app"
+          xattr -cr "$APP"
+          codesign --force --deep --sign - "$APP"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+      - name: Test final macOS app scanner runtime
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          APP="src-tauri/target/${{ matrix.target }}/release/bundle/macos/СБК Инструменты.app"
+          WORKER="$APP/Contents/MacOS/sbk-scanner-worker"
+          RUNTIME="$APP/Contents/Resources/scanner-runtime"
+          python scripts/verify_runtime_manifest.py --root "$RUNTIME" --worker "$WORKER"
+          SCANDOCUMENT_RESOURCE_ROOT="$RUNTIME" "$WORKER" preview --config scanner-worker/tests/fixtures/preview-docx.json
+          SCANDOCUMENT_RESOURCE_ROOT="$RUNTIME" "$WORKER" process --config scanner-worker/tests/fixtures/process-docx.json
+          python scripts/verify_runtime_manifest.py --root "$RUNTIME" --worker "$WORKER"
+          codesign --verify --deep --strict --verbose=2 "$APP"
       - name: Sign, notarize and archive portable macOS app
         if: runner.os == 'macOS' && startsWith(github.ref, 'refs/tags/v') && steps.apple_credentials.outputs.available == 'true'
         shell: bash
@@ -248,6 +268,9 @@ jobs:
           xcrun stapler staple "$APP"
           codesign --verify --deep --strict "$APP"
           spctl --assess --type execute --verbose=4 "$APP"
+          python scripts/verify_runtime_manifest.py \
+            --root "$APP/Contents/Resources/scanner-runtime" \
+            --worker "$APP/Contents/MacOS/sbk-scanner-worker"
           rm "$ZIP"
           ditto -c -k --sequesterRsrc --keepParent "$APP" "$ZIP"
           shasum -a 256 "$ZIP" > "$ZIP.sha256"
@@ -257,8 +280,6 @@ jobs:
         run: |
           APP="src-tauri/target/${{ matrix.target }}/release/bundle/macos/СБК Инструменты.app"
           mkdir -p release-artifacts
-          xattr -cr "$APP"
-          codesign --force --deep --sign - "$APP"
           codesign --verify --deep --strict --verbose=2 "$APP"
           READY_TOKEN="$(uuidgen | tr '[:upper:]' '[:lower:]')"
           READY_MARKER="$RUNNER_TEMP/SBKTools-ready-$READY_TOKEN.marker"

@@ -146,6 +146,7 @@ def annotations_from(config: dict) -> list[Annotation]:
         x=float(value.get("x", 0)), y=float(value.get("y", 0)),
         width=float(value.get("width", 0)), height=float(value.get("height", 0)),
         color=str(value.get("color", "#ffd84d")), intensity=float(value.get("intensity", 0.6)),
+        shape=str(value.get("shape", "rectangle")),
     ) for value in values]
 
 

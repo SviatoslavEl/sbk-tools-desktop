@@ -12,6 +12,23 @@ from pathlib import Path
 from scandocument.errors import CancelledError, DocxConversionError
 
 
+def _office_environment(profile: Path, workdir: Path) -> dict[str, str]:
+    environment = os.environ.copy()
+    environment.update({
+        "HOME": str(profile),
+        "TMPDIR": str(workdir),
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "SAL_USE_VCLPLUGIN": "svp",
+        "SAL_DISABLE_OPENCL": "1",
+    })
+    for name in (
+        "http_proxy", "https_proxy", "ftp_proxy", "all_proxy",
+        "HTTP_PROXY", "HTTPS_PROXY", "FTP_PROXY", "ALL_PROXY",
+    ):
+        environment.pop(name, None)
+    return environment
+
+
 def _attach_windows_kill_job(process: subprocess.Popen[bytes]):
     """Kill the complete office process tree if ScanDocument is terminated."""
     if os.name != "nt":
@@ -133,18 +150,7 @@ def convert_with_office(
         command = [
             str(sandbox), "-p", sandbox_profile, *command,
         ]
-    environment = os.environ.copy()
-    environment.update({
-        "HOME": str(profile),
-        "TMPDIR": str(workdir),
-        "SAL_USE_VCLPLUGIN": "svp",
-        "SAL_DISABLE_OPENCL": "1",
-    })
-    for name in (
-        "http_proxy", "https_proxy", "ftp_proxy", "all_proxy",
-        "HTTP_PROXY", "HTTPS_PROXY", "FTP_PROXY", "ALL_PROXY",
-    ):
-        environment.pop(name, None)
+    environment = _office_environment(profile, workdir)
     creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     if os.name == "nt":
         creation_flags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)

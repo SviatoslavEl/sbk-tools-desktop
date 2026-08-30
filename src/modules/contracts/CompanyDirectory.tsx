@@ -12,6 +12,7 @@ import {
 import {
   affiliationTypes,
   buildCompanyDirectoryMigration,
+  companyUsedAsPerformer,
   companyRelationshipLabel,
   emptyCompany,
   emptyCompanyDirectory,
@@ -132,8 +133,16 @@ export function useCompanyDirectory(contracts: StoredRecord<ContractData>[]) {
         source: "manual" as const,
         updatedAt: now,
       };
+      if (
+        normalized.scope === "external" &&
+        (companyUsedAsPerformer(normalized, records) ||
+          (previous != null && companyUsedAsPerformer(previous, records)))
+      )
+        throw new Error(
+          "Компания используется как юрлицо-исполнитель и должна оставаться во внутренней группе.",
+        );
       const next = normalizeCompanyDirectory({
-        schemaVersion: 1,
+        schemaVersion: 2,
         companies: [
           normalized,
           ...directory.companies.filter((item) => item.id !== normalized.id),
@@ -233,8 +242,10 @@ export function CompanyNameField({
   onChange: (name: string, id: string) => void;
 }) {
   const available = companies
-    .filter((company) =>
-      role === "ours" ? company.isOurs : company.isCounterparty,
+    .filter(
+      (company) =>
+        company.scope === (role === "ours" ? "internal" : "external") ||
+        company.id === companyId,
     )
     .sort((a, b) => a.name.localeCompare(b.name, "ru"));
   const selectedValue =
@@ -311,18 +322,14 @@ export function CompanyDirectoryDialog({
   onClose: () => void;
   onSave: (company: CompanyCard, previous?: CompanyCard) => Promise<void>;
 }) {
-  const [filter, setFilter] = useState<"all" | "ours" | "counterparties">(
-    "all",
-  );
+  const [filter, setFilter] = useState<"all" | "internal" | "external">("all");
   const [search, setSearch] = useState("");
   const [editing, setEditing] = useState<CompanyCard | null>(null);
   const filtered = useMemo(
     () =>
       companies
         .filter((company) => {
-          if (filter === "ours" && !company.isOurs) return false;
-          if (filter === "counterparties" && !company.isCounterparty)
-            return false;
+          if (filter !== "all" && company.scope !== filter) return false;
           return [company.name, company.shortName, company.inn, company.ogrn]
             .join(" ")
             .toLocaleLowerCase("ru")
@@ -335,7 +342,7 @@ export function CompanyDirectoryDialog({
     <>
       <Dialog
         title="Компании и контрагенты"
-        description="Карточки автоматически создаются из договоров. Реквизиты и связи можно дополнить вручную."
+        description="Внутренняя группа и внешние компании хранятся раздельно. Карточки из договоров попадают в подходящий раздел автоматически."
         onClose={onClose}
         width="1100px"
       >
@@ -360,7 +367,7 @@ export function CompanyDirectoryDialog({
               />
             </label>
             <label>
-              <span>Тип</span>
+              <span>Раздел</span>
               <select
                 value={filter}
                 onChange={(event) =>
@@ -368,8 +375,8 @@ export function CompanyDirectoryDialog({
                 }
               >
                 <option value="all">Все компании</option>
-                <option value="ours">Наши компании</option>
-                <option value="counterparties">Контрагенты</option>
+                <option value="internal">Внутренняя группа компаний</option>
+                <option value="external">Внешние компании</option>
               </select>
             </label>
             {!readOnly && (
@@ -432,12 +439,13 @@ export function CompanyDirectoryDialog({
                           )}
                         </td>
                         <td>
-                          {company.isOurs && (
-                            <span className="status success">Наша</span>
-                          )}{" "}
-                          {company.isCounterparty && (
-                            <span className="status neutral">Контрагент</span>
-                          )}
+                          <span
+                            className={`status ${company.scope === "internal" ? "success" : "neutral"}`}
+                          >
+                            {company.scope === "internal"
+                              ? "Внутренняя группа"
+                              : "Внешняя"}
+                          </span>
                         </td>
                         <td>
                           {company.inn || "—"}
@@ -600,26 +608,19 @@ function CompanyEditor({
             />
           </label>
         </div>
-        <div className="company-role-row">
-          <label className="checkbox-row">
-            <input
-              type="checkbox"
-              checked={item.isOurs}
-              onChange={(event) => update("isOurs", event.target.checked)}
-            />{" "}
-            Наша компания
-          </label>
-          <label className="checkbox-row">
-            <input
-              type="checkbox"
-              checked={item.isCounterparty}
-              onChange={(event) =>
-                update("isCounterparty", event.target.checked)
-              }
-            />{" "}
-            Контрагент
-          </label>
-        </div>
+        <label>
+          Раздел справочника *
+          <select
+            value={item.scope}
+            onChange={(event) =>
+              update("scope", event.target.value as CompanyCard["scope"])
+            }
+          >
+            <option value="internal">Внутренняя группа компаний</option>
+            <option value="external">Внешние компании</option>
+          </select>
+          <small>Компания может находиться только в одном разделе.</small>
+        </label>
         <div className="inline-heading">
           <div>
             <h3>Аффилированность</h3>

@@ -5,8 +5,10 @@ import { useRecords } from "../../hooks/useRecords";
 import { parseCsv, toCsv } from "../../lib/csv";
 import {
   clearImportRowIssues,
+  currentImportReviewIndex,
   importProblemRows,
   missingImportFields,
+  nextImportProblemIndex,
   replaceImportReviewRow,
   type ImportRequiredField,
 } from "../../lib/importReview";
@@ -141,6 +143,7 @@ export function StaffRegistry() {
   const [importEditingIndex, setImportEditingIndex] = useState<number | null>(
     null,
   );
+  const [importReviewIndex, setImportReviewIndex] = useState<number | null>(null);
   const [importOverrides, setImportOverrides] = useState<
     Map<number, StaffImportOverride>
   >(new Map());
@@ -489,6 +492,7 @@ export function StaffRegistry() {
     const parsed = mapStaffRows(rows, mapping, importDefaults);
     setImportSource({ headers, rows, mapping });
     setImportRows(parsed.items);
+    setImportReviewIndex(null);
     setImportSourceIssues(parsed.issues);
     setConfirmedImportIssues(new Set());
     setImportOverrides(new Map());
@@ -520,6 +524,7 @@ export function StaffRegistry() {
       | "engagementOther",
     value: string,
   ) => {
+    setImportReviewIndex(index);
     setImportRows((current) => {
       if (!current?.[index]) return current;
       const source = current[index];
@@ -584,6 +589,20 @@ export function StaffRegistry() {
         return issues;
       })
     : [];
+  useEffect(() => {
+    if (importRows && importReviewIndex === null && staffImportProblems[0])
+      setImportReviewIndex(staffImportProblems[0].index);
+  }, [importRows, importReviewIndex, staffImportProblems]);
+  const staffImportReview = (() => {
+    const index = currentImportReviewIndex(
+      importReviewIndex,
+      staffImportProblems.map((entry) => entry.index),
+      importRows?.length || 0,
+    );
+    if (index == null || !importRows?.[index]) return null;
+    const problem = staffImportProblems.find((entry) => entry.index === index);
+    return { index, item: importRows[index], issues: problem?.issues || [] };
+  })();
 
   const commitImport = async () => {
     if (!importRows) return;
@@ -1329,6 +1348,7 @@ export function StaffRegistry() {
             setImportRows(null);
             setImportSource(null);
             setImportEditingIndex(null);
+            setImportReviewIndex(null);
             setImportOverrides(new Map());
           }}
           width="880px"
@@ -1463,19 +1483,23 @@ export function StaffRegistry() {
               </strong>
               <span>
                 {staffImportProblems.length
-                  ? "Заполните обязательные поля текущего сотрудника — следующая проблемная строка появится автоматически."
+                  ? "Заполните текущего сотрудника и нажмите «Сохранить и перейти дальше»."
                   : "Все сотрудники проверены и готовы к атомарному импорту."}
               </span>
             </div>
-            {staffImportProblems[0] ? (
+            {staffImportReview ? (
               (() => {
-                const problem = staffImportProblems[0];
+                const problem = staffImportReview;
                 const item = problem.item;
                 const assignment = primaryAssignment(item);
                 const missing = new Set(
-                  missingImportFields(item, requiredStaffImportFields).map(
-                    (field) => field.key,
-                  ),
+                  requiredStaffImportFields
+                    .filter(
+                      (field) =>
+                        field.key !== "engagementOther" ||
+                        assignment.engagementType === "Иное",
+                    )
+                    .map((field) => field.key),
                 );
                 return (
                   <section className="document-card">
@@ -1578,6 +1602,21 @@ export function StaffRegistry() {
                     >
                       Открыть карточку для исправления остальных замечаний
                     </button>
+                    <button
+                      className="primary"
+                      type="button"
+                      disabled={problem.issues.length > 0}
+                      onClick={() =>
+                        setImportReviewIndex(
+                          nextImportProblemIndex(
+                            staffImportProblems.map((entry) => entry.index),
+                            problem.index,
+                          ),
+                        )
+                      }
+                    >
+                      Сохранить и перейти дальше
+                    </button>
                   </section>
                 );
               })()
@@ -1601,6 +1640,7 @@ export function StaffRegistry() {
                 setImportRows(null);
                 setImportSource(null);
                 setImportEditingIndex(null);
+                setImportReviewIndex(null);
                 setImportOverrides(new Map());
               }}
             >

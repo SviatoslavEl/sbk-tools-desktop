@@ -53,5 +53,10 @@ def apply_annotations(image: Image.Image, annotations: Iterable[Annotation], pag
             else:
                 radius = max(2.0, min(crop.width, crop.height) * (0.025 + annotation.intensity * 0.09))
                 crop = crop.filter(ImageFilter.GaussianBlur(radius=radius))
-            result.paste(crop, (left, top))
+            if annotation.shape == "ellipse":
+                mask = Image.new("L", crop.size, 0)
+                ImageDraw.Draw(mask).ellipse((0, 0, max(0, crop.width - 1), max(0, crop.height - 1)), fill=255)
+                result.paste(crop, (left, top), mask)
+            else:
+                result.paste(crop, (left, top))
     return result

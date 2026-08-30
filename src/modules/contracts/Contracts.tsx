@@ -25,8 +25,10 @@ import {
 import {
   applyImportReviewOverrides,
   buildImportReviewOverride,
+  currentImportReviewIndex,
   importProblemRows,
   missingImportFields,
+  nextImportProblemIndex,
   replaceImportReviewRow,
   type ImportReviewOverride,
   type ImportRequiredField,
@@ -351,6 +353,7 @@ export function ContractsRegistry() {
   const [importEditingIndex, setImportEditingIndex] = useState<number | null>(
     null,
   );
+  const [importReviewIndex, setImportReviewIndex] = useState<number | null>(null);
   const [importReviewedRows, setImportReviewedRows] = useState<Set<number>>(
     new Set(),
   );
@@ -722,6 +725,7 @@ export function ContractsRegistry() {
     const parsed = mapContracts(rows, mapping, importLegalEntity);
     setImportSource({ headers, rows, mapping });
     setImportRows(parsed);
+    setImportReviewIndex(null);
     setImportReviewedRows(new Set());
     setImportOverrides(new Map());
     setImportReport(null);
@@ -735,14 +739,14 @@ export function ContractsRegistry() {
     return mapContracts(importSource.rows, mapping, legalEntity);
   };
 
-  const updateContractImportRow = <K extends keyof ContractData>(
+  const updateContractImportRowPatch = (
     index: number,
-    key: K,
-    value: ContractData[K],
+    patch: Partial<ContractData>,
   ) => {
+    setImportReviewIndex(index);
     setImportRows((current) => {
       if (!current?.[index]) return current;
-      const edited = { ...current[index], [key]: value };
+      const edited = { ...current[index], ...patch };
       const baseline = reparseContractImport()[index] || current[index];
       const override = buildImportReviewOverride(baseline, edited);
       setImportOverrides((existing) => {
@@ -755,6 +759,12 @@ export function ContractsRegistry() {
     });
     setImportReport(null);
   };
+
+  const updateContractImportRow = <K extends keyof ContractData>(
+    index: number,
+    key: K,
+    value: ContractData[K],
+  ) => updateContractImportRowPatch(index, { [key]: value });
 
   const contractImportProblems =
     importRows && importSource
@@ -816,6 +826,20 @@ export function ContractsRegistry() {
           return issues;
         })
       : [];
+  useEffect(() => {
+    if (importRows && importReviewIndex === null && contractImportProblems[0])
+      setImportReviewIndex(contractImportProblems[0].index);
+  }, [importRows, importReviewIndex, contractImportProblems]);
+  const contractImportReview = (() => {
+    const index = currentImportReviewIndex(
+      importReviewIndex,
+      contractImportProblems.map((entry) => entry.index),
+      importRows?.length || 0,
+    );
+    if (index == null || !importRows?.[index]) return null;
+    const problem = contractImportProblems.find((entry) => entry.index === index);
+    return { index, item: importRows[index], issues: problem?.issues || [] };
+  })();
 
   const commitImport = async () => {
     if (!importRows || !importSource) return;
@@ -1594,6 +1618,7 @@ export function ContractsRegistry() {
             setImportRows(null);
             setImportSource(null);
             setImportEditingIndex(null);
+            setImportReviewIndex(null);
             setImportOverrides(new Map());
           }}
           width="880px"
@@ -1675,18 +1700,16 @@ export function ContractsRegistry() {
               </strong>
               <span>
                 {contractImportProblems.length
-                  ? "Заполните отмеченные поля текущей строки — затем автоматически появится следующая проблемная строка."
+                  ? "Заполните текущую строку и нажмите «Сохранить и перейти дальше»."
                   : "Все строки проверены и готовы к атомарному импорту."}
               </span>
             </div>
-            {contractImportProblems[0] ? (
+            {contractImportReview ? (
               (() => {
-                const problem = contractImportProblems[0];
+                const problem = contractImportReview;
                 const item = problem.item;
                 const missing = new Set(
-                  missingImportFields(item, requiredContractImportFields).map(
-                    (field) => field.key,
-                  ),
+                  requiredContractImportFields.map((field) => field.key),
                 );
                 return (
                   <section className="document-card">
@@ -1715,16 +1738,10 @@ export function ContractsRegistry() {
                           companies={companyDirectory.companies}
                           role="ours"
                           onChange={(name, id) => {
-                            updateContractImportRow(
-                              problem.index,
-                              "performingLegalEntity",
-                              name,
-                            );
-                            updateContractImportRow(
-                              problem.index,
-                              "performingLegalEntityId",
-                              id,
-                            );
+                            updateContractImportRowPatch(problem.index, {
+                              performingLegalEntity: name,
+                              performingLegalEntityId: id,
+                            });
                           }}
                         />
                       )}
@@ -1753,16 +1770,10 @@ export function ContractsRegistry() {
                           companies={companyDirectory.companies}
                           role="counterparty"
                           onChange={(name, id) => {
-                            updateContractImportRow(
-                              problem.index,
-                              "customer",
-                              name,
-                            );
-                            updateContractImportRow(
-                              problem.index,
-                              "customerCompanyId",
-                              id,
-                            );
+                            updateContractImportRowPatch(problem.index, {
+                              customer: name,
+                              customerCompanyId: id,
+                            });
                           }}
                         />
                       )}
@@ -1790,6 +1801,21 @@ export function ContractsRegistry() {
                     >
                       Открыть карточку для исправления остальных замечаний
                     </button>
+                    <button
+                      className="primary"
+                      type="button"
+                      disabled={problem.issues.length > 0}
+                      onClick={() =>
+                        setImportReviewIndex(
+                          nextImportProblemIndex(
+                            contractImportProblems.map((entry) => entry.index),
+                            problem.index,
+                          ),
+                        )
+                      }
+                    >
+                      Сохранить и перейти дальше
+                    </button>
                   </section>
                 );
               })()
@@ -1813,6 +1839,7 @@ export function ContractsRegistry() {
                 setImportRows(null);
                 setImportSource(null);
                 setImportEditingIndex(null);
+                setImportReviewIndex(null);
                 setImportOverrides(new Map());
               }}
             >

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import { ConfirmDialog } from "../../components/Dialog";
 import { useRecords } from "../../hooks/useRecords";
 import { chooseSavePath, exportText } from "../../lib/files";
@@ -41,9 +41,6 @@ import {
   type SnapshotLink,
 } from "./types";
 import { Stage2Workspace } from "./Stage2Workspace";
-import { demoProcurements } from "./demo";
-
-const demoSeedTitle = "demo-procurements-v1";
 
 function snapshot(
   sourceModule: SnapshotLink["sourceModule"],
@@ -63,7 +60,6 @@ export function ProcurementRegistry() {
   const workspaceAccess = useWorkspaceAccess();
   const readOnly = !workspaceAccess.editor;
   const store = useRecords<ProcurementData>("procurement");
-  const demoSettings = useRecords<{ seededAt: string }>("settings");
   const [search, setSearch] = useState("");
   const [status, setStatus] = useState("");
   const [editing, setEditing] = useState<
@@ -71,38 +67,6 @@ export function ProcurementRegistry() {
   >(null);
   const [archiving, setArchiving] =
     useState<StoredRecord<ProcurementData> | null>(null);
-  const [seedingDemos, setSeedingDemos] = useState(false);
-  const addDemos = async () => {
-    if (seedingDemos) return;
-    setSeedingDemos(true);
-    try {
-      const existingIds = new Set(store.records.map((record) => record.id));
-      for (const demo of demoProcurements())
-        if (!existingIds.has(demo.id))
-          await store.save(demo.item.name, demo.item, demo.id);
-      const marker = demoSettings.records.find(
-        (record) => record.title === demoSeedTitle,
-      );
-      await demoSettings.save(
-        demoSeedTitle,
-        { seededAt: new Date().toISOString() },
-        marker?.id,
-      );
-    } finally {
-      setSeedingDemos(false);
-    }
-  };
-  useEffect(() => {
-    if (
-      !readOnly &&
-      !store.loading &&
-      !demoSettings.loading &&
-      !demoSettings.records.some((record) => record.title === demoSeedTitle)
-    )
-      void addDemos();
-    // The marker is stored in the current workspace, so a newly selected workspace gets its own demos.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [readOnly, store.loading, demoSettings.loading]);
   const filtered = store.records.filter(
     (record) =>
       [
@@ -178,14 +142,6 @@ export function ProcurementRegistry() {
         </label>
         {!readOnly && (
           <div className="toolbar-actions">
-            <button
-              className="secondary"
-              type="button"
-              disabled={seedingDemos}
-              onClick={() => void addDemos()}
-            >
-              {seedingDemos ? "Добавляем…" : "Добавить демо"}
-            </button>
             <button
               className="primary"
               type="button"
@@ -372,7 +328,10 @@ function ProcurementEditor({
   const update = <K extends keyof ProcurementData>(
     key: K,
     value: ProcurementData[K],
-  ) => setItem((current) => ({ ...current, [key]: value }));
+  ) => {
+    setError("");
+    setItem((current) => ({ ...current, [key]: value }));
+  };
   const save = async () => {
     const blocking = procurementWarnings(item).filter(
       (warning) =>
@@ -382,7 +341,7 @@ function ProcurementEditor({
         warning.includes("превышает 100"),
     );
     if (blocking.length) {
-      setError(blocking.join(" "));
+      setError("Исправьте отмеченные замечания перед сохранением.");
       return;
     }
     await onSave(item, record?.id);

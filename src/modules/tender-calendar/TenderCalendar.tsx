@@ -33,8 +33,12 @@ const plusDays = (date: string, days: number) => {
   value.setDate(value.getDate() + days);
   return dateKey(value);
 };
-export const suggestedInternalDeadline = (start: string, deadline: string) => {
-  const effectiveStart = start || dateKey(new Date());
+export const suggestedInternalDeadline = (
+  start: string,
+  deadline: string,
+  now = new Date(),
+) => {
+  const effectiveStart = start || dateKey(now);
   const proposed = plusDays(deadline, -2);
   return proposed < effectiveStart ? effectiveStart : proposed;
 };

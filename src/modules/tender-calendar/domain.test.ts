@@ -9,8 +9,9 @@ const staffRecord = (id: string, patch: Partial<StaffData>): StoredRecord<StaffD
 
 describe("tender calendar planning", () => {
   it("keeps a minimal same-day tender date sequence valid", () => {
-    const today = new Date().toISOString().slice(0, 10);
-    expect(suggestedInternalDeadline("", today)).toBe(today);
+    expect(
+      suggestedInternalDeadline("", "2026-08-30", new Date(2026, 7, 30, 23, 30)),
+    ).toBe("2026-08-30");
   });
 
   it("counts only business days", () => expect(datesBetween("2026-08-28", "2026-09-01")).toEqual(["2026-08-28", "2026-08-31", "2026-09-01"]));

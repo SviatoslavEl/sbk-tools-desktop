@@ -90,6 +90,16 @@ describe("facsimile preview model", () => {
     expect(second.x).not.toBe(first.x);
   });
 
+  it("does not retain a hidden all-page region after switching to one page", () => {
+    const placement = buildFacsimilePlacement({
+      ...editable,
+      placementMode: "region" as const,
+      region: [0.1, 0.2, 0.6, 0.5] as [number, number, number, number],
+    }, { application: "current", pages: [0] });
+    expect(placement.region).toBeUndefined();
+    expect(placement.randomizeInRegion).toBe(false);
+  });
+
   it("keeps an info-button click from activating its surrounding checkbox label", () => {
     const event = { preventDefault: vi.fn(), stopPropagation: vi.fn() };
     suppressLabelActivation(event);
