@@ -35,6 +35,7 @@ jobs:
       - run: pip install -r requirements-dev.lock
         working-directory: scanner-worker
       - run: python scripts/check_versions.py
+      - run: python scripts/check_windows_manifest.py
       - run: python scripts/validate_intelligence_contract.py
       - run: npm test
       - run: npm run build
@@ -66,7 +67,7 @@ jobs:
   build:
     needs: quality-gate
     env:
-      ARTIFACT_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('2.5.1-test.{0}', github.run_number) }}
+      ARTIFACT_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('2.5.2-test.{0}', github.run_number) }}
     strategy:
       fail-fast: false
       matrix:
@@ -210,7 +211,7 @@ jobs:
           SCANDOCUMENT_RESOURCE_ROOT=src-tauri/runtime-resources "$WORKER" process --config scanner-worker/tests/fixtures/process-ocr.json
           SCANDOCUMENT_RESOURCE_ROOT=src-tauri/runtime-resources "$WORKER" process --config scanner-worker/tests/fixtures/process-facsimile.json
       - name: Build macOS app for manual verification
-        if: runner.os == 'macOS' && !startsWith(github.ref, 'refs/tags/v')
+        if: runner.os == 'macOS' && (!startsWith(github.ref, 'refs/tags/v') || steps.apple_credentials.outputs.available != 'true')
         shell: bash
         run: npm run tauri build -- ${{ matrix.args }}
       - name: Build and attach signed macOS release bundles
@@ -251,16 +252,45 @@ jobs:
           ditto -c -k --sequesterRsrc --keepParent "$APP" "$ZIP"
           shasum -a 256 "$ZIP" > "$ZIP.sha256"
       - name: Archive unsigned macOS app for manual verification
-        if: runner.os == 'macOS' && !startsWith(github.ref, 'refs/tags/v')
+        if: runner.os == 'macOS' && (!startsWith(github.ref, 'refs/tags/v') || steps.apple_credentials.outputs.available != 'true')
         shell: bash
         run: |
           APP="src-tauri/target/${{ matrix.target }}/release/bundle/macos/СБК Инструменты.app"
           mkdir -p release-artifacts
+          xattr -cr "$APP"
+          codesign --force --deep --sign - "$APP"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          READY_TOKEN="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+          READY_MARKER="$RUNNER_TEMP/SBKTools-ready-$READY_TOKEN.marker"
+          LAUNCH_LOG="$RUNNER_TEMP/SBKTools-macos-launch.log"
+          TMPDIR="$RUNNER_TEMP/" SBK_ONEFILE_GUI_READY_TOKEN="$READY_TOKEN" \
+            "$APP/Contents/MacOS/sbk-tools-desktop" >"$LAUNCH_LOG" 2>&1 &
+          APP_PID=$!
+          READY=false
+          for _ in {1..240}; do
+            if [[ -f "$READY_MARKER" ]]; then
+              READY=true
+              break
+            fi
+            if ! kill -0 "$APP_PID" 2>/dev/null; then
+              cat "$LAUNCH_LOG"
+              echo "macOS app exited before opening its window" >&2
+              exit 1
+            fi
+            sleep 0.5
+          done
+          kill "$APP_PID" 2>/dev/null || true
+          wait "$APP_PID" 2>/dev/null || true
+          if [[ "$READY" != true ]]; then
+            cat "$LAUNCH_LOG"
+            echo "macOS app did not report a ready window" >&2
+            exit 1
+          fi
           ZIP="release-artifacts/SBK-Tools-${ARTIFACT_VERSION}-${{ matrix.target }}-unsigned.app.zip"
           ditto -c -k --sequesterRsrc --keepParent "$APP" "$ZIP"
           shasum -a 256 "$ZIP" > "$ZIP.sha256"
       - name: Upload portable macOS app
-        if: runner.os == 'macOS' && (!startsWith(github.ref, 'refs/tags/v') || steps.apple_credentials.outputs.available == 'true')
+        if: runner.os == 'macOS'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: SBK-Tools-${{ matrix.target }}-App

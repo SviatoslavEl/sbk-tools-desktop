@@ -14,6 +14,7 @@ def main() -> None:
         "src-tauri/tauri.conf.json": json.loads((root / "src-tauri/tauri.conf.json").read_text(encoding="utf-8"))["version"],
         "src-tauri/Cargo.toml": re.search(r'^version = "([^"]+)"', (root / "src-tauri/Cargo.toml").read_text(encoding="utf-8"), re.MULTILINE).group(1),
         "scanner-worker/pyproject.toml": re.search(r'^version = "([^"]+)"', (root / "scanner-worker/pyproject.toml").read_text(encoding="utf-8"), re.MULTILINE).group(1),
+        "scanner-worker/src/scandocument/__init__.py": re.search(r'^__version__ = "([^"]+)"', (root / "scanner-worker/src/scandocument/__init__.py").read_text(encoding="utf-8"), re.MULTILINE).group(1),
         "windows-launcher/Cargo.toml": re.search(r'^version = "([^"]+)"', (root / "windows-launcher/Cargo.toml").read_text(encoding="utf-8"), re.MULTILINE).group(1),
     }
     mismatches = {name: value for name, value in checks.items() if value != version}

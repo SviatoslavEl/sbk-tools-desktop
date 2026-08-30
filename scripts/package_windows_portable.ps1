@@ -44,6 +44,9 @@ function Assert-AsInvoker([string]$Executable, [string]$Label) {
     if ($text -notmatch 'uiAccess="false"') {
         throw "$Label unexpectedly requests UI access"
     }
+    if ($text -notmatch 'name="Microsoft.Windows.Common-Controls"' -or $text -notmatch 'version="6.0.0.0"') {
+        throw "$Label does not activate Windows Common Controls v6"
+    }
 }
 
 if (Test-Path $Stage) { Remove-Item -Recurse -Force $Stage }
