@@ -1,0 +1,66 @@
+name: Publish verified desktop release
+
+on:
+  workflow_run:
+    workflows: ["Release desktop builds"]
+    types: [completed]
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  publish:
+    if: github.event.workflow_run.conclusion == 'success' && startsWith(github.event.workflow_run.head_branch, 'v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download verified desktop artifacts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          set -euo pipefail
+          mkdir -p release-artifacts
+          gh run download "$RUN_ID" --repo SviatoslavEl/sbk-tools-desktop --name SBK-Tools-aarch64-apple-darwin-App --dir release-artifacts
+          gh run download "$RUN_ID" --repo SviatoslavEl/sbk-tools-desktop --name SBK-Tools-Windows-x64-Portable --dir release-artifacts
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          mac="release-artifacts/SBK-Tools-${RELEASE_TAG}-aarch64-apple-darwin-unsigned.app.zip"
+          windows="release-artifacts/ScanDocument.exe"
+          test -f "$mac"
+          test -f "$mac.sha256"
+          test -f "$windows"
+          test -f "$windows.sha256"
+          cat > release-notes.md <<EOF
+          Версия $version для Windows x64 и macOS Apple Silicon.
+
+          В сканер добавлено сохранение одного документа в несколько PDF-блоков с произвольными диапазонами страниц. Исправлена компоновка инструментов, удалены координатные поля, добавлена настройка интенсивности и прозрачности. Обычное размытие создаётся прямоугольником, размытие печати — кругом.
+
+          Финальные пакеты проверены на чистых GitHub Actions-агентах. Windows: запущен итоговый единый EXE, проверены окно приложения, встроенный сканер и восстановление после аварийного завершения. macOS: из итогового APP обработаны PDF, DOCX, OCR и факсимиле.
+
+          macOS-архив подписан ad-hoc, поскольку в репозитории не настроен сертификат Apple Developer ID. Если Gatekeeper блокирует первый запуск, распакуйте приложение в «Программы» и выполните:
+
+          \`xattr -dr com.apple.quarantine "/Applications/СБК Инструменты.app"\`
+          EOF
+          gh release view "$RELEASE_TAG" --repo SviatoslavEl/sbk-tools-desktop >/dev/null 2>&1 || \
+            gh release create "$RELEASE_TAG" --repo SviatoslavEl/sbk-tools-desktop --draft --title "СБК Инструменты $RELEASE_TAG" --notes-file release-notes.md
+          gh release upload "$RELEASE_TAG" "$windows" "$windows.sha256" "$mac" "$mac.sha256" --repo SviatoslavEl/sbk-tools-desktop --clobber
+          gh release edit "$RELEASE_TAG" --repo SviatoslavEl/sbk-tools-desktop --title "СБК Инструменты $RELEASE_TAG" --notes-file release-notes.md --draft=false
+
+      - name: Verify published assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          set -euo pipefail
+          assets="$(gh release view "$RELEASE_TAG" --repo SviatoslavEl/sbk-tools-desktop --json assets,isDraft,url)"
+          test "$(jq -r '.isDraft' <<<"$assets")" = false
+          jq -e '.assets | map(.name) | index("ScanDocument.exe")' <<<"$assets" >/dev/null
+          jq -e '.assets | map(.name) | index("ScanDocument.exe.sha256")' <<<"$assets" >/dev/null
+          jq -e --arg tag "$RELEASE_TAG" '.assets | map(.name) | index("SBK-Tools-" + $tag + "-aarch64-apple-darwin-unsigned.app.zip")' <<<"$assets" >/dev/null
