@@ -9,7 +9,7 @@ import zipfile
 from pathlib import Path
 
 import pytest
-from PIL import Image
+from PIL import Image, ImageChops
 from pypdf import PdfReader
 
 from scandocument.errors import CancelledError, CorruptDocumentError, DocumentTooLargeError, UnsupportedFormatError
@@ -251,6 +251,19 @@ def test_page_tools_and_print_blur_change_only_selected_page() -> None:
     result = apply_annotations(source, operations, 0)
     assert result.tobytes() != source.tobytes()
     assert apply_annotations(source, operations, 1).tobytes() == source.tobytes()
+
+
+@pytest.mark.parametrize("kind", ["marker", "stroke", "blur", "print_blur"])
+def test_page_tool_intensity_controls_visible_strength(kind: str) -> None:
+    source = Image.effect_noise((320, 240), 90).convert("RGB")
+    low = Annotation(kind, [0], .15, .2, .65, .35, "#202020", .1, "ellipse")
+    high = Annotation(kind, [0], .15, .2, .65, .35, "#202020", 1.0, "ellipse")
+
+    def change_score(result: Image.Image) -> int:
+        difference = ImageChops.difference(source, result)
+        return sum(value * count for value, count in enumerate(difference.histogram()))
+
+    assert change_score(apply_annotations(source, [high], 0)) > change_score(apply_annotations(source, [low], 0))
 
 
 @pytest.mark.parametrize("kind", ["blur", "print_blur"])

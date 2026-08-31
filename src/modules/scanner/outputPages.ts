@@ -1,5 +1,18 @@
 export type OutputPageMode = "all" | "range";
 
+export interface OutputBlockDefinition {
+  id: string;
+  name: string;
+  pageRange: string;
+}
+
+export interface OutputPageBlock {
+  id: string;
+  name: string;
+  fileName: string;
+  order: number[];
+}
+
 export class OutputPageRangeError extends Error {
   constructor(message: string) {
     super(message);
@@ -37,4 +50,32 @@ export function buildOutputPageOrder(currentOrder: number[], mode: OutputPageMod
   const selected = parseOutputPages(mode, value, currentOrder.length);
   if (selected === null) return [...currentOrder];
   return selected.map((position) => currentOrder[position]);
+}
+
+export function safeOutputBlockName(value: string): string {
+  return value.trim().replace(/\.pdf$/i, "").replace(/[<>:"/\\|?*\u0000-\u001f]/g, " ").replace(/\s+/g, " ").replace(/[. ]+$/g, "");
+}
+
+export function buildOutputPageBlocks(
+  currentOrder: number[],
+  definitions: OutputBlockDefinition[],
+  pageCount: number,
+): OutputPageBlock[] {
+  if (!definitions.length) throw new OutputPageRangeError("Добавьте хотя бы один блок страниц.");
+  const usedNames = new Set<string>();
+  return definitions.map((definition, index) => {
+    const name = definition.name.trim();
+    if (!name) throw new OutputPageRangeError(`Укажите название блока ${index + 1}.`);
+    const fileName = safeOutputBlockName(name);
+    if (!fileName) throw new OutputPageRangeError(`Название блока ${index + 1} не содержит допустимых символов.`);
+    const nameKey = fileName.toLocaleLowerCase("ru-RU");
+    if (usedNames.has(nameKey)) throw new OutputPageRangeError(`Название «${fileName}» используется повторно.`);
+    usedNames.add(nameKey);
+    return {
+      id: definition.id,
+      name,
+      fileName,
+      order: buildOutputPageOrder(currentOrder, "range", definition.pageRange, pageCount),
+    };
+  });
 }

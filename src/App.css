@@ -168,8 +168,8 @@ textarea { resize: vertical; }
 .file-picker, .file-button { display: block; text-align: center; cursor: pointer; }
 .file-picker input, .file-button input { display: none; }
 .selected-file { overflow: hidden; margin: 8px 0 0; color: #617368; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
-.preset-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
-.preset-grid button { min-height: 54px; padding: 8px; color: #315c40; background: #f7fcf8; border: 1px solid #c5d8c9; border-radius: 8px; text-align: left; }
+.preset-grid { display: grid; min-width: 0; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; }
+.preset-grid button { min-width: 0; min-height: 54px; padding: 8px; color: #315c40; background: #f7fcf8; border: 1px solid #c5d8c9; border-radius: 8px; overflow-wrap: anywhere; text-align: left; }
 .preset-grid button strong, .preset-grid button small { display: block; }
 .preset-grid button small { margin-top: 3px; color: #6b7f70; font-size: 9px; }
 .preset-grid button.selected { color: #1f6e30; background: #dff3e3; border-color: #49ad5c; box-shadow: inset 3px 0 #2f9845; }
@@ -220,8 +220,6 @@ details label { display: block; margin-top: 10px; }
 .page-editor > div { display: flex; gap: 3px; max-width: 360px; overflow: auto; }
 .page-editor > div button { min-width: 28px; height: 28px; border: 1px solid #bfd0c2; border-radius: 6px; color: #315c40; background: #fff; }
 .page-editor > div button.active { color: #fff; background: #2f9845; border-color: #2f9845; }
-.redaction-row { display: grid; grid-template-columns: 55px repeat(4, 70px) 95px 38px; gap: 5px; align-items: end; margin: 7px 0; }
-.redaction-row input, .redaction-row select { width: 100%; min-height: 34px; padding: 5px; color: #173c2a; background: #fff; border: 1px solid #bfd0c2; border-radius: 6px; }
 .scanner-estimate { display: flex; justify-content: space-between; gap: 12px; padding: 7px 13px; color: #5c7062; background: #f8fbf9; border-top: 1px solid #dbe7de; font-size: 10px; }
 .ocr-result { margin: 0 13px 10px; border: 1px solid #dbe7de; border-radius: 10px; padding: 9px 11px; background: #f8fbf9; }
 .ocr-result summary { cursor: pointer; font-weight: 700; color: #226b37; }

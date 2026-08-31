@@ -43,8 +43,9 @@
 .scanner-info:focus .scanner-info-text,
 .scanner-info:focus-within .scanner-info-text { display: block; }
 
-.surface.scanner-controls { position: relative; z-index: 8; overflow: visible; }
-.scanner-controls .surface-body { overflow: visible; }
+.surface.scanner-controls { position: relative; z-index: 8; min-width: 0; max-width: 100%; overflow: visible; }
+.scanner-controls .surface-body { min-width: 0; max-width: 100%; overflow: visible; }
+.scanner-control-stack > * { min-width: 0; max-width: 100%; }
 
 .facsimile-saved-list { display: grid; gap: 5px; margin-top: 7px; }
 .facsimile-saved-row { display: flex; align-items: center; justify-content: space-between; gap: 7px; }
@@ -55,14 +56,30 @@
 .output-page-selection label { display: grid; gap: 3px; }
 .output-page-selection select, .output-page-selection input { min-height: 34px; padding: 6px 8px; color: #173c2a; background: #fff; border: 1px solid #bfd0c2; border-radius: 7px; }
 .output-page-selection span { align-self: center; }
+.split-blocks { display: grid; flex: 1 0 100%; min-width: 0; gap: 7px; padding: 9px; border: 1px solid #d7e7da; border-radius: 9px; background: #fff; }
+.split-blocks > p { margin: 0; color: #607468; font-size: 10px; }
+.split-block-row { display: grid; min-width: 0; grid-template-columns: minmax(120px, 1fr) minmax(150px, 1.25fr) 36px; align-items: end; gap: 7px; }
+.split-block-row label { min-width: 0; }
+.split-block-row input { width: 100%; min-width: 0; }
+.split-block-row .icon-button { width: 36px; height: 34px; }
+.split-block-footer { display: flex; min-width: 0; align-items: center; justify-content: space-between; gap: 9px; }
+.split-block-footer span { min-width: 0; overflow-wrap: anywhere; }
 
 .compression-controls { display: grid; gap: 7px; padding: 10px; background: #f5faf6; border: 1px solid #d7e7da; border-radius: 9px; }
 .compression-controls h3 { margin: 0; }
 .region-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
 .region-grid input { width: 100%; }
 .annotation-buttons { display: flex; flex-wrap: wrap; gap: 6px; }
-.annotation-row { display: grid; grid-template-columns: minmax(110px, 1.4fr) repeat(5, minmax(58px, .7fr)) 38px; gap: 5px; align-items: end; margin: 7px 0; }
-.annotation-row input { width: 100%; min-height: 34px; padding: 5px; color: #173c2a; background: #fff; border: 1px solid #bfd0c2; border-radius: 6px; }
+.geometry-control-card { min-width: 0; max-width: 100%; margin: 7px 0; padding: 8px; border: 1px solid #d4e3d7; border-radius: 8px; background: #f8fbf9; }
+.geometry-card-header { display: flex; min-width: 0; align-items: center; justify-content: space-between; gap: 8px; }
+.geometry-card-header strong { min-width: 0; overflow-wrap: anywhere; }
+.geometry-card-header .icon-button { flex: 0 0 34px; }
+.geometry-inline-select { display: grid; min-width: 0; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 8px; margin-top: 7px; font-size: 9px; }
+.geometry-inline-select select { width: 100%; min-width: 0; min-height: 34px; padding: 5px; color: #173c2a; background: #fff; border: 1px solid #bfd0c2; border-radius: 6px; }
+.geometry-intensity { display: grid; min-width: 0; gap: 3px; margin-top: 7px; font-size: 9px; }
+.geometry-intensity > span:last-child { display: grid; min-width: 0; grid-template-columns: minmax(0, 1fr) 38px; align-items: center; gap: 7px; }
+.geometry-intensity input { width: 100%; min-width: 0; accent-color: #2f9845; }
+.geometry-intensity output { text-align: right; font-size: 10px; font-weight: 700; }
 .annotation-overlay { position: absolute; z-index: 5; border-radius: 2px; }
 .annotation-overlay.stroke { background: rgba(255,255,255,.01); }
 .annotation-overlay.stroke::before { content: ""; position: absolute; left: 0; right: 0; top: 50%; border-top: 3px solid; border-color: inherit; transform: translateY(-50%); }
@@ -91,5 +108,7 @@
 .page-jump input { width: 72px; min-height: 30px; }
 
 @media (max-width: 900px) {
-  .annotation-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .split-block-row { grid-template-columns: minmax(0, 1fr) 36px; }
+  .split-block-row label { grid-column: 1 / -1; }
+  .split-block-row .icon-button { grid-column: 2; grid-row: 1; }
 }

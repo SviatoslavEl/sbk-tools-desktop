@@ -33,12 +33,18 @@ def apply_annotations(image: Image.Image, annotations: Iterable[Annotation], pag
             )
             result = Image.alpha_composite(result.convert("RGBA"), overlay).convert("RGB")
         elif annotation.kind == "stroke":
-            draw = ImageDraw.Draw(result)
+            overlay = Image.new("RGBA", result.size, (0, 0, 0, 0))
             color = ImageColor.getrgb(annotation.color)
             thickness = max(2, round((bottom - top) * max(0.08, annotation.intensity * 0.35)))
-            draw.line((left, (top + bottom) // 2, right, (top + bottom) // 2), fill=color, width=thickness)
+            ImageDraw.Draw(overlay).line(
+                (left, (top + bottom) // 2, right, (top + bottom) // 2),
+                fill=(*color, round(255 * annotation.intensity)),
+                width=thickness,
+            )
+            result = Image.alpha_composite(result.convert("RGBA"), overlay).convert("RGB")
         else:
-            crop = result.crop((left, top, right, bottom))
+            original_crop = result.crop((left, top, right, bottom))
+            crop = original_crop.copy()
             if annotation.kind == "print_blur":
                 # Pixelation followed by blur survives downsampling and ordinary
                 # office printing better than a soft screen-only blur.
@@ -53,6 +59,7 @@ def apply_annotations(image: Image.Image, annotations: Iterable[Annotation], pag
             else:
                 radius = max(2.0, min(crop.width, crop.height) * (0.025 + annotation.intensity * 0.09))
                 crop = crop.filter(ImageFilter.GaussianBlur(radius=radius))
+            crop = Image.blend(original_crop, crop, annotation.intensity)
             if annotation.shape == "ellipse":
                 mask = Image.new("L", crop.size, 0)
                 ImageDraw.Draw(mask).ellipse((0, 0, max(0, crop.width - 1), max(0, crop.height - 1)), fill=255)
