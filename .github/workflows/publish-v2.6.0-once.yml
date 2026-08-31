@@ -1,0 +1,68 @@
+name: Publish v2.6.0 release assets
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/publish-v2.6.0-once.yml
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download verified macOS artifact
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p mac-artifact
+          gh run download 33342194281 \
+            --repo SviatoslavEl/sbk-tools-desktop \
+            --name SBK-Tools-aarch64-apple-darwin-App \
+            --dir mac-artifact
+          test -f mac-artifact/SBK-Tools-v2.6.0-aarch64-apple-darwin-unsigned.app.zip
+          test -f mac-artifact/SBK-Tools-v2.6.0-aarch64-apple-darwin-unsigned.app.zip.sha256
+
+      - name: Attach macOS files and publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          cat > release-notes.md <<'EOF'
+          Исправлены запуск Windows, встроенный сканер и обработка документов на macOS, импорт договоров и кадров, разделение компаний, интерактивные инструменты сканера, факсимиле, открытие папки и усиленное сжатие.
+
+          Финальные пакеты проверены на чистых GitHub Actions-агентах. Windows: запущен итоговый единый EXE, проверены окно приложения, встроенный сканер и восстановление после аварийного завершения. macOS: из итогового APP обработаны PDF, DOCX, OCR и факсимиле.
+
+          macOS-архив подписан ad-hoc, поскольку в репозитории не настроен сертификат Apple Developer ID. Если Gatekeeper блокирует первый запуск, распакуйте приложение в «Программы» и выполните:
+
+          `xattr -dr com.apple.quarantine "/Applications/СБК Инструменты.app"`
+          EOF
+
+          gh release view v2.6.0 --repo SviatoslavEl/sbk-tools-desktop >/dev/null 2>&1 || \
+            gh release create v2.6.0 --repo SviatoslavEl/sbk-tools-desktop --draft --title 'СБК Инструменты v2.6.0' --notes-file release-notes.md
+          gh release upload v2.6.0 \
+            mac-artifact/SBK-Tools-v2.6.0-aarch64-apple-darwin-unsigned.app.zip \
+            mac-artifact/SBK-Tools-v2.6.0-aarch64-apple-darwin-unsigned.app.zip.sha256 \
+            --repo SviatoslavEl/sbk-tools-desktop \
+            --clobber
+          gh release edit v2.6.0 \
+            --repo SviatoslavEl/sbk-tools-desktop \
+            --title 'СБК Инструменты v2.6.0' \
+            --notes-file release-notes.md \
+            --draft=false
+
+      - name: Verify published assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          assets="$(gh release view v2.6.0 --repo SviatoslavEl/sbk-tools-desktop --json assets,isDraft,url)"
+          test "$(jq -r '.isDraft' <<<"$assets")" = false
+          jq -e '.assets | map(.name) | index("ScanDocument.exe")' <<<"$assets" >/dev/null
+          jq -e '.assets | map(.name) | index("ScanDocument.exe.sha256")' <<<"$assets" >/dev/null
+          jq -e '.assets | map(.name) | index("SBK-Tools-v2.6.0-aarch64-apple-darwin-unsigned.app.zip")' <<<"$assets" >/dev/null
+          jq -e '.assets | map(.name) | index("SBK-Tools-v2.6.0-aarch64-apple-darwin-unsigned.app.zip.sha256")' <<<"$assets" >/dev/null
