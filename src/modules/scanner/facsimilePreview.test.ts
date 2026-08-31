@@ -100,6 +100,19 @@ describe("facsimile preview model", () => {
     expect(placement.randomizeInRegion).toBe(false);
   });
 
+  it("supports an interactive region and deterministic random rotation for a page range", () => {
+    const placement = buildFacsimilePlacement({
+      ...editable,
+      placementMode: "random-region" as const,
+      region: [0.1, 0.2, 0.6, 0.5] as [number, number, number, number],
+      randomRotationDegrees: 12,
+      randomSeed: 91,
+    }, { application: "explicitPages", pages: [1, 3] });
+    expect(placement.region).toEqual([0.1, 0.2, 0.6, 0.5]);
+    expect(placement.randomizeInRegion).toBe(true);
+    expect(positionFacsimileInRegion(placement, 1).rotation).not.toBe(positionFacsimileInRegion(placement, 3).rotation);
+  });
+
   it("keeps an info-button click from activating its surrounding checkbox label", () => {
     const event = { preventDefault: vi.fn(), stopPropagation: vi.fn() };
     suppressLabelActivation(event);

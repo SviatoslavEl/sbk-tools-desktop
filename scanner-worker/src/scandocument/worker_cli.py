@@ -105,6 +105,7 @@ def placement_from(data: dict | None, validated_paths: set[Path] | None = None) 
         region=tuple(float(value) for value in region_values) if region_values is not None else None,
         randomize_in_region=bool(data.get("randomizeInRegion", False)),
         random_seed=int(data.get("randomSeed", 42)),
+        random_rotation_degrees=float(data.get("randomRotationDegrees", 0)),
     )
     if not 0 <= placement.x <= 1 or not 0 <= placement.y <= 1:
         raise ValueError("Координаты факсимиле находятся вне страницы.")
@@ -167,18 +168,13 @@ def estimate_preview_output_bytes(
     source_bytes: int,
     target_ratio: float | None,
 ) -> int:
-    """Estimate from a real rendered page and never advertise an unattainable target."""
-    from scandocument.pdf_engine import _jpeg_for_budget
-
-    preview_jpeg_bytes = len(_jpeg_for_budget(processed, settings.jpeg_quality, None))
-    minimum_preview_jpeg_bytes = len(_jpeg_for_budget(processed, 55, None))
-    preview_dpi = max(1.0, processed.width * 72 / max(1.0, page_size[0]))
-    scale = max(1.0, settings.dpi / preview_dpi)
-    estimated = max(16_384 * pages, round(preview_jpeg_bytes * (scale ** 1.55) * pages * 1.04))
-    attainable_floor = max(8_192 * pages, round(minimum_preview_jpeg_bytes * (scale ** 1.55) * pages * 1.04))
+    """Return one whole-document estimate that never depends on the open page."""
+    del processed, page_size
+    raster_ratio = (settings.dpi / 200) ** 1.7 * (settings.jpeg_quality / 84) ** 1.3
+    estimated = max(8_192 * pages, round(source_bytes * min(1.5, raster_ratio)))
     if target_ratio is not None:
-        target = round(source_bytes * max(0.25, min(1.0, float(target_ratio))))
-        estimated = max(attainable_floor, min(estimated, target))
+        target = round(source_bytes * max(0.10, min(1.0, float(target_ratio))))
+        estimated = max(8_192 * pages, min(estimated, target))
     return estimated
 
 
@@ -210,7 +206,10 @@ def preview(config: dict) -> int:
         for placement in placements:
             if placement.applies_to(page_index):
                 x, y = placement.position_for_page(page_index)
-                processed = apply_facsimile(processed, replace(placement, x=x, y=y))
+                processed = apply_facsimile(
+                    processed,
+                    replace(placement, x=x, y=y, rotation=placement.rotation_for_page(page_index)),
+                )
     redactions = redactions_from(config)
     if redactions:
         from PIL import ImageDraw

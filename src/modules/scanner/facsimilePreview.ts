@@ -14,6 +14,7 @@ export interface FacsimilePlacementPayload {
   pages: number[];
   region?: [number, number, number, number];
   randomizeInRegion?: boolean;
+  randomRotationDegrees?: number;
   randomSeed?: number;
 }
 
@@ -30,6 +31,7 @@ export interface EditableFacsimile {
   placementMode?: "manual" | "region" | "random-region";
   region?: [number, number, number, number];
   randomSeed?: number;
+  randomRotationDegrees?: number;
 }
 
 export type FacsimileGeometry = Pick<EditableFacsimile, "x" | "y" | "width" | "rotation" | "opacity" | "removeLightBackground">;
@@ -132,8 +134,9 @@ export function buildFacsimilePlacement(
     removeLightBackground: facsimile.removeLightBackground,
     application: selection.application,
     pages: selection.pages,
-    region: selection.application === "all" && facsimile.placementMode && facsimile.placementMode !== "manual" ? facsimile.region : undefined,
-    randomizeInRegion: selection.application === "all" && facsimile.placementMode === "random-region",
+    region: selection.application !== "current" && facsimile.placementMode && facsimile.placementMode !== "manual" ? facsimile.region : undefined,
+    randomizeInRegion: selection.application !== "current" && facsimile.placementMode === "random-region",
+    randomRotationDegrees: selection.application !== "current" ? facsimile.randomRotationDegrees : undefined,
     randomSeed: facsimile.randomSeed,
   };
 }
@@ -142,19 +145,26 @@ export function positionFacsimileInRegion(
   placement: FacsimilePlacementPayload,
   pageIndex: number,
 ): FacsimilePlacementPayload {
-  if (!placement.region) return placement;
-  const [rx, ry, rw, rh] = placement.region;
-  const maxX = Math.max(rx, rx + rw - placement.width);
-  const maxY = Math.max(ry, ry + rh - Math.min(placement.width, rh));
-  if (!placement.randomizeInRegion) {
-    return { ...placement, x: Math.min(Math.max(placement.x, rx), maxX), y: Math.min(Math.max(placement.y, ry), maxY) };
-  }
   const fraction = (salt: number) => {
     let value = (Math.imul(placement.randomSeed || 42, 1_664_525) + Math.imul(pageIndex + 1, 1_013_904_223) + salt) >>> 0;
     value = (value ^ (value >>> 16)) >>> 0;
     return value / 0xFFFFFFFF;
   };
-  return { ...placement, x: rx + (maxX - rx) * fraction(0), y: ry + (maxY - ry) * fraction(0x9E3779B9) };
+  const randomizedRotation = placement.rotation
+    + (fraction(0x85EBCA6B) * 2 - 1) * (placement.randomRotationDegrees || 0);
+  if (!placement.region) return { ...placement, rotation: randomizedRotation };
+  const [rx, ry, rw, rh] = placement.region;
+  const maxX = Math.max(rx, rx + rw - placement.width);
+  const maxY = Math.max(ry, ry + rh - Math.min(placement.width, rh));
+  if (!placement.randomizeInRegion) {
+    return { ...placement, x: Math.min(Math.max(placement.x, rx), maxX), y: Math.min(Math.max(placement.y, ry), maxY), rotation: randomizedRotation };
+  }
+  return {
+    ...placement,
+    x: rx + (maxX - rx) * fraction(0),
+    y: ry + (maxY - ry) * fraction(0x9E3779B9),
+    rotation: randomizedRotation,
+  };
 }
 
 export function facsimileAppliesTo(placement: FacsimilePlacementPayload, pageIndex: number): boolean {

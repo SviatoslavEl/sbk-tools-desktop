@@ -1,9 +1,11 @@
 import { useEffect, useMemo, useState } from "react";
 import { openPath } from "@tauri-apps/plugin-opener";
 import { ConfirmDialog, Dialog } from "../../components/Dialog";
+import { SortableHeader } from "../../components/SortableHeader";
 import { useRecords } from "../../hooks/useRecords";
 import { parseCsv, toCsv } from "../../lib/csv";
 import { chooseOpenPath, chooseSavePath, exportText } from "../../lib/files";
+import { compareSortValues, toggleSort, type SortDirection } from "../../lib/tableSort";
 import {
   copyAttachment,
   createBackup,
@@ -56,6 +58,7 @@ const money = (value: number) =>
   " ₽";
 const date = (value: string) =>
   value ? new Date(`${value}T00:00:00`).toLocaleDateString("ru-RU") : "—";
+type ContractSortKey = "number" | "performer" | "customer" | "subject" | "amount" | "period" | "stage" | "payment" | "acts" | "importantDate" | "responsible";
 const contractHeaders = [
   "Юрлицо-исполнитель",
   "Номер",
@@ -390,6 +393,7 @@ export function ContractsRegistry() {
     new Set(),
   );
   const [companyDirectoryOpen, setCompanyDirectoryOpen] = useState(false);
+  const [sort, setSort] = useState<{ key: ContractSortKey; direction: SortDirection } | null>(null);
 
   const filtered = useMemo(
     () =>
@@ -412,8 +416,27 @@ export function ContractsRegistry() {
           (!stageFilter || item.stage === stageFilter) &&
           (!paymentFilter || item.paymentStatus === paymentFilter)
         );
+      }).sort((left, right) => {
+        if (!sort) return 0;
+        const value = (record: StoredRecord<ContractData>) => {
+          const item = record.payload;
+          return {
+            number: `${item.number}\u0000${item.date}`,
+            performer: item.performingLegalEntity,
+            customer: item.customer,
+            subject: item.subject,
+            amount: item.amount,
+            period: item.startDate || item.endDate,
+            stage: item.stage,
+            payment: item.paymentStatus,
+            acts: item.actsStatus,
+            importantDate: item.nextImportantDate,
+            responsible: item.responsible,
+          }[sort.key];
+        };
+        return compareSortValues(value(left), value(right), sort.direction);
       }),
-    [store.records, search, legalEntityFilter, stageFilter, paymentFilter],
+    [store.records, search, legalEntityFilter, stageFilter, paymentFilter, sort],
   );
   const legalEntities = [
     ...new Set(
@@ -1013,22 +1036,13 @@ export function ContractsRegistry() {
           </select>
         </label>
         <div className="toolbar-actions">
-          <button
-            className="secondary"
-            type="button"
-            onClick={() => setCompanyDirectoryOpen(true)}
-          >
-            Компании и контрагенты
-          </button>
-          {!readOnly && (
-            <button
-              className="secondary"
-              type="button"
-              onClick={() => void openImport()}
-            >
-              Импорт CSV / XLSX / DOCX
-            </button>
-          )}
+          <div className="toolbar-action-group"><span>Справочник</span><button className="secondary" type="button" onClick={() => setCompanyDirectoryOpen(true)}>Компании и контрагенты</button></div>
+          <div className="toolbar-action-group"><span>Обмен</span>
+            {!readOnly && <button className="secondary" type="button" onClick={() => void openImport()}>Импорт</button>}
+            <button className="secondary" type="button" onClick={() => void exportArchive()}>Экспорт ZIP</button>
+            <button className="secondary" type="button" onClick={() => void exportSelection()}>CSV</button>
+            <button className="secondary" type="button" onClick={() => void exportXlsx()}>XLSX</button>
+          </div>
           <button
             className="secondary"
             type="button"
@@ -1038,27 +1052,6 @@ export function ContractsRegistry() {
             }}
           >
             Подбор под закупку
-          </button>
-          <button
-            className="secondary"
-            type="button"
-            onClick={() => void exportArchive()}
-          >
-            ZIP + документы
-          </button>
-          <button
-            className="secondary"
-            type="button"
-            onClick={() => void exportSelection()}
-          >
-            CSV
-          </button>
-          <button
-            className="secondary"
-            type="button"
-            onClick={() => void exportXlsx()}
-          >
-            XLSX
           </button>
           {!readOnly && (
             <button
@@ -1082,17 +1075,11 @@ export function ContractsRegistry() {
           <table>
             <thead>
               <tr>
-                <th>Номер и дата</th>
-                <th>Юрлицо-исполнитель</th>
-                <th>Заказчик</th>
-                <th>Предмет</th>
-                <th>Сумма</th>
-                <th>Период</th>
-                <th>Стадия</th>
-                <th>Оплата</th>
-                <th>Акты</th>
-                <th>Важная дата</th>
-                <th>Ответственный</th>
+                {([[
+                  "number", "Номер и дата"], ["performer", "Юрлицо-исполнитель"], ["customer", "Заказчик"],
+                  ["subject", "Предмет"], ["amount", "Сумма"], ["period", "Период"], ["stage", "Стадия"],
+                  ["payment", "Оплата"], ["acts", "Акты"], ["importantDate", "Важная дата"], ["responsible", "Ответственный"],
+                ] as Array<[ContractSortKey, string]>).map(([column, label]) => <SortableHeader key={column} label={label} column={column} active={sort?.key === column} direction={sort?.direction || "asc"} onSort={(key) => setSort((current) => toggleSort(current, key))} />)}
                 <th />
               </tr>
             </thead>

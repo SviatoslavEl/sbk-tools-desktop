@@ -35,7 +35,6 @@ import {
   pointerDelta,
   resizeRect,
   rotationFromPointer,
-  updateRect,
   type NormalizedRect,
   type ResizeHandle,
 } from "./interactiveGeometry";
@@ -83,10 +82,10 @@ interface PreviewResult {
   pageSizePoints?: [number, number];
 }
 
-const initialFacsimile = (path: string, url: string, fileName: string): FacsimileState => ({
-  id: crypto.randomUUID(), imagePath: path, imageUrl: url, fileName, x: 0.62, y: 0.72, width: 0.22, rotation: 0, opacity: 1,
-  removeLightBackground: false, applyTo: "current", pageRange: "", pageGeometries: {},
-  placementMode: "manual", region: [0.1, 0.1, 0.8, 0.8], randomSeed: 42, imageAspect: 3,
+const initialFacsimile = (path: string, url: string, fileName: string, width = 0.22): FacsimileState => ({
+  id: crypto.randomUUID(), imagePath: path, imageUrl: url, fileName, x: 0.62, y: 0.72, width, rotation: 0, opacity: 1,
+  removeLightBackground: true, applyTo: "current", pageRange: "", pageGeometries: {},
+  placementMode: "manual", region: [0.1, 0.1, 0.8, 0.8], randomSeed: 42, randomRotationDegrees: 0, imageAspect: 3,
 });
 
 const resizeLabels: Record<ResizeHandle, string> = { nw: "Изменить размер сверху слева", ne: "Изменить размер сверху справа", sw: "Изменить размер снизу слева", se: "Изменить размер снизу справа" };
@@ -151,6 +150,7 @@ export function Scanner() {
   const latestPreviewJob = useRef("");
   const activeJobRef = useRef("");
   const previewCache = useRef(new BoundedPreviewCache<PreviewResult>(8));
+  const lastFacsimileWidth = useRef(0.22);
   const journal = templates.records.filter((record) => record.payload.kind === "processing-journal").slice(0, 10);
 
   useEffect(() => {
@@ -311,7 +311,7 @@ export function Scanner() {
     const path = await chooseOpenPath("Выберите факсимиле", ["png", "jpg", "jpeg"]);
     if (!path) return;
     const imageUrl = await invoke<string>("read_binary_file", { path, maxBytes: 12 * 1024 * 1024 });
-    setFacsimile(initialFacsimile(path, imageUrl, path.split(/[\\/]/).pop() || "Факсимиле"));
+    setFacsimile(initialFacsimile(path, imageUrl, path.split(/[\\/]/).pop() || "Факсимиле", lastFacsimileWidth.current));
   };
 
   const useTemplate = async (template: ScannerRecord) => {
@@ -320,7 +320,7 @@ export function Scanner() {
     const separator = workspace.root.includes("\\") ? "\\" : "/";
     const path = `${workspace.root}${separator}${template.relativePath.replace(/\//g, separator)}`;
     const imageUrl = await invoke<string>("read_binary_file", { path, maxBytes: 12 * 1024 * 1024 });
-    setFacsimile(initialFacsimile(path, imageUrl, template.fileName));
+    setFacsimile(initialFacsimile(path, imageUrl, template.fileName, lastFacsimileWidth.current));
   };
 
   const saveFacsimileTemplate = async () => {
@@ -335,9 +335,20 @@ export function Scanner() {
     setFacsimile((current) => current ? updateFacsimileGeometry(current, pageIndex, update) : current);
   };
 
+  const updateSharedFacsimileAppearance = (update: Partial<Pick<FacsimileGeometry, "width" | "opacity" | "removeLightBackground">>) => {
+    setFacsimile((current) => {
+      if (!current) return current;
+      const pageGeometries = Object.fromEntries(Object.entries(current.pageGeometries).map(([page, geometry]) => [page, { ...geometry, ...update }]));
+      const next = { ...current, ...update, pageGeometries };
+      if (update.width != null) lastFacsimileWidth.current = update.width;
+      return next;
+    });
+  };
+
   const commitFacsimile = async (addAnother: boolean) => {
     if (!facsimile || !facsimileSelection.selection) return;
     if (!editingFacsimileId && facsimile.applyTo === "all" && pageCount > 1 && !window.confirm(`Зафиксировать факсимиле на всех ${pageCount} страницах?`)) return;
+    lastFacsimileWidth.current = facsimile.width;
     const committed = { ...facsimile, lockedSelection: facsimileSelection.selection };
     setSavedFacsimiles((current) => editingFacsimileId
       ? current.map((entry) => entry.id === editingFacsimileId ? committed : entry)
@@ -362,6 +373,20 @@ export function Scanner() {
     if (editingFacsimileId) setSavedFacsimiles((current) => current.filter((entry) => entry.id !== editingFacsimileId));
     setFacsimile(null);
     setEditingFacsimileId("");
+  };
+
+  const placeAllFacsimilesOnEveryPage = () => {
+    setSavedFacsimiles((current) => current.map((entry) => {
+      const geometry = facsimileGeometry(entry, pageIndex);
+      return {
+        ...entry,
+        ...geometry,
+        applyTo: "all",
+        pageRange: "",
+        lockedSelection: { application: "all", pages: [] },
+        pageGeometries: {},
+      };
+    }));
   };
 
   const processDocument = async () => {
@@ -547,19 +572,15 @@ export function Scanner() {
       width: action.initial.width + (action.mode === "resize" ? delta.x : 0),
       rotation: action.initial.rotation,
     }, previewAspect, facsimile.imageAspect);
-    updateCurrentFacsimileGeometry(candidate);
+    if (action.mode === "resize") {
+      updateCurrentFacsimileGeometry({ x: candidate.x, y: candidate.y });
+      updateSharedFacsimileAppearance({ width: candidate.width });
+    } else updateCurrentFacsimileGeometry(candidate);
   };
 
   const stopInteractive = () => { if (dragState.current?.target === "draw") setDrawingTool(null); dragState.current = null; };
 
   const updateAnnotationIntensity = (id: string, percent: number) => setAnnotations((items) => items.map((item) => item.id === id ? { ...item, intensity: Math.max(.05, Math.min(1, percent / 100 || .05)) } : item));
-  const updateRegionRect = (update: Partial<NormalizedRect>) => setFacsimile((current) => {
-    if (!current?.region) return current;
-    const [x, y, width, height] = current.region;
-    const next = updateRect({ x, y, width, height }, update, .05);
-    return { ...current, region: [next.x, next.y, next.width, next.height] };
-  });
-
   const nudge = (event: KeyboardEvent<HTMLDivElement>) => {
     if (!facsimile || !currentFacsimileGeometry) return;
     const step = event.shiftKey ? 0.01 : 0.002;
@@ -630,29 +651,29 @@ export function Scanner() {
           {templates.records.filter((record) => record.payload.kind === "facsimile-template").length > 0 && <select aria-label="Шаблон факсимиле" defaultValue="" onChange={(event) => { const template = templates.records.find((record) => record.id === event.target.value); if (template) void useTemplate(template.payload); }}><option value="">Выбрать сохранённый шаблон</option>{templates.records.filter((record) => record.payload.kind === "facsimile-template").map((record) => <option key={record.id} value={record.id}>{record.title}</option>)}</select>}
         </> : <div className="facsimile-controls">
           <strong>{editingFacsimileId ? "Редактирование: " : ""}{facsimile.fileName}</strong>
-          <label>Применить<select value={facsimile.applyTo} onChange={(event) => { const applyTo = event.target.value as FacsimileState["applyTo"]; setFacsimile({ ...facsimile, applyTo, placementMode: applyTo === "all" ? facsimile.placementMode : "manual", lockedSelection: undefined }); }}><option value="current">к текущей странице</option><option value="range">к диапазону</option><option value="all">ко всем страницам</option></select></label>
+          <label>Применить<select value={facsimile.applyTo} onChange={(event) => { const applyTo = event.target.value as FacsimileState["applyTo"]; setFacsimile({ ...facsimile, applyTo, placementMode: applyTo === "current" ? "manual" : facsimile.placementMode, lockedSelection: undefined }); }}><option value="current">к текущей странице</option><option value="range">к диапазону</option><option value="all">ко всем страницам</option></select></label>
           {facsimile.applyTo === "range" && <label>Страницы<input aria-invalid={!!facsimileSelection.error} value={facsimile.pageRange} placeholder="1-3, 5" onChange={(event) => setFacsimile({ ...facsimile, pageRange: event.target.value, lockedSelection: undefined })} />{facsimileSelection.error && <small className="field-error">{facsimileSelection.error}</small>}</label>}
-          {facsimile.applyTo === "all" && <><label>Размещение<select value={facsimile.placementMode || "manual"} onChange={(event) => setFacsimile({ ...facsimile, placementMode: event.target.value as NonNullable<FacsimileState["placementMode"]> })}><option value="manual">Одинаковое положение</option><option value="region">В выбранной области</option><option value="random-region">Случайно внутри области</option></select></label>{facsimile.placementMode !== "manual" && facsimile.region && <div className="region-grid"><label>X области, %<input type="number" min="0" max="95" value={Math.round(facsimile.region[0] * 100)} onChange={(event) => updateRegionRect({ x: Number(event.target.value) / 100 })} /></label><label>Y области, %<input type="number" min="0" max="95" value={Math.round(facsimile.region[1] * 100)} onChange={(event) => updateRegionRect({ y: Number(event.target.value) / 100 })} /></label><label>Ширина, %<input type="number" min="5" max="100" value={Math.round(facsimile.region[2] * 100)} onChange={(event) => updateRegionRect({ width: Number(event.target.value) / 100 })} /></label><label>Высота, %<input type="number" min="5" max="100" value={Math.round(facsimile.region[3] * 100)} onChange={(event) => updateRegionRect({ height: Number(event.target.value) / 100 })} /></label></div>}<p className="help-text">Область можно перемещать и растягивать прямо на документе. Случайное положение воспроизводимо.</p></>}
+          {facsimile.applyTo !== "current" && <><label>Размещение<select value={facsimile.placementMode || "manual"} onChange={(event) => setFacsimile({ ...facsimile, placementMode: event.target.value as NonNullable<FacsimileState["placementMode"]> })}><option value="manual">Одинаковое положение</option><option value="region">В выбранной области</option><option value="random-region">Случайно внутри области</option></select></label>{facsimile.placementMode !== "manual" && facsimile.region && <p className="help-text">Область перемещается и растягивается прямо на документе. Координаты вводить не нужно.</p>}<label className="checkbox-row"><input type="checkbox" checked={(facsimile.randomRotationDegrees || 0) > 0} onChange={(event) => setFacsimile({ ...facsimile, randomRotationDegrees: event.target.checked ? 8 : 0 })} /> Случайный поворот на разных страницах</label>{(facsimile.randomRotationDegrees || 0) > 0 && <label>Разброс поворота <input type="range" min="1" max="30" value={facsimile.randomRotationDegrees || 8} onChange={(event) => setFacsimile({ ...facsimile, randomRotationDegrees: event.target.valueAsNumber })} /> ±{Math.round(facsimile.randomRotationDegrees || 8)}°</label>}</>}
           {visibleOnCurrentPage && currentFacsimileGeometry && <>
-            <label>Размер <input type="range" min="8" max="60" value={currentFacsimileGeometry.width * 100} onChange={(event) => updateCurrentFacsimileGeometry(normalizeFacsimile({ ...currentFacsimileGeometry, width: Number(event.target.value) / 100 }, previewAspect, facsimile.imageAspect))} /> {Math.round(currentFacsimileGeometry.width * 100)}%{pageSizeMm ? ` · ${(pageSizeMm[0] * currentFacsimileGeometry.width).toFixed(1)} мм` : ""}</label>
+            <label>Размер на всех выбранных страницах <input type="range" min="8" max="60" value={currentFacsimileGeometry.width * 100} onChange={(event) => updateSharedFacsimileAppearance({ width: normalizeFacsimile({ ...currentFacsimileGeometry, width: Number(event.target.value) / 100 }, previewAspect, facsimile.imageAspect).width })} /> {Math.round(currentFacsimileGeometry.width * 100)}%{pageSizeMm ? ` · ${(pageSizeMm[0] * currentFacsimileGeometry.width).toFixed(1)} мм` : ""}</label>
             <label>Поворот <input type="range" min="-180" max="180" value={currentFacsimileGeometry.rotation} onChange={(event) => updateCurrentFacsimileGeometry(normalizeFacsimile({ ...currentFacsimileGeometry, rotation: Number(event.target.value) }, previewAspect, facsimile.imageAspect))} /> {currentFacsimileGeometry.rotation}°</label>
-            <label>Прозрачность <input type="range" min="10" max="100" value={currentFacsimileGeometry.opacity * 100} onChange={(event) => updateCurrentFacsimileGeometry({ opacity: Number(event.target.value) / 100 })} /> {Math.round(currentFacsimileGeometry.opacity * 100)}%</label>
-            <label className="checkbox-row"><input type="checkbox" checked={currentFacsimileGeometry.removeLightBackground} onChange={(event) => updateCurrentFacsimileGeometry({ removeLightBackground: event.target.checked })} /> Удалить светлый фон</label>
+            <label>Прозрачность на всех выбранных страницах <input type="range" min="10" max="100" value={currentFacsimileGeometry.opacity * 100} onChange={(event) => updateSharedFacsimileAppearance({ opacity: Number(event.target.value) / 100 })} /> {Math.round(currentFacsimileGeometry.opacity * 100)}%</label>
+            <label className="checkbox-row"><input type="checkbox" checked={currentFacsimileGeometry.removeLightBackground} onChange={(event) => updateSharedFacsimileAppearance({ removeLightBackground: event.target.checked })} /> Удалить светлый фон на всех размещениях</label>
           </>}
           {!visibleOnCurrentPage && facsimileSelection.selection && <p className="help-text">Открытая страница не входит в выбранный диапазон факсимиле. Перейдите на одну из выбранных страниц для изменения её положения.</p>}
-          {facsimileSelection.selection && facsimile.applyTo !== "current" && <><p className="help-text">Положение и оформление меняются отдельно для открытой страницы.</p><button className="secondary small" type="button" onClick={() => setFacsimile((current) => current && facsimileSelection.selection ? applyGeometryToPages(current, pageIndex, selectedFacsimilePages(facsimileSelection.selection, pageCount)) : current)}>Применить параметры этой страницы ко всем выбранным</button></>}
+          {facsimileSelection.selection && facsimile.applyTo !== "current" && <><p className="help-text">Положение и угол можно настроить отдельно; размер, прозрачность и удаление фона общие для выбранных страниц.</p><button className="secondary small" type="button" onClick={() => setFacsimile((current) => current && facsimileSelection.selection ? applyGeometryToPages(current, pageIndex, selectedFacsimilePages(facsimileSelection.selection, pageCount)) : current)}>Скопировать положение на выбранные страницы</button></>}
           <button className="secondary small" type="button" onClick={() => void saveFacsimileTemplate()}>Сохранить изображение как шаблон</button>
           <button className="primary small" type="button" disabled={!facsimileSelection.selection} onClick={() => void commitFacsimile(false)}>{editingFacsimileId ? "Сохранить изменения" : "Зафиксировать"}</button>
         </div>}
       </div>
-      {savedFacsimiles.length > 0 && <div className="notice success"><span>Зафиксировано факсимиле: {savedFacsimiles.length}</span><div className="facsimile-saved-list">{savedFacsimiles.map((saved, index) => <div className="facsimile-saved-row" key={saved.id}><span>{index + 1}. {saved.fileName}</span><div className="button-row"><button className="link-button" type="button" onClick={() => editSavedFacsimile(saved)}>Изменить</button><button className="link-button danger" type="button" onClick={() => { setSavedFacsimiles((current) => current.filter((entry) => entry.id !== saved.id)); if (editingFacsimileId === saved.id) { setFacsimile(null); setEditingFacsimileId(""); } }}>Удалить</button></div></div>)}</div><button className="link-button danger" type="button" onClick={() => { setSavedFacsimiles([]); setFacsimile(null); setEditingFacsimileId(""); }}>Удалить все</button></div>}
+      {savedFacsimiles.length > 0 && <div className="notice success"><span>Зафиксировано факсимиле: {savedFacsimiles.length}</span><div className="facsimile-saved-list">{savedFacsimiles.map((saved, index) => <div className="facsimile-saved-row" key={saved.id}><span>{index + 1}. {saved.fileName}</span><div className="button-row"><button className="link-button" type="button" onClick={() => editSavedFacsimile(saved)}>Изменить</button><button className="link-button danger" type="button" onClick={() => { setSavedFacsimiles((current) => current.filter((entry) => entry.id !== saved.id)); if (editingFacsimileId === saved.id) { setFacsimile(null); setEditingFacsimileId(""); } }}>Удалить</button></div></div>)}</div>{savedFacsimiles.length > 1 && <button className="secondary small" type="button" onClick={placeAllFacsimilesOnEveryPage}>Объединить и разместить все на каждой странице</button>}<button className="link-button danger" type="button" onClick={() => { setSavedFacsimiles([]); setFacsimile(null); setEditingFacsimileId(""); }}>Удалить все</button></div>}
       {facsimile && workerFacsimile && !editingFacsimileId && <button className="secondary full-width" type="button" onClick={() => void commitFacsimile(true)}>Зафиксировать и добавить ещё</button>}
       <div className="control-divider" />
       <label className="checkbox-row"><input type="checkbox" checked={ocrEnabled} onChange={(event) => setOcrEnabled(event.target.checked)} /> Поисковый OCR <InfoHint label="Поисковый OCR">Добавляет в PDF невидимый текстовый слой: по документу можно искать и копировать распознанный текст. Работает локально, но увеличивает время обработки.</InfoHint></label>
       {ocrEnabled && <label>Языки OCR<select value={ocrLanguages} onChange={(event) => setOcrLanguages(event.target.value)}><option value="rus+eng">Русский + английский</option><option value="rus">Русский</option><option value="eng">Английский</option></select></label>}
       <label className="checkbox-row"><input type="checkbox" checked={pdfaEnabled} onChange={(event) => setPdfaEnabled(event.target.checked)} /> Архивный PDF/A-2b <InfoHint label="PDF/A-2b">Создаёт вариант PDF для долговременного хранения со встроенным цветовым профилем и метаданными. Может увеличить размер файла; это не электронная подпись.</InfoHint></label>
-      <div className="compression-controls"><h3>Сжатие PDF</h3><label>Режим<select value={compressionMode} onChange={(event) => { const mode = event.target.value as CompressionMode; const profile = compressionProfile(mode); setCompressionMode(mode); if (profile.dpi) setDpi(profile.dpi); if (profile.quality) setQuality(profile.quality); }}><option value="none">Без целевого ограничения</option><option value="balanced">Бережное · цель около 70%</option><option value="strong">Сильное · цель около 50%</option><option value="maximum">Максимальное · цель около 25%</option></select></label><p className="help-text">Оценка зависит от содержимого. Для максимального сжатия используется 120 dpi и минимальное качество JPEG; мелкий текст следует проверить в результате.</p></div>
-      <details><summary>Точная настройка</summary><label>Разрешение<select value={dpi} onChange={(event) => setDpi(Number(event.target.value))}><option value="120">120 dpi</option><option value="150">150 dpi</option><option value="200">200 dpi</option><option value="300">300 dpi</option></select></label><label>Качество PDF<input type="range" min="55" max="100" value={quality} onChange={(event) => setQuality(Number(event.target.value))} /> {quality}%</label><button className="secondary small" type="button" onClick={() => { setDpi(200); setQuality(84); }}>Вернуть значения пресета</button></details>
+      <div className="compression-controls"><h3>Сжатие PDF</h3><label>Режим<select value={compressionMode} onChange={(event) => { const mode = event.target.value as CompressionMode; const profile = compressionProfile(mode); setCompressionMode(mode); if (profile.dpi) setDpi(profile.dpi); if (profile.quality) setQuality(profile.quality); }}><option value="none">Без целевого ограничения</option><option value="balanced">Бережное · цель около 70%</option><option value="strong">Сильное · цель около 50%</option><option value="maximum">Экстремальное · цель около 12%</option></select></label><p className="help-text">Оценка считается один раз по всему файлу и не меняется при переходе между страницами. Экстремальный режим использует 96 dpi и сильное JPEG-сжатие; мелкий текст следует проверить.</p></div>
+      <details><summary>Точная настройка</summary><label>Разрешение<select value={dpi} onChange={(event) => setDpi(Number(event.target.value))}><option value="96">96 dpi</option><option value="120">120 dpi</option><option value="150">150 dpi</option><option value="200">200 dpi</option><option value="300">300 dpi</option></select></label><label>Качество PDF<input type="range" min="32" max="100" value={quality} onChange={(event) => setQuality(Number(event.target.value))} /> {quality}%</label><button className="secondary small" type="button" onClick={() => { setDpi(200); setQuality(84); }}>Вернуть значения пресета</button></details>
       <details><summary>Журнал обработки · {journal.length}</summary>{journal.length === 0 ? <p className="help-text">Записей пока нет.</p> : <div className="journal-list">{journal.map((record) => <div key={record.id}><strong>{record.payload.status === "completed" ? "✓" : "!"} {record.title}</strong><span>{record.payload.inputType} · {record.payload.pageCount || 0} стр. · {record.payload.durationMs ? `${(record.payload.durationMs / 1000).toFixed(1)} с` : "—"}</span>{record.payload.appliedOperations?.length ? <small>{record.payload.appliedOperations.join(" · ")}</small> : null}{record.payload.outputSha256 ? <small title={record.payload.outputSha256}>SHA-256: {record.payload.outputSha256.slice(0, 16)}…</small> : null}</div>)}</div>}</details>
       <div className="control-divider" />
       <div>
@@ -682,8 +703,8 @@ export function Scanner() {
         <div className="document-stage">
           <div ref={pageElement} className={`document-page real-preview ${drawingTool ? "drawing-tool-active" : ""}`} role="group" tabIndex={0} aria-label={drawingTool ? `Полотно документа: применить инструмент «${{ redaction: "Скрытие", marker: "Маркер", stroke: "Штрих", blur: "Размытие", print_blur: "Размытие для печати" }[drawingTool]}» клавишей Enter или протянуть мышью` : "Полотно документа"} style={{ aspectRatio: String(previewAspect), width: `${72 * previewZoom}%`, maxWidth: `${720 * previewZoom}px` }} onKeyDown={drawFromKeyboard} onPointerDown={startDrawingOnPage} onPointerMove={moveInteractive} onPointerUp={stopInteractive} onPointerCancel={stopInteractive} onLostPointerCapture={stopInteractive}>
             {previewUrl && <img className="page-image" draggable={false} src={showOriginal && originalUrl ? originalUrl : previewUrl} alt={`${showOriginal ? "Оригинал" : "Обработка"} страницы ${pageIndex + 1}`} onLoad={(event) => setPreviewAspect(event.currentTarget.naturalWidth / Math.max(1, event.currentTarget.naturalHeight))} />}
-            {previewing && <div className="preview-loader">Обновляем страницу…</div>}
-            {!showOriginal && facsimile?.applyTo === "all" && facsimile.placementMode !== "manual" && facsimile.region && <div className="facsimile-region editable-geometry selected" role="button" tabIndex={0} aria-label="Область размещения факсимиле: перетаскивайте или изменяйте размер за углы" style={{ left: `${facsimile.region[0] * 100}%`, top: `${facsimile.region[1] * 100}%`, width: `${facsimile.region[2] * 100}%`, height: `${facsimile.region[3] * 100}%` }} onPointerDown={(event) => startRegionDrag("move", event)}><ResizeHandles onStart={(handle, event) => startRegionDrag(handle, event)} /></div>}
+            {previewing && <div className="preview-loader" role="status" aria-live="polite"><span className="loading-spinner" aria-hidden="true" /><strong>Загружаем документ</strong><small>Подготавливаем страницу и рассчитываем весь файл…</small></div>}
+            {!showOriginal && facsimile && facsimile.applyTo !== "current" && facsimile.placementMode !== "manual" && facsimile.region && <div className="facsimile-region editable-geometry selected" role="button" tabIndex={0} aria-label="Область размещения факсимиле: перетаскивайте или изменяйте размер за углы" style={{ left: `${facsimile.region[0] * 100}%`, top: `${facsimile.region[1] * 100}%`, width: `${facsimile.region[2] * 100}%`, height: `${facsimile.region[3] * 100}%` }} onPointerDown={(event) => startRegionDrag("move", event)}><ResizeHandles onStart={(handle, event) => startRegionDrag(handle, event)} /></div>}
             {!showOriginal && redactions.filter((entry) => entry.page === pageIndex).map((entry) => <div key={entry.id} className={`redaction-overlay editable-geometry ${selectedOverlay?.kind === "redaction" && selectedOverlay.id === entry.id ? "selected" : ""} ${entry.color}`} role="button" tabIndex={0} aria-label={`Область скрытия на странице ${entry.page + 1}`} style={{ left: `${entry.x * 100}%`, top: `${entry.y * 100}%`, width: `${entry.width * 100}%`, height: `${entry.height * 100}%` }} onKeyDown={(event) => nudgeOverlay("redaction", entry.id, event)} onPointerDown={(event) => startRectDrag("redaction", entry.id, "move", event)}>{selectedOverlay?.kind === "redaction" && selectedOverlay.id === entry.id && <ResizeHandles onStart={(handle, event) => startRectDrag("redaction", entry.id, handle, event)} />}</div>)}
             {!showOriginal && annotations.filter((entry) => entry.page === pageIndex).map((entry) => <div key={entry.id} className={`annotation-overlay editable-geometry ${entry.kind} ${entry.shape} ${selectedOverlay?.kind === "annotation" && selectedOverlay.id === entry.id ? "selected" : ""}`} role="button" tabIndex={0} aria-label={`${{ marker: "Маркер", stroke: "Штрих", blur: "Размытие", print_blur: "Размытие для печати" }[entry.kind]} на странице ${entry.page + 1}`} style={{ left: `${entry.x * 100}%`, top: `${entry.y * 100}%`, width: `${entry.width * 100}%`, height: `${entry.height * 100}%`, backgroundColor: entry.kind === "marker" ? entry.color : undefined, opacity: entry.kind === "marker" ? Math.max(.08, entry.intensity * .65) : Math.max(.12, entry.intensity), borderColor: entry.kind === "stroke" ? entry.color : undefined, backdropFilter: entry.kind === "blur" ? `blur(${2 + entry.intensity * 10}px)` : entry.kind === "print_blur" ? `blur(${4 + entry.intensity * 14}px)` : undefined }} onKeyDown={(event) => nudgeOverlay("annotation", entry.id, event)} onPointerDown={(event) => startRectDrag("annotation", entry.id, "move", event)}>{selectedOverlay?.kind === "annotation" && selectedOverlay.id === entry.id && <ResizeHandles onStart={(handle, event) => startRectDrag("annotation", entry.id, handle, event)} />}</div>)}
             {!showOriginal && visibleSavedFacsimiles.map(({ saved, placement }, index) => <div className="facsimile real saved" role="button" tabIndex={0} aria-label={`Изменить зафиксированное факсимиле ${saved.fileName}`} key={`${saved.id}-${index}`} style={facsimileOverlayStyle(positionFacsimileInRegion(placement, pageIndex))} onClick={() => editSavedFacsimile(saved)} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") editSavedFacsimile(saved); }}><img src={placement.imageUrl} alt="Зафиксированное факсимиле" style={{ opacity: placement.opacity, mixBlendMode: placement.removeLightBackground ? "multiply" : "normal" }} /></div>)}

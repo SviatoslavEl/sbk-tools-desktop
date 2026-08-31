@@ -1,6 +1,7 @@
 import { Fragment, useEffect, useMemo, useState } from "react";
 import { openPath } from "@tauri-apps/plugin-opener";
 import { ConfirmDialog, Dialog } from "../../components/Dialog";
+import { SortableHeader } from "../../components/SortableHeader";
 import { useRecords } from "../../hooks/useRecords";
 import { parseCsv, toCsv } from "../../lib/csv";
 import {
@@ -13,6 +14,7 @@ import {
   type ImportRequiredField,
 } from "../../lib/importReview";
 import { chooseOpenPath, chooseSavePath, exportText } from "../../lib/files";
+import { compareSortValues, toggleSort, type SortDirection } from "../../lib/tableSort";
 import {
   copyAttachment,
   createBackup,
@@ -64,6 +66,7 @@ import {
 
 const date = (value: string) =>
   value ? new Date(`${value}T00:00:00`).toLocaleDateString("ru-RU") : "—";
+type StaffSortKey = "name" | "legalEntity" | "department" | "position" | "basis" | "status" | "qualification" | "document" | "readiness";
 const categoryLabels: Record<StaffDocument["category"], string> = {
   education: "Образование и дипломы",
   certificate: "Сертификаты",
@@ -164,6 +167,7 @@ export function StaffRegistry() {
     status: "Не указано" as StaffData["status"],
   });
   const [selectionOpen, setSelectionOpen] = useState(false);
+  const [sort, setSort] = useState<{ key: StaffSortKey; direction: SortDirection }>({ key: "department", direction: "asc" });
   const [selectedStaff, setSelectedStaff] = useState<Set<string>>(new Set());
   const [selectionCriteria, setSelectionCriteria] =
     useState<StaffSelectionCriteria>({
@@ -240,13 +244,25 @@ export function StaffRegistry() {
             expiryMatches
           );
         })
-        .sort((a, b) => {
-          const left = primaryAssignment(a.payload);
-          const right = primaryAssignment(b.payload);
-          return `${left.department}\u0000${a.payload.fullName}`.localeCompare(
-            `${right.department}\u0000${b.payload.fullName}`,
-            "ru",
-          );
+        .sort((leftRecord, rightRecord) => {
+          const value = (record: StoredRecord<StaffData>) => {
+            const item = record.payload;
+            const assignment = primaryAssignment(item);
+            const urgent = urgentDocument(item.documents, expiryDays);
+            const requirements = staffRequirements(item, expiryDays);
+            return {
+              name: item.fullName,
+              legalEntity: assignment.legalEntity,
+              department: `${assignment.department}\u0000${item.fullName}`,
+              position: assignment.position || item.role,
+              basis: assignment.engagementType,
+              status: assignment.status,
+              qualification: item.primarySpecialization || item.qualification,
+              document: urgent?.document.expiresDate || "9999-12-31",
+              readiness: requirements.met / Math.max(1, requirements.total),
+            }[sort.key];
+          };
+          return compareSortValues(value(leftRecord), value(rightRecord), sort.direction);
         }),
     [
       normalizedRecords,
@@ -257,6 +273,7 @@ export function StaffRegistry() {
       statusFilter,
       expiryFilter,
       expiryDays,
+      sort,
     ],
   );
   const legalEntities = [
@@ -772,15 +789,12 @@ export function StaffRegistry() {
           </select>
         </label>
         <div className="toolbar-actions">
-          {!readOnly && (
-            <button
-              className="secondary"
-              type="button"
-              onClick={() => void openImport()}
-            >
-              Импорт CSV / XLSX
-            </button>
-          )}
+          <div className="toolbar-action-group"><span>Обмен</span>
+            {!readOnly && <button className="secondary" type="button" onClick={() => void openImport()}>Импорт</button>}
+            <button className="secondary" type="button" onClick={() => void exportArchive()}>Экспорт ZIP</button>
+            <button className="secondary" type="button" onClick={() => void exportSelection()}>CSV</button>
+            <button className="secondary" type="button" onClick={() => void exportXlsx()}>XLSX</button>
+          </div>
           <button
             className="secondary"
             type="button"
@@ -790,27 +804,6 @@ export function StaffRegistry() {
             }}
           >
             Подбор под закупку
-          </button>
-          <button
-            className="secondary"
-            type="button"
-            onClick={() => void exportArchive()}
-          >
-            ZIP + документы
-          </button>
-          <button
-            className="secondary"
-            type="button"
-            onClick={() => void exportSelection()}
-          >
-            CSV
-          </button>
-          <button
-            className="secondary"
-            type="button"
-            onClick={() => void exportXlsx()}
-          >
-            XLSX
           </button>
           {!readOnly && (
             <button
@@ -834,15 +827,11 @@ export function StaffRegistry() {
           <table>
             <thead>
               <tr>
-                <th>ФИО</th>
-                <th>Юрлицо</th>
-                <th>Отдел</th>
-                <th>Должность / роль</th>
-                <th>Основание</th>
-                <th>Статус</th>
-                <th>Квалификация</th>
-                <th>Самый срочный документ</th>
-                <th>Готовность к закупке</th>
+                {([[
+                  "name", "ФИО"], ["legalEntity", "Юрлицо"], ["department", "Отдел"],
+                  ["position", "Должность / роль"], ["basis", "Основание"], ["status", "Статус"],
+                  ["qualification", "Квалификация"], ["document", "Самый срочный документ"], ["readiness", "Готовность к закупке"],
+                ] as Array<[StaffSortKey, string]>).map(([column, label]) => <SortableHeader key={column} label={label} column={column} active={sort.key === column} direction={sort.direction} onSort={(key) => setSort((current) => toggleSort(current, key))} />)}
                 <th />
               </tr>
             </thead>
@@ -860,7 +849,7 @@ export function StaffRegistry() {
                 const requirements = staffRequirements(item, expiryDays);
                 return (
                   <Fragment key={record.id}>
-                    {department !== previousDepartment && (
+                    {sort.key === "department" && department !== previousDepartment && (
                       <tr className="department-group-row">
                         <td colSpan={10}>{department}</td>
                       </tr>

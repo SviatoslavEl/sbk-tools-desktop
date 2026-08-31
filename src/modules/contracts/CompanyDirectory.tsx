@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { Dialog } from "../../components/Dialog";
 import {
   getWorkspaceInfo,
@@ -492,16 +493,19 @@ export function CompanyDirectoryDialog({
         </footer>
       </Dialog>
       {editing && (
-        <CompanyEditor
-          company={editing}
-          companies={companies}
-          onClose={() => setEditing(null)}
-          onSave={async (company) => {
-            const previous = companies.find((item) => item.id === company.id);
-            await onSave(company, previous);
-            setEditing(null);
-          }}
-        />
+        createPortal(
+          <CompanyEditor
+            company={editing}
+            companies={companies}
+            onClose={() => setEditing(null)}
+            onSave={async (company) => {
+              const previous = companies.find((item) => item.id === company.id);
+              await onSave(company, previous);
+              setEditing(null);
+            }}
+          />,
+          document.body,
+        )
       )}
     </>
   );

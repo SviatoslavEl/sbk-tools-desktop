@@ -231,13 +231,16 @@ def test_maximum_compression_can_select_120_dpi() -> None:
     assert EffectSettings(dpi=145).validated().dpi == 150
 
 
-def test_compression_estimate_does_not_claim_impossible_source_ratio() -> None:
+def test_compression_estimate_uses_the_whole_source_instead_of_the_open_page() -> None:
     image = Image.effect_noise((1100, 900), 70).convert("RGB")
     estimate = estimate_preview_output_bytes(
         image, EffectSettings(dpi=200, jpeg_quality=84), (595.0, 842.0), 1, 1_752, .7,
     )
     assert estimate > round(1_752 * .7)
-    assert estimate >= len(_jpeg_for_budget(image, 55, None))
+    other_page = Image.new("RGB", (200, 300), "white")
+    assert estimate == estimate_preview_output_bytes(
+        other_page, EffectSettings(dpi=200, jpeg_quality=84), (300.0, 500.0), 1, 1_752, .7,
+    )
 
 
 def test_page_tools_and_print_blur_change_only_selected_page() -> None:

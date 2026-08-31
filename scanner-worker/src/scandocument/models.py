@@ -40,8 +40,8 @@ class EffectSettings:
     safe_mode: bool = True
 
     def validated(self) -> "EffectSettings":
-        self.dpi = min((120, 150, 200, 300), key=lambda x: abs(x - int(self.dpi)))
-        self.jpeg_quality = max(55, min(100, int(self.jpeg_quality)))
+        self.dpi = min((96, 120, 150, 200, 300), key=lambda x: abs(x - int(self.dpi)))
+        self.jpeg_quality = max(32, min(100, int(self.jpeg_quality)))
         limit = 1.0 if self.safe_mode else 3.0
         self.max_rotation_deg = max(0.0, min(limit, float(self.max_rotation_deg)))
         self.horizontal_shift = max(0.0, min(0.01, float(self.horizontal_shift)))
@@ -91,6 +91,7 @@ class FacsimilePlacement:
     region: tuple[float, float, float, float] | None = None
     randomize_in_region: bool = False
     random_seed: int = 42
+    random_rotation_degrees: float = 0.0
 
     def applies_to(self, page_index: int) -> bool:
         return self.application == "all" or page_index in self.pages
@@ -131,6 +132,14 @@ class FacsimilePlacement:
             return (value & 0xFFFFFFFF) / 0xFFFFFFFF
 
         return rx + (max_x - rx) * fraction(0), ry + (max_y - ry) * fraction(0x9E3779B9)
+
+    def rotation_for_page(self, page_index: int) -> float:
+        if self.random_rotation_degrees <= 0:
+            return self.rotation
+        value = (int(self.random_seed) * 1_664_525 + (page_index + 1) * 1_013_904_223 + 0x85EBCA6B) & 0xFFFFFFFF
+        value ^= value >> 16
+        fraction = (value & 0xFFFFFFFF) / 0xFFFFFFFF
+        return self.rotation + (fraction * 2 - 1) * min(180.0, self.random_rotation_degrees)
 
 
 @dataclass(slots=True)

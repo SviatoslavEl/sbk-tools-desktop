@@ -128,7 +128,10 @@ def _process_page(
             from scandocument.facsimile import apply_facsimile
 
             x, y = facsimile.position_for_page(index)
-            processed = apply_facsimile(processed, replace(facsimile, x=x, y=y))
+            processed = apply_facsimile(
+                processed,
+                replace(facsimile, x=x, y=y, rotation=facsimile.rotation_for_page(index)),
+            )
     active_redactions = page_redactions if page_redactions is not None else request.redactions
     if active_redactions:
         from PIL import ImageDraw
@@ -210,8 +213,8 @@ def process_document(
         )
         estimated_output = max(1, total_render_pixels * max(20, request.settings.jpeg_quality) // 420)
         if request.compression_target_ratio is not None:
-            ratio = max(0.25, min(1.0, request.compression_target_ratio))
-            attainable_floor = max(info.page_count * 8_192, total_render_pixels * 55 // 420)
+            ratio = max(0.10, min(1.0, request.compression_target_ratio))
+            attainable_floor = max(info.page_count * 6_144, total_render_pixels * 32 // 560)
             estimated_output = max(attainable_floor, min(estimated_output, round(info.size_bytes * ratio)))
         output.parent.mkdir(parents=True, exist_ok=True)
         free_bytes = shutil.disk_usage(output.parent).free
@@ -292,7 +295,7 @@ def process_document(
             if request.compression_target_ratio is not None:
                 target_total_bytes = max(
                     total * 8_192,
-                    round(info.size_bytes * max(0.25, min(1.0, request.compression_target_ratio))),
+                    round(info.size_bytes * max(0.10, min(1.0, request.compression_target_ratio))),
                 )
             selected_pixels = [
                 max(1, round(info.page_sizes_points[index][0] / 72 * request.settings.dpi)

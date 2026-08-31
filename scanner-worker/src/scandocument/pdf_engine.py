@@ -27,14 +27,20 @@ def render_page(document: pdfium.PdfDocument, index: int, dpi: int) -> tuple[Ima
 def _jpeg_for_budget(image: Image.Image, quality: int, target_bytes: int | None) -> bytes:
     def encode(selected_quality: int) -> bytes:
         buffer = io.BytesIO()
-        image.save(buffer, "JPEG", quality=selected_quality, optimize=True, subsampling=1)
+        image.save(
+            buffer,
+            "JPEG",
+            quality=selected_quality,
+            optimize=True,
+            subsampling=2 if selected_quality < 65 else 1,
+        )
         return buffer.getvalue()
 
-    maximum = max(55, min(100, int(quality)))
+    maximum = max(32, min(100, int(quality)))
     if target_bytes is None:
         return encode(maximum)
     target = max(8_192, int(target_bytes * 0.94))
-    low, high = 55, maximum
+    low, high = 32, maximum
     best = encode(low)
     if len(best) > target:
         return best
