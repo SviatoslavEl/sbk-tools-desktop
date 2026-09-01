@@ -51,4 +51,17 @@ describe("предпросмотр сканера", () => {
     expect(component).toContain("Сохранить блоки PDF");
     expect(scannerStyles).toContain(".split-block-row { display: grid; min-width: 0;");
   });
+
+  it("совпадает по непрозрачности и толщине штриха с итоговым PDF", () => {
+    const component = readFileSync(new URL("./Scanner.tsx", import.meta.url), "utf8");
+    const scannerStyles = readFileSync(new URL("./scanner.css", import.meta.url), "utf8");
+    const worker = readFileSync(new URL("../../../scanner-worker/src/scandocument/annotations.py", import.meta.url), "utf8");
+    expect(component).toContain("opacity: entry.intensity");
+    expect(component).not.toContain("entry.intensity * .65");
+    expect(component).toContain('"--stroke-thickness"');
+    expect(scannerStyles).toContain("height: var(--stroke-thickness, 35%)");
+    expect(scannerStyles).not.toContain("border-top: 3px solid");
+    expect(worker).toContain("round(255 * annotation.intensity)");
+    expect(worker).not.toContain("min(0.7, annotation.intensity * 0.65)");
+  });
 });

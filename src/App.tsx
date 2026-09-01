@@ -4,6 +4,7 @@ import { Dialog } from "./components/Dialog";
 import { Archive } from "./modules/archive/Archive";
 import { Calculator } from "./modules/calculator/Calculator";
 import { ContractsRegistry } from "./modules/contracts/Contracts";
+import { CounterpartiesRegistry } from "./modules/contracts/Counterparties";
 import { Scanner } from "./modules/scanner/Scanner";
 import { About, Settings } from "./modules/settings/Settings";
 import { StaffRegistry } from "./modules/staff/Staff";
@@ -41,6 +42,7 @@ type ToolId =
   | "calculator"
   | "scanner"
   | "contracts"
+  | "counterparties"
   | "staff"
   | "archive"
   | "settings"
@@ -53,6 +55,7 @@ const tools: Array<{ id: ToolId; icon: string; label: string }> = [
   { id: "calculator", icon: "₽", label: "Тендерный калькулятор" },
   { id: "scanner", icon: "▤", label: "Сканирование документов" },
   { id: "contracts", icon: "✓", label: "Опыт по договорам" },
+  { id: "counterparties", icon: "⌕", label: "Контрагенты" },
   { id: "staff", icon: "●", label: "Кадры" },
 ];
 
@@ -78,6 +81,10 @@ const toolTitles: Record<ToolId, [string, string]> = {
     "Опыт по договорам",
     "Самостоятельный реестр исполнения, оплат и актов",
   ],
+  counterparties: [
+    "Контрагенты",
+    "Быстрый поиск компаний и лиц, принимающих решения",
+  ],
   staff: ["Кадры", "Люди, основания сотрудничества и подтверждающие документы"],
   archive: ["Архив", "Восстановление и окончательное удаление записей"],
   settings: ["Настройки", "Рабочая папка, интерфейс и резервные копии"],
@@ -97,6 +104,8 @@ const helpText: Record<ToolId, string> = {
     "Обычный сценарий требует трёх действий: выбрать документ, выбрать пресет и сохранить новый PDF. Исходный файл не перезаписывается.",
   contracts:
     "Стадия исполнения, состояние оплаты и состояние актов — независимые поля. Двойной щелчок по строке открывает карточку.",
+  counterparties:
+    "Отдельный справочник внутренних компаний и внешних контрагентов. Поиск работает по реквизитам, контактам, ФИО и должностям лиц, принимающих решения.",
   staff:
     "Основание сотрудничества хранится отдельно от должности и статуса. Дипломы, сертификаты и договоры добавляются повторяемыми записями.",
   archive:
@@ -415,6 +424,7 @@ function App() {
               {activeTool === "calculator" && <Calculator />}
               {activeTool === "scanner" && <Scanner />}
               {activeTool === "contracts" && <ContractsRegistry />}
+              {activeTool === "counterparties" && <CounterpartiesRegistry />}
               {activeTool === "staff" && <StaffRegistry />}
               {activeTool === "archive" && <Archive />}
               {activeTool === "settings" && (

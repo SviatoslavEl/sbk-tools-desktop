@@ -88,7 +88,7 @@
 .geometry-intensity output { text-align: right; font-size: 10px; font-weight: 700; }
 .annotation-overlay { position: absolute; z-index: 5; border-radius: 2px; }
 .annotation-overlay.stroke { background: rgba(255,255,255,.01); }
-.annotation-overlay.stroke::before { content: ""; position: absolute; left: 0; right: 0; top: 50%; border-top: 3px solid; border-color: inherit; transform: translateY(-50%); }
+.annotation-overlay.stroke::before { content: ""; position: absolute; left: 0; right: 0; top: 50%; height: var(--stroke-thickness, 35%); min-height: 2px; background: currentColor; border-radius: 999px; transform: translateY(-50%); }
 .annotation-overlay.blur { backdrop-filter: blur(6px); border: 1px dashed rgba(47, 91, 61, .45); background: rgba(230, 236, 231, .18); }
 .annotation-overlay.print_blur { backdrop-filter: blur(10px); background: repeating-linear-gradient(45deg, rgba(160, 170, 163, .36) 0 5px, rgba(210, 217, 212, .42) 5px 10px); }
 .annotation-overlay.ellipse { border-radius: 50%; overflow: visible; }

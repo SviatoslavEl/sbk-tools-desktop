@@ -209,6 +209,44 @@ export function useCompanyDirectory(contracts: StoredRecord<ContractData>[]) {
     [directory],
   );
 
+  const persistContractUpdatesThenDirectory = useCallback(async (items: Array<{ id: string; payload: ContractData }>) => {
+    const merged = mergeCompaniesFromContracts(directory, items.map((item) => item.payload));
+    const updates = items.map((item) => {
+      const payload = linkContractToDirectory(item.payload, merged.directory.companies);
+      return { id: item.id, title: `${payload.number} — ${payload.customer}`, payload };
+    });
+    await updateContractsAndCompanyDirectoryAtomic(updates, merged.directory);
+    setDirectory(merged.directory);
+    return updates.length;
+  }, [directory]);
+
+  const setCompaniesArchived = useCallback(async (ids: string[], archived: boolean) => {
+    const selected = new Set(ids);
+    const now = new Date().toISOString();
+    const next = normalizeCompanyDirectory({
+      schemaVersion: 2,
+      companies: directory.companies.map((company) => selected.has(company.id)
+        ? { ...company, archived, updatedAt: now }
+        : company),
+    });
+    await updateContractsAndCompanyDirectoryAtomic([], next);
+    setDirectory(next);
+  }, [directory]);
+
+  const deleteArchivedCompanies = useCallback(async (ids: string[], records: StoredRecord<ContractData>[]) => {
+    const selected = new Set(ids);
+    const referenced = directory.companies.filter((company) => selected.has(company.id) && records.some((record) =>
+      record.payload.performingLegalEntityId === company.id || record.payload.customerCompanyId === company.id
+    ));
+    if (referenced.length) throw new Error(`Нельзя удалить связанные с договорами компании: ${referenced.map((company) => company.shortName || company.name).join(", ")}. Их можно оставить в архиве.`);
+    const next = normalizeCompanyDirectory({
+      schemaVersion: 2,
+      companies: directory.companies.filter((company) => !selected.has(company.id) || !company.archived),
+    });
+    await updateContractsAndCompanyDirectoryAtomic([], next);
+    setDirectory(next);
+  }, [directory]);
+
   return {
     companies: directory.companies,
     loading,
@@ -219,6 +257,9 @@ export function useCompanyDirectory(contracts: StoredRecord<ContractData>[]) {
     save,
     persistContractThenDirectory,
     persistContractsThenDirectory,
+    persistContractUpdatesThenDirectory,
+    setCompaniesArchived,
+    deleteArchivedCompanies,
     reload,
   };
 }
@@ -511,16 +552,18 @@ export function CompanyDirectoryDialog({
   );
 }
 
-function CompanyEditor({
+export function CompanyEditor({
   company,
   companies,
   onClose,
   onSave,
+  readOnly = false,
 }: {
   company: CompanyCard;
   companies: CompanyCard[];
   onClose: () => void;
   onSave: (company: CompanyCard) => Promise<void>;
+  readOnly?: boolean;
 }) {
   const [item, setItem] = useState(() => structuredClone(company));
   const [error, setError] = useState("");
@@ -548,13 +591,13 @@ function CompanyEditor({
       <header>
         <div>
           <h2>{item.name || "Новая компания"}</h2>
-          <p>Реквизиты и аффилированность</p>
+          <p>Реквизиты, лица принимающие решения и аффилированность</p>
         </div>
         <button className="icon-button" type="button" onClick={onClose}>
           ×
         </button>
       </header>
-      <div className="drawer-body">
+      <fieldset className="drawer-body company-editor-fieldset" disabled={readOnly}>
         {error && <div className="notice error">{error}</div>}
         <h3>Карточка</h3>
         <div className="form-grid">
@@ -625,6 +668,72 @@ function CompanyEditor({
           </select>
           <small>Компания может находиться только в одном разделе.</small>
         </label>
+        <div className="inline-heading">
+          <div>
+            <h3>Лица, принимающие решения</h3>
+            <p>Контакты руководителей и ответственных сотрудников компании.</p>
+          </div>
+          <button
+            className="secondary small"
+            type="button"
+            onClick={() =>
+              update("decisionMakers", [
+                ...item.decisionMakers,
+                {
+                  id: crypto.randomUUID(),
+                  fullName: "",
+                  position: "",
+                  department: "",
+                  phone: "",
+                  email: "",
+                  notes: "",
+                  isPrimary: item.decisionMakers.length === 0,
+                },
+              ])
+            }
+          >
+            Добавить ЛПР
+          </button>
+        </div>
+        {item.decisionMakers.length === 0 && (
+          <div className="empty-inline">Лица, принимающие решения, не указаны.</div>
+        )}
+        {item.decisionMakers.map((person) => (
+          <div className="decision-maker-card" key={person.id}>
+            <div className="form-grid compact">
+              <label className="wide">
+                ФИО
+                <input value={person.fullName} onChange={(event) => update("decisionMakers", item.decisionMakers.map((entry) => entry.id === person.id ? { ...entry, fullName: event.target.value } : entry))} />
+              </label>
+              <label>
+                Должность
+                <input value={person.position} onChange={(event) => update("decisionMakers", item.decisionMakers.map((entry) => entry.id === person.id ? { ...entry, position: event.target.value } : entry))} />
+              </label>
+              <label>
+                Подразделение
+                <input value={person.department} onChange={(event) => update("decisionMakers", item.decisionMakers.map((entry) => entry.id === person.id ? { ...entry, department: event.target.value } : entry))} />
+              </label>
+              <label>
+                Телефон
+                <input value={person.phone} onChange={(event) => update("decisionMakers", item.decisionMakers.map((entry) => entry.id === person.id ? { ...entry, phone: event.target.value } : entry))} />
+              </label>
+              <label>
+                E-mail
+                <input type="email" value={person.email} onChange={(event) => update("decisionMakers", item.decisionMakers.map((entry) => entry.id === person.id ? { ...entry, email: event.target.value } : entry))} />
+              </label>
+              <label className="wide">
+                Примечание
+                <input value={person.notes} onChange={(event) => update("decisionMakers", item.decisionMakers.map((entry) => entry.id === person.id ? { ...entry, notes: event.target.value } : entry))} />
+              </label>
+            </div>
+            <div className="button-row">
+              <label className="checkbox-row">
+                <input type="checkbox" checked={person.isPrimary} onChange={(event) => update("decisionMakers", item.decisionMakers.map((entry) => ({ ...entry, isPrimary: entry.id === person.id ? event.target.checked : event.target.checked ? false : entry.isPrimary })))} /> Основной контакт
+              </label>
+              <button className="secondary small danger" type="button" onClick={() => update("decisionMakers", item.decisionMakers.filter((entry) => entry.id !== person.id))}>Удалить ЛПР</button>
+            </div>
+          </div>
+        ))}
         <div className="inline-heading">
           <div>
             <h3>Аффилированность</h3>
@@ -738,12 +847,12 @@ function CompanyEditor({
             onChange={(event) => update("notes", event.target.value)}
           />
         </label>
-      </div>
+      </fieldset>
       <footer>
         <button className="secondary" type="button" onClick={onClose}>
           Отмена
         </button>
-        <button className="primary" type="button" onClick={() => void submit()}>
+        <button className="primary" type="button" disabled={readOnly} onClick={() => void submit()}>
           Сохранить компанию
         </button>
       </footer>

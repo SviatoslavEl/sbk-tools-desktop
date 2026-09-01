@@ -22,6 +22,7 @@ import {
   discardStagedAttachments,
   getWorkspaceInfo,
   importRecordsAtomic,
+  updateRecordsAtomic,
   readTextFile,
   readXlsx,
   recordHistory,
@@ -94,6 +95,36 @@ export const normalizeStaffData = (payload: StaffData): StaffData => {
   };
   return { ...source, organizationalAssignments: staffAssignments(source) };
 };
+
+export function mergeStaffImportUpdate(previous: StaffData, imported: StaffData, mapping: StaffImportMapping): StaffData {
+  const next = structuredClone(previous);
+  const copy = <K extends keyof StaffData>(field: keyof StaffImportMapping, key: K) => { if (mapping[field] >= 0) next[key] = imported[key]; };
+  copy("fullName", "fullName"); copy("birthDate", "birthDate"); copy("role", "role"); copy("grade", "grade");
+  copy("primarySpecialization", "primarySpecialization"); copy("additionalSpecializations", "additionalSpecializations"); copy("competencies", "competencies"); copy("industries", "industries");
+  if (["skills", "additionalSpecializations", "competencies"].some((field) => mapping[field as keyof StaffImportMapping] >= 0)) next.skills = imported.skills;
+  copy("qualification", "qualification"); copy("location", "location"); copy("travelReadiness", "travelReadiness");
+  copy("phone", "phone"); copy("email", "email");
+  if (mapping.contacts >= 0) { next.phone = imported.phone; next.email = imported.email; }
+  copy("experienceYears", "experienceYears"); copy("experienceText", "experienceNotes"); copy("availableFrom", "availableFrom"); copy("availableTo", "availableTo");
+  copy("hourlyRate", "hourlyRate"); copy("disclosureAllowed", "disclosureAllowed"); copy("notes", "notes");
+  const assignmentFields: Array<keyof StaffImportMapping> = ["legalEntity", "department", "role", "basis", "basisOther", "basisNumber", "startDate", "endDate", "status"];
+  if (assignmentFields.some((field) => mapping[field] >= 0)) {
+    const current = primaryAssignment(next);
+    const incoming = primaryAssignment(imported);
+    const assignment = { ...current };
+    const assignmentCopy = (field: keyof StaffImportMapping, key: keyof typeof assignment) => { if (mapping[field] >= 0) assignment[key] = incoming[key] as never; };
+    assignmentCopy("legalEntity", "legalEntity"); assignmentCopy("department", "department"); assignmentCopy("role", "position"); assignmentCopy("basis", "engagementType"); assignmentCopy("basisOther", "engagementOther"); assignmentCopy("basisNumber", "basisNumber"); assignmentCopy("startDate", "startDate"); assignmentCopy("endDate", "endDate"); assignmentCopy("status", "status");
+    next.organizationalAssignments = [assignment, ...next.organizationalAssignments.filter((item) => item.id !== current.id)];
+    next.basis = assignment.engagementType; next.basisOther = assignment.engagementOther; next.basisNumber = assignment.basisNumber; next.startDate = assignment.startDate; next.endDate = assignment.endDate; next.status = assignment.status;
+  }
+  if (["certificates", "certificateStatuses", "education"].some((field) => mapping[field as keyof StaffImportMapping] >= 0)) {
+    const replaced = new Set<StaffDocument["category"]>();
+    if (mapping.certificates >= 0 || mapping.certificateStatuses >= 0) replaced.add("certificate");
+    if (mapping.education >= 0) replaced.add("education");
+    next.documents = [...next.documents.filter((document) => !replaced.has(document.category)), ...imported.documents.filter((document) => replaced.has(document.category))];
+  }
+  return normalizeStaffData(next);
+}
 const requiredStaffImportFields: ImportRequiredField<StaffData>[] = [
   { key: "fullName", label: "ФИО", missing: (item) => !item.fullName.trim() },
   {
@@ -143,6 +174,7 @@ export function StaffRegistry() {
     null,
   );
   const [importRows, setImportRows] = useState<StaffData[] | null>(null);
+  const [importMode, setImportMode] = useState<"add" | "update">("add");
   const [importEditingIndex, setImportEditingIndex] = useState<number | null>(
     null,
   );
@@ -499,9 +531,10 @@ export function StaffRegistry() {
     });
   };
 
-  const openImport = async () => {
+  const openImport = async (mode: "add" | "update" = "add") => {
     const path = await chooseOpenPath("Импорт кадров", ["csv", "xlsx"]);
     if (!path) return;
+    setImportMode(mode);
     const [headers, ...rows] = path.toLowerCase().endsWith(".xlsx")
       ? (await readXlsx(path)).rows
       : parseCsv(await readTextFile(path));
@@ -576,7 +609,7 @@ export function StaffRegistry() {
 
   const staffImportProblems = importRows
     ? importProblemRows(importRows, (item, index) => {
-        const issues = missingImportFields(item, requiredStaffImportFields).map(
+        const issues = (importMode === "add" ? missingImportFields(item, requiredStaffImportFields) : item.fullName.trim() ? [] : [{ label: "ФИО" }]).map(
           (field) => `Не заполнено: ${field.label}`,
         );
         issues.push(
@@ -595,6 +628,7 @@ export function StaffRegistry() {
         )
           issues.push("Сотрудник повторяется внутри импортируемого файла");
         if (
+          importMode === "add" &&
           normalizedRecords.some(
             (record) =>
               record.payload.fullName.toLowerCase() ===
@@ -627,13 +661,10 @@ export function StaffRegistry() {
     const keys = new Set<string>();
     for (const [index, item] of importRows.entries()) {
       const assignment = primaryAssignment(item);
-      if (
-        !item.fullName ||
-        !item.role ||
-        !assignment.legalEntity ||
-        !assignment.department ||
+      if (importMode === "add" && (
+        !item.fullName || !item.role || !assignment.legalEntity || !assignment.department ||
         (assignment.engagementType === "Иное" && !assignment.engagementOther)
-      )
+      ))
         errors.push(
           `Строка ${index + 2}: нужны ФИО, должность, юрлицо, отдел и пояснение для «Иное»`,
         );
@@ -647,7 +678,7 @@ export function StaffRegistry() {
             item.fullName.toLowerCase() &&
           record.payload.birthDate === item.birthDate,
       );
-      if (duplicate)
+      if (duplicate && importMode === "add")
         errors.push(
           `Строка ${index + 2}: дубль существующей карточки ${item.fullName}`,
         );
@@ -659,14 +690,19 @@ export function StaffRegistry() {
       return;
     }
     try {
-      await importRecordsAtomic(
-        "staff",
-        importRows.map((item) => ({
-          id: crypto.randomUUID(),
-          title: item.fullName,
-          payload: item,
-        })),
-      );
+      if (importMode === "update") {
+        const updates = importRows.map((item, index) => {
+          let candidates = normalizedRecords.filter((record) => record.payload.fullName.trim().toLocaleLowerCase("ru-RU") === item.fullName.trim().toLocaleLowerCase("ru-RU"));
+          if (item.birthDate) candidates = candidates.filter((record) => record.payload.birthDate === item.birthDate);
+          if (candidates.length !== 1) throw new Error(`Строка ${index + 2}: ${candidates.length ? "найдено несколько кадровых карточек" : "сотрудник не найден"}. Для обновления нужны ФИО и дата рождения.`);
+          const previous = candidates[0];
+          const payload = mergeStaffImportUpdate(previous.payload, item, importSource?.mapping || detectStaffMapping([]));
+          return { id: previous.id, title: payload.fullName, payload };
+        });
+        await updateRecordsAtomic("staff", updates);
+      } else {
+        await importRecordsAtomic("staff", importRows.map((item) => ({ id: crypto.randomUUID(), title: item.fullName, payload: item })));
+      }
       await store.reload();
       setImportRows(null);
       setImportSource(null);
@@ -790,7 +826,8 @@ export function StaffRegistry() {
         </label>
         <div className="toolbar-actions">
           <div className="toolbar-action-group"><span>Обмен</span>
-            {!readOnly && <button className="secondary" type="button" onClick={() => void openImport()}>Импорт</button>}
+            {!readOnly && <button className="secondary" type="button" onClick={() => void openImport("add")}>Добавить из файла</button>}
+            {!readOnly && <button className="secondary" type="button" onClick={() => void openImport("update")}>Обновить из файла</button>}
             <button className="secondary" type="button" onClick={() => void exportArchive()}>Экспорт ZIP</button>
             <button className="secondary" type="button" onClick={() => void exportSelection()}>CSV</button>
             <button className="secondary" type="button" onClick={() => void exportXlsx()}>XLSX</button>
@@ -805,6 +842,7 @@ export function StaffRegistry() {
           >
             Подбор под закупку
           </button>
+          {!readOnly && filtered.length > 0 && <button className="secondary danger" type="button" onClick={() => { if (window.confirm(`Перенести в архив все найденные кадровые карточки (${filtered.length})?`)) void store.archiveMany(filtered.map((record) => record.id)); }}>В архив все найденные</button>}
           {!readOnly && (
             <button
               className="primary"

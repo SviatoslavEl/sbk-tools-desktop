@@ -83,6 +83,17 @@ describe("справочник компаний", () => {
     expect(migrated.companies.some((company) => "isOurs" in company || "isCounterparty" in company)).toBe(false);
   });
 
+  it("дополняет старую карточку архивом и ЛПР, не меняя существующие поля", () => {
+    const legacy = { ...emptyCompany("2026-01-01", "legacy-lpr"), name: "ООО Контрагент" };
+    delete (legacy as Partial<typeof legacy>).decisionMakers;
+    delete (legacy as Partial<typeof legacy>).archived;
+    const normalizedLegacy = normalizeCompanyDirectory({ schemaVersion: 2, companies: [legacy as never] }).companies[0];
+    expect(normalizedLegacy).toMatchObject({ name: "ООО Контрагент", decisionMakers: [], archived: false });
+    const withPerson = normalizeCompanyDirectory({ schemaVersion: 2, companies: [{ ...emptyCompany("2026-01-01", "with-lpr"), name: "АО Клиент", archived: true, decisionMakers: [{ id: "person", fullName: "Иванова Анна", position: "Генеральный директор", department: "Руководство", phone: "+7 999 000-00-00", email: "director@example.test", notes: "ЛПР", isPrimary: true }] }] }).companies[0];
+    expect(withPerson.archived).toBe(true);
+    expect(withPerson.decisionMakers[0]).toMatchObject({ fullName: "Иванова Анна", isPrimary: true });
+  });
+
   it("при связывании приоритетно использует существующий id, затем имя", () => {
     const byId = { ...emptyCompany("2026-01-01", "id-company"), name: "Компания по ID", scope: "internal" as const };
     const byName = { ...emptyCompany("2026-01-01", "name-company"), name: "Совпавшее имя", scope: "internal" as const };

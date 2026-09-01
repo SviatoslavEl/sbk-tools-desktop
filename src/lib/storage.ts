@@ -25,6 +25,7 @@ export interface WorkspaceInfo {
   warning?: string;
   writable: boolean;
   editor: boolean;
+  accessControlled: boolean;
   accessMessage: string;
   schemaVersion: number;
   freeSpaceBytes: number;
@@ -125,10 +126,24 @@ export async function getWorkspaceInfo(): Promise<WorkspaceInfo> {
     configured: true,
     writable: true,
     editor: true,
+    accessControlled: false,
     accessMessage: "Режим предпросмотра",
     schemaVersion: 1,
     freeSpaceBytes: 0,
   };
+}
+
+export async function switchWorkspaceMode(editor: boolean, password: string): Promise<void> {
+  if (!isTauri()) return;
+  await invoke<void>("switch_workspace_mode", { editor, password });
+  window.dispatchEvent(new Event(workspaceAccessInvalidatedEvent));
+  window.dispatchEvent(new Event("sbk-workspace-refresh"));
+}
+
+export async function setWorkspaceAccessPassword(currentPassword: string, newPassword: string): Promise<void> {
+  if (!isTauri()) return;
+  await invoke<void>("set_workspace_access_password", { currentPassword, newPassword });
+  window.dispatchEvent(new Event("sbk-workspace-refresh"));
 }
 
 export async function setWorkspaceLocation(path: string): Promise<string> {
@@ -270,6 +285,19 @@ export async function importRecordsAtomic<T>(
     })),
     ...existing,
   ]);
+  return records.length;
+}
+
+export async function updateRecordsAtomic<T>(module: ModuleId, records: RecordMutation<T>[]): Promise<number> {
+  if (isTauri()) return invokeMutation<number>("update_records_atomic", { module, records });
+  const existing = readFallback<T>(module);
+  const updates = new Map(records.map((record) => [record.id, record]));
+  const now = new Date().toISOString();
+  if (records.some((record) => !existing.some((item) => item.id === record.id && !item.archived))) throw new Error("Запись для обновления не найдена");
+  writeFallback(module, existing.map((record) => {
+    const update = updates.get(record.id);
+    return update ? { ...record, title: update.title, payload: update.payload, updatedAt: now } : record;
+  }));
   return records.length;
 }
 
@@ -437,6 +465,16 @@ export async function archiveRecord(
   }
 }
 
+export async function archiveRecords(module: ModuleId, ids: string[], archived = true): Promise<number> {
+  if (isTauri()) return invokeMutation<number>("archive_records", { module, ids, archived });
+  const records = readFallback(module);
+  const selected = new Set(ids);
+  let changed = 0;
+  records.forEach((record) => { if (selected.has(record.id)) { record.archived = archived; record.updatedAt = new Date().toISOString(); changed += 1; } });
+  writeFallback(module, records);
+  return changed;
+}
+
 export async function deleteRecord(
   module: ModuleId,
   id: string,
@@ -449,6 +487,14 @@ export async function deleteRecord(
     module,
     readFallback(module).filter((record) => record.id !== id),
   );
+}
+
+export async function deleteRecords(module: ModuleId, ids: string[]): Promise<number> {
+  if (isTauri()) return invokeMutation<number>("delete_records", { module, ids });
+  const selected = new Set(ids);
+  const records = readFallback(module);
+  writeFallback(module, records.filter((record) => !selected.has(record.id)));
+  return records.filter((record) => selected.has(record.id)).length;
 }
 
 export async function copyAttachment(

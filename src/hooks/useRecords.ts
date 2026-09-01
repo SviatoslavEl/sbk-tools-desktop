@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   archiveRecord,
+  archiveRecords,
   listRecords,
   saveRecord,
   type ModuleId,
@@ -47,5 +48,11 @@ export function useRecords<T>(module: ModuleId) {
     setRecords((current) => current.filter((record) => record.id !== id));
   }, [module]);
 
-  return { records, loading, error, reload, save, archive };
+  const archiveMany = useCallback(async (ids: string[]) => {
+    await archiveRecords(module, ids, true);
+    const selected = new Set(ids);
+    setRecords((current) => current.filter((record) => !selected.has(record.id)));
+  }, [module]);
+
+  return { records, loading, error, reload, save, archive, archiveMany };
 }

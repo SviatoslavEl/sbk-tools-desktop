@@ -46,11 +46,7 @@ import {
 } from "./types";
 import { contractBalance, contractChecks } from "./validation";
 import { matchContract, type ContractSelectionCriteria } from "./selection";
-import {
-  CompanyDirectoryDialog,
-  CompanyNameField,
-  useCompanyDirectory,
-} from "./CompanyDirectory";
+import { CompanyNameField, useCompanyDirectory } from "./CompanyDirectory";
 import type { CompanyCard } from "./companies";
 
 const money = (value: number) =>
@@ -339,6 +335,28 @@ export function mapContracts(
     });
 }
 
+export function mergeContractImportUpdate(
+  previous: ContractData,
+  imported: ContractData,
+  mapping: Record<ImportField, number>,
+): ContractData {
+  const next = { ...previous };
+  const copy = <K extends keyof ContractData>(field: ImportField, key: K) => {
+    if (mapping[field] >= 0) next[key] = imported[key];
+  };
+  copy("performingLegalEntity", "performingLegalEntity");
+  copy("number", "number"); copy("date", "date"); copy("customer", "customer"); copy("subject", "subject");
+  copy("industry", "industry"); copy("serviceType", "serviceType"); copy("standards", "standards"); copy("workScope", "workScope"); copy("contractRole", "contractRole");
+  copy("amount", "amount"); copy("ourShare", "ourShareAmount"); copy("start", "startDate"); copy("end", "endDate");
+  if (mapping.period >= 0) { next.startDate = imported.startDate; next.endDate = imported.endDate; }
+  copy("stage", "stage"); copy("payment", "paymentStatus"); copy("acts", "actsStatus"); copy("paid", "paidAmount");
+  copy("paymentPlanned", "paymentPlannedDate"); copy("paymentActual", "paymentActualDate"); copy("important", "nextImportantDate");
+  copy("responsible", "responsible"); copy("contact", "contact"); copy("review", "reviewAvailable"); copy("disclosure", "disclosureAllowed");
+  copy("discloseCustomer", "discloseCustomer"); copy("discloseNumber", "discloseNumber"); copy("discloseSubject", "discloseSubject"); copy("discloseAmount", "discloseAmount");
+  if (mapping.notes >= 0 || mapping.period >= 0) next.notes = imported.notes;
+  return next;
+}
+
 export function ContractsRegistry() {
   const store = useRecords<ContractData>("contract-experience");
   const companyDirectory = useCompanyDirectory(store.records);
@@ -353,6 +371,7 @@ export function ContractsRegistry() {
     null,
   );
   const [importRows, setImportRows] = useState<ContractData[] | null>(null);
+  const [importMode, setImportMode] = useState<"add" | "update">("add");
   const [importEditingIndex, setImportEditingIndex] = useState<number | null>(
     null,
   );
@@ -392,7 +411,6 @@ export function ContractsRegistry() {
   const [selectedContracts, setSelectedContracts] = useState<Set<string>>(
     new Set(),
   );
-  const [companyDirectoryOpen, setCompanyDirectoryOpen] = useState(false);
   const [sort, setSort] = useState<{ key: ContractSortKey; direction: SortDirection } | null>(null);
 
   const filtered = useMemo(
@@ -724,13 +742,14 @@ export function ContractsRegistry() {
     window.alert(`Подборка сохранена: ${path}`);
   };
 
-  const openImport = async () => {
+  const openImport = async (mode: "add" | "update" = "add") => {
     const path = await chooseOpenPath("Импорт договоров", [
       "csv",
       "xlsx",
       "docx",
     ]);
     if (!path) return;
+    setImportMode(mode);
     const table = path.toLowerCase().endsWith(".docx")
       ? (await readDocxTable(path)).rows
       : path.toLowerCase().endsWith(".xlsx")
@@ -792,9 +811,9 @@ export function ContractsRegistry() {
   const contractImportProblems =
     importRows && importSource
       ? importProblemRows(importRows, (item, index) => {
-          const issues = missingImportFields(
-            item,
-            requiredContractImportFields,
+          const issues = (importMode === "add"
+            ? missingImportFields(item, requiredContractImportFields)
+            : item.number.trim() ? [] : [{ label: "Номер договора" }]
           ).map((field) => `Не заполнено: ${field.label}`);
           const raw = importSource.rows[index] || [];
           const rawValue = (key: ImportField) =>
@@ -818,10 +837,8 @@ export function ContractsRegistry() {
             )
               issues.push(`Неизвестный статус актов «${rawValue("acts")}`);
           }
-          issues.push(
-            ...contractChecks(item)
-              .filter((check) => check.severity === "error")
-              .map((check) => check.message),
+          if (importMode === "add") issues.push(
+            ...contractChecks(item).filter((check) => check.severity === "error").map((check) => check.message),
           );
           const duplicateInFile = importRows.some(
             (other, otherIndex) =>
@@ -836,8 +853,9 @@ export function ContractsRegistry() {
           );
           if (duplicateInFile)
             issues.push("Договор повторяется внутри импортируемого файла");
-          if (
-            store.records.some(
+        if (
+          importMode === "add" &&
+          store.records.some(
               (record) =>
                 record.payload.number === item.number &&
                 record.payload.customer === item.customer &&
@@ -869,14 +887,9 @@ export function ContractsRegistry() {
     const errors: string[] = [];
     const keys = new Set<string>();
     for (const [index, item] of importRows.entries()) {
-      if (
-        !item.performingLegalEntity ||
-        !item.number ||
-        !item.customer ||
-        !item.subject
-      ) {
+      if ((importMode === "add" && (!item.performingLegalEntity || !item.number || !item.customer || !item.subject)) || (importMode === "update" && !item.number)) {
         errors.push(
-          `Строка ${index + 2}: нужны юрлицо-исполнитель, номер, заказчик и предмет`,
+          importMode === "update" ? `Строка ${index + 2}: для обновления нужен номер договора` : `Строка ${index + 2}: нужны юрлицо-исполнитель, номер, заказчик и предмет`,
         );
         continue;
       }
@@ -919,14 +932,11 @@ export function ContractsRegistry() {
           record.payload.date === item.date &&
           record.payload.subject === item.subject,
       );
-      if (duplicate)
+      if (duplicate && importMode === "add")
         errors.push(
           `Строка ${index + 2}: дубль существующего договора ${item.number}`,
         );
-      for (const check of contractChecks(item).filter(
-        (check) => check.severity === "error",
-      ))
-        errors.push(`Строка ${index + 2}: ${check.message}`);
+      if (importMode === "add") for (const check of contractChecks(item).filter((check) => check.severity === "error")) errors.push(`Строка ${index + 2}: ${check.message}`);
     }
     if (errors.length) {
       setImportReport(
@@ -935,9 +945,25 @@ export function ContractsRegistry() {
       return;
     }
     try {
-      await companyDirectory.persistContractsThenDirectory(importRows);
+      if (importMode === "update") {
+        const updates = importRows.map((item, index) => {
+          let candidates = store.records.filter((record) => record.payload.number.trim().toLocaleLowerCase("ru-RU") === item.number.trim().toLocaleLowerCase("ru-RU"));
+          if (item.performingLegalEntity.trim()) candidates = candidates.filter((record) => record.payload.performingLegalEntity.trim().toLocaleLowerCase("ru-RU") === item.performingLegalEntity.trim().toLocaleLowerCase("ru-RU"));
+          if (candidates.length > 1 && item.customer.trim()) candidates = candidates.filter((record) => record.payload.customer.trim().toLocaleLowerCase("ru-RU") === item.customer.trim().toLocaleLowerCase("ru-RU"));
+          if (candidates.length > 1 && item.date) candidates = candidates.filter((record) => record.payload.date === item.date);
+          if (candidates.length !== 1) throw new Error(`Строка ${index + 2}: ${candidates.length ? "найдено несколько договоров" : "договор не найден"}. Для обновления нужны номер и юрлицо-исполнитель.`);
+          const previous = candidates[0];
+          const payload = mergeContractImportUpdate(previous.payload, item, importSource.mapping);
+          const validationErrors = contractChecks(payload).filter((check) => check.severity === "error");
+          if (validationErrors.length) throw new Error(`Строка ${index + 2}: ${validationErrors.map((check) => check.message).join(" ")}`);
+          return { id: previous.id, payload };
+        });
+        await companyDirectory.persistContractUpdatesThenDirectory(updates);
+      } else {
+        await companyDirectory.persistContractsThenDirectory(importRows);
+      }
       await store.reload();
-      setImportReport(`Пакет принят полностью: ${importRows.length} записей.`);
+      setImportReport(importMode === "update" ? `Обновлено договоров: ${importRows.length}. Предыдущие версии сохранены в истории.` : `Пакет принят полностью: ${importRows.length} записей.`);
       setImportRows(null);
       setImportSource(null);
     } catch (reason) {
@@ -1036,9 +1062,9 @@ export function ContractsRegistry() {
           </select>
         </label>
         <div className="toolbar-actions">
-          <div className="toolbar-action-group"><span>Справочник</span><button className="secondary" type="button" onClick={() => setCompanyDirectoryOpen(true)}>Компании и контрагенты</button></div>
           <div className="toolbar-action-group"><span>Обмен</span>
-            {!readOnly && <button className="secondary" type="button" onClick={() => void openImport()}>Импорт</button>}
+            {!readOnly && <button className="secondary" type="button" onClick={() => void openImport("add")}>Добавить из файла</button>}
+            {!readOnly && <button className="secondary" type="button" onClick={() => void openImport("update")}>Обновить из файла</button>}
             <button className="secondary" type="button" onClick={() => void exportArchive()}>Экспорт ZIP</button>
             <button className="secondary" type="button" onClick={() => void exportSelection()}>CSV</button>
             <button className="secondary" type="button" onClick={() => void exportXlsx()}>XLSX</button>
@@ -1053,6 +1079,7 @@ export function ContractsRegistry() {
           >
             Подбор под закупку
           </button>
+          {!readOnly && filtered.length > 0 && <button className="secondary danger" type="button" onClick={() => { if (window.confirm(`Перенести в архив все найденные договоры (${filtered.length})?`)) void store.archiveMany(filtered.map((record) => record.id)); }}>В архив все найденные</button>}
           {!readOnly && (
             <button
               className="primary"
@@ -1222,23 +1249,6 @@ export function ContractsRegistry() {
             await companyDirectory.persistContractThenDirectory(item, id);
             await store.reload();
             setEditing(null);
-          }}
-        />
-      )}
-      {companyDirectoryOpen && (
-        <CompanyDirectoryDialog
-          companies={companyDirectory.companies}
-          error={companyDirectory.error}
-          readOnly={readOnly}
-          accessMessage={companyDirectory.accessMessage}
-          onClose={() => setCompanyDirectoryOpen(false)}
-          onSave={async (company, previous) => {
-            const result = await companyDirectory.save(
-              company,
-              previous,
-              store.records,
-            );
-            if (result.updatedContracts) await store.reload();
           }}
         />
       )}

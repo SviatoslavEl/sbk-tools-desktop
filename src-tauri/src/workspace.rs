@@ -1,8 +1,24 @@
+use argon2::Argon2;
+use base64::{Engine as _, engine::general_purpose::STANDARD_NO_PAD};
 use fs2::FileExt;
+use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{
+    Mutex,
+    atomic::{AtomicBool, Ordering},
+};
+
+const ACCESS_CONTROL_FILE: &str = ".workspace-access.json";
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceAccessControl {
+    version: u8,
+    salt: String,
+    password_hash: String,
+}
 
 const WORKSPACE_DIRS: [&str; 13] = [
     "settings",
@@ -26,7 +42,7 @@ pub(crate) struct Workspace {
     pub(crate) configured: bool,
     pub(crate) warning: Option<String>,
     pub(crate) writable: bool,
-    pub(crate) access_message: String,
+    access_controlled: AtomicBool,
     editor_lease: Mutex<EditorLease>,
 }
 
@@ -180,6 +196,92 @@ fn acquire_editor_lease(root: &Path, writable: bool) -> EditorLease {
     }
 }
 
+fn read_access_control(root: &Path) -> Result<Option<WorkspaceAccessControl>, String> {
+    let path = root.join(ACCESS_CONTROL_FILE);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes = fs::read(&path)
+        .map_err(|error| format!("Не удалось прочитать настройки доступа: {error}"))?;
+    let control: WorkspaceAccessControl = serde_json::from_slice(&bytes).map_err(|_| {
+        "Файл управления доступом повреждён. Восстановите его из резервной копии.".to_string()
+    })?;
+    if control.version != 1 {
+        return Err("Версия настроек доступа не поддерживается".to_string());
+    }
+    Ok(Some(control))
+}
+
+fn verify_access_password(root: &Path, password: &str) -> Result<(), String> {
+    let control = read_access_control(root)?
+        .ok_or_else(|| "Пароль рабочей папки ещё не установлен".to_string())?;
+    let salt = STANDARD_NO_PAD
+        .decode(control.salt)
+        .map_err(|_| "Файл управления доступом повреждён".to_string())?;
+    let expected = STANDARD_NO_PAD
+        .decode(control.password_hash)
+        .map_err(|_| "Файл управления доступом повреждён".to_string())?;
+    let mut actual = vec![0u8; expected.len()];
+    Argon2::default()
+        .hash_password_into(password.as_bytes(), &salt, &mut actual)
+        .map_err(|error| format!("Не удалось проверить пароль: {error}"))?;
+    if actual.len() != expected.len()
+        || !actual
+            .iter()
+            .zip(expected.iter())
+            .fold(0u8, |difference, (left, right)| difference | (left ^ right))
+            .eq(&0)
+    {
+        return Err("Неверный пароль рабочей папки".to_string());
+    }
+    Ok(())
+}
+
+fn write_access_control(root: &Path, password: &str) -> Result<(), String> {
+    if password.chars().count() < 6 {
+        return Err("Пароль должен содержать не менее 6 символов".to_string());
+    }
+    let mut salt = [0u8; 16];
+    getrandom::fill(&mut salt).map_err(|error| format!("Не удалось создать пароль: {error}"))?;
+    let mut password_hash = [0u8; 32];
+    Argon2::default()
+        .hash_password_into(password.as_bytes(), &salt, &mut password_hash)
+        .map_err(|error| format!("Не удалось создать пароль: {error}"))?;
+    let control = WorkspaceAccessControl {
+        version: 1,
+        salt: STANDARD_NO_PAD.encode(salt),
+        password_hash: STANDARD_NO_PAD.encode(password_hash),
+    };
+    let target = root.join(ACCESS_CONTROL_FILE);
+    let encoded = serde_json::to_vec_pretty(&control).map_err(|error| error.to_string())?;
+    if target.exists() {
+        // Windows cannot atomically rename over an existing file. Keeping the
+        // control file present while rewriting is safer than briefly removing
+        // password protection; an interrupted write fails closed on next start.
+        let mut file = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&target)
+            .map_err(|error| format!("Не удалось сменить пароль: {error}"))?;
+        file.write_all(&encoded)
+            .map_err(|error| format!("Не удалось сменить пароль: {error}"))?;
+        file.sync_all()
+            .map_err(|error| format!("Не удалось сменить пароль: {error}"))?;
+        return Ok(());
+    }
+    let temporary = root.join(format!(
+        "{ACCESS_CONTROL_FILE}.{}.tmp",
+        uuid::Uuid::new_v4()
+    ));
+    fs::write(&temporary, encoded)
+        .map_err(|error| format!("Не удалось сохранить настройки доступа: {error}"))?;
+    fs::rename(&temporary, &target).map_err(|error| {
+        let _ = fs::remove_file(&temporary);
+        format!("Не удалось включить парольный доступ: {error}")
+    })?;
+    Ok(())
+}
+
 pub(crate) struct ProvisionalEditorLease {
     _lease: EditorLease,
 }
@@ -236,15 +338,9 @@ pub(crate) fn open_workspace() -> Result<Workspace, String> {
     // The operating system / network filesystem is the authority. There is no
     // application password that pretends to grant access: a process may edit
     // only while it both has write permission and owns the exclusive lock.
-    let editor_lease = acquire_editor_lease(&root, writable);
+    let access_controlled = read_access_control(&root)?.is_some();
+    let editor_lease = acquire_editor_lease(&root, writable && !access_controlled);
     let editor = editor_lease.active;
-    let access_message = if editor {
-        "Редактирование разрешено: получена эксклюзивная блокировка общей папки.".to_string()
-    } else if writable {
-        "Только просмотр и экспорт: редактор уже работает с общей папкой.".to_string()
-    } else {
-        "Только просмотр и экспорт: файловая система не разрешает запись.".to_string()
-    };
     if editor {
         cleanup_stale_partial_backups(&root);
         let runtime = root.join("runtime-cache");
@@ -264,7 +360,7 @@ pub(crate) fn open_workspace() -> Result<Workspace, String> {
         configured,
         warning,
         writable,
-        access_message,
+        access_controlled: AtomicBool::new(access_controlled),
         editor_lease: Mutex::new(editor_lease),
     })
 }
@@ -285,6 +381,81 @@ fn cleanup_stale_partial_backups(root: &Path) {
 }
 
 impl Workspace {
+    pub(crate) fn access_controlled(&self) -> bool {
+        self.access_controlled.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn access_message(&self) -> String {
+        if self.is_editor() {
+            if self.access_controlled() {
+                "Режим редактирования включён по паролю; эксклюзивная блокировка получена."
+            } else {
+                "Редактирование разрешено: получена эксклюзивная блокировка общей папки."
+            }
+            .to_string()
+        } else if !self.writable {
+            "Только просмотр и экспорт: файловая система не разрешает запись.".to_string()
+        } else if self.access_controlled() {
+            "Только просмотр. Для редактирования введите пароль рабочей папки.".to_string()
+        } else {
+            "Только просмотр и экспорт: редактор уже работает с общей папкой.".to_string()
+        }
+    }
+
+    pub(crate) fn acquire_editor_with_password(&self, password: &str) -> Result<(), String> {
+        if !self.writable {
+            return Err("Файловая система не разрешает запись".to_string());
+        }
+        if self.access_controlled() {
+            verify_access_password(&self.root, password)?;
+        }
+        let mut lease = self
+            .editor_lease
+            .lock()
+            .map_err(|_| "Переключение режима недоступно".to_string())?;
+        if lease.active {
+            return Ok(());
+        }
+        let next = acquire_editor_lease(&self.root, true);
+        if !next.active {
+            return Err("Режим редактирования уже занят другим пользователем. Дождитесь его выхода и повторите попытку.".to_string());
+        }
+        *lease = next;
+        Ok(())
+    }
+
+    pub(crate) fn release_editor_with_password(&self, password: &str) -> Result<(), String> {
+        if self.access_controlled() {
+            verify_access_password(&self.root, password)?;
+        }
+        let mut lease = self
+            .editor_lease
+            .lock()
+            .map_err(|_| "Переключение режима недоступно".to_string())?;
+        *lease = EditorLease {
+            active: false,
+            token: uuid::Uuid::new_v4().to_string(),
+            edit: None,
+            guard: None,
+        };
+        Ok(())
+    }
+
+    pub(crate) fn set_access_password(
+        &self,
+        current_password: &str,
+        new_password: &str,
+    ) -> Result<(), String> {
+        if !self.is_editor() {
+            return Err("Установить или сменить пароль может только текущий редактор".to_string());
+        }
+        if self.access_controlled() {
+            verify_access_password(&self.root, current_password)?;
+        }
+        write_access_control(&self.root, new_password)?;
+        self.access_controlled.store(true, Ordering::SeqCst);
+        Ok(())
+    }
     pub(crate) fn is_editor(&self) -> bool {
         self.editor_lease
             .lock()
@@ -338,7 +509,7 @@ impl Workspace {
             configured: true,
             warning: None,
             writable: editor,
-            access_message: "test".to_string(),
+            access_controlled: AtomicBool::new(false),
             editor_lease: Mutex::new(lease),
         }
     }
@@ -410,6 +581,42 @@ mod tests {
         let root = std::env::temp_dir().join(format!("sbk-shared-guard-{}", Uuid::new_v4()));
         let workspace = Workspace::for_test(root, false);
         assert!(workspace.require_editor().is_err());
+    }
+
+    #[test]
+    fn password_control_requires_explicit_verified_mode_switch() {
+        let root = std::env::temp_dir().join(format!("sbk-password-access-{}", Uuid::new_v4()));
+        ensure_workspace(&root).expect("workspace");
+        let workspace = Workspace::for_test(root.clone(), true);
+        workspace
+            .set_access_password("", "correct-horse")
+            .expect("set first password");
+        assert!(workspace.access_controlled());
+        assert!(root.join(ACCESS_CONTROL_FILE).is_file());
+        assert!(workspace.release_editor_with_password("wrong").is_err());
+        assert!(workspace.is_editor());
+        workspace
+            .release_editor_with_password("correct-horse")
+            .expect("release editor");
+        assert!(!workspace.is_editor());
+        assert!(workspace.acquire_editor_with_password("wrong").is_err());
+        assert!(!workspace.is_editor());
+        workspace
+            .acquire_editor_with_password("correct-horse")
+            .expect("acquire editor");
+        assert!(workspace.is_editor());
+        workspace
+            .set_access_password("correct-horse", "new-correct-horse")
+            .expect("change password");
+        assert!(
+            workspace
+                .release_editor_with_password("correct-horse")
+                .is_err()
+        );
+        workspace
+            .release_editor_with_password("new-correct-horse")
+            .expect("new password releases editor");
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

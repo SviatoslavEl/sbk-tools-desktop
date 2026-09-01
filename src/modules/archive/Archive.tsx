@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { archiveRecord, deleteRecord, listRecords, type ModuleId, type StoredRecord } from "../../lib/storage";
+import { archiveRecord, archiveRecords, deleteRecord, deleteRecords, listRecords, type ModuleId, type StoredRecord } from "../../lib/storage";
 import { useWorkspaceAccess } from "../../lib/workspaceAccess";
 
 const sections: Array<{ module: ModuleId; title: string }> = [
@@ -42,11 +42,25 @@ export function Archive() {
     finally { setBusy(""); }
   };
 
+  const processAll = async (module: ModuleId, action: "restore" | "delete") => {
+    const records = data[module] || [];
+    if (!records.length) return;
+    const question = action === "delete" ? `Окончательно удалить все записи раздела (${records.length})? История и вложения будут удалены.` : `Восстановить все записи раздела (${records.length})?`;
+    if (!window.confirm(question)) return;
+    setBusy(`${module}-all`);
+    try {
+      if (action === "delete") await deleteRecords(module, records.map((record) => record.id));
+      else await archiveRecords(module, records.map((record) => record.id), false);
+      await reload();
+    } catch (reason) { setError(String(reason)); }
+    finally { setBusy(""); }
+  };
+
   return <div className="archive-grid">
     {!workspaceAccess.editor && <div className="notice warning"><strong>Режим просмотра</strong><span>{workspaceAccess.message}</span></div>}
     {error && <div className="notice error">{error}</div>}
     {sections.map(({ module, title }) => <section className="surface" key={module}>
-      <div className="surface-title"><h2>{title}</h2><span>{data[module]?.length || 0}</span></div>
+      <div className="surface-title"><h2>{title}</h2><div className="button-row"><span>{data[module]?.length || 0}</span>{workspaceAccess.editor && Boolean(data[module]?.length) && <><button className="secondary small" type="button" disabled={busy === `${module}-all`} onClick={() => void processAll(module, "restore")}>Восстановить все</button><button className="secondary small danger" type="button" disabled={busy === `${module}-all`} onClick={() => void processAll(module, "delete")}>Удалить все</button></>}</div></div>
       <div className="surface-body archive-list">
         {!data[module]?.length && <div className="empty-inline">В архиве нет записей.</div>}
         {data[module]?.map((record) => <div className="archive-row" key={record.id}>

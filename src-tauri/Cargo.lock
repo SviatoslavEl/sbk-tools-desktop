@@ -3223,7 +3223,7 @@ dependencies = [
 
 [[package]]
 name = "sbk-tools-desktop"
-version = "2.6.2"
+version = "2.7.0"
 dependencies = [
  "argon2",
  "base64 0.22.1",

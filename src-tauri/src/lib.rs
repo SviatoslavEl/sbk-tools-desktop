@@ -71,6 +71,7 @@ struct WorkspaceInfo {
     warning: Option<String>,
     writable: bool,
     editor: bool,
+    access_controlled: bool,
     access_message: String,
     schema_version: i64,
     free_space_bytes: u64,
@@ -272,13 +273,7 @@ fn parse_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredRecord> {
 #[tauri::command]
 fn workspace_info(state: State<'_, AppState>) -> Result<WorkspaceInfo, String> {
     let editor = state.workspace.is_editor();
-    let access_message = if editor {
-        state.workspace.access_message.clone()
-    } else if state.workspace.writable {
-        "Только просмотр и экспорт: редактор уже работает с общей папкой или блокировка была потеряна. Для повторного получения доступа перезапустите приложение.".to_string()
-    } else {
-        "Только просмотр и экспорт: файловая система не разрешает запись.".to_string()
-    };
+    let access_message = state.workspace.access_message();
     Ok(WorkspaceInfo {
         root: state.workspace.root.to_string_lossy().into_owned(),
         portable: state.workspace.portable,
@@ -286,10 +281,35 @@ fn workspace_info(state: State<'_, AppState>) -> Result<WorkspaceInfo, String> {
         warning: state.workspace.warning.clone(),
         writable: state.workspace.writable,
         editor,
+        access_controlled: state.workspace.access_controlled(),
         access_message,
         schema_version: SCHEMA_VERSION,
         free_space_bytes: fs2::available_space(&state.workspace.root).unwrap_or(0),
     })
+}
+
+#[tauri::command]
+fn switch_workspace_mode(
+    state: State<'_, AppState>,
+    editor: bool,
+    password: String,
+) -> Result<(), String> {
+    if editor {
+        state.workspace.acquire_editor_with_password(&password)
+    } else {
+        state.workspace.release_editor_with_password(&password)
+    }
+}
+
+#[tauri::command]
+fn set_workspace_access_password(
+    state: State<'_, AppState>,
+    current_password: String,
+    new_password: String,
+) -> Result<(), String> {
+    state
+        .workspace
+        .set_access_password(&current_password, &new_password)
 }
 
 #[tauri::command]
@@ -1153,6 +1173,67 @@ fn import_records_atomic(
     Ok(count)
 }
 
+#[tauri::command]
+fn update_records_atomic(
+    state: State<'_, AppState>,
+    module: String,
+    records: Vec<ImportRecord>,
+) -> Result<usize, String> {
+    state.workspace.require_editor()?;
+    if records.is_empty() || records.len() > 10_000 {
+        return Err("Пакет обновления должен содержать от 1 до 10 000 записей".to_string());
+    }
+    let _maintenance = state
+        .maintenance
+        .lock()
+        .map_err(|_| "Хранилище временно недоступно".to_string())?;
+    let history_limit = configured_history_limit(&state.workspace.root);
+    let mut connection = open_database(&state.workspace.root, &module)?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+    let now = Utc::now().to_rfc3339();
+    let mut ids = HashSet::new();
+    for record in &records {
+        if record.title.trim().is_empty()
+            || Uuid::parse_str(&record.id).is_err()
+            || !ids.insert(record.id.clone())
+        {
+            return Err(
+                "Пакет обновления содержит пустое название или повторяющийся идентификатор"
+                    .to_string(),
+            );
+        }
+        let previous: Option<String> = transaction
+            .query_row(
+                "SELECT payload FROM records WHERE id = ?1 AND archived = 0",
+                [&record.id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let previous = previous
+            .ok_or_else(|| format!("Запись {} не найдена или находится в архиве", record.id))?;
+        let payload = serde_json::to_string(&record.payload).map_err(|error| error.to_string())?;
+        transaction.execute(
+            "UPDATE records SET title = ?1, payload = ?2, updated_at = ?3 WHERE id = ?4 AND archived = 0",
+            params![record.title.trim(), payload, now, record.id],
+        ).map_err(|error| format!("Пакет обновления не сохранён: {error}"))?;
+        transaction.execute(
+            "INSERT INTO history(record_id, action, snapshot, created_at) VALUES (?1, 'updated', ?2, ?3)",
+            params![record.id, previous, now],
+        ).map_err(|error| error.to_string())?;
+        transaction.execute(
+            "DELETE FROM history WHERE record_id = ?1 AND id NOT IN (SELECT id FROM history WHERE record_id = ?1 ORDER BY id DESC LIMIT ?2)",
+            params![record.id, history_limit],
+        ).map_err(|error| error.to_string())?;
+    }
+    transaction
+        .commit()
+        .map_err(|error| format!("Пакет обновления не сохранён: {error}"))?;
+    Ok(records.len())
+}
+
 const COMPANY_DIRECTORY_DRAFT_KEY: &str = "company-directory-v1";
 
 fn validate_company_directory_payload(directory: &Value) -> Result<(), String> {
@@ -1687,6 +1768,49 @@ fn archive_record(
 }
 
 #[tauri::command]
+fn archive_records(
+    state: State<'_, AppState>,
+    module: String,
+    ids: Vec<String>,
+    archived: bool,
+) -> Result<usize, String> {
+    state.workspace.require_editor()?;
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    if ids.len() > 50_000 {
+        return Err("Слишком много записей для одной операции".to_string());
+    }
+    let _maintenance = state
+        .maintenance
+        .lock()
+        .map_err(|_| "Хранилище временно недоступно".to_string())?;
+    let mut connection = open_database(&state.workspace.root, &module)?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+    let now = Utc::now().to_rfc3339();
+    let mut changed = 0;
+    for id in &ids {
+        let count = transaction
+            .execute(
+                "UPDATE records SET archived = ?1, updated_at = ?2 WHERE id = ?3",
+                params![archived as i64, now, id],
+            )
+            .map_err(|error| error.to_string())?;
+        if count > 0 {
+            changed += 1;
+            transaction.execute(
+                "INSERT INTO history(record_id, action, snapshot, created_at) VALUES (?1, ?2, NULL, ?3)",
+                params![id, if archived { "archived" } else { "restored" }, now],
+            ).map_err(|error| error.to_string())?;
+        }
+    }
+    transaction.commit().map_err(|error| error.to_string())?;
+    Ok(changed)
+}
+
+#[tauri::command]
 fn save_draft(
     state: State<'_, AppState>,
     module: String,
@@ -1787,6 +1911,62 @@ fn delete_record(state: State<'_, AppState>, module: String, id: String) -> Resu
         fs::remove_dir_all(attachment_dir).map_err(|error| error.to_string())?;
     }
     Ok(())
+}
+
+#[tauri::command]
+fn delete_records(
+    state: State<'_, AppState>,
+    module: String,
+    ids: Vec<String>,
+) -> Result<usize, String> {
+    state.workspace.require_editor()?;
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    if ids.len() > 50_000 {
+        return Err("Слишком много записей для одной операции".to_string());
+    }
+    let _maintenance = state
+        .maintenance
+        .lock()
+        .map_err(|_| "Хранилище временно недоступно".to_string())?;
+    let mut connection = open_database(&state.workspace.root, &module)?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+    for id in &ids {
+        let archived: Option<i64> = transaction
+            .query_row("SELECT archived FROM records WHERE id = ?1", [id], |row| {
+                row.get(0)
+            })
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if archived != Some(1) {
+            return Err("Окончательно удалить можно только записи из архива".to_string());
+        }
+    }
+    for id in &ids {
+        transaction
+            .execute("DELETE FROM history WHERE record_id = ?1", [id])
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute("DELETE FROM records WHERE id = ?1", [id])
+            .map_err(|error| error.to_string())?;
+    }
+    transaction.commit().map_err(|error| error.to_string())?;
+    let module = validated_module(&module)?;
+    for id in &ids {
+        let attachment_dir = state
+            .workspace
+            .root
+            .join("attachments")
+            .join(module)
+            .join(safe_file_name(id));
+        if attachment_dir.is_dir() {
+            fs::remove_dir_all(attachment_dir).map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(ids.len())
 }
 
 fn safe_file_name(name: &str) -> String {
@@ -3612,6 +3792,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             workspace_info,
+            switch_workspace_mode,
+            set_workspace_access_password,
             intelligence_provider_status,
             validate_intelligence_configuration,
             analysis_job_list,
@@ -3629,14 +3811,17 @@ pub fn run() {
             restore_history_version,
             upsert_record,
             import_records_atomic,
+            update_records_atomic,
             import_contracts_with_company_directory_atomic,
             update_contracts_and_company_directory_atomic,
             save_contract_with_company_directory_atomic,
             archive_record,
+            archive_records,
             save_draft,
             read_draft,
             clear_draft,
             delete_record,
+            delete_records,
             copy_attachment,
             discard_staged_attachments,
             delete_attachment,

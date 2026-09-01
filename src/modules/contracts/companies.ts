@@ -13,6 +13,17 @@ export interface CompanyAffiliation {
   note: string;
 }
 
+export interface DecisionMaker {
+  id: string;
+  fullName: string;
+  position: string;
+  department: string;
+  phone: string;
+  email: string;
+  notes: string;
+  isPrimary: boolean;
+}
+
 export interface CompanyCard {
   id: string;
   name: string;
@@ -26,6 +37,8 @@ export interface CompanyCard {
   scope: CompanyScope;
   source: "contracts" | "manual";
   affiliations: CompanyAffiliation[];
+  decisionMakers: DecisionMaker[];
+  archived: boolean;
   createdAt: string;
   updatedAt: string;
 }
@@ -62,6 +75,8 @@ export const emptyCompany = (now: string = new Date().toISOString(), id: string 
   scope: "external",
   source: "manual",
   affiliations: [],
+  decisionMakers: [],
+  archived: false,
   createdAt: now,
   updatedAt: now,
 });
@@ -86,6 +101,19 @@ export function normalizeCompanyDirectory(value: CompanyDirectoryData | null | u
         name: company.name.trim(),
         inn: normalizeInn(company.inn || ""),
         affiliations: Array.isArray(company.affiliations) ? company.affiliations.filter((item) => item?.targetCompanyId) : [],
+        decisionMakers: Array.isArray(company.decisionMakers)
+          ? company.decisionMakers.map((person) => ({
+              id: person.id || crypto.randomUUID(),
+              fullName: person.fullName || "",
+              position: person.position || "",
+              department: person.department || "",
+              phone: person.phone || "",
+              email: person.email || "",
+              notes: person.notes || "",
+              isPrimary: Boolean(person.isPrimary),
+            }))
+          : [],
+        archived: Boolean(company.archived),
       };
     });
   const companies: CompanyCard[] = [];
@@ -111,6 +139,8 @@ export function normalizeCompanyDirectory(value: CompanyDirectoryData | null | u
     existing.address ||= company.address;
     existing.contact ||= company.contact;
     existing.notes ||= company.notes;
+    if (!existing.decisionMakers.length && company.decisionMakers.length) existing.decisionMakers = company.decisionMakers;
+    if (!company.archived) existing.archived = false;
     if (company.scope === "internal") existing.scope = "internal";
     if (company.source === "manual") existing.source = "manual";
     existing.affiliations.push(...company.affiliations);

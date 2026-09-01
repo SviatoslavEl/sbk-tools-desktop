@@ -16,6 +16,8 @@ import {
   rotateBackups,
   setBackupPinned,
   setWorkspaceLocation,
+  setWorkspaceAccessPassword,
+  switchWorkspaceMode,
   verifyBackup,
   verifyEncryptedBackup,
   type BackupInfo,
@@ -56,6 +58,8 @@ export function Settings({
   const [retentionDays, setRetentionDays] = useState(180);
   const [encryptBackup, setEncryptBackup] = useState(false);
   const [backupPassword, setBackupPassword] = useState("");
+  const [workspacePassword, setWorkspacePassword] = useState("");
+  const [newWorkspacePassword, setNewWorkspacePassword] = useState("");
   const [intelligence, setIntelligence] =
     useState<IntelligenceProviderStatus | null>(null);
   const [accessTimers, setAccessTimers] =
@@ -93,6 +97,30 @@ export function Settings({
   }, [workspace?.root, retention, retentionDays]);
   const updateAccessTimers = (next: AccessTimers) =>
     setAccessTimers(saveAccessTimers(next, workspace?.root));
+  const refreshWorkspace = async () => {
+    const next = await getWorkspaceInfo();
+    setWorkspace(next);
+    window.dispatchEvent(new Event("sbk-workspace-refresh"));
+    return next;
+  };
+  const changeWorkspaceMode = async (editor: boolean) => {
+    setMessage(editor ? "Проверяем пароль и получаем режим редактирования…" : "Освобождаем режим редактирования…");
+    try {
+      await switchWorkspaceMode(editor, workspacePassword);
+      const next = await refreshWorkspace();
+      setWorkspacePassword("");
+      setMessage(next.accessMessage);
+    } catch (reason) { setMessage(`Ошибка доступа: ${String(reason)}`); }
+  };
+  const saveWorkspacePassword = async () => {
+    setMessage("Сохраняем пароль рабочей папки…");
+    try {
+      await setWorkspaceAccessPassword(workspacePassword, newWorkspacePassword);
+      const next = await refreshWorkspace();
+      setWorkspacePassword(""); setNewWorkspacePassword("");
+      setMessage(next.accessMessage);
+    } catch (reason) { setMessage(`Ошибка доступа: ${String(reason)}`); }
+  };
 
   const saveSettings = async (patch: Partial<AppSettings>) => {
     const existing = store.records.find(
@@ -222,6 +250,18 @@ export function Settings({
                 "Проверяем…"}
             </strong>
           </div>
+          <div className="settings-form workspace-password-controls">
+            {workspace?.accessControlled ? <>
+              <label>Пароль рабочей папки<input type="password" autoComplete="current-password" value={workspacePassword} onChange={(event) => setWorkspacePassword(event.target.value)} /></label>
+              <div className="button-row">
+                <button className="primary" type="button" disabled={!workspacePassword} onClick={() => void changeWorkspaceMode(!workspace?.editor)}>{workspace?.editor ? "Перейти в режим просмотра" : "Войти в режим редактирования"}</button>
+              </div>
+              {workspace?.editor && <><label>Новый пароль<input type="password" autoComplete="new-password" value={newWorkspacePassword} onChange={(event) => setNewWorkspacePassword(event.target.value)} /></label><button className="secondary" type="button" disabled={!workspacePassword || newWorkspacePassword.length < 6} onClick={() => void saveWorkspacePassword()}>Сменить пароль</button></>}
+            </> : workspace?.editor ? <>
+              <label>Новый пароль рабочей папки<input type="password" autoComplete="new-password" value={newWorkspacePassword} onChange={(event) => setNewWorkspacePassword(event.target.value)} placeholder="Не менее 6 символов" /></label>
+              <button className="primary" type="button" disabled={newWorkspacePassword.length < 6} onClick={() => void saveWorkspacePassword()}>Включить вход по паролю</button>
+            </> : <div className="notice warning">Сейчас режим редактирования занят другим экземпляром. После его закрытия текущий экземпляр сможет войти в режим редактирования.</div>}
+          </div>
           <div className="settings-row">
             <span>Версия базы</span>
             <strong>{workspace?.schemaVersion || "—"}</strong>
@@ -242,10 +282,9 @@ export function Settings({
             Подключить папку
           </button>
           <p className="help-text">
-            Права задаются средствами Windows/macOS и сетевого хранилища.
-            Одновременно редактирует только владелец эксклюзивной блокировки;
-            остальные могут просматривать данные и делать выгрузки. После
-            освобождения блокировки перезапустите приложение.
+            Каждый экземпляр открывает защищённую общую папку в режиме просмотра.
+            Редактирование включается вручную по общему паролю. Одновременно
+            редактирует только один пользователь; выход из режима сразу освобождает доступ без перезапуска приложения.
           </p>
           <div className="notice warning">
             <strong>Требование к сетевой папке</strong>

@@ -29,7 +29,7 @@ def apply_annotations(image: Image.Image, annotations: Iterable[Annotation], pag
             ImageDraw.Draw(overlay).rounded_rectangle(
                 (left, top, right, bottom),
                 radius=max(1, round((bottom - top) * 0.12)),
-                fill=(*color, round(255 * min(0.7, annotation.intensity * 0.65))),
+                fill=(*color, round(255 * annotation.intensity)),
             )
             result = Image.alpha_composite(result.convert("RGBA"), overlay).convert("RGB")
         elif annotation.kind == "stroke":
