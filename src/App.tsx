@@ -118,10 +118,15 @@ const helpText: Record<ToolId, string> = {
 
 function App() {
   const [workspace, setWorkspace] = useState<WorkspaceInfo | null>(null);
+  const [startupDelayElapsed, setStartupDelayElapsed] = useState(false);
   const [workspaceError, setWorkspaceError] = useState("");
   const [workspaceReady, setWorkspaceReady] = useState("");
   const [accessTimers, setAccessTimers] =
     useState<AccessTimers>(readAccessTimers);
+  useEffect(() => {
+    const timer = window.setTimeout(() => setStartupDelayElapsed(true), 3500);
+    return () => window.clearTimeout(timer);
+  }, []);
   useEffect(() => {
     let generation = 0;
     const refreshWorkspace = () => {
@@ -247,13 +252,14 @@ function App() {
   };
   const [title, subtitle] = toolTitles[activeTool];
 
-  if (!workspace)
+  if (!workspace || !startupDelayElapsed)
     return (
       <div className="startup-screen">
         <div className="startup-card">
           <div className="brand-mark large">СБК</div>
           <h1>Подготавливаем рабочее пространство</h1>
-          <p>{workspaceError || "Проверяем папку данных…"}</p>
+          <p>{workspaceError || "Проверяем папку данных, доступ редактора и встроенные модули…"}</p>
+          {!workspaceError && <><div className="startup-progress" aria-hidden="true"><span /></div><div className="startup-steps"><span>Рабочая папка</span><span>Базы</span><span>Модули</span></div></>}
         </div>
       </div>
     );
@@ -402,7 +408,7 @@ function App() {
             </div>
             {!workspace.editor && (
               <span className="status neutral" title={workspace.accessMessage}>
-                Только просмотр и экспорт
+                {workspace.editorOwner ? `Редактор: ${workspace.editorOwner.displayName}` : "Только просмотр и экспорт"}
               </span>
             )}
             <button

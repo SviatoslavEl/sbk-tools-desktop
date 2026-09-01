@@ -1,0 +1,11 @@
+{
+  "protocolVersion": 2,
+  "inputPaths": [
+    "scanner-worker/tests/fixtures/simple.pdf",
+    "scanner-worker/tests/fixtures/simple.docx"
+  ],
+  "outputPath": "scanner-worker/tests/output/merged.pdf",
+  "preset": "Офисный скан",
+  "seed": 42,
+  "ocrEnabled": false
+}

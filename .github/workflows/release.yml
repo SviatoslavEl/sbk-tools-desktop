@@ -67,7 +67,7 @@ jobs:
   build:
     needs: quality-gate
     env:
-      ARTIFACT_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('2.7.0-test.{0}', github.run_number) }}
+      ARTIFACT_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('2.8.0-test.{0}', github.run_number) }}
     strategy:
       fail-fast: false
       matrix:
@@ -199,6 +199,7 @@ jobs:
           SCANDOCUMENT_RESOURCE_ROOT=src-tauri/runtime-resources "$WORKER" preview --config scanner-worker/tests/fixtures/preview-docx.json
           SCANDOCUMENT_RESOURCE_ROOT=src-tauri/runtime-resources "$WORKER" process --config scanner-worker/tests/fixtures/process-docx.json
           SCANDOCUMENT_RESOURCE_ROOT=src-tauri/runtime-resources "$WORKER" process --config scanner-worker/tests/fixtures/process-demo-docx.json
+          SCANDOCUMENT_RESOURCE_ROOT=src-tauri/runtime-resources "$WORKER" merge --config scanner-worker/tests/fixtures/merge.json
           SCANDOCUMENT_RESOURCE_ROOT=src-tauri/runtime-resources "$WORKER" process --config scanner-worker/tests/fixtures/process-ocr.json
           SCANDOCUMENT_RESOURCE_ROOT=src-tauri/runtime-resources "$WORKER" process --config scanner-worker/tests/fixtures/process-facsimile.json
       - name: Generate trusted runtime manifest

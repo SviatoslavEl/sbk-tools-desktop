@@ -39,7 +39,7 @@ use intelligence::{
     ProviderConfiguration, validate_provider_configuration,
 };
 use workspace::{
-    Workspace, open_workspace, prepare_workspace_location, validate_workspace_layout,
+    EditorOwner, Workspace, open_workspace, prepare_workspace_location, validate_workspace_layout,
     workspace_pointer_path,
 };
 
@@ -73,6 +73,7 @@ struct WorkspaceInfo {
     editor: bool,
     access_controlled: bool,
     access_message: String,
+    editor_owner: Option<EditorOwner>,
     schema_version: i64,
     free_space_bytes: u64,
 }
@@ -239,6 +240,7 @@ struct ContractReportRow {
     subject: String,
     amount: String,
     period: String,
+    disclosure_status: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -283,6 +285,7 @@ fn workspace_info(state: State<'_, AppState>) -> Result<WorkspaceInfo, String> {
         editor,
         access_controlled: state.workspace.access_controlled(),
         access_message,
+        editor_owner: state.workspace.editor_owner(),
         schema_version: SCHEMA_VERSION,
         free_space_bytes: fs2::available_space(&state.workspace.root).unwrap_or(0),
     })
@@ -672,6 +675,17 @@ fn write_contract_report_docx(path: String, data: ContractReportData) -> Result<
             false,
             20,
             "222222",
+            40,
+        ));
+        body.push_str(&docx_paragraph(
+            &format!("Конфиденциальность: {}", row.disclosure_status),
+            true,
+            20,
+            if row.disclosure_status.starts_with("Запрещено") {
+                "A33A32"
+            } else {
+                "1F6D3B"
+            },
             200,
         ));
     }
@@ -804,6 +818,7 @@ fn write_contract_report_pdf(path: String, data: ContractReportData) -> Result<(
             format!("Заказчик: {}", row.customer),
             format!("Предмет: {}", row.subject),
             format!("Стоимость: {}. Период: {}", row.amount, row.period),
+            format!("Конфиденциальность: {}", row.disclosure_status),
         ] {
             write_lines(
                 wrap_report_text(&text, 95),
@@ -2430,6 +2445,7 @@ fn create_registry_archive_impl(
     module: &str,
     destination: &Path,
     record_ids: Option<&HashSet<String>>,
+    attachment_paths: Option<&HashSet<String>>,
 ) -> Result<BackupInfo, String> {
     let module = validated_module(module)?;
     if destination.extension().and_then(|value| value.to_str()) != Some("zip") {
@@ -2465,7 +2481,19 @@ fn create_registry_archive_impl(
         archive
             .start_file("README.txt", options)
             .map_err(|error| error.to_string())?;
-        archive.write_all("Экспорт СБК Инструменты. Записи находятся в records.json, все прикреплённые документы — в папке attachments.\n".as_bytes()).map_err(|error| error.to_string())?;
+        let attachment_note = if attachment_paths.is_some() {
+            "В папке attachments находятся только выбранные категории документов."
+        } else {
+            "Все прикреплённые документы находятся в папке attachments."
+        };
+        archive
+            .write_all(
+                format!(
+                    "Экспорт СБК Инструменты. Записи находятся в records.json. {attachment_note}\n"
+                )
+                .as_bytes(),
+            )
+            .map_err(|error| error.to_string())?;
         archive
             .start_file("records.json", options)
             .map_err(|error| error.to_string())?;
@@ -2480,6 +2508,9 @@ fn create_registry_archive_impl(
         let mut included = HashSet::new();
         for record in &records {
             for relative_path in attachments::managed_paths(&record.payload) {
+                if attachment_paths.is_some_and(|paths| !paths.contains(&relative_path)) {
+                    continue;
+                }
                 if !included.insert(relative_path.clone()) {
                     continue;
                 }
@@ -2546,17 +2577,21 @@ fn create_registry_archive(
     module: String,
     path: String,
     record_ids: Option<Vec<String>>,
+    attachment_paths: Option<Vec<String>>,
 ) -> Result<BackupInfo, String> {
     let _maintenance = state
         .maintenance
         .lock()
         .map_err(|_| "Хранилище временно недоступно".to_string())?;
     let selected = record_ids.map(|values| values.into_iter().collect::<HashSet<_>>());
+    let selected_attachments =
+        attachment_paths.map(|values| values.into_iter().collect::<HashSet<_>>());
     create_registry_archive_impl(
         &state.workspace,
         &module,
         &PathBuf::from(path),
         selected.as_ref(),
+        selected_attachments.as_ref(),
     )
 }
 
@@ -3503,7 +3538,11 @@ fn run_scanner_worker(
     operation: String,
     mut config: Value,
 ) -> Result<Value, String> {
-    if operation != "preview" && operation != "process" && operation != "extract" {
+    if operation != "preview"
+        && operation != "process"
+        && operation != "merge"
+        && operation != "extract"
+    {
         return Err("Неизвестная операция сканера".to_string());
     }
     if config.get("protocolVersion").and_then(Value::as_i64) != Some(2) {
@@ -3517,6 +3556,32 @@ fn run_scanner_worker(
     if !Path::new(input).is_file() {
         return Err("Исходный документ не найден".to_string());
     }
+    let merge_inputs = if operation == "merge" {
+        let values = config
+            .get("inputPaths")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "Не выбраны документы для объединения".to_string())?;
+        if !(2..=100).contains(&values.len()) {
+            return Err("Для объединения выберите от 2 до 100 документов".to_string());
+        }
+        let mut paths = Vec::with_capacity(values.len());
+        for value in values {
+            let path = value
+                .as_str()
+                .map(PathBuf::from)
+                .ok_or_else(|| "Некорректный путь документа для объединения".to_string())?;
+            if !path.is_file() {
+                return Err(format!(
+                    "Документ для объединения не найден: {}",
+                    path.display()
+                ));
+            }
+            paths.push(path);
+        }
+        Some(paths)
+    } else {
+        None
+    };
     if operation == "preview" {
         let preview_dir = workspace.root.join("runtime-cache").join("previews");
         fs::create_dir_all(&preview_dir).map_err(|error| error.to_string())?;
@@ -3532,14 +3597,21 @@ fn run_scanner_worker(
                 .into_owned(),
         );
         config["previewCacheDir"] = Value::String(source_cache.to_string_lossy().into_owned());
-    } else if operation == "process" {
+    } else if operation == "process" || operation == "merge" {
         let output = config
             .get("outputPath")
             .and_then(Value::as_str)
             .ok_or_else(|| "Не выбран путь итогового PDF".to_string())?;
-        if Path::new(input).canonicalize().ok() == Path::new(output).canonicalize().ok()
-            && Path::new(output).exists()
-        {
+        let output_path = Path::new(output);
+        let overwrites_source = if let Some(inputs) = &merge_inputs {
+            inputs.iter().any(|input| {
+                input.canonicalize().ok() == output_path.canonicalize().ok() && output_path.exists()
+            })
+        } else {
+            Path::new(input).canonicalize().ok() == output_path.canonicalize().ok()
+                && output_path.exists()
+        };
+        if overwrites_source {
             return Err("Исходный документ нельзя перезаписать".to_string());
         }
     }
@@ -3689,7 +3761,7 @@ fn run_scanner_worker(
                 }
                 return Err(error);
             }
-            if operation == "process"
+            if (operation == "process" || operation == "merge")
                 && let Some(output) = event.get("outputPath").and_then(Value::as_str)
             {
                 let digest = sha256_file(Path::new(output))?;
@@ -4353,6 +4425,9 @@ mod tests {
         fs::create_dir_all(attachment.parent().expect("attachment parent"))
             .expect("attachment directory");
         fs::write(&attachment, b"certificate").expect("attachment");
+        let education_relative = "attachments/staff/person/education.pdf";
+        let education_attachment = root.join(education_relative);
+        fs::write(&education_attachment, b"education").expect("education attachment");
         let excluded_relative = "attachments/staff/other/private.pdf";
         let excluded_attachment = root.join(excluded_relative);
         fs::create_dir_all(excluded_attachment.parent().expect("excluded parent"))
@@ -4361,7 +4436,7 @@ mod tests {
         let connection = open_database(&root, "staff").expect("database");
         connection.execute(
             "INSERT INTO records(id, title, payload, archived, created_at, updated_at) VALUES ('person', 'Иванов', ?1, 0, 'now', 'now')",
-            [serde_json::json!({"documents": [{"relativePath": relative}]}).to_string()],
+            [serde_json::json!({"documents": [{"relativePath": relative}, {"relativePath": education_relative}]}).to_string()],
         ).expect("insert");
         connection.execute(
             "INSERT INTO records(id, title, payload, archived, created_at, updated_at) VALUES ('other', 'Петров', ?1, 0, 'now', 'now')",
@@ -4370,8 +4445,15 @@ mod tests {
         drop(connection);
         let destination = root.with_extension("viewer-export.zip");
         let selected = HashSet::from(["person".to_string()]);
-        create_registry_archive_impl(&workspace, "staff", &destination, Some(&selected))
-            .expect("archive");
+        let selected_attachments = HashSet::from([relative.to_string()]);
+        create_registry_archive_impl(
+            &workspace,
+            "staff",
+            &destination,
+            Some(&selected),
+            Some(&selected_attachments),
+        )
+        .expect("archive");
         let mut archive =
             zip::ZipArchive::new(File::open(&destination).expect("open archive")).expect("zip");
         let records: Vec<Value> = {
@@ -4383,6 +4465,7 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0]["id"], "person");
         assert!(archive.by_name(relative).is_ok());
+        assert!(archive.by_name(education_relative).is_err());
         assert!(archive.by_name(excluded_relative).is_err());
         drop(archive);
         fs::remove_file(destination).expect("remove export");
@@ -4411,7 +4494,7 @@ mod tests {
         ).expect("record");
         drop(connection);
         let result =
-            create_registry_archive_impl(&workspace, "staff", &root.join("export.zip"), None);
+            create_registry_archive_impl(&workspace, "staff", &root.join("export.zip"), None, None);
         let error = match result {
             Ok(_) => panic!("symlink must fail"),
             Err(error) => error,
@@ -4628,6 +4711,7 @@ mod tests {
                 subject: "Аудит информационной безопасности".to_string(),
                 amount: "1 000 000 ₽".to_string(),
                 period: "2025—2026".to_string(),
+                disclosure_status: "Запрещено раскрывать".to_string(),
             }],
         };
         let docx = root.join("report.docx");
@@ -4647,6 +4731,7 @@ mod tests {
                         subject: row.subject.clone(),
                         amount: row.amount.clone(),
                         period: row.period.clone(),
+                        disclosure_status: row.disclosure_status.clone(),
                     })
                     .collect(),
             },

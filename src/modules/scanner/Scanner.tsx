@@ -116,6 +116,7 @@ export function Scanner() {
   const [showOriginal, setShowOriginal] = useState(false);
   const [fullscreen, setFullscreen] = useState(false);
   const [batchPaths, setBatchPaths] = useState<string[]>([]);
+  const [mergePaths, setMergePaths] = useState<string[]>([]);
   const [previewAspect, setPreviewAspect] = useState(0.707);
   const [previewZoom, setPreviewZoom] = useState(1);
   const [previewing, setPreviewing] = useState(false);
@@ -290,6 +291,22 @@ export function Scanner() {
     const paths = await chooseOpenPaths("Выберите PDF и DOCX для пакета", ["pdf", "docx"]);
     if (paths.length) { setBatchPaths(paths); setError(""); setResultPath(""); setResultKind(""); }
   };
+  const chooseMerge = async () => {
+    const paths = await chooseOpenPaths("Выберите документы в порядке объединения", ["pdf", "docx"]);
+    if (paths.length) {
+      setMergePaths((current) => [...current, ...paths.filter((path) => !current.includes(path))]);
+      setError(""); setResultPath(""); setResultKind("");
+    }
+  };
+  const moveMergePath = (index: number, offset: number) => {
+    setMergePaths((current) => {
+      const target = index + offset;
+      if (target < 0 || target >= current.length) return current;
+      const next = [...current];
+      [next[index], next[target]] = [next[target], next[index]];
+      return next;
+    });
+  };
 
   const processBatch = async () => {
     if (!batchPaths.length) return;
@@ -305,6 +322,55 @@ export function Scanner() {
     }
     setActiveJob(""); activeJobRef.current = ""; setProgress({ stage: "Пакет готов", currentPage: batchPaths.length, totalPages: batchPaths.length, percent: 100 });
     setResultPath(directory); setResultKind("batch"); if (workspaceAccess.editor) await templates.save(`Пакет ${new Date().toLocaleString("ru-RU")}`, { kind: "processing-journal", inputType: "BATCH", pageCount: batchPaths.length, preset, ocr: ocrEnabled, status: "completed", durationMs: Date.now() - startedAt }).catch(() => undefined);
+  };
+
+  const processMerge = async () => {
+    if (mergePaths.length < 2) return;
+    const outputPath = await chooseSavePath("Сохранить объединённый PDF", "объединённый-документ.pdf", ["pdf"]);
+    if (!outputPath) return;
+    const jobId = crypto.randomUUID();
+    const startedAt = Date.now();
+    setActiveJob(jobId); activeJobRef.current = jobId; setError(""); setWarnings([]);
+    setProgress({ stage: "Подготавливаем объединение", currentPage: 0, totalPages: mergePaths.length, percent: 0 });
+    try {
+      const response = await invoke<{ outputPath: string; warnings?: string[]; outputBytes?: number; originalBytes?: number; savingsPercent?: number; pageCount?: number; outputSha256?: string }>("scanner_run", {
+        jobId,
+        operation: "merge",
+        config: {
+          protocolVersion: 2,
+          inputPath: mergePaths[0],
+          inputPaths: mergePaths,
+          outputPath,
+          preset,
+          ocrEnabled,
+          ocrLanguages,
+          pdfaEnabled,
+          seed: 42,
+          settings: { dpi, jpeg_quality: quality },
+          compressionTargetRatio,
+        },
+      });
+      setWarnings(response.warnings || []);
+      setOriginalBytes(response.originalBytes || 0);
+      setEstimatedOutputBytes(response.outputBytes || 0);
+      setEstimatedSavingsPercent(response.savingsPercent || 0);
+      setResultPath(response.outputPath);
+      setResultKind("single");
+      setProgress({ stage: "Документы объединены", currentPage: mergePaths.length, totalPages: mergePaths.length, percent: 100 });
+      if (workspaceAccess.editor) await templates.save(`Объединение ${new Date().toLocaleString("ru-RU")}`, {
+        kind: "processing-journal", inputType: "MERGE", pageCount: response.pageCount,
+        preset, ocr: ocrEnabled, status: "completed", durationMs: Date.now() - startedAt,
+        outputSha256: response.outputSha256, appliedOperations: [`Файлов: ${mergePaths.length}`, `Пресет: ${preset}`],
+      }).catch(() => undefined);
+    } catch (reason) {
+      setError(String(reason)); setProgress(null);
+      if (workspaceAccess.editor) await templates.save(`Ошибка объединения ${new Date().toLocaleString("ru-RU")}`, {
+        kind: "processing-journal", inputType: "MERGE", pageCount: mergePaths.length,
+        preset, ocr: ocrEnabled, status: "failed", durationMs: Date.now() - startedAt,
+      }).catch(() => undefined);
+    } finally {
+      setActiveJob(""); activeJobRef.current = "";
+    }
   };
 
   const chooseFacsimile = async () => {
@@ -641,7 +707,10 @@ export function Scanner() {
     .filter(({ placement }) => facsimileAppliesTo(placement, pageIndex));
   return <div className="scanner-layout">
     <section className="surface scanner-controls"><div className="surface-title"><h2>Настройки</h2></div><div className="surface-body scanner-control-stack">
-      <button className="primary full-width" type="button" onClick={() => void chooseDocument()}>{inputPath ? "Заменить файл" : "Выбрать PDF или DOCX"}</button><button className="secondary full-width" type="button" onClick={() => void chooseBatch()}>Пакетная обработка</button>{batchPaths.length > 0 && <div className="notice success"><span>Выбрано файлов: {batchPaths.length}</span><button className="primary small" type="button" onClick={() => void processBatch()}>Обработать пакет в папку</button></div>}{documentName && <p className="selected-file">▧ {documentName}</p>}
+      <button className="primary full-width" type="button" onClick={() => void chooseDocument()}>{inputPath ? "Заменить файл" : "Выбрать PDF или DOCX"}</button>
+      <button className="secondary full-width" type="button" onClick={() => void chooseMerge()}>{mergePaths.length ? "Добавить файлы к объединению" : "Объединить файлы в один PDF"}</button>
+      {mergePaths.length > 0 && <div className="merge-file-list"><div className="inline-heading"><strong>Порядок объединения</strong><button className="link-button danger" type="button" onClick={() => setMergePaths([])}>Очистить</button></div>{mergePaths.map((path, index) => <div className="merge-file-row" key={`${path}-${index}`}><span><strong>{index + 1}.</strong> {path.split(/[\\/]/).pop()}</span><div className="button-row"><button className="icon-button" type="button" aria-label={`Переместить файл ${index + 1} выше`} disabled={index === 0} onClick={() => moveMergePath(index, -1)}>↑</button><button className="icon-button" type="button" aria-label={`Переместить файл ${index + 1} ниже`} disabled={index === mergePaths.length - 1} onClick={() => moveMergePath(index, 1)}>↓</button><button className="icon-button danger" type="button" aria-label={`Удалить файл ${index + 1} из объединения`} onClick={() => setMergePaths((current) => current.filter((_, itemIndex) => itemIndex !== index))}>×</button></div></div>)}<button className="primary full-width" type="button" disabled={mergePaths.length < 2 || !!activeJob} onClick={() => void processMerge()}>Объединить {mergePaths.length} файла(ов)</button><small>К каждому документу применяется выбранный пресет, OCR и настройки сжатия.</small></div>}
+      <button className="secondary full-width" type="button" onClick={() => void chooseBatch()}>Пакетная обработка</button>{batchPaths.length > 0 && <div className="notice success"><span>Выбрано файлов: {batchPaths.length}</span><button className="primary small" type="button" onClick={() => void processBatch()}>Обработать пакет в папку</button></div>}{documentName && <p className="selected-file">▧ {documentName}</p>}
       <div><h3>Пресет</h3><div className="preset-grid">{presets.map(([name, description]) => <button key={name} className={preset === name ? "selected" : ""} type="button" onClick={() => { setPreset(name); void makePreview(inputPath, name, pageIndex); }}><strong>{name}</strong><small>{description}</small></button>)}</div></div>
       <div className="control-divider" />
       <div>

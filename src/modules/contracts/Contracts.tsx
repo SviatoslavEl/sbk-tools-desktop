@@ -176,33 +176,22 @@ export function normalizeContractData(payload: ContractData): ContractData {
   };
 }
 
-const hiddenDisclosure = "Скрыто условиями конфиденциальности";
 export function contractReportRow(
   payload: ContractData,
 ): ContractReportData["rows"][number] {
   const item = normalizeContractData(payload);
   return {
     legalEntity: item.performingLegalEntity,
-    number:
-      item.disclosureAllowed && item.discloseNumber
-        ? item.number
-        : hiddenDisclosure,
+    number: item.number,
     date: date(item.date),
-    customer:
-      item.disclosureAllowed && item.discloseCustomer
-        ? item.customer
-        : hiddenDisclosure,
-    subject:
-      item.disclosureAllowed && item.discloseSubject
-        ? item.subject
-        : hiddenDisclosure,
-    amount:
-      item.disclosureAllowed && item.discloseAmount
-        ? money(item.amount)
-        : hiddenDisclosure,
-    amountValue:
-      item.disclosureAllowed && item.discloseAmount ? item.amount : null,
+    customer: item.customer,
+    subject: item.subject,
+    amount: money(item.amount),
+    amountValue: item.amount,
     period: `${date(item.startDate)} — ${date(item.endDate)}`,
+    disclosureStatus: item.disclosureAllowed
+      ? "Разрешено раскрывать"
+      : "Запрещено раскрывать",
   };
 }
 
@@ -406,7 +395,7 @@ export function ContractsRegistry() {
       endDateTo: "",
       reviewOnly: false,
       completedOnly: true,
-      disclosureOnly: true,
+      disclosureOnly: false,
     });
   const [selectedContracts, setSelectedContracts] = useState<Set<string>>(
     new Set(),
@@ -681,7 +670,6 @@ export function ContractsRegistry() {
           : "",
         selectionCriteria.reviewOnly ? "есть отзыв" : "",
         selectionCriteria.completedOnly ? "только выполненные" : "",
-        selectionCriteria.disclosureOnly ? "разрешённые к раскрытию" : "",
       ]
         .filter(Boolean)
         .join("; "),
@@ -692,17 +680,6 @@ export function ContractsRegistry() {
     const data = reportData();
     if (!data.rows.length)
       return window.alert("Отметьте хотя бы один договор.");
-    const restricted = matches.filter(
-      ({ record }) =>
-        selectedContracts.has(record.id) && !record.payload.disclosureAllowed,
-    ).length;
-    if (
-      restricted &&
-      !window.confirm(
-        `В подборке ${restricted} договоров без разрешения на раскрытие. Вы уверены, что их можно включить в заявку и выгрузить?`,
-      )
-    )
-      return;
     const path = await chooseSavePath(
       `Выгрузить подборку в ${format.toUpperCase()}`,
       `подбор-договоров.${format}`,
@@ -723,6 +700,7 @@ export function ContractsRegistry() {
             "Предмет",
             "Стоимость",
             "Период",
+            "Конфиденциальность",
           ],
           ...data.rows.map((row) => [
             data.title,
@@ -734,6 +712,7 @@ export function ContractsRegistry() {
             row.subject,
             row.amountValue === null ? "" : String(row.amountValue),
             row.period,
+            row.disclosureStatus,
           ]),
         ],
       });
@@ -1480,19 +1459,6 @@ export function ContractsRegistry() {
                 />{" "}
                 Только с отзывом
               </label>
-              <label className="checkbox-row">
-                <input
-                  type="checkbox"
-                  checked={selectionCriteria.disclosureOnly}
-                  onChange={(event) =>
-                    setSelectionCriteria({
-                      ...selectionCriteria,
-                      disclosureOnly: event.target.checked,
-                    })
-                  }
-                />{" "}
-                Только разрешённые к раскрытию
-              </label>
             </div>
             <div className="import-summary">
               <strong>
@@ -1521,6 +1487,7 @@ export function ContractsRegistry() {
                     <th>Договор</th>
                     <th>Заказчик</th>
                     <th>Предмет</th>
+                    <th>Конфиденциальность</th>
                     <th>Почему подходит</th>
                   </tr>
                 </thead>
@@ -1549,6 +1516,11 @@ export function ContractsRegistry() {
                       <td>{record.payload.number}</td>
                       <td>{record.payload.customer}</td>
                       <td>{record.payload.subject}</td>
+                      <td>
+                        <span className={`status ${record.payload.disclosureAllowed ? "success" : "warning"}`}>
+                          {record.payload.disclosureAllowed ? "Можно раскрывать" : "Запрещено раскрывать"}
+                        </span>
+                      </td>
                       <td>
                         <small>{match.reasons.join(" · ")}</small>
                       </td>
@@ -2268,89 +2240,15 @@ function ContractEditor({
         <label className="checkbox-row">
           <input
             type="checkbox"
-            checked={item.disclosureAllowed}
-            onChange={(event) => {
-              const allowed = event.target.checked;
-              setItem((current) => {
-                const hasGranularPermission =
-                  current.discloseCustomer ||
-                  current.discloseNumber ||
-                  current.discloseSubject ||
-                  current.discloseAmount;
-                return {
-                  ...current,
-                  disclosureAllowed: allowed,
-                  discloseCustomer:
-                    allowed && !hasGranularPermission
-                      ? true
-                      : current.discloseCustomer,
-                  discloseNumber:
-                    allowed && !hasGranularPermission
-                      ? true
-                      : current.discloseNumber,
-                  discloseSubject:
-                    allowed && !hasGranularPermission
-                      ? true
-                      : current.discloseSubject,
-                  discloseAmount:
-                    allowed && !hasGranularPermission
-                      ? true
-                      : current.discloseAmount,
-                };
-              });
-            }}
+            checked={!item.disclosureAllowed}
+            onChange={(event) => update("disclosureAllowed", !event.target.checked)}
           />{" "}
-          Разрешено включать договор в подборку
+          По договору запрещено раскрывать информацию
         </label>
-        {item.disclosureAllowed && (
-          <div className="surface compact-card">
-            <strong>Что разрешено раскрывать при выгрузке</strong>
-            <label className="checkbox-row">
-              <input
-                type="checkbox"
-                checked={item.discloseCustomer}
-                onChange={(event) =>
-                  update("discloseCustomer", event.target.checked)
-                }
-              />{" "}
-              Заказчика
-            </label>
-            <label className="checkbox-row">
-              <input
-                type="checkbox"
-                checked={item.discloseNumber}
-                onChange={(event) =>
-                  update("discloseNumber", event.target.checked)
-                }
-              />{" "}
-              Номер договора
-            </label>
-            <label className="checkbox-row">
-              <input
-                type="checkbox"
-                checked={item.discloseSubject}
-                onChange={(event) =>
-                  update("discloseSubject", event.target.checked)
-                }
-              />{" "}
-              Предмет договора
-            </label>
-            <label className="checkbox-row">
-              <input
-                type="checkbox"
-                checked={item.discloseAmount}
-                onChange={(event) =>
-                  update("discloseAmount", event.target.checked)
-                }
-              />{" "}
-              Стоимость
-            </label>
-            <small>
-              Запрещённые поля в Word и PDF заменяются отметкой о
-              конфиденциальности, а в Excel стоимость остаётся пустой.
-            </small>
-          </div>
-        )}
+        <div className={`notice ${item.disclosureAllowed ? "success" : "warning"}`}>
+          <strong>{item.disclosureAllowed ? "Раскрытие разрешено" : "Конфиденциальный договор"}</strong>
+          <span>Статус носит справочный характер: договор всегда участвует в подборе с полными реквизитами, а запрет явно указывается на экране и в выгрузке.</span>
+        </div>
         <label>
           Примечания
           <textarea

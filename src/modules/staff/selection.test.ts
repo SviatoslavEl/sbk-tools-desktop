@@ -3,7 +3,7 @@ import { emptyOrganizationalAssignment, emptyStaff, emptyStaffDocument } from ".
 import { matchStaff, staffDocumentsValid, travelReady, type StaffSelectionCriteria } from "./selection";
 
 const criteria = (patch: Partial<StaffSelectionCriteria> = {}): StaffSelectionCriteria => ({
-  procurementTitle: "Аудит информационной безопасности", keywords: "ГОСТ", legalEntity: "", department: "", position: "", status: "", minExperienceYears: 0, maxHourlyRate: 0, location: "", travelRequired: false, availableFrom: "", availableTo: "", validDocumentsOnly: false, disclosureOnly: true, ...patch,
+  procurementTitle: "Аудит информационной безопасности", keywords: "ГОСТ", legalEntity: "", department: "", position: "", status: "", minExperienceYears: 0, maxHourlyRate: 0, location: "", travelRequired: false, availableFrom: "", availableTo: "", validDocumentsOnly: false, disclosureOnly: true, certificateMode: "", certificateQuery: "", educationRequired: false, educationQuery: "", cooperationMode: "", ...patch,
 });
 
 describe("подбор кадров", () => {
@@ -38,6 +38,20 @@ describe("подбор кадров", () => {
     const match = matchStaff(item, criteria({ legalEntity: "ООО Б", position: "Руководитель", status: "Кандидат", disclosureOnly: false }));
     expect(match.score).toBeGreaterThan(0);
     expect(match.assignmentId).toBe("two");
+  });
+
+  it("фильтрует по сертификату, образованию и совместительству", () => {
+    const item = { ...emptyStaff(), role: "Аудитор", competencies: ["ГОСТ", "информационная безопасность"], disclosureAllowed: true, organizationalAssignments: [
+      { ...emptyOrganizationalAssignment(), engagementType: "Внешнее совместительство" as const, position: "Аудитор" },
+    ], documents: [
+      { ...emptyStaffDocument("certificate"), name: "ISO 27001 Lead Auditor", expiresDate: "2027-05-01" },
+      { ...emptyStaffDocument("education"), name: "Диплом по информационной безопасности", issuer: "МИФИ" },
+    ] };
+    const matched = matchStaff(item, criteria({ certificateMode: "valid", certificateQuery: "ISO 27001", educationRequired: true, educationQuery: "МИФИ", cooperationMode: "part-time" }), "2026-09-01");
+    expect(matched.score).toBeGreaterThan(0);
+    expect(matched.reasons.join(" ")).toContain("действующий сертификат");
+    expect(matchStaff(item, criteria({ cooperationMode: "Внутреннее совместительство" }), "2026-09-01").score).toBe(0);
+    expect(matchStaff(item, criteria({ certificateQuery: "CISSP" }), "2026-09-01").score).toBe(0);
   });
 
   it("не принимает отрицательную готовность к командировкам", () => {

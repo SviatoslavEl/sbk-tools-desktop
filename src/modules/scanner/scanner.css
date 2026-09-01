@@ -55,6 +55,10 @@
 .preview-loader { grid-template-rows: auto auto auto; gap: 8px; text-align: center; }
 .preview-loader small { color: #65786b; font-size: 10px; }
 .loading-spinner { width: 34px; height: 34px; margin: 0 auto; border: 4px solid #d8e9dc; border-top-color: #2f9845; border-radius: 50%; animation: scanner-spin .75s linear infinite; }
+.merge-file-list { display: grid; gap: 8px; padding: 12px; border: 1px solid #cfe0d3; border-radius: 12px; background: #f6faf7; }
+.merge-file-row { min-width: 0; display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 7px 8px; border-radius: 9px; background: #fff; }
+.merge-file-row > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.merge-file-list > small { color: #617368; line-height: 1.35; }
 @keyframes scanner-spin { to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) { .loading-spinner { animation-duration: 1.8s; } }
 

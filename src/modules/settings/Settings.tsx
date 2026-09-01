@@ -250,6 +250,13 @@ export function Settings({
                 "Проверяем…"}
             </strong>
           </div>
+          {workspace?.editorOwner && <div className="settings-row">
+            <span>Текущий редактор</span>
+            <strong>
+              {workspace.editorOwner.displayName}
+              {workspace.editorOwner.startedAt && <small>с {new Date(workspace.editorOwner.startedAt).toLocaleString("ru-RU")}</small>}
+            </strong>
+          </div>}
           <div className="settings-form workspace-password-controls">
             {workspace?.accessControlled ? <>
               <label>Пароль рабочей папки<input type="password" autoComplete="current-password" value={workspacePassword} onChange={(event) => setWorkspacePassword(event.target.value)} /></label>

@@ -5,10 +5,25 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="theme-color" content="#2f9845" />
     <title>СБК Инструменты</title>
+    <style>
+      html, body, #root { min-height: 100%; margin: 0; }
+      body { background: #edf4ef; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #183425; }
+      .preload-shell { min-height: 100vh; display: grid; place-items: center; padding: 32px; box-sizing: border-box; background: linear-gradient(145deg, #f3f7f4, #e4eee7); }
+      .preload-card { width: min(520px, 100%); box-sizing: border-box; padding: 38px; border-radius: 24px; background: #fff; box-shadow: 0 24px 70px rgba(18, 64, 39, .16); display: grid; gap: 18px; }
+      .preload-mark { width: 66px; height: 66px; border-radius: 18px; display: grid; place-items: center; background: #20783c; color: #fff; font-size: 23px; font-weight: 800; }
+      .preload-card h1, .preload-card p { margin: 0; }
+      .preload-card p { color: #567064; }
+      .preload-progress { height: 8px; overflow: hidden; border-radius: 99px; background: #dce9df; }
+      .preload-progress::after { content: ""; display: block; width: 42%; height: 100%; border-radius: inherit; background: #2f9845; animation: preload-slide 1.15s ease-in-out infinite alternate; }
+      .preload-steps { display: flex; gap: 8px; flex-wrap: wrap; font-size: 13px; color: #658072; }
+      .preload-steps span::before { content: "•"; margin-right: 6px; color: #2f9845; }
+      @keyframes preload-slide { from { transform: translateX(-25%); } to { transform: translateX(165%); } }
+      @media (prefers-reduced-motion: reduce) { .preload-progress::after { animation-duration: 2.4s; } }
+    </style>
   </head>
 
   <body>
-    <div id="root"></div>
+    <div id="root"><div class="preload-shell" role="status" aria-live="polite"><div class="preload-card"><div class="preload-mark">СБК</div><h1>Запускаем СБК Инструменты</h1><p>Подготавливаем защищённое рабочее пространство и встроенные модули…</p><div class="preload-progress" aria-hidden="true"></div><div class="preload-steps"><span>База данных</span><span>Сканер</span><span>Реестры</span><span>Интерфейс</span></div></div></div></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

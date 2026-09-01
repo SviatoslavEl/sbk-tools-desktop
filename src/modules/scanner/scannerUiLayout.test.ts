@@ -64,4 +64,17 @@ describe("предпросмотр сканера", () => {
     expect(worker).toContain("round(255 * annotation.intensity)");
     expect(worker).not.toContain("min(0.7, annotation.intensity * 0.65)");
   });
+
+  it("показывает объединение файлов и приветственный экран до инициализации", () => {
+    const component = readFileSync(new URL("./Scanner.tsx", import.meta.url), "utf8");
+    const app = readFileSync(new URL("../../App.tsx", import.meta.url), "utf8");
+    const html = readFileSync(new URL("../../../index.html", import.meta.url), "utf8");
+
+    expect(component).toContain("Объединить файлы в один PDF");
+    expect(component).toContain('operation: "merge"');
+    expect(component).toContain("Добавить файлы к объединению");
+    expect(app).toContain("setStartupDelayElapsed(true), 3500");
+    expect(html).toContain("Запускаем СБК Инструменты");
+    expect(html).toContain("preload-progress");
+  });
 });

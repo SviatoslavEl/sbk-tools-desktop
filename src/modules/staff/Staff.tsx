@@ -75,6 +75,7 @@ const categoryLabels: Record<StaffDocument["category"], string> = {
   permit: "Удостоверения и допуски",
   other: "Прочие документы",
 };
+const staffDocumentCategories = Object.keys(categoryLabels) as StaffDocument["category"][];
 
 const expiryLabels: Record<ExpiryCategory, string> = {
   expired: "Истёк",
@@ -201,6 +202,9 @@ export function StaffRegistry() {
   const [selectionOpen, setSelectionOpen] = useState(false);
   const [sort, setSort] = useState<{ key: StaffSortKey; direction: SortDirection }>({ key: "department", direction: "asc" });
   const [selectedStaff, setSelectedStaff] = useState<Set<string>>(new Set());
+  const [selectionDocumentCategories, setSelectionDocumentCategories] = useState<Set<StaffDocument["category"]>>(
+    () => new Set(staffDocumentCategories),
+  );
   const [selectionCriteria, setSelectionCriteria] =
     useState<StaffSelectionCriteria>({
       procurementTitle: "",
@@ -217,6 +221,11 @@ export function StaffRegistry() {
       availableTo: "",
       validDocumentsOnly: true,
       disclosureOnly: true,
+      certificateMode: "",
+      certificateQuery: "",
+      educationRequired: false,
+      educationQuery: "",
+      cooperationMode: "",
     });
   const normalizedRecords = useMemo(
     () =>
@@ -457,6 +466,7 @@ export function StaffRegistry() {
   };
   const exportArchive = async (
     recordIds = filtered.map((record) => record.id),
+    documentCategories?: Iterable<StaffDocument["category"]>,
   ) => {
     if (!recordIds.length) return window.alert("Нет сотрудников для экспорта.");
     const selected = new Set(recordIds);
@@ -477,7 +487,16 @@ export function StaffRegistry() {
     );
     if (!path) return;
     try {
-      const result = await createRegistryArchive("staff", path, recordIds);
+      const selectedCategories = documentCategories ? new Set(documentCategories) : null;
+      const attachmentPaths = selectedCategories
+        ? normalizedRecords
+            .filter((record) => selected.has(record.id))
+            .flatMap((record) => record.payload.documents)
+            .filter((document) => selectedCategories.has(document.category))
+            .map((document) => document.relativePath)
+            .filter((value): value is string => Boolean(value))
+        : undefined;
+      const result = await createRegistryArchive("staff", path, recordIds, attachmentPaths);
       window.alert(`Архив создан: ${result.fileName}`);
     } catch (reason) {
       window.alert(`Не удалось создать архив: ${String(reason)}`);
@@ -1257,7 +1276,82 @@ export function StaffRegistry() {
                 />{" "}
                 Только разрешённые для заявки
               </label>
+              <label>
+                Сертификаты
+                <select
+                  value={selectionCriteria.certificateMode}
+                  onChange={(event) => setSelectionCriteria({
+                    ...selectionCriteria,
+                    certificateMode: event.target.value as StaffSelectionCriteria["certificateMode"],
+                  })}
+                >
+                  <option value="">Не учитывать</option>
+                  <option value="any">Есть сертификат</option>
+                  <option value="valid">Есть действующий сертификат</option>
+                </select>
+              </label>
+              <label>
+                Название или номер сертификата
+                <input
+                  value={selectionCriteria.certificateQuery}
+                  placeholder="ISO 27001, серия, организация…"
+                  onChange={(event) => setSelectionCriteria({ ...selectionCriteria, certificateQuery: event.target.value })}
+                />
+              </label>
+              <label className="checkbox-row">
+                <input
+                  type="checkbox"
+                  checked={selectionCriteria.educationRequired}
+                  onChange={(event) => setSelectionCriteria({ ...selectionCriteria, educationRequired: event.target.checked })}
+                />{" "}
+                Требуется документ об образовании
+              </label>
+              <label>
+                Образование
+                <input
+                  value={selectionCriteria.educationQuery}
+                  placeholder="ВУЗ, специальность, диплом…"
+                  onChange={(event) => setSelectionCriteria({ ...selectionCriteria, educationQuery: event.target.value })}
+                />
+              </label>
+              <label>
+                Совместительство
+                <select
+                  value={selectionCriteria.cooperationMode}
+                  onChange={(event) => setSelectionCriteria({
+                    ...selectionCriteria,
+                    cooperationMode: event.target.value as StaffSelectionCriteria["cooperationMode"],
+                  })}
+                >
+                  <option value="">Не учитывать</option>
+                  <option value="part-time">Любое совместительство</option>
+                  <option value="Внутреннее совместительство">Внутреннее</option>
+                  <option value="Внешнее совместительство">Внешнее</option>
+                </select>
+              </label>
             </div>
+            <section className="selection-document-options" aria-label="Документы для архива подбора">
+              <div className="inline-heading">
+                <div><strong>Документы для ZIP</strong><small>В архив попадут только отмеченные категории.</small></div>
+                <div className="button-row">
+                  <button className="link-button" type="button" onClick={() => setSelectionDocumentCategories(new Set(staffDocumentCategories))}>Выбрать все</button>
+                  <button className="link-button" type="button" onClick={() => setSelectionDocumentCategories(new Set())}>Без документов</button>
+                </div>
+              </div>
+              <div className="document-category-grid">
+                {staffDocumentCategories.map((category) => <label className="checkbox-row" key={category}>
+                  <input
+                    type="checkbox"
+                    checked={selectionDocumentCategories.has(category)}
+                    onChange={(event) => setSelectionDocumentCategories((current) => {
+                      const next = new Set(current);
+                      if (event.target.checked) next.add(category); else next.delete(category);
+                      return next;
+                    })}
+                  />{" "}{categoryLabels[category]}
+                </label>)}
+              </div>
+            </section>
             <div className="import-summary">
               <strong>
                 Найдено: {staffMatches.length} · выбрано: {selectedStaff.size}
@@ -1352,9 +1446,9 @@ export function StaffRegistry() {
               className="secondary"
               disabled={!selectedStaff.size}
               type="button"
-              onClick={() => void exportArchive([...selectedStaff])}
+              onClick={() => void exportArchive([...selectedStaff], selectionDocumentCategories)}
             >
-              ZIP + документы
+              ZIP · выбранные документы
             </button>
             <button
               className="primary"

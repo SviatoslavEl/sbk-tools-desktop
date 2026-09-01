@@ -27,6 +27,12 @@ export interface WorkspaceInfo {
   editor: boolean;
   accessControlled: boolean;
   accessMessage: string;
+  editorOwner?: {
+    displayName: string;
+    userName: string;
+    deviceName: string;
+    startedAt: string;
+  };
   schemaVersion: number;
   freeSpaceBytes: number;
 }
@@ -128,6 +134,7 @@ export async function getWorkspaceInfo(): Promise<WorkspaceInfo> {
     editor: true,
     accessControlled: false,
     accessMessage: "Режим предпросмотра",
+    editorOwner: { displayName: "Локальный предпросмотр", userName: "", deviceName: "", startedAt: "" },
     schemaVersion: 1,
     freeSpaceBytes: 0,
   };
@@ -178,6 +185,7 @@ export interface ContractReportData {
     amount: string;
     amountValue: number | null;
     period: string;
+    disclosureStatus: string;
   }>;
 }
 export async function writeContractReportDocx(
@@ -570,6 +578,7 @@ export async function createRegistryArchive(
   module: ModuleId,
   path: string,
   recordIds?: string[],
+  attachmentPaths?: string[],
 ): Promise<BackupInfo> {
   if (!isTauri())
     throw new Error("Архив со вложениями доступен в desktop-версии");
@@ -577,6 +586,7 @@ export async function createRegistryArchive(
     module,
     path,
     recordIds: recordIds || null,
+    attachmentPaths: attachmentPaths || null,
   });
 }
 export async function createEncryptedBackup(

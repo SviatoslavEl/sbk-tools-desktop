@@ -78,6 +78,11 @@ textarea { resize: vertical; }
 .import-review-table { max-height: 430px; }
 .selection-filters { grid-template-columns: repeat(4, minmax(0, 1fr)); }
 .selection-filters .wide { grid-column: span 2; }
+.selection-document-options { display: grid; gap: 12px; padding: 16px; border: 1px solid #d6e4d9; border-radius: 14px; background: #f5faf6; }
+.selection-document-options .inline-heading > div:first-child { display: grid; gap: 4px; }
+.selection-document-options small { color: #64776b; }
+.document-category-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px 18px; }
+@media (max-width: 900px) { .document-category-grid { grid-template-columns: 1fr 1fr; } }
 .total-row { display: flex; justify-content: space-between; padding-top: 10px; margin-top: 2px; border-top: 1px solid #e3ece5; font-size: 12px; }
 .result-panel .surface-body { padding: 20px; }
 .eyebrow { color: #64776b; font-size: 12px; }
@@ -447,6 +452,12 @@ tbody tr:hover .sticky-cell { background: #f6fbf7; }
 .startup-screen { min-height: 100vh; display: grid; place-items: center; padding: 32px; background: linear-gradient(145deg, #f3f7f4, #e4eee7); }
 .startup-card { width: min(560px, 100%); padding: 36px; border-radius: 24px; background: #fff; box-shadow: 0 24px 70px rgba(18, 64, 39, .16); display: grid; gap: 18px; }
 .startup-card h1, .startup-card p { margin: 0; }
+.startup-progress { height: 8px; overflow: hidden; border-radius: 999px; background: #dce9df; }
+.startup-progress span { display: block; width: 42%; height: 100%; border-radius: inherit; background: var(--primary, #2f9845); animation: startup-slide 1.15s ease-in-out infinite alternate; }
+.startup-steps { display: flex; flex-wrap: wrap; gap: 8px 16px; color: var(--muted, #617368); font-size: 13px; }
+.startup-steps span::before { content: "•"; margin-right: 6px; color: var(--primary, #2f9845); }
+@keyframes startup-slide { from { transform: translateX(-25%); } to { transform: translateX(165%); } }
+@media (prefers-reduced-motion: reduce) { .startup-progress span { animation-duration: 2.4s; } }
 .department-group-row td {
   background: #eaf4eb;
   color: #1f6d3b;

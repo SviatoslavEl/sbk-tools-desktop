@@ -280,6 +280,73 @@ def process(config: dict) -> int:
     return 0
 
 
+def merge(config: dict) -> int:
+    """Apply the selected processing profile to several inputs and join the pages."""
+    validate_protocol(config)
+    raw_paths = config.get("inputPaths")
+    if not isinstance(raw_paths, list) or not 2 <= len(raw_paths) <= 100:
+        raise ValueError("Для объединения выберите от 2 до 100 документов.")
+    sources = [Path(value).expanduser().resolve() for value in raw_paths]
+    output = Path(config["outputPath"]).expanduser().resolve()
+    if any(source == output for source in sources):
+        raise ValueError("Итоговый PDF не должен перезаписывать исходный документ.")
+    ocr_enabled = bool(config.get("ocrEnabled", False))
+    ocr_languages = validate_ocr_languages(config.get("ocrLanguages", "rus+eng")) if ocr_enabled else "rus+eng"
+    warnings: list[str] = []
+    original_bytes = sum(source.stat().st_size for source in sources)
+
+    from pypdf import PdfWriter
+    from scandocument.pdf_engine import write_atomic
+
+    with SecureWorkspace() as workspace:
+        parts: list[Path] = []
+        for index, source in enumerate(sources):
+            part = workspace / f"merged-source-{index + 1}.pdf"
+            request = ProcessRequest(
+                input_path=source,
+                output_path=part,
+                settings=settings_for(config.get("preset", "Офисный скан"), config.get("settings")),
+                seed=int(config.get("seed", 42)) + index,
+                ocr_enabled=ocr_enabled,
+                ocr_languages=ocr_languages,
+                page_order=[],
+                page_rotations={},
+                redactions=[],
+                annotations=[],
+                facsimiles=[],
+                pdfa_enabled=bool(config.get("pdfaEnabled", False)),
+                compression_target_ratio=(float(config["compressionTargetRatio"])
+                                          if config.get("compressionTargetRatio") is not None else None),
+            )
+            part_warnings, _confidence, _text, _low_confidence = process_document(
+                request,
+                lambda event, file_index=index, file_name=source.name: emit({
+                    "type": "progress",
+                    "stage": f"{file_name}: {event.stage}",
+                    "currentPage": file_index + 1,
+                    "totalPages": len(sources),
+                    "percent": round((file_index + event.percent / 100) / len(sources) * 92),
+                }),
+            )
+            warnings.extend(part_warnings)
+            parts.append(part)
+
+        emit({"type": "progress", "stage": "Объединяем страницы", "currentPage": len(sources),
+              "totalPages": len(sources), "percent": 96})
+        writer = PdfWriter()
+        for part in parts:
+            writer.append(str(part))
+        page_count = len(writer.pages)
+        write_atomic(writer, output)
+
+    output_bytes = output.stat().st_size
+    emit({"type": "complete", "outputPath": str(output), "warnings": warnings,
+          "pageCount": page_count, "outputBytes": output_bytes, "originalBytes": original_bytes,
+          "savingsPercent": (1 - output_bytes / max(1, original_bytes)) * 100,
+          "protocolVersion": 2})
+    return 0
+
+
 def main() -> int:
     from scandocument import __version__
     from scandocument.resources import cleanup_stale_onefile_dirs
@@ -288,7 +355,7 @@ def main() -> int:
     cleanup_stale_onefile_dirs()
     SecureWorkspace.cleanup_stale()
     parser = argparse.ArgumentParser(prog="sbk-scanner-worker")
-    parser.add_argument("command", choices=("preview", "process", "extract", "info"))
+    parser.add_argument("command", choices=("preview", "process", "merge", "extract", "info"))
     parser.add_argument("--config")
     args = parser.parse_args()
     try:
@@ -302,7 +369,9 @@ def main() -> int:
             validate_protocol(config)
             emit(extract_document(Path(config["inputPath"])))
             return 0
-        return preview(config) if args.command == "preview" else process(config)
+        if args.command == "preview":
+            return preview(config)
+        return merge(config) if args.command == "merge" else process(config)
     except Exception as error:
         emit({"type": "error", "message": str(error), "class": type(error).__name__})
         return 1

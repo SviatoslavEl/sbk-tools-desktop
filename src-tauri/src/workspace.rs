@@ -1,5 +1,6 @@
 use argon2::Argon2;
 use base64::{Engine as _, engine::general_purpose::STANDARD_NO_PAD};
+use chrono::Utc;
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
@@ -11,6 +12,23 @@ use std::sync::{
 };
 
 const ACCESS_CONTROL_FILE: &str = ".workspace-access.json";
+const EDITOR_PRESENCE_FILE: &str = ".workspace-editor.json";
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct EditorOwner {
+    pub(crate) display_name: String,
+    pub(crate) user_name: String,
+    pub(crate) device_name: String,
+    pub(crate) started_at: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EditorPresence {
+    token: String,
+    owner: EditorOwner,
+}
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -51,6 +69,80 @@ struct EditorLease {
     token: String,
     edit: Option<File>,
     guard: Option<File>,
+    presence_path: Option<PathBuf>,
+    owner: Option<EditorOwner>,
+}
+
+impl Drop for EditorLease {
+    fn drop(&mut self) {
+        let Some(path) = self.presence_path.take() else {
+            return;
+        };
+        let owned = fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<EditorPresence>(&bytes).ok())
+            .is_some_and(|presence| presence.token == self.token);
+        if owned {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+fn environment_value(names: &[&str]) -> String {
+    names
+        .iter()
+        .find_map(|name| {
+            std::env::var(name)
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
+        .unwrap_or_default()
+}
+
+fn current_editor_owner() -> EditorOwner {
+    let user_name = environment_value(&["USERNAME", "USER", "LOGNAME"]);
+    let device_name = environment_value(&["COMPUTERNAME", "HOSTNAME"]);
+    let display_name = match (user_name.is_empty(), device_name.is_empty()) {
+        (false, false) => format!("{user_name} · {device_name}"),
+        (false, true) => user_name.clone(),
+        (true, false) => device_name.clone(),
+        (true, true) => "Пользователь этого компьютера".to_string(),
+    };
+    EditorOwner {
+        display_name,
+        user_name,
+        device_name,
+        started_at: Utc::now().to_rfc3339(),
+    }
+}
+
+fn write_editor_presence(root: &Path, token: &str, owner: &EditorOwner) -> Option<PathBuf> {
+    let path = root.join(EDITOR_PRESENCE_FILE);
+    let encoded = serde_json::to_vec_pretty(&EditorPresence {
+        token: token.to_string(),
+        owner: owner.clone(),
+    })
+    .ok()?;
+    let mut file = File::create(&path).ok()?;
+    file.write_all(&encoded).ok()?;
+    file.sync_all().ok()?;
+    Some(path)
+}
+
+fn read_editor_presence(root: &Path) -> Option<EditorOwner> {
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(root.join(".workspace.edit.lock"))
+        .ok()?;
+    if lock.try_lock_exclusive().is_ok() {
+        let _ = FileExt::unlock(&lock);
+        return None;
+    }
+    let bytes = fs::read(root.join(EDITOR_PRESENCE_FILE)).ok()?;
+    serde_json::from_slice::<EditorPresence>(&bytes)
+        .ok()
+        .map(|presence| presence.owner)
 }
 
 impl Drop for Workspace {
@@ -181,6 +273,8 @@ fn acquire_editor_lease(root: &Path, writable: bool) -> EditorLease {
             token,
             edit: None,
             guard: None,
+            presence_path: None,
+            owner: None,
         };
     }
     let edit = lock_token_file(&root.join(".workspace.edit.lock"), &token, true, true).ok();
@@ -188,11 +282,17 @@ fn acquire_editor_lease(root: &Path, writable: bool) -> EditorLease {
         lock_token_file(&root.join(".workspace.edit.guard"), &token, true, true).ok()
     });
     let active = edit.is_some() && guard.is_some();
+    let owner = active.then(current_editor_owner);
+    let presence_path = owner
+        .as_ref()
+        .and_then(|owner| write_editor_presence(root, &token, owner));
     EditorLease {
         active,
         token,
         edit: if active { edit } else { None },
         guard: if active { guard } else { None },
+        presence_path,
+        owner,
     }
 }
 
@@ -395,6 +495,11 @@ impl Workspace {
             .to_string()
         } else if !self.writable {
             "Только просмотр и экспорт: файловая система не разрешает запись.".to_string()
+        } else if let Some(owner) = self.editor_owner() {
+            format!(
+                "Только просмотр: режим редактирования сейчас у {}. Попросите пользователя выйти из режима редактора.",
+                owner.display_name
+            )
         } else if self.access_controlled() {
             "Только просмотр. Для редактирования введите пароль рабочей папки.".to_string()
         } else {
@@ -437,6 +542,8 @@ impl Workspace {
             token: uuid::Uuid::new_v4().to_string(),
             edit: None,
             guard: None,
+            presence_path: None,
+            owner: None,
         };
         Ok(())
     }
@@ -461,6 +568,15 @@ impl Workspace {
             .lock()
             .map(|lease| lease.active)
             .unwrap_or(false)
+    }
+
+    pub(crate) fn editor_owner(&self) -> Option<EditorOwner> {
+        let lease = self.editor_lease.lock().ok()?;
+        if lease.active {
+            return lease.owner.clone();
+        }
+        drop(lease);
+        read_editor_presence(&self.root)
     }
 
     pub(crate) fn require_editor(&self) -> Result<(), String> {
@@ -489,9 +605,14 @@ impl Workspace {
             Ok(())
         })();
         if result.is_err() {
-            lease.active = false;
-            lease.edit = None;
-            lease.guard = None;
+            *lease = EditorLease {
+                active: false,
+                token: uuid::Uuid::new_v4().to_string(),
+                edit: None,
+                guard: None,
+                presence_path: None,
+                owner: None,
+            };
         }
         result.map_err(|error: String| {
             format!(
@@ -588,6 +709,9 @@ mod tests {
         let root = std::env::temp_dir().join(format!("sbk-password-access-{}", Uuid::new_v4()));
         ensure_workspace(&root).expect("workspace");
         let workspace = Workspace::for_test(root.clone(), true);
+        let owner = workspace.editor_owner().expect("editor identity");
+        assert!(!owner.display_name.is_empty());
+        assert!(root.join(EDITOR_PRESENCE_FILE).is_file());
         workspace
             .set_access_password("", "correct-horse")
             .expect("set first password");
@@ -599,12 +723,14 @@ mod tests {
             .release_editor_with_password("correct-horse")
             .expect("release editor");
         assert!(!workspace.is_editor());
+        assert!(!root.join(EDITOR_PRESENCE_FILE).exists());
         assert!(workspace.acquire_editor_with_password("wrong").is_err());
         assert!(!workspace.is_editor());
         workspace
             .acquire_editor_with_password("correct-horse")
             .expect("acquire editor");
         assert!(workspace.is_editor());
+        assert!(root.join(EDITOR_PRESENCE_FILE).is_file());
         workspace
             .set_access_password("correct-horse", "new-correct-horse")
             .expect("change password");

@@ -397,7 +397,9 @@ def make_preview(
                     prepared_warnings = convert_docx_to_pdf(source, staged_pdf, lambda: token.cancelled)
                     token.check()
                     try:
-                        staged_pdf.replace(cached_pdf)
+                        from scandocument.office_engine import _install_converted_pdf
+
+                        _install_converted_pdf(staged_pdf, cached_pdf)
                     except OSError:
                         if not cached_pdf.is_file():
                             raise

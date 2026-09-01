@@ -49,7 +49,7 @@ describe("подбор опыта по договорам", () => {
     expect(normalizeContractData(legacy).discloseAmount).toBe(true);
   });
 
-  it("скрывает запрещённые реквизиты в файле подборки", () => {
+  it("показывает реквизиты и добавляет справочный статус конфиденциальности", () => {
     const row = contractReportRow({
       ...emptyContract(),
       disclosureAllowed: true,
@@ -62,8 +62,13 @@ describe("подбор опыта по договорам", () => {
     });
     expect(row.number).toBe("42/26");
     expect(row.subject).toBe("Аудит");
-    expect(row.customer).toContain("конфиденциальности");
-    expect(row.amount).toContain("конфиденциальности");
-    expect(row.amountValue).toBeNull();
+    expect(row.customer).toBe("Секретный заказчик");
+    expect(row.amountValue).toBe(1_500_000);
+    expect(row.disclosureStatus).toBe("Разрешено раскрывать");
+    expect(contractReportRow({ ...emptyContract(), number: "НДА-1", customer: "Заказчик" })).toMatchObject({
+      number: "НДА-1",
+      customer: "Заказчик",
+      disclosureStatus: "Запрещено раскрывать",
+    });
   });
 });

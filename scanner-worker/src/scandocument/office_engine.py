@@ -1,15 +1,39 @@
 from __future__ import annotations
 
+import errno
 import os
 import platform
 import shutil
 import signal
 import subprocess
 import time
+import uuid
 from collections.abc import Callable
 from pathlib import Path
 
 from scandocument.errors import CancelledError, DocxConversionError
+
+
+def _install_converted_pdf(produced: Path, destination: Path) -> None:
+    """Move a converted PDF safely, including between Windows drive letters."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.replace(produced, destination)
+        return
+    except OSError as error:
+        if error.errno != errno.EXDEV and getattr(error, "winerror", None) != 17:
+            raise
+
+    staged = destination.with_name(f".{destination.name}.{os.getpid()}.{uuid.uuid4().hex}.copying")
+    try:
+        with produced.open("rb") as source, staged.open("xb") as target:
+            shutil.copyfileobj(source, target, length=1024 * 1024)
+            target.flush()
+            os.fsync(target.fileno())
+        os.replace(staged, destination)
+        produced.unlink(missing_ok=True)
+    finally:
+        staged.unlink(missing_ok=True)
 
 
 def _office_environment(profile: Path, workdir: Path) -> dict[str, str]:
@@ -191,8 +215,7 @@ def convert_with_office(
         raise DocxConversionError(
             "Встроенный движок не смог отобразить DOCX. Проверьте документ в Word и повторите."
         )
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    os.replace(produced, destination)
+    _install_converted_pdf(produced, destination)
     return [
         "DOCX преобразован встроенным офисным движком. Проверьте предварительный просмотр: "
         "результат может отличаться, если в документе использованы отсутствующие шрифты."
