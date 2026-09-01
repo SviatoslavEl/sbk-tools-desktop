@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 import { ConfirmDialog } from "../../components/Dialog";
 import { useRecords } from "../../hooks/useRecords";
+import { useUnsavedChanges } from "../../hooks/useUnsavedChanges";
 import type { StoredRecord } from "../../lib/storage";
 import { useWorkspaceAccess } from "../../lib/workspaceAccess";
 import type { ProcurementData } from "../procurement/types";
@@ -493,7 +494,9 @@ function ScheduleEditor({
         }
       : emptyTenderSchedule(),
   );
+  const [savedSnapshot, setSavedSnapshot] = useState(() => JSON.stringify(item));
   const [error, setError] = useState("");
+  const { requestClose, confirmation: discardConfirmation } = useUnsavedChanges(JSON.stringify(item) !== savedSnapshot, onClose);
   const update = <K extends keyof TenderScheduleData>(
     key: K,
     value: TenderScheduleData[K],
@@ -569,6 +572,8 @@ function ScheduleEditor({
     )
       return setError("Проверьте сотрудника, даты и часы во всех назначениях.");
     await onSave(ready, record?.id);
+    setItem(ready);
+    setSavedSnapshot(JSON.stringify(ready));
     setError("");
   };
   const risks = scheduleRisks(item, [
@@ -576,7 +581,7 @@ function ScheduleEditor({
     item,
   ]);
 
-  return (
+  return (<>
     <aside
       className="detail-drawer procurement-drawer"
       role="dialog"
@@ -588,7 +593,7 @@ function ScheduleEditor({
           <h2>{record ? item.procurementTitle : "Новая заявка в календаре"}</h2>
           <p>Распределение подготовки, сроки и загрузка команды</p>
         </div>
-        <button className="icon-button" type="button" onClick={onClose}>
+        <button className="icon-button" type="button" aria-label="Закрыть план подготовки" title="Закрыть" onClick={requestClose}>
           ×
         </button>
       </header>
@@ -1053,6 +1058,7 @@ function ScheduleEditor({
             <button
               className="icon-button danger"
               type="button"
+              aria-label={`Удалить контрольную точку ${milestone.title || "без названия"}`}
               onClick={() =>
                 update(
                   "milestones",
@@ -1079,7 +1085,7 @@ function ScheduleEditor({
           {item.assignments.reduce((sum, entry) => sum + entry.plannedHours, 0)}{" "}
           из {item.estimatedHours} ч.
         </span>
-        <button className="secondary" type="button" onClick={onClose}>
+        <button className="secondary" type="button" onClick={requestClose}>
           Закрыть
         </button>
         <button className="primary" type="button" onClick={() => void save()}>
@@ -1087,5 +1093,7 @@ function ScheduleEditor({
         </button>
       </footer>
     </aside>
+    {discardConfirmation}
+  </>
   );
 }

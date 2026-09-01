@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { Dialog } from "../../components/Dialog";
+import { useUnsavedChanges } from "../../hooks/useUnsavedChanges";
 import {
   getWorkspaceInfo,
   importContractsWithCompanyDirectoryAtomic,
@@ -566,7 +567,9 @@ export function CompanyEditor({
   readOnly?: boolean;
 }) {
   const [item, setItem] = useState(() => structuredClone(company));
+  const [savedSnapshot, setSavedSnapshot] = useState(() => JSON.stringify(item));
   const [error, setError] = useState("");
+  const { requestClose, confirmation: discardConfirmation } = useUnsavedChanges(JSON.stringify(item) !== savedSnapshot, onClose);
   const update = <K extends keyof CompanyCard>(key: K, value: CompanyCard[K]) =>
     setItem((current) => ({ ...current, [key]: value }));
   const submit = async () => {
@@ -577,11 +580,12 @@ export function CompanyEditor({
     }
     try {
       await onSave(item);
+      setSavedSnapshot(JSON.stringify(item));
     } catch (reason) {
       setError(`Не удалось сохранить карточку: ${String(reason)}`);
     }
   };
-  return (
+  return (<>
     <aside
       className="detail-drawer company-editor-drawer"
       role="dialog"
@@ -593,7 +597,7 @@ export function CompanyEditor({
           <h2>{item.name || "Новая компания"}</h2>
           <p>Реквизиты, лица принимающие решения и аффилированность</p>
         </div>
-        <button className="icon-button" type="button" onClick={onClose}>
+        <button className="icon-button" type="button" aria-label="Закрыть карточку компании" title="Закрыть" onClick={requestClose}>
           ×
         </button>
       </header>
@@ -849,7 +853,7 @@ export function CompanyEditor({
         </label>
       </fieldset>
       <footer>
-        <button className="secondary" type="button" onClick={onClose}>
+        <button className="secondary" type="button" onClick={requestClose}>
           Отмена
         </button>
         <button className="primary" type="button" disabled={readOnly} onClick={() => void submit()}>
@@ -857,5 +861,7 @@ export function CompanyEditor({
         </button>
       </footer>
     </aside>
+    {discardConfirmation}
+  </>
   );
 }

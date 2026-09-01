@@ -3,6 +3,7 @@ import { openPath } from "@tauri-apps/plugin-opener";
 import { ConfirmDialog, Dialog } from "../../components/Dialog";
 import { SortableHeader } from "../../components/SortableHeader";
 import { useRecords } from "../../hooks/useRecords";
+import { useUnsavedChanges } from "../../hooks/useUnsavedChanges";
 import { parseCsv, toCsv } from "../../lib/csv";
 import { chooseOpenPath, chooseSavePath, exportText } from "../../lib/files";
 import { compareSortValues, toggleSort, type SortDirection } from "../../lib/tableSort";
@@ -1579,7 +1580,7 @@ export function ContractsRegistry() {
           </footer>
         </Dialog>
       )}
-      {!readOnly && importRows && importSource && (
+      {!readOnly && importRows && importSource && importEditingIndex === null && (
         <Dialog
           title="Проверка импорта договоров"
           description="Показываем только строки, которые нужно дополнить. Готовые строки не перегружают список; пакет сохранится одной транзакцией."
@@ -1884,6 +1885,7 @@ function ContractEditor({
         ? normalizeContractData(structuredClone(initialValue))
         : emptyContract(),
   );
+  const [savedSnapshot, setSavedSnapshot] = useState(() => JSON.stringify(item));
   const [error, setError] = useState("");
   const [history, setHistory] = useState<HistoryEntry[]>([]);
   useEffect(() => {
@@ -1900,12 +1902,12 @@ function ContractEditor({
     key: K,
     value: ContractData[K],
   ) => setItem((current) => ({ ...current, [key]: value }));
-  const close = async () => {
+  const { requestClose, confirmation: discardConfirmation } = useUnsavedChanges(JSON.stringify(item) !== savedSnapshot, async () => {
     await discardStagedAttachments("contract-experience", recordId).catch(
       () => undefined,
     );
     onClose();
-  };
+  });
   const submit = async () => {
     if (
       !item.performingLegalEntity.trim() ||
@@ -1926,10 +1928,11 @@ function ContractEditor({
       return;
     }
     await onSave(item, recordId);
+    setSavedSnapshot(JSON.stringify(item));
   };
   const checks = contractChecks(item);
   const balance = contractBalance(item);
-  return (
+  return (<>
     <aside
       className="detail-drawer"
       role="dialog"
@@ -1952,7 +1955,9 @@ function ContractEditor({
         <button
           className="icon-button"
           type="button"
-          onClick={() => void close()}
+          aria-label="Закрыть карточку договора"
+          title="Закрыть"
+          onClick={requestClose}
         >
           ×
         </button>
@@ -2310,7 +2315,7 @@ function ContractEditor({
         <button
           className="secondary"
           type="button"
-          onClick={() => void close()}
+          onClick={requestClose}
         >
           Отмена
         </button>
@@ -2319,6 +2324,8 @@ function ContractEditor({
         </button>
       </footer>
     </aside>
+    {discardConfirmation}
+  </>
   );
 }
 

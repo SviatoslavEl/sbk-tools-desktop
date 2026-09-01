@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { applicationCompleteness, buildRebidSteps, calculateGoNoGo, cashFlowSummary, complianceSummary, confirmGoNoGo, detectContractRisks, markSignificantChange, procurementWarnings, replaceDocumentVersion, resourceConflicts, scenarioFinancials, suggestedExperience, suggestedTeam } from "./domain";
 import { emptyContract } from "../contracts/types";
 import { emptyStaff } from "../staff/types";
-import { emptyProcurement, emptyRequirement } from "./types";
+import { emptyProcurement, emptyRequirement, emptyScenario } from "./types";
 
 describe("procurement domain", () => {
   it("builds a bounded rebid ladder and marks losses", () => {
@@ -33,6 +33,17 @@ describe("procurement domain", () => {
   it("finds contradictory deadlines and partner shares", () => {
     const item = { ...emptyProcurement(), name: "Тест", customer: "Заказчик", subject: "Услуги", nmc: 1, questionDeadline: "2026-02-02", submissionDeadline: "2026-02-01", partners: [{ id: "1", name: "П", role: "", workShare: 101, responsibility: "" }] };
     expect(procurementWarnings(item, new Date("2026-01-01"))).toHaveLength(2);
+  });
+
+  it("reports an invalid scenario VAT rate without allowing it to reach rendering", () => {
+    const item = emptyProcurement();
+    item.name = "Тест";
+    item.customer = "Заказчик";
+    item.subject = "Услуги";
+    item.nmc = 1;
+    item.participationScenarios = [{ ...emptyScenario(), id: "vat", name: "Ошибка НДС", vatRate: 101 }];
+    expect(procurementWarnings(item)).toContain("Ставка НДС сценария «Ошибка НДС» должна быть от 0 до 100%.");
+    expect(() => scenarioFinancials(item.participationScenarios[0])).toThrow("Ставка НДС должна быть от 0 до 100%.");
   });
 
   it("does not allow a positive Go/No-Go decision while a blocking criterion fails", () => {

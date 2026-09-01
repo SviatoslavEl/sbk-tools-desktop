@@ -30,6 +30,12 @@ const competitorNoVat = {
 };
 
 describe("calculator engine VAT model", () => {
+  it("blocks a calculation with a negative direct cost instead of silently clamping it", () => {
+    const result = calculate(data({ cost: -1 }));
+    expect(result.valid).toBe(false);
+    expect(result.issues).toContainEqual(expect.objectContaining({ field: "cost", blocking: true }));
+  });
+
   it.each([0, 5, 7, 10, 11, 20, 22] satisfies VatRate[])(
     "round-trips VAT rate %s%%",
     (rate) => {

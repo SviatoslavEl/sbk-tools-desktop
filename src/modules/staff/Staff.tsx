@@ -3,6 +3,7 @@ import { openPath } from "@tauri-apps/plugin-opener";
 import { ConfirmDialog, Dialog } from "../../components/Dialog";
 import { SortableHeader } from "../../components/SortableHeader";
 import { useRecords } from "../../hooks/useRecords";
+import { useUnsavedChanges } from "../../hooks/useUnsavedChanges";
 import { parseCsv, toCsv } from "../../lib/csv";
 import {
   clearImportRowIssues,
@@ -1461,7 +1462,7 @@ export function StaffRegistry() {
           </footer>
         </Dialog>
       )}
-      {!readOnly && importRows && importSource && (
+      {!readOnly && importRows && importSource && importEditingIndex === null && (
         <Dialog
           title="Проверка импорта кадров"
           description="Показываем только сотрудников, чьи обязательные данные требуют дополнения. Готовые строки скрыты; пакет сохраняется одной транзакцией."
@@ -1853,6 +1854,7 @@ function StaffEditor({
   const [item, setItem] = useState<StaffData>(() =>
     normalizeStaffData(record?.payload || initialValue || emptyStaff()),
   );
+  const [savedSnapshot, setSavedSnapshot] = useState(() => JSON.stringify(item));
   const [tab, setTab] = useState<StaffTab>("general");
   const [error, setError] = useState("");
   const [history, setHistory] = useState<HistoryEntry[]>([]);
@@ -1909,6 +1911,7 @@ function StaffEditor({
       },
       recordId,
     );
+    setSavedSnapshot(JSON.stringify(item));
   };
   const tabs: Array<[StaffTab, string]> = importMode
     ? [
@@ -1928,11 +1931,11 @@ function StaffEditor({
         ["notes", "Примечания"],
       ];
   const requirements = staffRequirements(item);
-  const close = async () => {
+  const { requestClose, confirmation: discardConfirmation } = useUnsavedChanges(JSON.stringify(item) !== savedSnapshot, async () => {
     await discardStagedAttachments("staff", recordId).catch(() => undefined);
     onClose();
-  };
-  return (
+  });
+  return (<>
     <aside
       className="detail-drawer wide-drawer"
       role="dialog"
@@ -1955,7 +1958,9 @@ function StaffEditor({
         <button
           className="icon-button"
           type="button"
-          onClick={() => void close()}
+          aria-label="Закрыть карточку сотрудника"
+          title="Закрыть"
+          onClick={requestClose}
         >
           ×
         </button>
@@ -2313,7 +2318,7 @@ function StaffEditor({
         <button
           className="secondary"
           type="button"
-          onClick={() => void close()}
+          onClick={requestClose}
         >
           Отмена
         </button>
@@ -2322,6 +2327,8 @@ function StaffEditor({
         </button>
       </footer>
     </aside>
+    {discardConfirmation}
+  </>
   );
 }
 
@@ -2384,6 +2391,7 @@ function OrganizationalAssignmentsEditor({
               className="icon-button danger"
               type="button"
               disabled={assignments.length === 1}
+              aria-label={`Удалить назначение ${assignment.position || assignment.legalEntity || "без названия"}`}
               onClick={() =>
                 onChange(
                   assignments.filter((entry) => entry.id !== assignment.id),
@@ -2610,6 +2618,7 @@ function DocumentsEditor({
             <button
               className="icon-button danger"
               type="button"
+              aria-label={`Удалить документ ${doc.name || doc.type || "без названия"}`}
               onClick={() => void removeDocument(doc)}
             >
               ×

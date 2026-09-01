@@ -109,6 +109,22 @@ function financingCostAtPrice(data: CalculatorData, directCosts: number, priceGr
 
 function validationIssues(data: CalculatorData): CalculationIssue[] {
   const issues: CalculationIssue[] = [];
+  if (!Number.isFinite(data.cost) || data.cost < 0) {
+    issues.push({
+      code: "invalid-data",
+      field: "cost",
+      blocking: true,
+      message: "Себестоимость должна быть неотрицательным числом.",
+    });
+  }
+  if (!Number.isFinite(data.proposedPrice) || data.proposedPrice < 0) {
+    issues.push({
+      code: "invalid-data",
+      field: "proposedPrice",
+      blocking: true,
+      message: "Предлагаемая цена должна быть неотрицательным числом.",
+    });
+  }
   if (data.warningMargin < data.minMargin) {
     issues.push({
       code: "invalid-thresholds",

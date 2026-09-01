@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type Dispatch, type SetStateAction } from "react";
+import { createContext, useCallback, useContext, useEffect, useId, useMemo, useState, type Dispatch, type SetStateAction } from "react";
 import { useRecords } from "../../hooks/useRecords";
 import { exportText, importText } from "../../lib/files";
 import { clearDraft, readDraft, saveDraft } from "../../lib/storage";
@@ -22,6 +22,8 @@ const money = (value: number) => new Intl.NumberFormat("ru-RU", {
 const percent = (value: number) => Number.isFinite(value) ? `${value.toFixed(1)}%` : "—";
 const clone = <T,>(value: T): T => JSON.parse(JSON.stringify(value));
 
+const NumberValidityContext = createContext<(id: string, invalid: boolean) => void>(() => undefined);
+
 function restoredCalculatorData(value: unknown) {
   try {
     return value ? migrateCalculatorData(value) : clone(initialCalculatorData);
@@ -37,10 +39,16 @@ function NumberField({ value, onChange, min, max, suffix }: {
   max?: number;
   suffix?: string;
 }) {
+  const id = useId();
+  const reportValidity = useContext(NumberValidityContext);
   const [text, setText] = useState(String(value));
   useEffect(() => setText(String(value)), [value]);
   const parsed = Number(text.replace(/ /g, "").replace(",", "."));
-  const invalid = !Number.isFinite(parsed) || (min != null && parsed < min) || (max != null && parsed > max);
+  const invalid = text.trim() === "" || !Number.isFinite(parsed) || (min != null && parsed < min) || (max != null && parsed > max);
+  useEffect(() => {
+    reportValidity(id, invalid);
+    return () => reportValidity(id, false);
+  }, [id, invalid, reportValidity]);
   return <div className="number-field">
     <input
       type="text"
@@ -51,7 +59,7 @@ function NumberField({ value, onChange, min, max, suffix }: {
         const next = event.target.value;
         setText(next);
         const numeric = Number(next.replace(/ /g, "").replace(",", "."));
-        if (Number.isFinite(numeric) && (min == null || numeric >= min) && (max == null || numeric <= max)) onChange(numeric);
+        if (next.trim() !== "" && Number.isFinite(numeric)) onChange(numeric);
       }}
     />
     {suffix && <span>{suffix}</span>}
@@ -67,10 +75,23 @@ export function Calculator() {
   const [recordId, setRecordId] = useState<string | undefined>();
   const [savedStatus, setSavedStatus] = useState("Загружаем черновик…");
   const [formError, setFormError] = useState("");
+  const [invalidNumberFields, setInvalidNumberFields] = useState<Set<string>>(new Set());
   const [activeChart, setActiveChart] = useState<"structure" | "scenario" | "competitors">("structure");
   const result = useMemo(() => calculate(data), [data]);
+  const calculationValid = result.valid && invalidNumberFields.size === 0;
+  const resultStatus = calculationValid ? result.status : "danger";
   const scenarios = useMemo(() => priceScenarios(data), [data]);
   const recommendation = useMemo(() => recommendPrice(data), [data]);
+  const reportNumberValidity = useCallback((id: string, invalid: boolean) => {
+    setInvalidNumberFields((current) => {
+      const alreadyInvalid = current.has(id);
+      if (alreadyInvalid === invalid) return current;
+      const next = new Set(current);
+      if (invalid) next.add(id);
+      else next.delete(id);
+      return next;
+    });
+  }, []);
 
   useEffect(() => {
     let active = true;
@@ -96,6 +117,10 @@ export function Calculator() {
 
   useEffect(() => {
     if (!draftReady || !workspaceAccess.editor) return;
+    if (!calculationValid) {
+      setSavedStatus("Исправьте поля — черновик не сохранён");
+      return;
+    }
     setSavedStatus("Сохраняем черновик…");
     const timer = window.setTimeout(() => {
       void saveDraft("calculator", data, recordId || "new")
@@ -103,14 +128,14 @@ export function Calculator() {
         .catch(() => setSavedStatus("Черновик не сохранён"));
     }, 450);
     return () => window.clearTimeout(timer);
-  }, [data, draftReady, recordId, workspaceAccess.editor]);
+  }, [data, draftReady, recordId, workspaceAccess.editor, calculationValid]);
 
   const update = <K extends keyof CalculatorData>(key: K, value: CalculatorData[K]) =>
     setData((current) => ({ ...current, [key]: value }));
 
   const saveCalculation = async (duplicate = false) => {
-    if (!result.valid) {
-      setFormError(result.issues.find((issue) => issue.blocking)?.message || "Исправьте ошибки расчёта перед сохранением.");
+    if (!calculationValid) {
+      setFormError(result.issues.find((issue) => issue.blocking)?.message || "Исправьте неверно заполненные числовые поля перед сохранением.");
       return;
     }
     const title = data.name.trim() || "Расчёт без названия";
@@ -127,8 +152,8 @@ export function Calculator() {
   };
 
   const exportCalculation = async () => {
-    if (!result.valid) {
-      setFormError(result.issues.find((issue) => issue.blocking)?.message || "Исправьте ошибки расчёта перед экспортом.");
+    if (!calculationValid) {
+      setFormError(result.issues.find((issue) => issue.blocking)?.message || "Исправьте неверно заполненные числовые поля перед экспортом.");
       return;
     }
     if (result.status === "danger" && !window.confirm("Расчёт убыточный или ниже минимальной маржи. Экспортировать с предупреждением?")) return;
@@ -149,7 +174,7 @@ export function Calculator() {
     }
   };
 
-  return <div className="module-stack">
+  return <NumberValidityContext.Provider value={reportNumberValidity}><div className="module-stack">
     <div className="module-toolbar">
       <div className="record-switcher">
         <label>Текущий расчёт
@@ -169,9 +194,9 @@ export function Calculator() {
       <div className="toolbar-actions">
         <button className="secondary" type="button" onClick={newCalculation}>Новый</button>
         <button className="secondary" type="button" onClick={() => void importCalculation()}>Импорт</button>
-        <button className="secondary" disabled={!result.valid} type="button" onClick={() => void exportCalculation()}>Экспорт</button>
+        <button className="secondary" disabled={!calculationValid} type="button" onClick={() => void exportCalculation()}>Экспорт</button>
         {recordId && <button className="secondary danger" type="button" onClick={() => { if (window.confirm("Переместить расчёт в архив?")) void saved.archive(recordId).then(newCalculation); }}>В архив</button>}
-        <button className="primary" disabled={!result.valid} type="button" onClick={() => void saveCalculation(false)}>Сохранить расчёт</button>
+        <button className="primary" disabled={!calculationValid} type="button" onClick={() => void saveCalculation(false)}>Сохранить расчёт</button>
       </div>
     </div>
 
@@ -256,11 +281,11 @@ export function Calculator() {
       </section>
 
       <section className="result-column">
-        <div className={`surface result-panel ${result.status}`}>
-          <div className="surface-title"><h2>Результат</h2><span className={`status ${result.status}`}>{result.status === "success" ? "✓ Расчёт устойчив" : result.status === "warning" ? "⚠ Низкая маржа" : "! Убыточно или ниже порога"}</span></div>
+        <div className={`surface result-panel ${resultStatus}`}>
+          <div className="surface-title"><h2>Результат</h2><span className={`status ${resultStatus}`}>{!calculationValid ? "! Исправьте исходные данные" : resultStatus === "success" ? "✓ Расчёт устойчив" : resultStatus === "warning" ? "⚠ Низкая маржа" : "! Убыточно или ниже порога"}</span></div>
           <div className="surface-body">
             <span className="eyebrow">Цена для заказчика с НДС</span>
-            <strong className="hero-number">{result.valid ? money(result.priceGross) : "Расчёт невозможен"}</strong>
+            <strong className="hero-number">{calculationValid ? money(result.priceGross) : "Расчёт невозможен"}</strong>
             <div className="metric-grid">
               <div><span>Прибыль</span><strong>{money(result.profit)}</strong></div>
               <div><span>Маржа</span><strong>{percent(result.margin)}</strong></div>
@@ -278,17 +303,17 @@ export function Calculator() {
               <div><span>Рентабельность полных затрат</span><strong>{percent(result.profitability)}</strong></div>
             </div>
             <details className="formula-details"><summary>Как получены цена и прибыль</summary><div><span>Полные затраты = прямые {money(result.directCosts)} + валюта {money(result.currencyCost)} + дополнительные {money(result.additionalCosts)} + агент {money(result.agentCommission)} + финансирование {money(result.financingCost)}</span><strong>{money(result.fullCosts)}</strong><span>Прибыль = цена без НДС {money(result.priceNet)} − полные затраты {money(result.fullCosts)}</span><strong>{money(result.profit)}</strong><span>Маржа = прибыль ÷ цена без НДС; наценка = прибыль ÷ полные затраты</span><strong>{percent(result.margin)} / {percent(result.markup)}</strong>{result.expenseResults.map((expense) => <small key={expense.id}>{expense.name}: {expense.explanation} → {money(expense.effectiveCost)}</small>)}</div></details>
-            {!result.valid && <div className="notice error"><strong>Цена не рассчитана.</strong><span>{result.issues.find((issue) => issue.blocking)?.message}</span></div>}
-            {result.valid && result.status === "danger" && <div className="notice warning"><strong>Проверьте цену.</strong><span>Расчёт убыточный или находится ниже установленного порога.</span></div>}
+            {!calculationValid && <div className="notice error"><strong>Цена не рассчитана.</strong><span>{result.issues.find((issue) => issue.blocking)?.message || "Исправьте неверно заполненные числовые поля."}</span></div>}
+            {calculationValid && result.status === "danger" && <div className="notice warning"><strong>Проверьте цену.</strong><span>Расчёт убыточный или находится ниже установленного порога.</span></div>}
             {recommendation && !recommendation.valid && <div className="notice error"><strong>Рекомендация недоступна.</strong><span>{recommendation.issue?.message}</span></div>}
             {recommendation?.valid && <div className="recommendation-card"><span>Рекомендованная цена с НДС</span><strong>{money(recommendation.priceGross)}</strong><small>База: {recommendation.basisLabel}. Ближайшее сравнимое предложение: {money(recommendation.lowestCompetitor)}. {recommendation.limitedByMargin ? `Ниже опускаться рискованно: защита маржи ${percent(data.minMargin)}.` : `Шаг ниже конкурента; расчётная маржа ${percent(recommendation.margin)}.`}</small><button className="secondary" type="button" onClick={() => setData((current) => ({ ...current, mode: "price-to-margin", proposedPrice: recommendation.priceGross, priceAmountType: "with-vat" }))}>Применить рекомендацию</button></div>}
-            <div className="button-row"><button className="primary grow" disabled={!result.valid} type="button" onClick={() => void saveCalculation(false)}>Сохранить</button><button className="secondary" disabled={!result.valid} type="button" onClick={() => void saveCalculation(true)}>Дублировать</button></div>
+            <div className="button-row"><button className="primary grow" disabled={!calculationValid} type="button" onClick={() => void saveCalculation(false)}>Сохранить</button><button className="secondary" disabled={!calculationValid} type="button" onClick={() => void saveCalculation(true)}>Дублировать</button></div>
           </div>
         </div>
         <CalculatorCharts data={data} result={result} scenarios={scenarios} active={activeChart} onActive={setActiveChart} />
       </section>
     </div>
-  </div>;
+  </div></NumberValidityContext.Provider>;
 }
 
 function VatSelect({ value, onChange }: { value: VatRate; onChange: (value: VatRate) => void }) {

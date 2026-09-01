@@ -126,6 +126,11 @@ export function procurementWarnings(item: ProcurementData, now = new Date()) {
   if (item.questionDeadline && item.submissionDeadline && item.questionDeadline > item.submissionDeadline) warnings.push("Срок вопросов позже срока подачи заявки.");
   const share = item.partners.reduce((sum, partner) => sum + partner.workShare, 0);
   if (share > 100) warnings.push(`Суммарная доля партнёров ${share}% превышает 100%.`);
+  for (const scenario of item.participationScenarios) {
+    if (!Number.isFinite(scenario.vatRate) || scenario.vatRate < 0 || scenario.vatRate > 100) {
+      warnings.push(`Ставка НДС сценария «${scenario.name || "Без названия"}» должна быть от 0 до 100%.`);
+    }
+  }
   const due = item.submissionDeadline ? new Date(`${item.submissionDeadline}T23:59:59`) : null;
   if (due && due < now && !["Подана", "Победа", "Проигрыш", "Отменена"].includes(item.status)) warnings.push("Срок подачи истёк, но закупка не отмечена как поданная или завершённая.");
   return warnings;

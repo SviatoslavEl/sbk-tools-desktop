@@ -349,6 +349,7 @@ function App() {
               <button
                 key={tool.id}
                 aria-label={tool.label}
+                aria-current={activeTool === tool.id ? "page" : undefined}
                 title={tool.label}
                 className={activeTool === tool.id ? "active" : ""}
                 onClick={() => selectTool(tool.id)}
@@ -364,6 +365,7 @@ function App() {
           <nav className="settings-nav">
             <button
               aria-label="Архив"
+              aria-current={activeTool === "archive" ? "page" : undefined}
               title="Архив"
               className={activeTool === "archive" ? "active" : ""}
               onClick={() => selectTool("archive")}
@@ -376,6 +378,7 @@ function App() {
             </button>
             <button
               aria-label="Настройки"
+              aria-current={activeTool === "settings" ? "page" : undefined}
               title="Настройки"
               className={activeTool === "settings" ? "active" : ""}
               onClick={() => selectTool("settings")}
@@ -388,6 +391,7 @@ function App() {
             </button>
             <button
               aria-label="О программе"
+              aria-current={activeTool === "about" ? "page" : undefined}
               title="О программе"
               className={activeTool === "about" ? "active" : ""}
               onClick={() => selectTool("about")}
@@ -414,7 +418,12 @@ function App() {
             <button
               className="help-button"
               type="button"
-              onClick={() => setShowHelp(true)}
+              aria-label={`Открыть справку: ${title}`}
+              title="Открыть справку"
+              onClick={(event) => {
+                event.currentTarget.focus();
+                setShowHelp(true);
+              }}
             >
               ?
             </button>

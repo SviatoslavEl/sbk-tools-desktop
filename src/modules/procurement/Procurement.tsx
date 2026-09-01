@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 import { ConfirmDialog } from "../../components/Dialog";
 import { useRecords } from "../../hooks/useRecords";
+import { useUnsavedChanges } from "../../hooks/useUnsavedChanges";
 import { chooseSavePath, exportText } from "../../lib/files";
 import { writeTextFile, writeXlsx, type StoredRecord } from "../../lib/storage";
 import { useWorkspaceAccess } from "../../lib/workspaceAccess";
@@ -308,6 +309,7 @@ function ProcurementEditor({
         )
       : emptyProcurement(),
   );
+  const [savedSnapshot, setSavedSnapshot] = useState(() => JSON.stringify(item));
   const [tab, setTab] = useState<Tab>("main");
   const [error, setError] = useState("");
   const [cost, setCost] = useState(
@@ -317,6 +319,7 @@ function ProcurementEditor({
   const [reduction, setReduction] = useState(1);
   const [rebidPreset, setRebidPreset] = useState<RebidPreset>("comfort");
   const warnings = procurementWarnings(item);
+  const { requestClose, confirmation: discardConfirmation } = useUnsavedChanges(JSON.stringify(item) !== savedSnapshot, onClose);
   const compliance = complianceSummary(item.requirements);
   const steps = useMemo(() => {
     try {
@@ -338,6 +341,7 @@ function ProcurementEditor({
         warning.startsWith("Не заполнены") ||
         warning.startsWith("НМЦ") ||
         warning.startsWith("Срок вопросов") ||
+        warning.startsWith("Ставка НДС") ||
         warning.includes("превышает 100"),
     );
     if (blocking.length) {
@@ -345,6 +349,7 @@ function ProcurementEditor({
       return;
     }
     await onSave(item, record?.id);
+    setSavedSnapshot(JSON.stringify(item));
     setError("");
   };
   const addLink = (
@@ -463,7 +468,7 @@ function ProcurementEditor({
     ["stage2", "Полный контур"],
     ["documents", "Документы"],
   ];
-  return (
+  return (<>
     <aside
       className="detail-drawer procurement-drawer"
       role="dialog"
@@ -474,7 +479,7 @@ function ProcurementEditor({
           <h2>{record ? item.name : "Новая закупка"}</h2>
           <p>Локальная карточка подготовки заявки</p>
         </div>
-        <button className="icon-button" type="button" onClick={onClose}>
+        <button className="icon-button" type="button" aria-label="Закрыть карточку закупки" title="Закрыть" onClick={requestClose}>
           ×
         </button>
       </header>
@@ -947,6 +952,7 @@ function ProcurementEditor({
                 <button
                   className="icon-button danger"
                   type="button"
+                  aria-label={`Удалить пункт чек-листа ${row.text || "без названия"}`}
                   onClick={() => remove("checklist", row.id)}
                 >
                   ×
@@ -1122,6 +1128,7 @@ function ProcurementEditor({
                 <button
                   className="icon-button danger"
                   type="button"
+                  aria-label={`Удалить ценовой раунд с ценой ${round.ourPrice}`}
                   onClick={() => remove("priceHistory", round.id)}
                 >
                   ×
@@ -1261,7 +1268,7 @@ function ProcurementEditor({
           {item.checklist.filter((row) => row.done).length} из{" "}
           {item.checklist.length}
         </span>
-        <button className="secondary" type="button" onClick={onClose}>
+        <button className="secondary" type="button" onClick={requestClose}>
           Закрыть
         </button>
         <button className="primary" type="button" onClick={() => void save()}>
@@ -1269,6 +1276,8 @@ function ProcurementEditor({
         </button>
       </footer>
     </aside>
+    {discardConfirmation}
+  </>
   );
 }
 
