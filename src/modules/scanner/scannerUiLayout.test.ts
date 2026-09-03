@@ -26,15 +26,18 @@ describe("предпросмотр сканера", () => {
     expect(capability).toContain('"path": "$TEMP/**"');
   });
 
-  it("удерживает параметры инструментов внутри узкой панели настроек", () => {
+  it("показывает инструменты и эффекты рядом с документом", () => {
     const component = readFileSync(new URL("./Scanner.tsx", import.meta.url), "utf8");
     const scannerStyles = readFileSync(new URL("./scanner.css", import.meta.url), "utf8");
     const appStyles = readFileSync(new URL("../../App.css", import.meta.url), "utf8");
 
-    expect(component.match(/className="geometry-control-card"/g)).toHaveLength(2);
-    expect(component).toContain("Интенсивность / прозрачность");
-    expect(component).toContain("Сила размытия");
+    expect(component.match(/className="geometry-control-card"/g)).toHaveLength(1);
+    expect(component).toContain("scanner-document-tools");
+    expect(component).toContain("DrawingToolIcon");
+    expect(component).toContain("Добавленные эффекты");
+    expect(component).toContain("Прозрачность / сила");
     expect(component).toContain("updateAnnotationIntensity");
+    expect(component).not.toContain("Безвозвратное скрытие");
     expect(component).not.toContain("Точные координаты");
     expect(component).not.toContain("updateAnnotationRect");
     expect(component).not.toContain("updateRedactionRect");
@@ -42,6 +45,8 @@ describe("предпросмотр сканера", () => {
     expect(component).toContain('const ellipse = drawingTool === "print_blur"');
     expect(component).not.toContain('drawingTool === "blur" || drawingTool === "print_blur"');
     expect(scannerStyles).toContain(".surface.scanner-controls { position: relative; z-index: 8; min-width: 0; max-width: 100%");
+    expect(scannerStyles).toContain(".scanner-document-tools");
+    expect(scannerStyles).toContain(".applied-effects-panel");
     expect(scannerStyles).toContain("grid-template-columns: repeat(2, minmax(0, 1fr))");
     expect(appStyles).toContain(".preset-grid { display: grid; min-width: 0; grid-template-columns: repeat(2, minmax(0, 1fr))");
     expect(scannerStyles).not.toContain("repeat(5, minmax(58px, .7fr))");
@@ -50,6 +55,8 @@ describe("предпросмотр сканера", () => {
     expect(component).toContain("Добавить блок");
     expect(component).toContain("Сохранить блоки PDF");
     expect(scannerStyles).toContain(".split-block-row { display: grid; min-width: 0;");
+    expect(component).toContain("Порядок листов");
+    expect(component).toContain("mergePageOrder");
   });
 
   it("совпадает по непрозрачности и толщине штриха с итоговым PDF", () => {

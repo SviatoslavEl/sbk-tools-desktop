@@ -56,6 +56,8 @@ const WORKSPACE_DIRS: [&str; 13] = [
 
 pub(crate) struct Workspace {
     pub(crate) root: PathBuf,
+    runtime_root: PathBuf,
+    runtime_guard: Option<File>,
     pub(crate) portable: bool,
     pub(crate) configured: bool,
     pub(crate) warning: Option<String>,
@@ -147,13 +149,56 @@ fn read_editor_presence(root: &Path) -> Option<EditorOwner> {
 
 impl Drop for Workspace {
     fn drop(&mut self) {
-        if !self.is_editor() {
-            return;
-        }
-        let runtime = self.root.join("runtime-cache");
-        let _ = fs::remove_dir_all(&runtime);
-        let _ = fs::create_dir_all(runtime);
+        // Each process owns only its own temporary directory. Closing one
+        // application instance must never remove previews or worker configs
+        // used by another concurrently running version.
+        self.runtime_guard.take();
+        let _ = fs::remove_dir_all(&self.runtime_root);
     }
+}
+
+fn create_runtime_root(root: &Path, workspace_writable: bool) -> Result<(PathBuf, File), String> {
+    // A viewer must also be able to render/convert documents when the shared
+    // workspace is mounted read-only. Keep its ephemeral files in the system
+    // temp directory instead of turning a valid read-only workspace into a
+    // startup error.
+    let base = if workspace_writable {
+        root.join("runtime-cache")
+    } else {
+        std::env::temp_dir().join("SBKTools").join("runtime-cache")
+    };
+    fs::create_dir_all(&base)
+        .map_err(|error| format!("Не удалось подготовить временные данные: {error}"))?;
+    if let Ok(entries) = fs::read_dir(&base) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() || !entry.file_name().to_string_lossy().starts_with("instance-") {
+                continue;
+            }
+            let lock_path = path.join(".instance.lock");
+            let Ok(lock) = OpenOptions::new().read(true).write(true).open(lock_path) else {
+                continue;
+            };
+            if lock.try_lock_exclusive().is_ok() {
+                let _ = FileExt::unlock(&lock);
+                drop(lock);
+                let _ = fs::remove_dir_all(path);
+            }
+        }
+    }
+    let runtime_root = base.join(format!("instance-{}", uuid::Uuid::new_v4()));
+    fs::create_dir(&runtime_root)
+        .map_err(|error| format!("Не удалось создать временную область процесса: {error}"))?;
+    let guard = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(runtime_root.join(".instance.lock"))
+        .map_err(|error| format!("Не удалось создать блокировку временной области: {error}"))?;
+    guard
+        .try_lock_exclusive()
+        .map_err(|error| format!("Не удалось заблокировать временную область: {error}"))?;
+    Ok((runtime_root, guard))
 }
 
 pub(crate) fn workspace_pointer_path() -> Result<PathBuf, String> {
@@ -265,6 +310,18 @@ fn lock_token_file(
     Ok(file)
 }
 
+fn verify_locked_token(file: &mut File, token: &str) -> Result<(), String> {
+    let mut stored = String::new();
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| error.to_string())?;
+    file.read_to_string(&mut stored)
+        .map_err(|error| error.to_string())?;
+    if stored != token {
+        return Err("Токен блокировки общей папки изменился".to_string());
+    }
+    Ok(())
+}
+
 fn acquire_editor_lease(root: &Path, writable: bool) -> EditorLease {
     let token = uuid::Uuid::new_v4().to_string();
     if !writable {
@@ -338,9 +395,7 @@ fn verify_access_password(root: &Path, password: &str) -> Result<(), String> {
 }
 
 fn write_access_control(root: &Path, password: &str) -> Result<(), String> {
-    if password.chars().count() < 6 {
-        return Err("Пароль должен содержать не менее 6 символов".to_string());
-    }
+    validate_new_access_password(password)?;
     let mut salt = [0u8; 16];
     getrandom::fill(&mut salt).map_err(|error| format!("Не удалось создать пароль: {error}"))?;
     let mut password_hash = [0u8; 32];
@@ -379,6 +434,23 @@ fn write_access_control(root: &Path, password: &str) -> Result<(), String> {
         let _ = fs::remove_file(&temporary);
         format!("Не удалось включить парольный доступ: {error}")
     })?;
+    Ok(())
+}
+
+fn validate_new_access_password(password: &str) -> Result<(), String> {
+    let length = password.chars().count();
+    if length < 6 {
+        return Err("Пароль должен содержать не менее 6 символов. Допустимы русские и латинские буквы, цифры, пробелы и специальные символы".to_string());
+    }
+    if length > 128 {
+        return Err("Пароль должен содержать не более 128 символов".to_string());
+    }
+    if password.trim() != password {
+        return Err("Пробелы в начале и конце пароля недопустимы".to_string());
+    }
+    if password.chars().any(char::is_control) {
+        return Err("Управляющие символы в пароле недопустимы".to_string());
+    }
     Ok(())
 }
 
@@ -441,13 +513,9 @@ pub(crate) fn open_workspace() -> Result<Workspace, String> {
     let access_controlled = read_access_control(&root)?.is_some();
     let editor_lease = acquire_editor_lease(&root, writable && !access_controlled);
     let editor = editor_lease.active;
+    let (runtime_root, runtime_guard) = create_runtime_root(&root, writable)?;
     if editor {
         cleanup_stale_partial_backups(&root);
-        let runtime = root.join("runtime-cache");
-        fs::remove_dir_all(&runtime)
-            .map_err(|error| format!("Не удалось очистить временные данные: {error}"))?;
-        fs::create_dir_all(&runtime)
-            .map_err(|error| format!("Не удалось подготовить временные данные: {error}"))?;
         let attachment_staging = root.join("attachment-staging");
         fs::remove_dir_all(&attachment_staging)
             .map_err(|error| format!("Не удалось очистить временные вложения: {error}"))?;
@@ -456,6 +524,8 @@ pub(crate) fn open_workspace() -> Result<Workspace, String> {
     }
     Ok(Workspace {
         root,
+        runtime_root,
+        runtime_guard: Some(runtime_guard),
         portable,
         configured,
         warning,
@@ -481,6 +551,10 @@ fn cleanup_stale_partial_backups(root: &Path) {
 }
 
 impl Workspace {
+    pub(crate) fn runtime_root(&self) -> &Path {
+        &self.runtime_root
+    }
+
     pub(crate) fn access_controlled(&self) -> bool {
         self.access_controlled.load(Ordering::SeqCst)
     }
@@ -587,23 +661,23 @@ impl Workspace {
         if !lease.active {
             return Err("Общая база открыта только для просмотра. Для изменения нужны права записи на папку и свободная блокировка редактора.".to_string());
         }
-        let result = (|| {
-            lease.edit.take();
-            lease.edit = Some(lock_token_file(
-                &self.root.join(".workspace.edit.lock"),
-                &lease.token,
-                false,
-                false,
-            )?);
-            lease.guard.take();
-            lease.guard = Some(lock_token_file(
-                &self.root.join(".workspace.edit.guard"),
-                &lease.token,
-                false,
-                false,
-            )?);
-            Ok(())
-        })();
+        // Verify the ownership markers through the already locked handles.
+        // Reopening them here used to release both exclusive locks for a brief
+        // interval, so a second process could become editor while a save was
+        // starting.
+        let token = lease.token.clone();
+        let result = lease
+            .edit
+            .as_mut()
+            .ok_or_else(|| "Основная блокировка отсутствует".to_string())
+            .and_then(|file| verify_locked_token(file, &token))
+            .and_then(|_| {
+                lease
+                    .guard
+                    .as_mut()
+                    .ok_or_else(|| "Страхующая блокировка отсутствует".to_string())
+                    .and_then(|file| verify_locked_token(file, &token))
+            });
         if result.is_err() {
             *lease = EditorLease {
                 active: false,
@@ -623,9 +697,14 @@ impl Workspace {
 
     #[cfg(test)]
     pub(crate) fn for_test(root: PathBuf, editor: bool) -> Self {
+        fs::create_dir_all(&root).expect("test workspace root");
         let lease = acquire_editor_lease(&root, editor);
+        let (runtime_root, runtime_guard) =
+            create_runtime_root(&root, true).expect("test runtime root");
         Self {
             root,
+            runtime_root,
+            runtime_guard: Some(runtime_guard),
             portable: false,
             configured: true,
             warning: None,
@@ -742,6 +821,41 @@ mod tests {
         workspace
             .release_editor_with_password("new-correct-horse")
             .expect("new password releases editor");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn password_policy_rejects_short_long_and_padded_values() {
+        assert!(validate_new_access_password("123").is_err());
+        assert!(validate_new_access_password(&"a".repeat(129)).is_err());
+        assert!(validate_new_access_password(" пароль").is_err());
+        assert!(validate_new_access_password("Пароль-42!").is_ok());
+    }
+
+    #[test]
+    fn runtime_directories_are_isolated_between_instances() {
+        let root = std::env::temp_dir().join(format!("sbk-runtime-isolation-{}", Uuid::new_v4()));
+        ensure_workspace(&root).expect("workspace");
+        let first = Workspace::for_test(root.clone(), true);
+        let second = Workspace::for_test(root.clone(), false);
+        assert_ne!(first.runtime_root(), second.runtime_root());
+        let second_marker = second.runtime_root().join("active-preview");
+        fs::write(&second_marker, b"ok").expect("marker");
+        drop(first);
+        assert!(second_marker.is_file());
+        drop(second);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn read_only_viewer_uses_system_temp_for_runtime_files() {
+        let root = std::env::temp_dir().join(format!("sbk-readonly-runtime-{}", Uuid::new_v4()));
+        ensure_workspace(&root).expect("workspace");
+        let (runtime, guard) = create_runtime_root(&root, false).expect("viewer runtime root");
+        assert!(!runtime.starts_with(&root));
+        assert!(runtime.join(".instance.lock").is_file());
+        drop(guard);
+        let _ = fs::remove_dir_all(runtime);
         let _ = fs::remove_dir_all(root);
     }
 

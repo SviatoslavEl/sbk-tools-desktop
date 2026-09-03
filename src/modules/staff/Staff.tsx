@@ -16,6 +16,7 @@ import {
 } from "../../lib/importReview";
 import { chooseOpenPath, chooseSavePath, exportText } from "../../lib/files";
 import { compareSortValues, toggleSort, type SortDirection } from "../../lib/tableSort";
+import { staffBasisTone } from "../../lib/statusTone";
 import {
   copyAttachment,
   createBackup,
@@ -948,7 +949,7 @@ export function StaffRegistry() {
                       </td>
                       <td>{assignment.position || item.role}</td>
                       <td>
-                        <span className="status neutral">
+                        <span className={`status ${staffBasisTone(assignment.engagementType)}`}>
                           {assignment.engagementType}
                           {assignment.engagementType === "Иное" &&
                           assignment.engagementOther

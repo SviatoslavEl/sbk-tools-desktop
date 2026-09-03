@@ -39,7 +39,12 @@ export interface ContractData {
   paymentActualDate: string;
   nextImportantDate: string;
   responsible: string;
+  /** Legacy free-form contact kept for backwards-compatible imports and records. */
   contact: string;
+  contactName?: string;
+  contactPosition?: string;
+  contactPhone?: string;
+  contactEmail?: string;
   reviewAvailable: boolean;
   disclosureAllowed: boolean;
   discloseCustomer: boolean;
@@ -74,6 +79,14 @@ export const emptyContract = (): ContractData => ({
   paymentActualDate: "",
   nextImportantDate: "",
   responsible: "",
-  contact: "", reviewAvailable: false, disclosureAllowed: false, discloseCustomer: false, discloseNumber: false, discloseSubject: false, discloseAmount: false, documents: [],
+  contact: "", contactName: "", contactPosition: "", contactPhone: "", contactEmail: "", reviewAvailable: false, disclosureAllowed: false, discloseCustomer: false, discloseNumber: false, discloseSubject: false, discloseAmount: false, documents: [],
   notes: "",
 });
+
+export function contractContactSummary(item: Partial<Pick<ContractData, "contact" | "contactName" | "contactPosition" | "contactPhone" | "contactEmail">>): string {
+  const structured = [item.contactName, item.contactPosition, item.contactPhone, item.contactEmail]
+    .map((value) => value?.trim() || "")
+    .filter(Boolean)
+    .join(" · ");
+  return structured || item.contact?.trim() || "";
+}

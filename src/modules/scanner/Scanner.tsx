@@ -59,6 +59,7 @@ interface FacsimileState extends EditableFacsimile {
 interface ScannerRecord { kind: "facsimile-template" | "processing-journal"; relativePath?: string; fileName?: string; inputType?: string; pageCount?: number; preset?: string; ocr?: boolean; status?: string; durationMs?: number; outputSha256?: string; appliedOperations?: string[]; }
 interface RedactionState { id: string; page: number; x: number; y: number; width: number; height: number; color: "black" | "white"; }
 interface AnnotationState { id: string; kind: "marker" | "stroke" | "blur" | "print_blur"; page: number; x: number; y: number; width: number; height: number; color: string; intensity: number; shape: "rectangle" | "ellipse"; }
+interface MergePageItem { id: string; path: string; pageIndex: number; }
 
 type OverlaySelection = { kind: "redaction" | "annotation"; id: string } | null;
 type DrawingTool = "redaction" | AnnotationState["kind"];
@@ -80,6 +81,20 @@ interface PreviewResult {
   originalBytes: number;
   estimatedSavingsPercent: number;
   pageSizePoints?: [number, number];
+}
+
+const drawingToolLabels: Record<AnnotationState["kind"], string> = {
+  marker: "Маркер",
+  stroke: "Штрих",
+  blur: "Размытие",
+  print_blur: "Размытие для печати",
+};
+
+function DrawingToolIcon({ kind }: { kind: AnnotationState["kind"] }) {
+  if (kind === "marker") return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 15 15 5l4 4L9 19H5v-4Z" /><path d="M4 21h16" /></svg>;
+  if (kind === "stroke") return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m4 18 16-12" /><path d="M5 20h14" /></svg>;
+  if (kind === "blur") return <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="6" width="16" height="12" rx="2" /><path d="M7 9h10M7 12h10M7 15h10" /></svg>;
+  return <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="7" /><path d="M8 9h8M7 12h10M8 15h8" /></svg>;
 }
 
 const initialFacsimile = (path: string, url: string, fileName: string, width = 0.22): FacsimileState => ({
@@ -117,6 +132,8 @@ export function Scanner() {
   const [fullscreen, setFullscreen] = useState(false);
   const [batchPaths, setBatchPaths] = useState<string[]>([]);
   const [mergePaths, setMergePaths] = useState<string[]>([]);
+  const [mergePageOrder, setMergePageOrder] = useState<MergePageItem[]>([]);
+  const [mergeInspecting, setMergeInspecting] = useState(false);
   const [previewAspect, setPreviewAspect] = useState(0.707);
   const [previewZoom, setPreviewZoom] = useState(1);
   const [previewing, setPreviewing] = useState(false);
@@ -293,20 +310,44 @@ export function Scanner() {
   };
   const chooseMerge = async () => {
     const paths = await chooseOpenPaths("Выберите документы в порядке объединения", ["pdf", "docx"]);
-    if (paths.length) {
-      setMergePaths((current) => [...current, ...paths.filter((path) => !current.includes(path))]);
-      setError(""); setResultPath(""); setResultKind("");
+    const newPaths = paths.filter((path) => !mergePaths.includes(path));
+    if (!newPaths.length) return;
+    setMergeInspecting(true); setError(""); setResultPath(""); setResultKind("");
+    const inspected: MergePageItem[] = [];
+    try {
+      for (const [fileIndex, path] of newPaths.entries()) {
+        const jobId = crypto.randomUUID();
+        setActiveJob(jobId); activeJobRef.current = jobId;
+        setProgress({ stage: `Определяем страницы: ${path.split(/[\\/]/).pop()}`, currentPage: fileIndex + 1, totalPages: newPaths.length, percent: Math.round(fileIndex / newPaths.length * 100) });
+        const response = await invoke<{ outputPath: string; originalPath?: string; pageCount: number }>("scanner_run", {
+          jobId, operation: "preview", config: { protocolVersion: 2, inputPath: path, preset: "Оригинал", pageIndex: 0, seed: 42, settings: { dpi: 96, jpeg_quality: 50 }, pageRotations: {}, redactions: [], annotations: [] },
+        });
+        void invoke("delete_runtime_file", { path: response.outputPath }).catch(() => undefined);
+        if (response.originalPath) void invoke("delete_runtime_file", { path: response.originalPath }).catch(() => undefined);
+        if (!Number.isInteger(response.pageCount) || response.pageCount < 1) throw new Error(`Не удалось определить страницы файла ${path.split(/[\\/]/).pop()}.`);
+        for (let page = 0; page < response.pageCount; page += 1) inspected.push({ id: crypto.randomUUID(), path, pageIndex: page });
+      }
+      setMergePaths((current) => [...current, ...newPaths]);
+      setMergePageOrder((current) => [...current, ...inspected]);
+      setProgress({ stage: "Страницы готовы к объединению", currentPage: inspected.length, totalPages: inspected.length, percent: 100 });
+    } catch (reason) {
+      setError(`Не удалось добавить документы к объединению: ${String(reason)}`);
+      setProgress(null);
+    } finally {
+      setActiveJob(""); activeJobRef.current = ""; setMergeInspecting(false);
     }
   };
-  const moveMergePath = (index: number, offset: number) => {
-    setMergePaths((current) => {
-      const target = index + offset;
-      if (target < 0 || target >= current.length) return current;
-      const next = [...current];
-      [next[index], next[target]] = [next[target], next[index]];
-      return next;
-    });
+  const removeMergePath = (path: string) => {
+    setMergePaths((current) => current.filter((entry) => entry !== path));
+    setMergePageOrder((current) => current.filter((entry) => entry.path !== path));
   };
+  const moveMergePage = (index: number, target: number) => setMergePageOrder((current) => {
+    if (target < 0 || target >= current.length || index === target) return current;
+    const next = [...current];
+    const [entry] = next.splice(index, 1);
+    next.splice(target, 0, entry);
+    return next;
+  });
 
   const processBatch = async () => {
     if (!batchPaths.length) return;
@@ -325,7 +366,7 @@ export function Scanner() {
   };
 
   const processMerge = async () => {
-    if (mergePaths.length < 2) return;
+    if (mergePaths.length < 2 || !mergePageOrder.length) return;
     const outputPath = await chooseSavePath("Сохранить объединённый PDF", "объединённый-документ.pdf", ["pdf"]);
     if (!outputPath) return;
     const jobId = crypto.randomUUID();
@@ -348,6 +389,7 @@ export function Scanner() {
           seed: 42,
           settings: { dpi, jpeg_quality: quality },
           compressionTargetRatio,
+          mergePageOrder: mergePageOrder.map((entry) => ({ sourceIndex: mergePaths.indexOf(entry.path), pageIndex: entry.pageIndex })),
         },
       });
       setWarnings(response.warnings || []);
@@ -356,11 +398,11 @@ export function Scanner() {
       setEstimatedSavingsPercent(response.savingsPercent || 0);
       setResultPath(response.outputPath);
       setResultKind("single");
-      setProgress({ stage: "Документы объединены", currentPage: mergePaths.length, totalPages: mergePaths.length, percent: 100 });
+      setProgress({ stage: "Документы объединены", currentPage: mergePageOrder.length, totalPages: mergePageOrder.length, percent: 100 });
       if (workspaceAccess.editor) await templates.save(`Объединение ${new Date().toLocaleString("ru-RU")}`, {
         kind: "processing-journal", inputType: "MERGE", pageCount: response.pageCount,
         preset, ocr: ocrEnabled, status: "completed", durationMs: Date.now() - startedAt,
-        outputSha256: response.outputSha256, appliedOperations: [`Файлов: ${mergePaths.length}`, `Пресет: ${preset}`],
+        outputSha256: response.outputSha256, appliedOperations: [`Файлов: ${mergePaths.length}`, `Страниц: ${mergePageOrder.length}`, `Пресет: ${preset}`],
       }).catch(() => undefined);
     } catch (reason) {
       setError(String(reason)); setProgress(null);
@@ -708,8 +750,18 @@ export function Scanner() {
   return <div className="scanner-layout">
     <section className="surface scanner-controls"><div className="surface-title"><h2>Настройки</h2></div><div className="surface-body scanner-control-stack">
       <button className="primary full-width" type="button" onClick={() => void chooseDocument()}>{inputPath ? "Заменить файл" : "Выбрать PDF или DOCX"}</button>
-      <button className="secondary full-width" type="button" onClick={() => void chooseMerge()}>{mergePaths.length ? "Добавить файлы к объединению" : "Объединить файлы в один PDF"}</button>
-      {mergePaths.length > 0 && <div className="merge-file-list"><div className="inline-heading"><strong>Порядок объединения</strong><button className="link-button danger" type="button" onClick={() => setMergePaths([])}>Очистить</button></div>{mergePaths.map((path, index) => <div className="merge-file-row" key={`${path}-${index}`}><span><strong>{index + 1}.</strong> {path.split(/[\\/]/).pop()}</span><div className="button-row"><button className="icon-button" type="button" aria-label={`Переместить файл ${index + 1} выше`} disabled={index === 0} onClick={() => moveMergePath(index, -1)}>↑</button><button className="icon-button" type="button" aria-label={`Переместить файл ${index + 1} ниже`} disabled={index === mergePaths.length - 1} onClick={() => moveMergePath(index, 1)}>↓</button><button className="icon-button danger" type="button" aria-label={`Удалить файл ${index + 1} из объединения`} onClick={() => setMergePaths((current) => current.filter((_, itemIndex) => itemIndex !== index))}>×</button></div></div>)}<button className="primary full-width" type="button" disabled={mergePaths.length < 2 || !!activeJob} onClick={() => void processMerge()}>Объединить {mergePaths.length} файла(ов)</button><small>К каждому документу применяется выбранный пресет, OCR и настройки сжатия.</small></div>}
+      <button className="secondary full-width" type="button" disabled={mergeInspecting || !!activeJob} onClick={() => void chooseMerge()}>{mergePaths.length ? "Добавить файлы к объединению" : "Объединить файлы в один PDF"}</button>
+      {mergePaths.length > 0 && <div className="merge-file-list">
+        <div className="inline-heading"><strong>Файлы объединения</strong><button className="link-button danger" type="button" onClick={() => { setMergePaths([]); setMergePageOrder([]); }}>Очистить</button></div>
+        {mergePaths.map((path, index) => <div className="merge-file-row" key={path}><span><strong>{index + 1}.</strong> {path.split(/[\\/]/).pop()} · {mergePageOrder.filter((page) => page.path === path).length} стр.</span><button className="icon-button danger" type="button" aria-label={`Удалить файл ${index + 1} из объединения`} onClick={() => removeMergePath(path)}>×</button></div>)}
+        <details className="merge-page-editor" open>
+          <summary>Порядок листов · {mergePageOrder.length}</summary>
+          <p>Перемещайте отдельные листы вверх и вниз — страницы разных файлов можно свободно смешивать.</p>
+          <div className="merge-page-list">{mergePageOrder.map((page, index) => <div className="merge-page-row" key={page.id}><span><strong>{index + 1}.</strong> {page.path.split(/[\\/]/).pop()} · стр. {page.pageIndex + 1}</span><div className="button-row"><button className="icon-button small" type="button" aria-label={`Переместить лист ${index + 1} в начало`} disabled={index === 0} onClick={() => moveMergePage(index, 0)}>⇈</button><button className="icon-button small" type="button" aria-label={`Переместить лист ${index + 1} выше`} disabled={index === 0} onClick={() => moveMergePage(index, index - 1)}>↑</button><button className="icon-button small" type="button" aria-label={`Переместить лист ${index + 1} ниже`} disabled={index === mergePageOrder.length - 1} onClick={() => moveMergePage(index, index + 1)}>↓</button><button className="icon-button small" type="button" aria-label={`Переместить лист ${index + 1} в конец`} disabled={index === mergePageOrder.length - 1} onClick={() => moveMergePage(index, mergePageOrder.length - 1)}>⇊</button></div></div>)}</div>
+        </details>
+        <button className="primary full-width" type="button" disabled={mergePaths.length < 2 || !mergePageOrder.length || !!activeJob || mergeInspecting} onClick={() => void processMerge()}>Объединить {mergePageOrder.length} стр. из {mergePaths.length} файлов</button>
+        <small>К каждому документу применяется выбранный пресет, OCR и настройки сжатия.</small>
+      </div>}
       <button className="secondary full-width" type="button" onClick={() => void chooseBatch()}>Пакетная обработка</button>{batchPaths.length > 0 && <div className="notice success"><span>Выбрано файлов: {batchPaths.length}</span><button className="primary small" type="button" onClick={() => void processBatch()}>Обработать пакет в папку</button></div>}{documentName && <p className="selected-file">▧ {documentName}</p>}
       <div><h3>Пресет</h3><div className="preset-grid">{presets.map(([name, description]) => <button key={name} className={preset === name ? "selected" : ""} type="button" onClick={() => { setPreset(name); void makePreview(inputPath, name, pageIndex); }}><strong>{name}</strong><small>{description}</small></button>)}</div></div>
       <div className="control-divider" />
@@ -744,21 +796,10 @@ export function Scanner() {
       <div className="compression-controls"><h3>Сжатие PDF</h3><label>Режим<select value={compressionMode} onChange={(event) => { const mode = event.target.value as CompressionMode; const profile = compressionProfile(mode); setCompressionMode(mode); if (profile.dpi) setDpi(profile.dpi); if (profile.quality) setQuality(profile.quality); }}><option value="none">Без целевого ограничения</option><option value="balanced">Бережное · цель около 70%</option><option value="strong">Сильное · цель около 50%</option><option value="maximum">Экстремальное · цель около 12%</option></select></label><p className="help-text">Оценка считается один раз по всему файлу и не меняется при переходе между страницами. Экстремальный режим использует 96 dpi и сильное JPEG-сжатие; мелкий текст следует проверить.</p></div>
       <details><summary>Точная настройка</summary><label>Разрешение<select value={dpi} onChange={(event) => setDpi(Number(event.target.value))}><option value="96">96 dpi</option><option value="120">120 dpi</option><option value="150">150 dpi</option><option value="200">200 dpi</option><option value="300">300 dpi</option></select></label><label>Качество PDF<input type="range" min="32" max="100" value={quality} onChange={(event) => setQuality(Number(event.target.value))} /> {quality}%</label><button className="secondary small" type="button" onClick={() => { setDpi(200); setQuality(84); }}>Вернуть значения пресета</button></details>
       <details><summary>Журнал обработки · {journal.length}</summary>{journal.length === 0 ? <p className="help-text">Записей пока нет.</p> : <div className="journal-list">{journal.map((record) => <div key={record.id}><strong>{record.payload.status === "completed" ? "✓" : "!"} {record.title}</strong><span>{record.payload.inputType} · {record.payload.pageCount || 0} стр. · {record.payload.durationMs ? `${(record.payload.durationMs / 1000).toFixed(1)} с` : "—"}</span>{record.payload.appliedOperations?.length ? <small>{record.payload.appliedOperations.join(" · ")}</small> : null}{record.payload.outputSha256 ? <small title={record.payload.outputSha256}>SHA-256: {record.payload.outputSha256.slice(0, 16)}…</small> : null}</div>)}</div>}</details>
-      <div className="control-divider" />
-      <div>
-        <div className="inline-heading"><h3>Безвозвратное скрытие</h3><button className={`secondary small ${drawingTool === "redaction" ? "selected-tool" : ""}`} type="button" aria-pressed={drawingTool === "redaction"} disabled={!inputPath} onClick={() => setDrawingTool((current) => current === "redaction" ? null : "redaction")}>Нарисовать область</button></div>
-        <p className="help-text">Выберите инструмент и протяните область на документе. Заливка применяется до OCR.</p>
-        {redactions.map((entry) => <div className="geometry-control-card" key={entry.id}><div className="geometry-card-header"><strong>Стр. {entry.page + 1} · Скрытие</strong><button className="icon-button danger" type="button" aria-label="Удалить область скрытия" onClick={() => { setRedactions((items) => items.filter((item) => item.id !== entry.id)); setSelectedOverlay(null); }}>×</button></div><label className="geometry-inline-select"><span>Цвет</span><select aria-label="Цвет скрытия" value={entry.color} onChange={(event) => setRedactions((items) => items.map((item) => item.id === entry.id ? { ...item, color: event.target.value as RedactionState["color"] } : item))}><option value="black">Чёрный</option><option value="white">Белый</option></select></label></div>)}
-      </div>
-      <div className="control-divider" />
-      <div>
-        <div className="inline-heading"><h3>Инструменты страницы</h3></div>
-        <div className="annotation-buttons">{(["marker", "stroke", "blur", "print_blur"] as const).map((kind) => <button key={kind} className={`secondary small ${drawingTool === kind ? "selected-tool" : ""}`} type="button" aria-pressed={drawingTool === kind} disabled={!inputPath} onClick={() => setDrawingTool((current) => current === kind ? null : kind)}>{{ marker: "Маркер", stroke: "Штрих", blur: "Размытие", print_blur: "Размытие для печати" }[kind]}</button>)}</div>
-        <p className="help-text">Выберите инструмент и протяните его по документу. Обычное размытие создаётся прямоугольником, размытие для печати — кругом. Область перемещается и растягивается прямо на странице.</p>
-        {annotations.map((entry) => <div className="geometry-control-card" key={entry.id}><div className="geometry-card-header"><strong>Стр. {entry.page + 1} · {{ marker: "Маркер", stroke: "Штрих", blur: "Размытие", print_blur: "Для печати" }[entry.kind]}</strong><button className="icon-button danger" type="button" aria-label="Удалить инструмент" onClick={() => { setAnnotations((items) => items.filter((item) => item.id !== entry.id)); setSelectedOverlay(null); }}>×</button></div><label className="geometry-intensity"><span>{entry.kind === "blur" || entry.kind === "print_blur" ? "Сила размытия" : "Интенсивность / прозрачность"}</span><span><input aria-label={`Интенсивность инструмента на странице ${entry.page + 1}`} type="range" min="5" max="100" value={Math.round(entry.intensity * 100)} onChange={(event) => updateAnnotationIntensity(entry.id, event.target.valueAsNumber)} /><output>{Math.round(entry.intensity * 100)}%</output></span></label></div>)}
-      </div>
     </div></section>
     <section className={`surface preview-panel ${fullscreen ? "fullscreen-preview" : ""}`}><div className="surface-title"><h2>Предпросмотр</h2><div className="button-row">{originalUrl && <button className="secondary small" type="button" onClick={() => setShowOriginal((value) => !value)}>{showOriginal ? "Показать обработку" : "Показать оригинал"}</button>}<button className="secondary small" type="button" disabled={previewZoom <= .5} aria-label="Уменьшить масштаб" onClick={() => setPreviewZoom((value) => Math.max(.5, Number((value - .25).toFixed(2))))}>−</button><button className="secondary small zoom-value" type="button" title="Сбросить масштаб" onClick={() => setPreviewZoom(1)}>{Math.round(previewZoom * 100)}%</button><button className="secondary small" type="button" disabled={previewZoom >= 2} aria-label="Увеличить масштаб" onClick={() => setPreviewZoom((value) => Math.min(2, Number((value + .25).toFixed(2))))}>+</button><button className="secondary small" type="button" onClick={() => setFullscreen((value) => !value)}>{fullscreen ? "Закрыть полный экран" : "На весь экран"}</button><span>{pageCount ? `Страница ${pageIndex + 1} из ${pageCount}` : "Файл не выбран"} · {preset}</span></div></div>
+      <div className="scanner-document-tools" role="toolbar" aria-label="Инструменты документа"><span>Инструменты</span>{(["marker", "stroke", "blur", "print_blur"] as const).map((kind) => <button key={kind} className={drawingTool === kind ? "selected-tool" : ""} type="button" aria-label={drawingToolLabels[kind]} title={drawingToolLabels[kind]} aria-pressed={drawingTool === kind} disabled={!inputPath || showOriginal} onClick={() => setDrawingTool((current) => current === kind ? null : kind)}><DrawingToolIcon kind={kind} /></button>)}</div>
+      {annotations.length > 0 && <details className="applied-effects-panel"><summary>Добавленные эффекты · {annotations.length}</summary><div>{annotations.map((entry) => <section className="geometry-control-card" key={entry.id}><div className="geometry-card-header"><button className="link-button" type="button" onClick={() => { setPageIndex(entry.page); setSelectedOverlay({ kind: "annotation", id: entry.id }); void makePreview(inputPath, preset, entry.page); }}><strong>Стр. {entry.page + 1} · {drawingToolLabels[entry.kind]}</strong></button><button className="icon-button danger" type="button" aria-label={`Удалить эффект ${drawingToolLabels[entry.kind]} со страницы ${entry.page + 1}`} onClick={() => { setAnnotations((items) => items.filter((item) => item.id !== entry.id)); setSelectedOverlay(null); }}>×</button></div><label className="geometry-intensity"><span>Прозрачность / сила</span><span><input aria-label={`Прозрачность эффекта на странице ${entry.page + 1}`} type="range" min="5" max="100" value={Math.round(entry.intensity * 100)} onChange={(event) => updateAnnotationIntensity(entry.id, event.target.valueAsNumber)} /><output>{Math.round(entry.intensity * 100)}%</output></span></label></section>)}</div></details>}
       {inputPath && <>
         <div className="page-editor"><span>Итоговый порядок ({pageOrder.length}):</span><div>{pageWindow.omittedBefore > 0 && <span className="page-gap">…{pageWindow.omittedBefore}…</span>}{pageWindow.pages.map((sourceIndex) => <button key={sourceIndex} className={sourceIndex === pageIndex ? "active" : ""} type="button" onClick={() => { setPageIndex(sourceIndex); void makePreview(inputPath, preset, sourceIndex); }}>{sourceIndex + 1}{pageRotations[sourceIndex] ? ` · ${pageRotations[sourceIndex]}°` : ""}</button>)}{pageWindow.omittedAfter > 0 && <span className="page-gap">…{pageWindow.omittedAfter}…</span>}</div><label className="page-jump">К странице<input type="number" min="1" max={pageCount} value={pageIndex + 1} onChange={(event) => { const selected = Math.max(0, Math.min(pageCount - 1, Number(event.target.value) - 1)); setPageIndex(selected); void makePreview(inputPath, preset, selected); }} /></label><button className="secondary small" type="button" onClick={() => moveCurrentPage(-1)}>← Раньше</button><button className="secondary small" type="button" onClick={() => moveCurrentPage(1)}>Позже →</button><button className="secondary small" type="button" onClick={() => rotateCurrentPage(-90)}>↶ 90°</button><button className="secondary small" type="button" onClick={() => rotateCurrentPage(90)}>↷ 90°</button><button className="secondary small danger" type="button" onClick={deleteCurrentPage}>Удалить страницу</button><button className="link-button" type="button" onClick={() => { const rotations = {}; setPageOrder(Array.from({ length: pageCount }, (_, index) => index)); setPageRotations(rotations); void makePreview(inputPath, preset, pageIndex, rotations); }}>Сбросить</button></div>
         <div className="output-page-selection">

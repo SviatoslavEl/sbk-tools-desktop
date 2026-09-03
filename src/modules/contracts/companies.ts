@@ -1,5 +1,5 @@
 import type { StoredRecord } from "../../lib/storage";
-import type { ContractData } from "./types";
+import { contractContactSummary, type ContractData } from "./types";
 
 export const affiliationTypes = ["Головная компания", "Дочерняя компания", "Филиал", "Компания группы", "Иная связь"] as const;
 
@@ -160,7 +160,7 @@ export function normalizeCompanyDirectory(value: CompanyDirectoryData | null | u
   return { schemaVersion: 2, companies };
 }
 
-type ContractSource = Pick<ContractData, "performingLegalEntity" | "customer"> & Partial<Pick<ContractData, "performingLegalEntityId" | "customerCompanyId" | "contact">> | StoredRecord<ContractData>;
+type ContractSource = Pick<ContractData, "performingLegalEntity" | "customer"> & Partial<Pick<ContractData, "performingLegalEntityId" | "customerCompanyId" | "contact" | "contactName" | "contactPosition" | "contactPhone" | "contactEmail">> | StoredRecord<ContractData>;
 
 const contractPayload = (source: ContractSource) => "payload" in source ? source.payload : source;
 
@@ -221,7 +221,7 @@ export function mergeCompaniesFromContracts(
   for (const source of contracts) {
     const contract = contractPayload(source);
     include(contract.performingLegalEntity || "", "ours", "", contract.performingLegalEntityId || "");
-    include(contract.customer || "", "counterparty", contract.contact || "", contract.customerCompanyId || "");
+    include(contract.customer || "", "counterparty", contractContactSummary(contract), contract.customerCompanyId || "");
   }
   return { directory: { schemaVersion: 2, companies }, changed };
 }

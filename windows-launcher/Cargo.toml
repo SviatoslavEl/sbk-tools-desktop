@@ -1,6 +1,6 @@
 [package]
 name = "sbk-tools-onefile-launcher"
-version = "2.8.1"
+version = "2.8.2"
 edition = "2024"
 build = "build.rs"
 

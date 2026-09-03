@@ -7,6 +7,7 @@ import { useUnsavedChanges } from "../../hooks/useUnsavedChanges";
 import { parseCsv, toCsv } from "../../lib/csv";
 import { chooseOpenPath, chooseSavePath, exportText } from "../../lib/files";
 import { compareSortValues, toggleSort, type SortDirection } from "../../lib/tableSort";
+import { actsStatusTone, contractStageTone, paymentStatusTone } from "../../lib/statusTone";
 import {
   copyAttachment,
   createBackup,
@@ -42,6 +43,7 @@ import {
   emptyContract,
   emptyContractDocument,
   paymentStatuses,
+  contractContactSummary,
   type ContractData,
   type ContractDocument,
 } from "./types";
@@ -80,6 +82,10 @@ const contractHeaders = [
   "Важная дата",
   "Ответственный",
   "Контакт",
+  "Контактное лицо",
+  "Должность контакта",
+  "Телефон контакта",
+  "Email контакта",
   "Отзыв",
   "Раскрытие разрешено",
   "Раскрывать заказчика",
@@ -121,6 +127,10 @@ const importFields = [
   ["important", "Важная дата", ["важная дата"]],
   ["responsible", "Ответственный", ["ответственный"]],
   ["contact", "Контакт", ["контакт"]],
+  ["contactName", "Контактное лицо", ["контактное лицо", "фио контакта"]],
+  ["contactPosition", "Должность контакта", ["должность контакта"]],
+  ["contactPhone", "Телефон контакта", ["телефон контакта"]],
+  ["contactEmail", "Email контакта", ["email контакта", "e-mail контакта"]],
   ["review", "Отзыв", ["отзыв"]],
   [
     "disclosure",
@@ -174,6 +184,10 @@ export function normalizeContractData(payload: ContractData): ContractData {
     discloseNumber: partial.discloseNumber ?? legacyPermission,
     discloseSubject: partial.discloseSubject ?? legacyPermission,
     discloseAmount: partial.discloseAmount ?? legacyPermission,
+    contactName: partial.contactName || "",
+    contactPosition: partial.contactPosition || "",
+    contactPhone: partial.contactPhone || "",
+    contactEmail: partial.contactEmail || "",
   };
 }
 
@@ -306,6 +320,10 @@ export function mapContracts(
         nextImportantDate: value(row, "important"),
         responsible: value(row, "responsible"),
         contact: value(row, "contact"),
+        contactName: value(row, "contactName"),
+        contactPosition: value(row, "contactPosition"),
+        contactPhone: value(row, "contactPhone"),
+        contactEmail: value(row, "contactEmail"),
         reviewAvailable: /^(да|yes|true|1)$/i.test(value(row, "review")),
         disclosureAllowed,
         discloseCustomer: disclose("discloseCustomer"),
@@ -341,7 +359,7 @@ export function mergeContractImportUpdate(
   if (mapping.period >= 0) { next.startDate = imported.startDate; next.endDate = imported.endDate; }
   copy("stage", "stage"); copy("payment", "paymentStatus"); copy("acts", "actsStatus"); copy("paid", "paidAmount");
   copy("paymentPlanned", "paymentPlannedDate"); copy("paymentActual", "paymentActualDate"); copy("important", "nextImportantDate");
-  copy("responsible", "responsible"); copy("contact", "contact"); copy("review", "reviewAvailable"); copy("disclosure", "disclosureAllowed");
+  copy("responsible", "responsible"); copy("contact", "contact"); copy("contactName", "contactName"); copy("contactPosition", "contactPosition"); copy("contactPhone", "contactPhone"); copy("contactEmail", "contactEmail"); copy("review", "reviewAvailable"); copy("disclosure", "disclosureAllowed");
   copy("discloseCustomer", "discloseCustomer"); copy("discloseNumber", "discloseNumber"); copy("discloseSubject", "discloseSubject"); copy("discloseAmount", "discloseAmount");
   if (mapping.notes >= 0 || mapping.period >= 0) next.notes = imported.notes;
   return next;
@@ -401,6 +419,8 @@ export function ContractsRegistry() {
   const [selectedContracts, setSelectedContracts] = useState<Set<string>>(
     new Set(),
   );
+  const [selectedRegistryContracts, setSelectedRegistryContracts] = useState<Set<string>>(new Set());
+  const [bulkArchiveIds, setBulkArchiveIds] = useState<string[]>([]);
   const [sort, setSort] = useState<{ key: ContractSortKey; direction: SortDirection } | null>(null);
 
   const filtered = useMemo(
@@ -413,6 +433,7 @@ export function ContractsRegistry() {
           item.customer,
           item.subject,
           item.responsible,
+          contractContactSummary(item),
         ]
           .join(" ")
           .toLowerCase()
@@ -446,6 +467,10 @@ export function ContractsRegistry() {
       }),
     [store.records, search, legalEntityFilter, stageFilter, paymentFilter, sort],
   );
+  useEffect(() => {
+    const available = new Set(store.records.map((record) => record.id));
+    setSelectedRegistryContracts((current) => new Set([...current].filter((id) => available.has(id))));
+  }, [store.records]);
   const legalEntities = [
     ...new Set(
       store.records
@@ -534,6 +559,10 @@ export function ContractsRegistry() {
         item.nextImportantDate,
         item.responsible,
         item.contact,
+        item.contactName || "",
+        item.contactPosition || "",
+        item.contactPhone || "",
+        item.contactEmail || "",
         item.reviewAvailable ? "Да" : "Нет",
         item.disclosureAllowed ? "Да" : "Нет",
         item.discloseCustomer ? "Да" : "Нет",
@@ -583,6 +612,10 @@ export function ContractsRegistry() {
         item.nextImportantDate,
         item.responsible,
         item.contact,
+        item.contactName || "",
+        item.contactPosition || "",
+        item.contactPhone || "",
+        item.contactEmail || "",
         item.reviewAvailable ? "Да" : "Нет",
         item.disclosureAllowed ? "Да" : "Нет",
         item.discloseCustomer ? "Да" : "Нет",
@@ -1059,7 +1092,7 @@ export function ContractsRegistry() {
           >
             Подбор под закупку
           </button>
-          {!readOnly && filtered.length > 0 && <button className="secondary danger" type="button" onClick={() => { if (window.confirm(`Перенести в архив все найденные договоры (${filtered.length})?`)) void store.archiveMany(filtered.map((record) => record.id)); }}>В архив все найденные</button>}
+          {!readOnly && selectedRegistryContracts.size > 1 && <button className="secondary danger" type="button" onClick={() => setBulkArchiveIds([...selectedRegistryContracts])}>В архив выбранные ({selectedRegistryContracts.size})</button>}
           {!readOnly && (
             <button
               className="primary"
@@ -1082,6 +1115,7 @@ export function ContractsRegistry() {
           <table>
             <thead>
               <tr>
+                {!readOnly && <th className="selection-cell"><input type="checkbox" aria-label="Выбрать все найденные договоры" checked={filtered.length > 0 && filtered.every((record) => selectedRegistryContracts.has(record.id))} onChange={(event) => setSelectedRegistryContracts((current) => { const next = new Set(current); filtered.forEach((record) => event.target.checked ? next.add(record.id) : next.delete(record.id)); return next; })} /></th>}
                 {([[
                   "number", "Номер и дата"], ["performer", "Юрлицо-исполнитель"], ["customer", "Заказчик"],
                   ["subject", "Предмет"], ["amount", "Сумма"], ["period", "Период"], ["stage", "Стадия"],
@@ -1101,6 +1135,7 @@ export function ContractsRegistry() {
                       if (!readOnly) setEditing(record);
                     }}
                   >
+                    {!readOnly && <td className="selection-cell"><input type="checkbox" aria-label={`Выбрать договор ${item.number}`} checked={selectedRegistryContracts.has(record.id)} onChange={(event) => setSelectedRegistryContracts((current) => { const next = new Set(current); if (event.target.checked) next.add(record.id); else next.delete(record.id); return next; })} /></td>}
                     <td className="sticky-cell">
                       {readOnly ? (
                         <>
@@ -1151,17 +1186,17 @@ export function ContractsRegistry() {
                       {date(item.startDate)} — {date(item.endDate)}
                     </td>
                     <td>
-                      <span className="status neutral">{item.stage}</span>
+                      <span className={`status ${contractStageTone(item.stage)}`}>{item.stage}</span>
                     </td>
                     <td>
                       <span
-                        className={`status ${item.paymentStatus === "Просрочено" ? "danger" : "neutral"}`}
+                        className={`status ${paymentStatusTone(item.paymentStatus)}`}
                       >
                         {item.paymentStatus}
                       </span>
                     </td>
                     <td>
-                      <span className="status neutral">{item.actsStatus}</span>
+                      <span className={`status ${actsStatusTone(item.actsStatus)}`}>{item.actsStatus}</span>
                     </td>
                     <td>{date(item.nextImportantDate)}</td>
                     <td>{item.responsible || "—"}</td>
@@ -1241,6 +1276,18 @@ export function ContractsRegistry() {
           onConfirm={() => {
             void store.archive(archiving.id);
             setArchiving(null);
+          }}
+        />
+      )}
+      {!readOnly && bulkArchiveIds.length > 1 && (
+        <ConfirmDialog
+          title="Перенести выбранные договоры в архив?"
+          message={`Будет перенесено договоров: ${bulkArchiveIds.length}. Записи, история и документы останутся в базе и смогут быть восстановлены.`}
+          confirmLabel="В архив"
+          onClose={() => setBulkArchiveIds([])}
+          onConfirm={() => {
+            void store.archiveMany(bulkArchiveIds).then(() => setSelectedRegistryContracts(new Set()));
+            setBulkArchiveIds([]);
           }}
         />
       )}
@@ -2225,13 +2272,13 @@ function ContractEditor({
           />
         )}
         <h3>Контакты и раскрытие</h3>
-        <label>
-          Контакт
-          <input
-            value={item.contact}
-            onChange={(event) => update("contact", event.target.value)}
-          />
-        </label>
+        <div className="form-grid">
+          <label>Контактное лицо<input value={item.contactName || ""} onChange={(event) => update("contactName", event.target.value)} placeholder="Фамилия, имя, отчество" /></label>
+          <label>Должность<input value={item.contactPosition || ""} onChange={(event) => update("contactPosition", event.target.value)} /></label>
+          <label>Телефон<input type="tel" value={item.contactPhone || ""} onChange={(event) => update("contactPhone", event.target.value)} placeholder="+7…" /></label>
+          <label>Email<input type="email" value={item.contactEmail || ""} onChange={(event) => update("contactEmail", event.target.value)} /></label>
+          <label className="wide">Дополнительные сведения о контакте<input value={item.contact} onChange={(event) => update("contact", event.target.value)} placeholder="Свободный комментарий или прежняя запись" /></label>
+        </div>
         <label className="checkbox-row">
           <input
             type="checkbox"
@@ -2254,6 +2301,14 @@ function ContractEditor({
           <strong>{item.disclosureAllowed ? "Раскрытие разрешено" : "Конфиденциальный договор"}</strong>
           <span>Статус носит справочный характер: договор всегда участвует в подборе с полными реквизитами, а запрет явно указывается на экране и в выгрузке.</span>
         </div>
+        <fieldset className="disclosure-options">
+          <legend>Какие реквизиты разрешено раскрывать</legend>
+          <p className="help-text">Настройки справочные: внутри программы договор и все реквизиты остаются доступными для поиска и подбора.</p>
+          <label className="checkbox-row"><input type="checkbox" checked={item.discloseCustomer} onChange={(event) => update("discloseCustomer", event.target.checked)} /> Заказчика</label>
+          <label className="checkbox-row"><input type="checkbox" checked={item.discloseNumber} onChange={(event) => update("discloseNumber", event.target.checked)} /> Номер договора</label>
+          <label className="checkbox-row"><input type="checkbox" checked={item.discloseSubject} onChange={(event) => update("discloseSubject", event.target.checked)} /> Предмет договора</label>
+          <label className="checkbox-row"><input type="checkbox" checked={item.discloseAmount} onChange={(event) => update("discloseAmount", event.target.checked)} /> Стоимость</label>
+        </fieldset>
         <label>
           Примечания
           <textarea

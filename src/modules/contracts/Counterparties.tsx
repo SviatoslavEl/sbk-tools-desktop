@@ -50,7 +50,7 @@ export function CounterpartiesRegistry() {
     {(directory.error || message) && <div className={`notice ${directory.error || message.startsWith("Error") || message.startsWith("Нельзя") ? "error" : "success"}`}>{directory.error || message}</div>}
     <div className="registry-toolbar">
       <label className="search-box"><span>Быстрый поиск</span><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Компания, ИНН, ФИО, должность, телефон…" /></label>
-      <label><span>Раздел</span><select value={scope} onChange={(event) => setScope(event.target.value as typeof scope)}><option value="all">Все компании</option><option value="internal">Внутренняя группа</option><option value="external">Внешние контрагенты</option></select></label>
+      <fieldset className="scope-switcher"><legend>Раздел контрагентов</legend><button type="button" className={scope === "external" ? "active" : ""} aria-pressed={scope === "external"} onClick={() => setScope("external")}>Внешние</button><button type="button" className={scope === "internal" ? "active" : ""} aria-pressed={scope === "internal"} onClick={() => setScope("internal")}>Внутренние</button><button type="button" className={scope === "all" ? "active" : ""} aria-pressed={scope === "all"} onClick={() => setScope("all")}>Все</button></fieldset>
       <label className="checkbox-row"><input type="checkbox" checked={showArchived} onChange={(event) => setShowArchived(event.target.checked)} /> Архив</label>
       <div className="toolbar-actions">
         {!showArchived && <button className="primary" type="button" disabled={!access.editor} onClick={() => setEditing(emptyCompany())}>Добавить компанию</button>}

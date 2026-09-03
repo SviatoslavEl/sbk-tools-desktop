@@ -295,7 +295,7 @@ def merge(config: dict) -> int:
     warnings: list[str] = []
     original_bytes = sum(source.stat().st_size for source in sources)
 
-    from pypdf import PdfWriter
+    from pypdf import PdfReader, PdfWriter
     from scandocument.pdf_engine import write_atomic
 
     with SecureWorkspace() as workspace:
@@ -334,8 +334,24 @@ def merge(config: dict) -> int:
         emit({"type": "progress", "stage": "Объединяем страницы", "currentPage": len(sources),
               "totalPages": len(sources), "percent": 96})
         writer = PdfWriter()
-        for part in parts:
-            writer.append(str(part))
+        raw_page_order = config.get("mergePageOrder")
+        if raw_page_order is None:
+            for part in parts:
+                writer.append(str(part))
+        else:
+            if not isinstance(raw_page_order, list) or not 1 <= len(raw_page_order) <= MAX_PAGES:
+                raise ValueError(f"Порядок объединения должен содержать от 1 до {MAX_PAGES} страниц.")
+            readers = [PdfReader(str(part)) for part in parts]
+            for position, item in enumerate(raw_page_order, start=1):
+                if not isinstance(item, dict):
+                    raise ValueError(f"Некорректная запись порядка страниц №{position}.")
+                source_index = item.get("sourceIndex")
+                page_index = item.get("pageIndex")
+                if not isinstance(source_index, int) or isinstance(source_index, bool) or not 0 <= source_index < len(readers):
+                    raise ValueError(f"Неизвестный исходный файл для страницы №{position}.")
+                if not isinstance(page_index, int) or isinstance(page_index, bool) or not 0 <= page_index < len(readers[source_index].pages):
+                    raise ValueError(f"Страница №{position} выходит за пределы исходного файла.")
+                writer.add_page(readers[source_index].pages[page_index])
         page_count = len(writer.pages)
         write_atomic(writer, output)
 

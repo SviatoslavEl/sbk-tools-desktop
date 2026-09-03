@@ -2292,8 +2292,7 @@ fn create_backup_impl(workspace: &Workspace, module: Option<String>) -> Result<B
         None => MODULES.to_vec(),
     };
     let snapshot_path = workspace
-        .root
-        .join("runtime-cache")
+        .runtime_root()
         .join(format!("backup-{}", Uuid::new_v4()));
     fs::create_dir(&snapshot_path).map_err(|error| error.to_string())?;
     let _snapshot = TemporaryDirectory(snapshot_path.clone());
@@ -2714,8 +2713,7 @@ fn verify_encrypted_backup(
 ) -> Result<BackupVerification, String> {
     let directory = state
         .workspace
-        .root
-        .join("runtime-cache")
+        .runtime_root()
         .join(format!("encrypted-verify-{}", Uuid::new_v4()));
     fs::create_dir(&directory).map_err(|error| error.to_string())?;
     let _temporary = TemporaryDirectory(directory.clone());
@@ -2733,8 +2731,7 @@ fn restore_encrypted_backup(
     state.workspace.require_editor()?;
     let directory = state
         .workspace
-        .root
-        .join("runtime-cache")
+        .runtime_root()
         .join(format!("encrypted-restore-{}", Uuid::new_v4()));
     fs::create_dir(&directory).map_err(|error| error.to_string())?;
     let _temporary = TemporaryDirectory(directory.clone());
@@ -2949,8 +2946,7 @@ fn verify_backup(state: State<'_, AppState>, path: String) -> Result<BackupVerif
     }
     let stage_path = state
         .workspace
-        .root
-        .join("runtime-cache")
+        .runtime_root()
         .join(format!("verify-backup-{}", Uuid::new_v4()));
     fs::create_dir(&stage_path).map_err(|error| error.to_string())?;
     let _stage = TemporaryDirectory(stage_path.clone());
@@ -3578,17 +3574,40 @@ fn run_scanner_worker(
             }
             paths.push(path);
         }
+        if let Some(order) = config.get("mergePageOrder") {
+            let entries = order
+                .as_array()
+                .ok_or_else(|| "Некорректный порядок страниц объединения".to_string())?;
+            if entries.is_empty() || entries.len() > 5_000 {
+                return Err("Порядок объединения должен содержать от 1 до 5000 страниц".to_string());
+            }
+            for (position, entry) in entries.iter().enumerate() {
+                let source_index = entry
+                    .get("sourceIndex")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| {
+                        format!("Некорректный исходный файл для страницы {}", position + 1)
+                    })?;
+                let page_index = entry
+                    .get("pageIndex")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| format!("Некорректный номер страницы {}", position + 1))?;
+                if source_index as usize >= paths.len() || page_index >= 5_000 {
+                    return Err(format!(
+                        "Порядок объединения содержит недопустимую страницу {}",
+                        position + 1
+                    ));
+                }
+            }
+        }
         Some(paths)
     } else {
         None
     };
     if operation == "preview" {
-        let preview_dir = workspace.root.join("runtime-cache").join("previews");
+        let preview_dir = workspace.runtime_root().join("previews");
         fs::create_dir_all(&preview_dir).map_err(|error| error.to_string())?;
-        let source_cache = workspace
-            .root
-            .join("runtime-cache")
-            .join("scanner-source-cache");
+        let source_cache = workspace.runtime_root().join("scanner-source-cache");
         fs::create_dir_all(&source_cache).map_err(|error| error.to_string())?;
         config["outputPath"] = Value::String(
             preview_dir
@@ -3624,8 +3643,7 @@ fn run_scanner_worker(
         None
     };
     let config_path = workspace
-        .root
-        .join("runtime-cache")
+        .runtime_root()
         .join(format!("scanner-{job_id}.json"));
     atomic_write(
         &config_path,
@@ -3813,8 +3831,7 @@ fn delete_runtime_file(state: State<'_, AppState>, path: String) -> Result<(), S
         .map_err(|_| "Временный файл уже удалён".to_string())?;
     let runtime = state
         .workspace
-        .root
-        .join("runtime-cache")
+        .runtime_root()
         .canonicalize()
         .map_err(|error| error.to_string())?;
     if !canonical.starts_with(&runtime) || !canonical.is_file() {

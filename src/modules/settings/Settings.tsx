@@ -34,6 +34,7 @@ import {
   type AccessTimers,
 } from "../../lib/sharedWorkspace";
 import { useWorkspaceAccess } from "../../lib/workspaceAccess";
+import { workspacePasswordError, workspacePasswordHint } from "./passwordPolicy";
 
 interface AppSettings {
   expiryDays: 30 | 60 | 90;
@@ -60,6 +61,12 @@ export function Settings({
   const [backupPassword, setBackupPassword] = useState("");
   const [workspacePassword, setWorkspacePassword] = useState("");
   const [newWorkspacePassword, setNewWorkspacePassword] = useState("");
+  const currentWorkspacePasswordError = workspacePassword
+    ? workspacePasswordError(workspacePassword)
+    : "";
+  const newWorkspacePasswordError = newWorkspacePassword
+    ? workspacePasswordError(newWorkspacePassword)
+    : "";
   const [intelligence, setIntelligence] =
     useState<IntelligenceProviderStatus | null>(null);
   const [accessTimers, setAccessTimers] =
@@ -104,6 +111,11 @@ export function Settings({
     return next;
   };
   const changeWorkspaceMode = async (editor: boolean) => {
+    const validationError = workspacePasswordError(workspacePassword);
+    if (validationError) {
+      setMessage(`Недопустимый пароль: ${validationError} ${workspacePasswordHint}`);
+      return;
+    }
     setMessage(editor ? "Проверяем пароль и получаем режим редактирования…" : "Освобождаем режим редактирования…");
     try {
       await switchWorkspaceMode(editor, workspacePassword);
@@ -113,6 +125,18 @@ export function Settings({
     } catch (reason) { setMessage(`Ошибка доступа: ${String(reason)}`); }
   };
   const saveWorkspacePassword = async () => {
+    const validationError = workspacePasswordError(newWorkspacePassword);
+    if (validationError) {
+      setMessage(`Недопустимый новый пароль: ${validationError} ${workspacePasswordHint}`);
+      return;
+    }
+    if (workspace?.accessControlled) {
+      const currentValidationError = workspacePasswordError(workspacePassword);
+      if (currentValidationError) {
+        setMessage(`Недопустимый текущий пароль: ${currentValidationError} ${workspacePasswordHint}`);
+        return;
+      }
+    }
     setMessage("Сохраняем пароль рабочей папки…");
     try {
       await setWorkspaceAccessPassword(workspacePassword, newWorkspacePassword);
@@ -259,14 +283,16 @@ export function Settings({
           </div>}
           <div className="settings-form workspace-password-controls">
             {workspace?.accessControlled ? <>
-              <label>Пароль рабочей папки<input type="password" autoComplete="current-password" value={workspacePassword} onChange={(event) => setWorkspacePassword(event.target.value)} /></label>
+              <label>Пароль рабочей папки<input type="password" autoComplete="current-password" aria-invalid={Boolean(currentWorkspacePasswordError)} aria-describedby="workspace-password-hint" value={workspacePassword} onChange={(event) => setWorkspacePassword(event.target.value)} />{currentWorkspacePasswordError && <small className="field-error">{currentWorkspacePasswordError}</small>}</label>
+              <p className="help-text" id="workspace-password-hint">{workspacePasswordHint}</p>
               <div className="button-row">
                 <button className="primary" type="button" disabled={!workspacePassword} onClick={() => void changeWorkspaceMode(!workspace?.editor)}>{workspace?.editor ? "Перейти в режим просмотра" : "Войти в режим редактирования"}</button>
               </div>
-              {workspace?.editor && <><label>Новый пароль<input type="password" autoComplete="new-password" value={newWorkspacePassword} onChange={(event) => setNewWorkspacePassword(event.target.value)} /></label><button className="secondary" type="button" disabled={!workspacePassword || newWorkspacePassword.length < 6} onClick={() => void saveWorkspacePassword()}>Сменить пароль</button></>}
+              {workspace?.editor && <><label>Новый пароль<input type="password" autoComplete="new-password" aria-invalid={Boolean(newWorkspacePasswordError)} value={newWorkspacePassword} onChange={(event) => setNewWorkspacePassword(event.target.value)} />{newWorkspacePasswordError && <small className="field-error">{newWorkspacePasswordError}</small>}</label><button className="secondary" type="button" disabled={!workspacePassword || !newWorkspacePassword || Boolean(newWorkspacePasswordError)} onClick={() => void saveWorkspacePassword()}>Сменить пароль</button></>}
             </> : workspace?.editor ? <>
-              <label>Новый пароль рабочей папки<input type="password" autoComplete="new-password" value={newWorkspacePassword} onChange={(event) => setNewWorkspacePassword(event.target.value)} placeholder="Не менее 6 символов" /></label>
-              <button className="primary" type="button" disabled={newWorkspacePassword.length < 6} onClick={() => void saveWorkspacePassword()}>Включить вход по паролю</button>
+              <label>Новый пароль рабочей папки<input type="password" autoComplete="new-password" aria-invalid={Boolean(newWorkspacePasswordError)} aria-describedby="new-workspace-password-hint" value={newWorkspacePassword} onChange={(event) => setNewWorkspacePassword(event.target.value)} placeholder="От 6 до 128 символов" />{newWorkspacePasswordError && <small className="field-error">{newWorkspacePasswordError}</small>}</label>
+              <p className="help-text" id="new-workspace-password-hint">{workspacePasswordHint}</p>
+              <button className="primary" type="button" disabled={!newWorkspacePassword || Boolean(newWorkspacePasswordError)} onClick={() => void saveWorkspacePassword()}>Включить вход по паролю</button>
             </> : <div className="notice warning">Сейчас режим редактирования занят другим экземпляром. После его закрытия текущий экземпляр сможет войти в режим редактирования.</div>}
           </div>
           <div className="settings-row">
