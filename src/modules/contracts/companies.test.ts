@@ -13,14 +13,14 @@ describe("справочник компаний", () => {
     const result = mergeCompaniesFromContracts(emptyCompanyDirectory(), contracts, () => `id-${++index}`, "2026-08-28T00:00:00.000Z");
     expect(result.changed).toBe(true);
     expect(result.directory.companies).toHaveLength(2);
-    expect(result.directory.schemaVersion).toBe(2);
+    expect(result.directory.schemaVersion).toBe(3);
     expect(result.directory.companies.find((item) => normalizeCompanyName(item.name) === "ооо сбк")).toMatchObject({ scope: "internal", source: "contracts" });
     expect(result.directory.companies.find((item) => item.name === "АО Заказчик")).toMatchObject({ scope: "external", contact: "Иванов, +7 900 000-00-00" });
   });
 
   it("не перезаписывает отредактированную карточку при повторной миграции", () => {
     const company = { ...emptyCompany("2026-01-01", "our-id"), name: "ООО СБК", inn: "123", scope: "internal" as const, source: "manual" as const };
-    const result = mergeCompaniesFromContracts({ schemaVersion: 2, companies: [company] }, [{ ...emptyContract(), performingLegalEntity: "ООО «СБК»" }], () => "unused");
+    const result = mergeCompaniesFromContracts({ schemaVersion: 3, companies: [company] }, [{ ...emptyContract(), performingLegalEntity: "ООО «СБК»" }], () => "unused");
     expect(result.changed).toBe(false);
     expect(result.directory.companies[0]).toMatchObject({ inn: "123", source: "manual" });
   });
@@ -35,7 +35,7 @@ describe("справочник компаний", () => {
 
   it("сохраняет привязку по id при переименовании карточки", () => {
     const company = { ...emptyCompany("2026-01-01", "our-id"), name: "Новое название", scope: "internal" as const };
-    const result = mergeCompaniesFromContracts({ schemaVersion: 2, companies: [company] }, [{ ...emptyContract(), performingLegalEntityId: "our-id", performingLegalEntity: "Старое название" }], () => "unexpected");
+    const result = mergeCompaniesFromContracts({ schemaVersion: 3, companies: [company] }, [{ ...emptyContract(), performingLegalEntityId: "our-id", performingLegalEntity: "Старое название" }], () => "unexpected");
     expect(result.changed).toBe(false);
     expect(result.directory.companies).toHaveLength(1);
     expect(result.directory.companies[0].name).toBe("Новое название");
@@ -58,6 +58,7 @@ describe("справочник компаний", () => {
 
   it("нормализует пунктуацию и объединяет карточки по ИНН", () => {
     expect(normalizeCompanyName("  ООО «Ёлка—Тест», г. Москва ")).toBe("ооо елка тест г москва");
+    expect(normalizeCompanyName(undefined)).toBe("");
     const first = { ...emptyCompany("2026-01-01", "1"), name: "ООО Альфа", inn: "77 01-23" };
     const second = { ...emptyCompany("2026-01-01", "2"), name: "Альфа Групп", inn: "770123", contact: "Контакт" };
     const normalized = normalizeCompanyDirectory({ schemaVersion: 1, companies: [first, second] });
@@ -75,7 +76,7 @@ describe("справочник компаний", () => {
     const legacyInternal = { ...base, name: "ООО Внутренняя", scope: undefined, isOurs: true, isCounterparty: true };
     const legacyExternal = { ...base, id: "external", name: "ООО Внешняя", scope: undefined, isOurs: false, isCounterparty: true };
     const migrated = normalizeCompanyDirectory({ schemaVersion: 1, companies: [legacyInternal, legacyExternal] } as never);
-    expect(migrated.schemaVersion).toBe(2);
+    expect(migrated.schemaVersion).toBe(3);
     expect(migrated.companies.map(({ name, scope }) => ({ name, scope }))).toEqual([
       { name: "ООО Внутренняя", scope: "internal" },
       { name: "ООО Внешняя", scope: "external" },
@@ -88,10 +89,48 @@ describe("справочник компаний", () => {
     delete (legacy as Partial<typeof legacy>).decisionMakers;
     delete (legacy as Partial<typeof legacy>).archived;
     const normalizedLegacy = normalizeCompanyDirectory({ schemaVersion: 2, companies: [legacy as never] }).companies[0];
-    expect(normalizedLegacy).toMatchObject({ name: "ООО Контрагент", decisionMakers: [], archived: false });
+    expect(normalizedLegacy).toMatchObject({ name: "ООО Контрагент", decisionMakers: [], authorizedSigners: [], archived: false });
     const withPerson = normalizeCompanyDirectory({ schemaVersion: 2, companies: [{ ...emptyCompany("2026-01-01", "with-lpr"), name: "АО Клиент", archived: true, decisionMakers: [{ id: "person", fullName: "Иванова Анна", position: "Генеральный директор", department: "Руководство", phone: "+7 999 000-00-00", email: "director@example.test", notes: "ЛПР", isPrimary: true }] }] }).companies[0];
     expect(withPerson.archived).toBe(true);
     expect(withPerson.decisionMakers[0]).toMatchObject({ fullName: "Иванова Анна", isPrimary: true });
+  });
+
+  it("дополняет базу подписантами и доверенностями без потери старых карточек", () => {
+    const legacy = { ...emptyCompany("2026-01-01", "legacy-company"), name: "ООО Старая компания" };
+    delete (legacy as Partial<typeof legacy>).authorizedSigners;
+    const signer = {
+      id: "signer",
+      fullName: "Петров Пётр Петрович",
+      position: "Коммерческий директор",
+      powerOfAttorneyNumber: "12-34",
+      issuedAt: "2026-01-10",
+      expiresAt: "2027-01-10",
+      notes: "Право подписи договоров",
+      document: { relativePath: "attachments/contract-experience/company-directory-v1/power.pdf", fileName: "power.pdf", sizeBytes: 1024, sha256: "abc", mimeType: "application/pdf" },
+    };
+    const normalized = normalizeCompanyDirectory({ schemaVersion: 2, companies: [legacy as never, { ...emptyCompany("2026-01-01", "internal"), name: "ООО Внутренняя", scope: "internal", authorizedSigners: [signer] }] });
+    expect(normalized.schemaVersion).toBe(3);
+    expect(normalized.companies[0]).toMatchObject({ name: "ООО Старая компания", authorizedSigners: [] });
+    expect(normalized.companies[1].authorizedSigners[0]).toMatchObject({ fullName: "Петров Пётр Петрович", document: { fileName: "power.pdf" } });
+  });
+
+  it("не блокирует внешнюю карточку скрытыми данными подписанта", () => {
+    const company = {
+      ...emptyCompany("2026-09-03T00:00:00.000Z", "external"),
+      name: "Внешний контрагент",
+      scope: "external" as const,
+      authorizedSigners: [{
+        id: "signer",
+        fullName: "",
+        position: "",
+        powerOfAttorneyNumber: "",
+        issuedAt: "2026-12-31",
+        expiresAt: "2026-01-01",
+        notes: "",
+        document: {},
+      }],
+    };
+    expect(validateCompany(company, [company])).toEqual([]);
   });
 
   it("при связывании приоритетно использует существующий id, затем имя", () => {

@@ -24,6 +24,25 @@ export interface DecisionMaker {
   isPrimary: boolean;
 }
 
+export interface PowerOfAttorneyDocument {
+  relativePath?: string;
+  fileName?: string;
+  sizeBytes?: number;
+  sha256?: string;
+  mimeType?: string;
+}
+
+export interface AuthorizedSigner {
+  id: string;
+  fullName: string;
+  position: string;
+  powerOfAttorneyNumber: string;
+  issuedAt: string;
+  expiresAt: string;
+  notes: string;
+  document: PowerOfAttorneyDocument;
+}
+
 export interface CompanyCard {
   id: string;
   name: string;
@@ -38,19 +57,20 @@ export interface CompanyCard {
   source: "contracts" | "manual";
   affiliations: CompanyAffiliation[];
   decisionMakers: DecisionMaker[];
+  authorizedSigners: AuthorizedSigner[];
   archived: boolean;
   createdAt: string;
   updatedAt: string;
 }
 
 export interface CompanyDirectoryData {
-  schemaVersion: 1 | 2;
+  schemaVersion: 1 | 2 | 3;
   companies: CompanyCard[];
 }
 
-export const emptyCompanyDirectory = (): CompanyDirectoryData => ({ schemaVersion: 2, companies: [] });
+export const emptyCompanyDirectory = (): CompanyDirectoryData => ({ schemaVersion: 3, companies: [] });
 
-export const normalizeCompanyName = (value: string) => value
+export const normalizeCompanyName = (value: string | null | undefined) => (value || "")
   .trim()
   .toLocaleLowerCase("ru-RU")
   .replace(/ё/g, "е")
@@ -76,6 +96,7 @@ export const emptyCompany = (now: string = new Date().toISOString(), id: string 
   source: "manual",
   affiliations: [],
   decisionMakers: [],
+  authorizedSigners: [],
   archived: false,
   createdAt: now,
   updatedAt: now,
@@ -113,6 +134,26 @@ export function normalizeCompanyDirectory(value: CompanyDirectoryData | null | u
               isPrimary: Boolean(person.isPrimary),
             }))
           : [],
+        authorizedSigners: Array.isArray(company.authorizedSigners)
+          ? company.authorizedSigners.map((person) => ({
+              id: person.id || crypto.randomUUID(),
+              fullName: person.fullName || "",
+              position: person.position || "",
+              powerOfAttorneyNumber: person.powerOfAttorneyNumber || "",
+              issuedAt: person.issuedAt || "",
+              expiresAt: person.expiresAt || "",
+              notes: person.notes || "",
+              document: person.document && typeof person.document === "object"
+                ? {
+                    relativePath: person.document.relativePath || undefined,
+                    fileName: person.document.fileName || undefined,
+                    sizeBytes: person.document.sizeBytes || undefined,
+                    sha256: person.document.sha256 || undefined,
+                    mimeType: person.document.mimeType || undefined,
+                  }
+                : {},
+            }))
+          : [],
         archived: Boolean(company.archived),
       };
     });
@@ -140,6 +181,7 @@ export function normalizeCompanyDirectory(value: CompanyDirectoryData | null | u
     existing.contact ||= company.contact;
     existing.notes ||= company.notes;
     if (!existing.decisionMakers.length && company.decisionMakers.length) existing.decisionMakers = company.decisionMakers;
+    if (!existing.authorizedSigners.length && company.authorizedSigners.length) existing.authorizedSigners = company.authorizedSigners;
     if (!company.archived) existing.archived = false;
     if (company.scope === "internal") existing.scope = "internal";
     if (company.source === "manual") existing.source = "manual";
@@ -157,7 +199,7 @@ export function normalizeCompanyDirectory(value: CompanyDirectoryData | null | u
         return true;
       });
   }
-  return { schemaVersion: 2, companies };
+  return { schemaVersion: 3, companies };
 }
 
 type ContractSource = Pick<ContractData, "performingLegalEntity" | "customer"> & Partial<Pick<ContractData, "performingLegalEntityId" | "customerCompanyId" | "contact" | "contactName" | "contactPosition" | "contactPhone" | "contactEmail">> | StoredRecord<ContractData>;
@@ -173,7 +215,7 @@ export function companyUsedAsPerformer(
     const contract = contractPayload(source);
     return (
       contract.performingLegalEntityId === company.id ||
-      normalizeCompanyName(contract.performingLegalEntity || "") === companyName
+      normalizeCompanyName(contract.performingLegalEntity) === companyName
     );
   });
 }
@@ -223,7 +265,7 @@ export function mergeCompaniesFromContracts(
     include(contract.performingLegalEntity || "", "ours", "", contract.performingLegalEntityId || "");
     include(contract.customer || "", "counterparty", contractContactSummary(contract), contract.customerCompanyId || "");
   }
-  return { directory: { schemaVersion: 2, companies }, changed };
+  return { directory: { schemaVersion: 3, companies }, changed };
 }
 
 export function linkContractToDirectory(contract: ContractData, companies: CompanyCard[]): ContractData {
@@ -289,6 +331,8 @@ export function validateCompany(company: CompanyCard, companies: CompanyCard[]):
   const inn = companyInn;
   if (inn && companies.some((item) => item.id !== company.id && normalizeInn(item.inn) === inn)) errors.push("Компания с таким ИНН уже есть в справочнике.");
   if (company.affiliations.some((item) => item.targetCompanyId === company.id)) errors.push("Компания не может быть связана сама с собой.");
+  if (company.scope === "internal" && company.authorizedSigners.some((person) => !person.fullName.trim())) errors.push("Укажите ФИО каждого подписанта по доверенности.");
+  if (company.scope === "internal" && company.authorizedSigners.some((person) => person.issuedAt && person.expiresAt && person.expiresAt < person.issuedAt)) errors.push("Срок доверенности не может заканчиваться раньше даты выдачи.");
   const relations = new Set<string>();
   for (const relation of company.affiliations) {
     const key = `${relation.targetCompanyId}|${relation.type}`;

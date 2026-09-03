@@ -1614,7 +1614,7 @@ fn update_contract_bundle_transaction(
 fn update_contracts_and_company_directory_atomic(
     state: State<'_, AppState>,
     records: Vec<ImportRecord>,
-    directory: Value,
+    mut directory: Value,
 ) -> Result<usize, String> {
     state.workspace.require_editor()?;
     let _maintenance = state
@@ -1622,8 +1622,21 @@ fn update_contracts_and_company_directory_atomic(
         .lock()
         .map_err(|_| "Хранилище временно недоступно".to_string())?;
     let history_limit = configured_history_limit(&state.workspace.root);
+    let mut attachment_moves = Vec::new();
+    finalize_staged_attachments(
+        &mut directory,
+        &state.workspace.root,
+        "contract-experience",
+        COMPANY_DIRECTORY_DRAFT_KEY,
+        &mut attachment_moves,
+    )?;
     let mut connection = open_database(&state.workspace.root, "contract-experience")?;
-    update_contract_bundle_transaction(&mut connection, records, &directory, history_limit)
+    let result =
+        update_contract_bundle_transaction(&mut connection, records, &directory, history_limit);
+    if result.is_err() {
+        rollback_attachment_moves(&attachment_moves);
+    }
+    result
 }
 
 fn save_contract_bundle_transaction(

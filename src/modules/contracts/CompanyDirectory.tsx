@@ -1,9 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import { openPath } from "@tauri-apps/plugin-opener";
 import { Dialog } from "../../components/Dialog";
+import { DrawerBackdrop } from "../../components/DrawerBackdrop";
 import { useUnsavedChanges } from "../../hooks/useUnsavedChanges";
 import {
   getWorkspaceInfo,
+  copyAttachment,
+  discardStagedAttachments,
   importContractsWithCompanyDirectoryAtomic,
   readDraft,
   saveContractWithCompanyDirectoryAtomic,
@@ -11,6 +15,7 @@ import {
   workspaceAccessInvalidatedEvent,
   type StoredRecord,
 } from "../../lib/storage";
+import { chooseOpenPath } from "../../lib/files";
 import {
   affiliationTypes,
   buildCompanyDirectoryMigration,
@@ -130,8 +135,8 @@ export function useCompanyDirectory(contracts: StoredRecord<ContractData>[]) {
       const now = new Date().toISOString();
       const normalized = {
         ...company,
-        name: company.name.trim(),
-        shortName: company.shortName.trim(),
+        name: (company.name || "").trim(),
+        shortName: (company.shortName || "").trim(),
         source: "manual" as const,
         updatedAt: now,
       };
@@ -144,7 +149,7 @@ export function useCompanyDirectory(contracts: StoredRecord<ContractData>[]) {
           "Компания используется как юрлицо-исполнитель и должна оставаться во внутренней группе.",
         );
       const next = normalizeCompanyDirectory({
-        schemaVersion: 2,
+        schemaVersion: 3,
         companies: [
           normalized,
           ...directory.companies.filter((item) => item.id !== normalized.id),
@@ -225,7 +230,7 @@ export function useCompanyDirectory(contracts: StoredRecord<ContractData>[]) {
     const selected = new Set(ids);
     const now = new Date().toISOString();
     const next = normalizeCompanyDirectory({
-      schemaVersion: 2,
+      schemaVersion: 3,
       companies: directory.companies.map((company) => selected.has(company.id)
         ? { ...company, archived, updatedAt: now }
         : company),
@@ -241,7 +246,7 @@ export function useCompanyDirectory(contracts: StoredRecord<ContractData>[]) {
     ));
     if (referenced.length) throw new Error(`Нельзя удалить связанные с договорами компании: ${referenced.map((company) => company.shortName || company.name).join(", ")}. Их можно оставить в архиве.`);
     const next = normalizeCompanyDirectory({
-      schemaVersion: 2,
+      schemaVersion: 3,
       companies: directory.companies.filter((company) => !selected.has(company.id) || !company.archived),
     });
     await updateContractsAndCompanyDirectoryAtomic([], next);
@@ -373,7 +378,7 @@ export function CompanyDirectoryDialog({
       companies
         .filter((company) => {
           if (filter !== "all" && company.scope !== filter) return false;
-          return [company.name, company.shortName, company.inn, company.ogrn]
+          return [company.name, company.shortName, company.inn, company.ogrn, ...company.authorizedSigners.flatMap((person) => [person.fullName, person.position, person.powerOfAttorneyNumber])]
             .join(" ")
             .toLocaleLowerCase("ru")
             .includes(search.toLocaleLowerCase("ru"));
@@ -443,6 +448,7 @@ export function CompanyDirectoryDialog({
                     <th>Тип</th>
                     <th>ИНН / КПП</th>
                     <th>Связи</th>
+                    <th>Право подписи</th>
                     {!readOnly && <th />}
                   </tr>
                 </thead>
@@ -499,6 +505,15 @@ export function CompanyDirectoryDialog({
                             ? relationships.map((label) => (
                                 <small className="company-relation" key={label}>
                                   {label}
+                                </small>
+                              ))
+                            : "—"}
+                        </td>
+                        <td>
+                          {company.scope === "internal" && company.authorizedSigners.length
+                            ? company.authorizedSigners.map((person) => (
+                                <small className="company-relation" key={person.id}>
+                                  {person.fullName || "ФИО не указано"}{person.powerOfAttorneyNumber ? ` · доверенность ${person.powerOfAttorneyNumber}` : ""}
                                 </small>
                               ))
                             : "—"}
@@ -569,6 +584,12 @@ export function CompanyEditor({
   const [item, setItem] = useState(() => structuredClone(company));
   const [savedSnapshot, setSavedSnapshot] = useState(() => JSON.stringify(item));
   const [error, setError] = useState("");
+  useEffect(
+    () => () => {
+      void discardStagedAttachments("contract-experience", directoryDraftKey);
+    },
+    [],
+  );
   const { requestClose, confirmation: discardConfirmation } = useUnsavedChanges(JSON.stringify(item) !== savedSnapshot, onClose);
   const update = <K extends keyof CompanyCard>(key: K, value: CompanyCard[K]) =>
     setItem((current) => ({ ...current, [key]: value }));
@@ -585,7 +606,31 @@ export function CompanyEditor({
       setError(`Не удалось сохранить карточку: ${String(reason)}`);
     }
   };
+  const updateAuthorizedSigner = (id: string, patch: Partial<CompanyCard["authorizedSigners"][number]>) =>
+    update("authorizedSigners", item.authorizedSigners.map((person) => person.id === id ? { ...person, ...patch } : person));
+  const uploadPowerOfAttorney = async (id: string) => {
+    const path = await chooseOpenPath("Выберите доверенность", ["pdf", "doc", "docx", "png", "jpg", "jpeg"]);
+    if (!path) return;
+    try {
+      const attachment = await copyAttachment(path, "contract-experience", directoryDraftKey);
+      updateAuthorizedSigner(id, { document: attachment });
+      setError("");
+    } catch (reason) {
+      setError(`Не удалось прикрепить доверенность: ${String(reason)}`);
+    }
+  };
+  const openPowerOfAttorney = async (relativePath: string) => {
+    try {
+      const workspace = await getWorkspaceInfo();
+      const separator = workspace.root.includes("\\") ? "\\" : "/";
+      await openPath(`${workspace.root}${separator}${relativePath.replace(/\//g, separator)}`);
+      setError("");
+    } catch (reason) {
+      setError(`Не удалось открыть доверенность: ${String(reason)}`);
+    }
+  };
   return (<>
+    <DrawerBackdrop onClose={requestClose}>
     <aside
       className="detail-drawer company-editor-drawer"
       role="dialog"
@@ -659,6 +704,36 @@ export function CompanyEditor({
             />
           </label>
         </div>
+        {item.scope === "internal" && <>
+          <div className="inline-heading">
+            <div>
+              <h3>Право подписи по доверенности</h3>
+              <p>Укажите сотрудников, которые могут подписывать документы от имени компании, и приложите доверенности.</p>
+            </div>
+            <button className="secondary small" type="button" onClick={() => update("authorizedSigners", [...item.authorizedSigners, { id: crypto.randomUUID(), fullName: "", position: "", powerOfAttorneyNumber: "", issuedAt: "", expiresAt: "", notes: "", document: {} }])}>
+              Добавить подписанта
+            </button>
+          </div>
+          {item.authorizedSigners.length === 0 && <div className="empty-inline">Подписанты по доверенности не указаны.</div>}
+          {item.authorizedSigners.map((person) => <div className="decision-maker-card" key={person.id}>
+            <div className="form-grid compact">
+              <label className="wide">ФИО *<input value={person.fullName} onChange={(event) => updateAuthorizedSigner(person.id, { fullName: event.target.value })} /></label>
+              <label>Должность<input value={person.position} onChange={(event) => updateAuthorizedSigner(person.id, { position: event.target.value })} /></label>
+              <label>Номер доверенности<input value={person.powerOfAttorneyNumber} onChange={(event) => updateAuthorizedSigner(person.id, { powerOfAttorneyNumber: event.target.value })} /></label>
+              <label>Дата выдачи<input type="date" value={person.issuedAt} onChange={(event) => updateAuthorizedSigner(person.id, { issuedAt: event.target.value })} /></label>
+              <label>Действует до<input type="date" value={person.expiresAt} onChange={(event) => updateAuthorizedSigner(person.id, { expiresAt: event.target.value })} /></label>
+              <label className="wide">Примечание<input value={person.notes} onChange={(event) => updateAuthorizedSigner(person.id, { notes: event.target.value })} /></label>
+            </div>
+            <div className="document-file">
+              <span>{person.document.fileName ? `▧ ${person.document.fileName}${person.document.sizeBytes ? ` · ${(person.document.sizeBytes / 1024 / 1024).toFixed(1)} МБ` : ""}` : "Доверенность не прикреплена"}</span>
+              <div className="button-row">
+                {person.document.relativePath && <button className="secondary small" type="button" onClick={() => void openPowerOfAttorney(person.document.relativePath!)}>Открыть</button>}
+                <button className="secondary small" type="button" onClick={() => void uploadPowerOfAttorney(person.id)}>{person.document.fileName ? "Заменить доверенность" : "Загрузить доверенность"}</button>
+                <button className="secondary small danger" type="button" onClick={() => update("authorizedSigners", item.authorizedSigners.filter((entry) => entry.id !== person.id))}>Удалить подписанта</button>
+              </div>
+            </div>
+          </div>)}
+        </>}
         <label>
           Раздел справочника *
           <select
@@ -861,6 +936,7 @@ export function CompanyEditor({
         </button>
       </footer>
     </aside>
+    </DrawerBackdrop>
     {discardConfirmation}
   </>
   );

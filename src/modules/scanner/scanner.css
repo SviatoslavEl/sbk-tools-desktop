@@ -66,6 +66,34 @@
 .merge-page-row { min-width: 0; display: flex; align-items: center; justify-content: space-between; gap: 7px; padding: 6px 7px; border-radius: 7px; background: #fff; }
 .merge-page-row > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; }
 .merge-page-row .icon-button { width: 28px; min-height: 28px; font-size: 14px; }
+.scanner-workspace-header { flex-wrap: wrap; }
+.scanner-workspace-tabs { display: flex; align-items: center; gap: 5px; }
+.scanner-workspace-tabs button { min-height: 34px; padding: 6px 10px; color: #53685a; background: transparent; border: 1px solid transparent; border-radius: 8px; font-weight: 700; }
+.scanner-workspace-tabs button.active { color: #1f6e30; background: #e4f5e7; border-color: #a9cfb0; }
+.scanner-workspace-header > span { color: #64776b; font-size: 11px; }
+.merge-main-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 14px; border-bottom: 1px solid #dbe7de; background: #f8fbf9; }
+.merge-main-toolbar > div:first-child { display: grid; gap: 3px; min-width: 0; }
+.merge-main-toolbar span { color: #607468; font-size: 10px; }
+.merge-main-workspace { display: grid; grid-template-columns: minmax(260px, 34%) minmax(0, 1fr); min-height: 610px; background: #dfe9e1; }
+.merge-organizer { min-width: 0; display: grid; grid-template-rows: auto minmax(0, 1fr); max-height: 610px; overflow: hidden; background: #f5faf6; border-right: 1px solid #c9dacd; }
+.merge-file-summary { display: grid; gap: 5px; padding: 9px; border-bottom: 1px solid #d7e7da; }
+.merge-file-summary .merge-file-row { border: 1px solid #d7e7da; font-size: 10px; }
+.merge-organizer .merge-page-list { max-height: none; padding: 9px; overflow-y: auto; }
+.merge-page-card { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 6px; align-items: center; padding: 7px; background: #fff; border: 1px solid #d4e3d7; border-radius: 9px; }
+.merge-page-card.active { background: #e8f6eb; border-color: #49ad5c; box-shadow: inset 3px 0 #2f9845; }
+.merge-page-select { min-width: 0; display: grid; grid-template-columns: 32px minmax(0, 1fr); gap: 1px 7px; padding: 3px; color: #315c40; background: transparent; border: 0; text-align: left; }
+.merge-page-select strong { grid-row: span 2; align-self: center; display: grid; width: 30px; height: 38px; place-items: center; color: #1f6e30; background: #eef7f0; border: 1px solid #c2d8c7; border-radius: 6px; }
+.merge-page-select span, .merge-page-select small { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.merge-page-select span { font-size: 10px; font-weight: 700; }
+.merge-page-select small { color: #6b7e70; font-size: 9px; }
+.merge-page-actions { display: grid; grid-template-columns: repeat(2, 27px); gap: 3px; }
+.merge-page-actions .icon-button { width: 27px; min-height: 27px; font-size: 13px; }
+.merge-preview-pane { min-width: 0; display: grid; grid-template-rows: auto minmax(0, 1fr); }
+.merge-preview-caption { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 9px 13px; color: #53685a; background: rgba(255,255,255,.82); border-bottom: 1px solid #cadacd; font-size: 10px; }
+.merge-preview-caption strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.merge-document-stage { position: relative; min-height: 560px; display: grid; place-items: center; padding: 24px; overflow: auto; }
+.merge-document-stage > img { display: block; width: min(72%, 720px); height: auto; background: #fff; box-shadow: 0 8px 30px rgba(38, 60, 45, .18); }
+.merge-drop-empty { min-height: 610px; }
 @keyframes scanner-spin { to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) { .loading-spinner { animation-duration: 1.8s; } }
 
@@ -136,6 +164,8 @@
 .page-jump input { width: 72px; min-height: 30px; }
 
 @media (max-width: 900px) {
+  .merge-main-workspace { grid-template-columns: minmax(220px, 40%) minmax(0, 1fr); }
+  .merge-main-toolbar { align-items: flex-start; }
   .split-block-row { grid-template-columns: minmax(0, 1fr) 36px; }
   .split-block-row label { grid-column: 1 / -1; }
   .split-block-row .icon-button { grid-column: 2; grid-row: 1; }

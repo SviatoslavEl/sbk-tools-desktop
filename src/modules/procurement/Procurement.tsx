@@ -1,5 +1,6 @@
 import { useMemo, useState } from "react";
 import { ConfirmDialog } from "../../components/Dialog";
+import { DrawerBackdrop } from "../../components/DrawerBackdrop";
 import { useRecords } from "../../hooks/useRecords";
 import { useUnsavedChanges } from "../../hooks/useUnsavedChanges";
 import { chooseSavePath, exportText } from "../../lib/files";
@@ -469,6 +470,7 @@ function ProcurementEditor({
     ["documents", "Документы"],
   ];
   return (<>
+    <DrawerBackdrop onClose={requestClose}>
     <aside
       className="detail-drawer procurement-drawer"
       role="dialog"
@@ -1276,6 +1278,7 @@ function ProcurementEditor({
         </button>
       </footer>
     </aside>
+    </DrawerBackdrop>
     {discardConfirmation}
   </>
   );

@@ -1,6 +1,7 @@
 import { Fragment, useEffect, useMemo, useState } from "react";
 import { openPath } from "@tauri-apps/plugin-opener";
 import { ConfirmDialog, Dialog } from "../../components/Dialog";
+import { DrawerBackdrop } from "../../components/DrawerBackdrop";
 import { SortableHeader } from "../../components/SortableHeader";
 import { useRecords } from "../../hooks/useRecords";
 import { useUnsavedChanges } from "../../hooks/useUnsavedChanges";
@@ -1937,6 +1938,7 @@ function StaffEditor({
     onClose();
   });
   return (<>
+    <DrawerBackdrop onClose={requestClose}>
     <aside
       className="detail-drawer wide-drawer"
       role="dialog"
@@ -2328,6 +2330,7 @@ function StaffEditor({
         </button>
       </footer>
     </aside>
+    </DrawerBackdrop>
     {discardConfirmation}
   </>
   );

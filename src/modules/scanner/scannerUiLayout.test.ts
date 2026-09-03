@@ -55,7 +55,7 @@ describe("предпросмотр сканера", () => {
     expect(component).toContain("Добавить блок");
     expect(component).toContain("Сохранить блоки PDF");
     expect(scannerStyles).toContain(".split-block-row { display: grid; min-width: 0;");
-    expect(component).toContain("Порядок листов");
+    expect(component).toContain("Листы объединяемого документа");
     expect(component).toContain("mergePageOrder");
   });
 
@@ -77,9 +77,11 @@ describe("предпросмотр сканера", () => {
     const app = readFileSync(new URL("../../App.tsx", import.meta.url), "utf8");
     const html = readFileSync(new URL("../../../index.html", import.meta.url), "utf8");
 
-    expect(component).toContain("Объединить файлы в один PDF");
+    expect(component).toContain("Объединение файлов");
     expect(component).toContain('operation: "merge"');
-    expect(component).toContain("Добавить файлы к объединению");
+    expect(component).toContain("Сборка общего документа");
+    expect(component).toContain("mergePreviewUrl");
+    expect(component).toContain("Предпросмотр страницы");
     expect(app).toContain("setStartupDelayElapsed(true), 3500");
     expect(html).toContain("Запускаем СБК Инструменты");
     expect(html).toContain("preload-progress");

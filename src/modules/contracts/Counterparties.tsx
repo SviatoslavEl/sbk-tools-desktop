@@ -28,6 +28,7 @@ export function CounterpartiesRegistry() {
         company.name, company.shortName, company.inn, company.kpp, company.ogrn,
         company.address, company.contact, company.notes,
         ...company.decisionMakers.flatMap((person) => [person.fullName, person.position, person.department, person.phone, person.email, person.notes]),
+        ...company.authorizedSigners.flatMap((person) => [person.fullName, person.position, person.powerOfAttorneyNumber, person.notes, person.document.fileName || ""]),
       ].join(" ").toLocaleLowerCase("ru-RU");
       return !needle || searchable.includes(needle);
     }).sort((a, b) => a.name.localeCompare(b.name, "ru"));
@@ -59,10 +60,11 @@ export function CounterpartiesRegistry() {
       </div>
     </div>
     <section className="surface table-surface">
-      <div className="table-scroll"><table><thead><tr><th>Компания</th><th>Реквизиты</th><th>Лица, принимающие решения</th><th>Контакты</th><th>Связи</th><th /></tr></thead><tbody>{filtered.map((company) => <tr key={company.id}>
+      <div className="table-scroll"><table><thead><tr><th>Компания</th><th>Реквизиты</th><th>Лица, принимающие решения</th><th>Право подписи</th><th>Контакты</th><th>Связи</th><th /></tr></thead><tbody>{filtered.map((company) => <tr key={company.id}>
         <td><button className="link-button" type="button" onClick={() => setEditing(company)}><strong>{company.shortName || company.name}</strong>{company.shortName && <small>{company.name}</small>}</button><span className={`status ${company.scope === "internal" ? "success" : "neutral"}`}>{company.scope === "internal" ? "Внутренняя" : "Внешняя"}</span></td>
         <td>{company.inn ? <>ИНН {company.inn}{company.kpp ? <><br />КПП {company.kpp}</> : null}</> : "—"}</td>
         <td>{company.decisionMakers.length ? company.decisionMakers.map((person) => <div className="decision-maker-summary" key={person.id}><strong>{person.fullName || "Без имени"}{person.isPrimary ? " ★" : ""}</strong><small>{person.position || person.department || "Должность не указана"}</small></div>) : "—"}</td>
+        <td>{company.scope === "internal" && company.authorizedSigners.length ? company.authorizedSigners.map((person) => <div className="decision-maker-summary" key={person.id}><strong>{person.fullName}</strong><small>{person.powerOfAttorneyNumber ? `Доверенность ${person.powerOfAttorneyNumber}` : "Номер не указан"}{person.document.fileName ? ` · ${person.document.fileName}` : ""}</small></div>) : "—"}</td>
         <td>{company.decisionMakers.map((person) => <small className="company-relation" key={person.id}>{[person.phone, person.email].filter(Boolean).join(" · ")}</small>)}{!company.decisionMakers.length && (company.contact || "—")}</td>
         <td>{companyRelationshipLabel(company, directory.companies).map((label) => <small className="company-relation" key={label}>{label}</small>)}</td>
         <td><button className="secondary small" type="button" onClick={() => setEditing(company)}>{access.editor ? "Редактировать" : "Открыть"}</button></td>

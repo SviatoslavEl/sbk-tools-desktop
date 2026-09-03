@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { openPath } from "@tauri-apps/plugin-opener";
 import { ConfirmDialog, Dialog } from "../../components/Dialog";
+import { DrawerBackdrop } from "../../components/DrawerBackdrop";
 import { SortableHeader } from "../../components/SortableHeader";
 import { useRecords } from "../../hooks/useRecords";
 import { useUnsavedChanges } from "../../hooks/useUnsavedChanges";
@@ -532,8 +533,14 @@ export function ContractsRegistry() {
     [store.records],
   );
 
-  const exportSelection = async () => {
-    const rows = filtered.map(({ payload }) => {
+  const selectedExportRecords = (recordIds: string[]) => {
+    const selected = new Set(recordIds);
+    return store.records.filter((record) => selected.has(record.id));
+  };
+  const exportSelection = async (recordIds: string[]) => {
+    const records = selectedExportRecords(recordIds);
+    if (!records.length) return window.alert("Отметьте договоры для экспорта.");
+    const rows = records.map(({ payload }) => {
       const item = normalizeContractData(payload);
       return [
         item.performingLegalEntity || "",
@@ -579,14 +586,16 @@ export function ContractsRegistry() {
       toCsv(contractHeaders, rows),
     );
   };
-  const exportXlsx = async () => {
+  const exportXlsx = async (recordIds: string[]) => {
+    const records = selectedExportRecords(recordIds);
+    if (!records.length) return window.alert("Отметьте договоры для экспорта.");
     const path = await chooseSavePath(
       "Экспорт договоров в Excel",
       "опыт-по-договорам.xlsx",
       ["xlsx"],
     );
     if (!path) return;
-    const rows = filtered.map(({ payload }) => {
+    const rows = records.map(({ payload }) => {
       const item = normalizeContractData(payload);
       return [
         item.performingLegalEntity || "",
@@ -1078,9 +1087,9 @@ export function ContractsRegistry() {
           <div className="toolbar-action-group"><span>Обмен</span>
             {!readOnly && <button className="secondary" type="button" onClick={() => void openImport("add")}>Добавить из файла</button>}
             {!readOnly && <button className="secondary" type="button" onClick={() => void openImport("update")}>Обновить из файла</button>}
-            <button className="secondary" type="button" onClick={() => void exportArchive()}>Экспорт ZIP</button>
-            <button className="secondary" type="button" onClick={() => void exportSelection()}>CSV</button>
-            <button className="secondary" type="button" onClick={() => void exportXlsx()}>XLSX</button>
+            <button className="secondary" type="button" disabled={selectedRegistryContracts.size === 0} title="В экспорт попадут только отмеченные договоры" onClick={() => void exportArchive([...selectedRegistryContracts])}>Экспорт ZIP ({selectedRegistryContracts.size})</button>
+            <button className="secondary" type="button" disabled={selectedRegistryContracts.size === 0} title="В экспорт попадут только отмеченные договоры" onClick={() => void exportSelection([...selectedRegistryContracts])}>CSV ({selectedRegistryContracts.size})</button>
+            <button className="secondary" type="button" disabled={selectedRegistryContracts.size === 0} title="В экспорт попадут только отмеченные договоры" onClick={() => void exportXlsx([...selectedRegistryContracts])}>XLSX ({selectedRegistryContracts.size})</button>
           </div>
           <button
             className="secondary"
@@ -1115,7 +1124,7 @@ export function ContractsRegistry() {
           <table>
             <thead>
               <tr>
-                {!readOnly && <th className="selection-cell"><input type="checkbox" aria-label="Выбрать все найденные договоры" checked={filtered.length > 0 && filtered.every((record) => selectedRegistryContracts.has(record.id))} onChange={(event) => setSelectedRegistryContracts((current) => { const next = new Set(current); filtered.forEach((record) => event.target.checked ? next.add(record.id) : next.delete(record.id)); return next; })} /></th>}
+                <th className="selection-cell"><input type="checkbox" aria-label="Выбрать все найденные договоры" checked={filtered.length > 0 && filtered.every((record) => selectedRegistryContracts.has(record.id))} onChange={(event) => setSelectedRegistryContracts((current) => { const next = new Set(current); filtered.forEach((record) => event.target.checked ? next.add(record.id) : next.delete(record.id)); return next; })} /></th>
                 {([[
                   "number", "Номер и дата"], ["performer", "Юрлицо-исполнитель"], ["customer", "Заказчик"],
                   ["subject", "Предмет"], ["amount", "Сумма"], ["period", "Период"], ["stage", "Стадия"],
@@ -1135,7 +1144,7 @@ export function ContractsRegistry() {
                       if (!readOnly) setEditing(record);
                     }}
                   >
-                    {!readOnly && <td className="selection-cell"><input type="checkbox" aria-label={`Выбрать договор ${item.number}`} checked={selectedRegistryContracts.has(record.id)} onChange={(event) => setSelectedRegistryContracts((current) => { const next = new Set(current); if (event.target.checked) next.add(record.id); else next.delete(record.id); return next; })} /></td>}
+                    <td className="selection-cell"><input type="checkbox" aria-label={`Выбрать договор ${item.number}`} checked={selectedRegistryContracts.has(record.id)} onChange={(event) => setSelectedRegistryContracts((current) => { const next = new Set(current); if (event.target.checked) next.add(record.id); else next.delete(record.id); return next; })} /></td>
                     <td className="sticky-cell">
                       {readOnly ? (
                         <>
@@ -1980,6 +1989,7 @@ function ContractEditor({
   const checks = contractChecks(item);
   const balance = contractBalance(item);
   return (<>
+    <DrawerBackdrop onClose={requestClose}>
     <aside
       className="detail-drawer"
       role="dialog"
@@ -2379,6 +2389,7 @@ function ContractEditor({
         </button>
       </footer>
     </aside>
+    </DrawerBackdrop>
     {discardConfirmation}
   </>
   );

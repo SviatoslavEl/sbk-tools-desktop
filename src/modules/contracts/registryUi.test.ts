@@ -37,6 +37,15 @@ describe("интерфейс реестров", () => {
     expect(component).toContain("setBulkArchiveIds([...selectedRegistryContracts])");
   });
 
+  it("выгружает только договоры, отмеченные в основной таблице", () => {
+    const component = readFileSync(new URL("./Contracts.tsx", import.meta.url), "utf8");
+    expect(component).toContain("selectedExportRecords");
+    expect(component).toContain("exportArchive([...selectedRegistryContracts])");
+    expect(component).toContain("exportSelection([...selectedRegistryContracts])");
+    expect(component).toContain("exportXlsx([...selectedRegistryContracts])");
+    expect(component).toContain("В экспорт попадут только отмеченные договоры");
+  });
+
   it("разделяет контрагентов, окрашивает основания и даёт групповой выбор в архиве", () => {
     const counterparties = readFileSync(new URL("./Counterparties.tsx", import.meta.url), "utf8");
     const staff = readFileSync(new URL("../staff/Staff.tsx", import.meta.url), "utf8");
@@ -56,5 +65,25 @@ describe("интерфейс реестров", () => {
     expect(styles).toContain(".app-shell { min-width: 0; max-width: 100vw; height: 100vh; overflow: hidden;");
     expect(styles).toContain(".tool-nav { min-height: 0; overflow-y: auto;");
     expect(styles).toContain(".tool-content { min-width: 0; min-height: 0; max-width: 100%; overflow: auto;");
+    expect(styles).toContain(".collapse-button { position: absolute; top: 70px; right: 7px;");
+  });
+
+  it("показывает доверенных подписантов внутренних компаний", () => {
+    const directory = readFileSync(new URL("./CompanyDirectory.tsx", import.meta.url), "utf8");
+    const counterparties = readFileSync(new URL("./Counterparties.tsx", import.meta.url), "utf8");
+    expect(directory).toContain("Подписанты по доверенности");
+    expect(directory).toContain("Загрузить доверенность");
+    expect(directory).toContain("authorizedSigners");
+    expect(counterparties).toContain("Право подписи");
+    expect(counterparties).toContain("powerOfAttorneyNumber");
+  });
+
+  it("закрывает карточки кликом по свободной области слева", () => {
+    const backdrop = readFileSync(new URL("../../components/DrawerBackdrop.tsx", import.meta.url), "utf8");
+    const contracts = readFileSync(new URL("./Contracts.tsx", import.meta.url), "utf8");
+    const staff = readFileSync(new URL("../staff/Staff.tsx", import.meta.url), "utf8");
+    expect(backdrop).toContain("event.currentTarget === event.target");
+    expect(contracts).toContain("<DrawerBackdrop onClose={requestClose}>");
+    expect(staff).toContain("<DrawerBackdrop onClose={requestClose}>");
   });
 });
