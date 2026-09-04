@@ -471,6 +471,11 @@ tbody tr:hover .sticky-cell { background: #f6fbf7; }
 .startup-progress span { display: block; width: 42%; height: 100%; border-radius: inherit; background: var(--primary, #2f9845); animation: startup-slide 1.15s ease-in-out infinite alternate; }
 .startup-steps { display: flex; flex-wrap: wrap; gap: 8px 16px; color: var(--muted, #617368); font-size: 13px; }
 .startup-steps span::before { content: "•"; margin-right: 6px; color: var(--primary, #2f9845); }
+.startup-steps.staged { display: grid; gap: 7px; color: #87938b; }
+.startup-steps.staged span::before { content: "○"; margin-right: 7px; color: #9da9a1; }
+.startup-steps.staged span.active { color: var(--muted, #617368); }
+.startup-steps.staged span.active::before { content: "●"; color: var(--primary, #2f9845); }
+.startup-actions { display: flex; flex-wrap: wrap; gap: 9px; }
 @keyframes startup-slide { from { transform: translateX(-25%); } to { transform: translateX(165%); } }
 @media (prefers-reduced-motion: reduce) { .startup-progress span { animation-duration: 2.4s; } }
 .department-group-row td {

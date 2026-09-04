@@ -82,7 +82,15 @@ describe("предпросмотр сканера", () => {
     expect(component).toContain("Сборка общего документа");
     expect(component).toContain("mergePreviewUrl");
     expect(component).toContain("Предпросмотр страницы");
+    expect(app).toContain("installedFastStart");
+    expect(app).toContain("if (installedFastStart) return;");
     expect(app).toContain("setStartupDelayElapsed(true), 3500");
+    expect(app).toContain("getStartupStatus");
+    expect(app).toContain("reportStartupUiVisible");
+    expect(app).toContain("Проверяем рабочую папку");
+    expect(app).toContain("Открываем базы данных");
+    expect(app).toContain("Выбрать другую папку");
+    expect(app).toContain("Повторить");
     expect(html).toContain("Запускаем СБК Инструменты");
     expect(html).toContain("preload-progress");
   });

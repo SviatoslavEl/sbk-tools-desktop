@@ -322,4 +322,34 @@ mod tests {
         drop(reader);
         let _ = fs::remove_dir_all(root);
     }
+
+    #[test]
+    fn opening_a_current_database_does_not_migrate_or_rewrite_it() {
+        let root = std::env::temp_dir().join(format!("sbk-current-schema-{}", Uuid::new_v4()));
+        fs::create_dir_all(root.join("staff")).expect("module directory");
+        fs::create_dir_all(root.join("backups")).expect("backup directory");
+        let database = root.join("staff").join("data.sqlite3");
+
+        let connection = open_database(&root, "staff").expect("create current database");
+        connection
+            .execute(
+                "INSERT INTO records(id,title,payload,created_at,updated_at) VALUES ('current','Current','{}','now','now')",
+                [],
+            )
+            .expect("seed current database");
+        drop(connection);
+        let before = fs::read(&database).expect("database snapshot");
+
+        drop(open_database(&root, "staff").expect("reopen current database"));
+
+        assert_eq!(fs::read(&database).expect("database after reopen"), before);
+        assert_eq!(
+            fs::read_dir(root.join("backups"))
+                .expect("backup directory")
+                .count(),
+            0,
+            "a current schema must not create a migration backup"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
 }

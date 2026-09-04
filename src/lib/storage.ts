@@ -37,6 +37,15 @@ export interface WorkspaceInfo {
   freeSpaceBytes: number;
 }
 
+export interface StartupStatus {
+  stage: string;
+  stageIndex: number;
+  ready: boolean;
+  failed: boolean;
+  needsWorkspace: boolean;
+  error?: string;
+}
+
 export interface AttachmentInfo {
   relativePath: string;
   fileName: string;
@@ -140,6 +149,27 @@ export async function getWorkspaceInfo(): Promise<WorkspaceInfo> {
   };
 }
 
+export async function getStartupStatus(): Promise<StartupStatus> {
+  if (isTauri()) return invoke<StartupStatus>("startup_status");
+  return {
+    stage: "Готово",
+    stageIndex: 4,
+    ready: true,
+    failed: false,
+    needsWorkspace: false,
+  };
+}
+
+export async function reportStartupUiVisible(): Promise<void> {
+  if (isTauri()) await invoke<void>("report_startup_ui_visible");
+}
+
+export async function retryWorkspaceInitialization(): Promise<StartupStatus> {
+  if (isTauri())
+    return invoke<StartupStatus>("retry_workspace_initialization");
+  return getStartupStatus();
+}
+
 export async function switchWorkspaceMode(editor: boolean, password: string): Promise<void> {
   if (!isTauri()) return;
   await invoke<void>("switch_workspace_mode", { editor, password });
@@ -153,10 +183,13 @@ export async function setWorkspaceAccessPassword(currentPassword: string, newPas
   window.dispatchEvent(new Event("sbk-workspace-refresh"));
 }
 
-export async function setWorkspaceLocation(path: string): Promise<string> {
+export async function setWorkspaceLocation(
+  path: string,
+  reopen = false,
+): Promise<string> {
   if (!isTauri())
     throw new Error("Выбор рабочей папки доступен в desktop-версии");
-  return invoke<string>("set_workspace_location", { path });
+  return invoke<string>("set_workspace_location", { path, reopen });
 }
 
 export async function quitApplication(): Promise<void> {

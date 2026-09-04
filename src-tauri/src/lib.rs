@@ -15,6 +15,8 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
+#[cfg(feature = "installed-fast-start")]
+use std::ops::Deref;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -55,11 +57,181 @@ fn gui_ready_marker_path() -> Option<PathBuf> {
     gui_ready_marker_path_for(&token, &std::env::temp_dir())
 }
 
+#[tauri::command]
+fn report_startup_ui_visible(app: AppHandle) -> Result<(), String> {
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "Главное окно приложения не создано".to_string())?;
+    if !window.is_visible().map_err(|error| error.to_string())? {
+        return Err("Главное окно приложения ещё не показано".to_string());
+    }
+    if let Some(marker) = gui_ready_marker_path() {
+        fs::write(marker, b"ready\n").map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 struct AppState {
+    #[cfg(feature = "installed-fast-start")]
+    workspace: Arc<StartupWorkspace>,
+    #[cfg(not(feature = "installed-fast-start"))]
     workspace: Arc<Workspace>,
     scanner_jobs: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     maintenance: Arc<Mutex<()>>,
+}
+
+impl AppState {
+    fn active_workspace(&self) -> Result<Arc<Workspace>, String> {
+        #[cfg(feature = "installed-fast-start")]
+        {
+            self.workspace.workspace()
+        }
+        #[cfg(not(feature = "installed-fast-start"))]
+        {
+            Ok(self.workspace.clone())
+        }
+    }
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StartupStatus {
+    stage: String,
+    stage_index: u8,
+    ready: bool,
+    failed: bool,
+    needs_workspace: bool,
+    error: Option<String>,
+}
+
+#[cfg(feature = "installed-fast-start")]
+struct StartupWorkspace {
+    value: OnceLock<Arc<Workspace>>,
+    status: Mutex<StartupStatus>,
+    initializing: AtomicBool,
+}
+
+#[cfg(feature = "installed-fast-start")]
+impl StartupWorkspace {
+    fn new() -> Self {
+        Self {
+            value: OnceLock::new(),
+            status: Mutex::new(StartupStatus {
+                stage: "Запускаем СБК Инструменты".to_string(),
+                stage_index: 0,
+                ready: false,
+                failed: false,
+                needs_workspace: false,
+                error: None,
+            }),
+            initializing: AtomicBool::new(false),
+        }
+    }
+
+    fn snapshot(&self) -> StartupStatus {
+        self.status
+            .lock()
+            .map(|status| status.clone())
+            .unwrap_or_else(|_| StartupStatus {
+                stage: "Не удалось прочитать состояние запуска".to_string(),
+                stage_index: 0,
+                ready: false,
+                failed: true,
+                needs_workspace: false,
+                error: Some("Внутренняя ошибка состояния запуска".to_string()),
+            })
+    }
+
+    fn workspace(&self) -> Result<Arc<Workspace>, String> {
+        self.value.get().cloned().ok_or_else(|| {
+            self.snapshot()
+                .error
+                .unwrap_or_else(|| "Рабочее пространство ещё загружается".to_string())
+        })
+    }
+
+    fn begin(&self) -> bool {
+        if self.value.get().is_some()
+            || self
+                .initializing
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+        {
+            return false;
+        }
+        self.set_status("Запускаем СБК Инструменты", 0, false, false, None);
+        true
+    }
+
+    fn set_stage(&self, stage: &str, stage_index: u8) {
+        self.set_status(stage, stage_index, false, false, None);
+    }
+
+    fn set_status(
+        &self,
+        stage: &str,
+        stage_index: u8,
+        failed: bool,
+        needs_workspace: bool,
+        error: Option<String>,
+    ) {
+        if let Ok(mut status) = self.status.lock() {
+            *status = StartupStatus {
+                stage: stage.to_string(),
+                stage_index,
+                ready: false,
+                failed,
+                needs_workspace,
+                error,
+            };
+        }
+    }
+
+    fn finish(&self, workspace: Workspace) -> Result<(), String> {
+        self.value
+            .set(Arc::new(workspace))
+            .map_err(|_| "Рабочее пространство уже открыто".to_string())?;
+        if let Ok(mut status) = self.status.lock() {
+            *status = StartupStatus {
+                stage: "Готово".to_string(),
+                stage_index: 4,
+                ready: true,
+                failed: false,
+                needs_workspace: false,
+                error: None,
+            };
+        }
+        self.initializing.store(false, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn fail(&self, error: String, needs_workspace: bool) {
+        self.set_status(
+            if needs_workspace {
+                "Проверяем рабочую папку"
+            } else {
+                "Запуск не завершён"
+            },
+            1,
+            true,
+            needs_workspace,
+            Some(error),
+        );
+        self.initializing.store(false, Ordering::SeqCst);
+    }
+}
+
+#[cfg(feature = "installed-fast-start")]
+impl Deref for StartupWorkspace {
+    type Target = Workspace;
+
+    fn deref(&self) -> &Self::Target {
+        self.value
+            .get()
+            .expect("workspace commands are unavailable until startup completes")
+            .as_ref()
+    }
 }
 
 #[derive(Serialize)]
@@ -272,22 +444,112 @@ fn parse_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredRecord> {
     })
 }
 
+#[cfg(feature = "installed-fast-start")]
+fn initialize_workspace_in_background(startup: Arc<StartupWorkspace>) {
+    if !startup.begin() {
+        return;
+    }
+    thread::spawn(move || {
+        startup.set_stage("Проверяем рабочую папку", 1);
+        let workspace = match open_workspace() {
+            Ok(workspace) => workspace,
+            Err(error) => {
+                startup.fail(error, false);
+                return;
+            }
+        };
+        if !workspace.configured {
+            let message = workspace.warning.clone().unwrap_or_else(|| {
+                "Выберите постоянную рабочую папку для баз, документов и резервных копий."
+                    .to_string()
+            });
+            drop(workspace);
+            startup.fail(message, true);
+            return;
+        }
+
+        startup.set_stage("Открываем базы данных", 2);
+        for module in MODULES {
+            let result = if workspace.is_editor() {
+                open_database(&workspace.root, module).map(|_| ())
+            } else {
+                open_database_read_only(&workspace.root, module).map(|_| ())
+            };
+            if let Err(error) = result {
+                startup.fail(
+                    format!("Не удалось открыть раздел «{module}»: {error}"),
+                    false,
+                );
+                return;
+            }
+        }
+
+        startup.set_stage("Готовим модули", 3);
+        if workspace.is_editor()
+            && let Err(error) = intelligence::recover_interrupted_jobs(&workspace.root)
+        {
+            startup.fail(
+                format!("Не удалось восстановить очередь обработки: {error}"),
+                false,
+            );
+            return;
+        }
+        if let Err(error) = startup.finish(workspace) {
+            startup.fail(error, false);
+        }
+    });
+}
+
+#[tauri::command]
+fn startup_status(state: State<'_, AppState>) -> StartupStatus {
+    #[cfg(feature = "installed-fast-start")]
+    {
+        state.workspace.snapshot()
+    }
+    #[cfg(not(feature = "installed-fast-start"))]
+    {
+        let _ = state;
+        StartupStatus {
+            stage: "Готово".to_string(),
+            stage_index: 4,
+            ready: true,
+            failed: false,
+            needs_workspace: false,
+            error: None,
+        }
+    }
+}
+
+#[tauri::command]
+fn retry_workspace_initialization(state: State<'_, AppState>) -> StartupStatus {
+    #[cfg(feature = "installed-fast-start")]
+    {
+        initialize_workspace_in_background(state.workspace.clone());
+        state.workspace.snapshot()
+    }
+    #[cfg(not(feature = "installed-fast-start"))]
+    {
+        startup_status(state)
+    }
+}
+
 #[tauri::command]
 fn workspace_info(state: State<'_, AppState>) -> Result<WorkspaceInfo, String> {
-    let editor = state.workspace.is_editor();
-    let access_message = state.workspace.access_message();
+    let workspace = state.active_workspace()?;
+    let editor = workspace.is_editor();
+    let access_message = workspace.access_message();
     Ok(WorkspaceInfo {
-        root: state.workspace.root.to_string_lossy().into_owned(),
-        portable: state.workspace.portable,
-        configured: state.workspace.configured,
-        warning: state.workspace.warning.clone(),
-        writable: state.workspace.writable,
+        root: workspace.root.to_string_lossy().into_owned(),
+        portable: workspace.portable,
+        configured: workspace.configured,
+        warning: workspace.warning.clone(),
+        writable: workspace.writable,
         editor,
-        access_controlled: state.workspace.access_controlled(),
+        access_controlled: workspace.access_controlled(),
         access_message,
-        editor_owner: state.workspace.editor_owner(),
+        editor_owner: workspace.editor_owner(),
         schema_version: SCHEMA_VERSION,
-        free_space_bytes: fs2::available_space(&state.workspace.root).unwrap_or(0),
+        free_space_bytes: fs2::available_space(&workspace.root).unwrap_or(0),
     })
 }
 
@@ -297,10 +559,11 @@ fn switch_workspace_mode(
     editor: bool,
     password: String,
 ) -> Result<(), String> {
+    let workspace = state.active_workspace()?;
     if editor {
-        state.workspace.acquire_editor_with_password(&password)
+        workspace.acquire_editor_with_password(&password)
     } else {
-        state.workspace.release_editor_with_password(&password)
+        workspace.release_editor_with_password(&password)
     }
 }
 
@@ -311,17 +574,28 @@ fn set_workspace_access_password(
     new_password: String,
 ) -> Result<(), String> {
     state
-        .workspace
+        .active_workspace()?
         .set_access_password(&current_password, &new_password)
 }
 
 #[tauri::command]
-fn set_workspace_location(path: String) -> Result<String, String> {
+fn set_workspace_location(
+    state: State<'_, AppState>,
+    path: String,
+    reopen: Option<bool>,
+) -> Result<String, String> {
     let selected = PathBuf::from(path.trim());
     if selected.as_os_str().is_empty() {
         return Err("Выберите папку".to_string());
     }
-    configure_workspace_location(&selected, &workspace_pointer_path()?)
+    let root = configure_workspace_location(&selected, &workspace_pointer_path()?)?;
+    #[cfg(feature = "installed-fast-start")]
+    if reopen.unwrap_or(false) && state.workspace.value.get().is_none() {
+        initialize_workspace_in_background(state.workspace.clone());
+    }
+    #[cfg(not(feature = "installed-fast-start"))]
+    let _ = (state, reopen);
+    Ok(root)
 }
 
 fn configure_workspace_location(selected: &Path, pointer: &Path) -> Result<String, String> {
@@ -3814,7 +4088,7 @@ async fn scanner_run(
     operation: String,
     config: Value,
 ) -> Result<Value, String> {
-    let workspace = state.workspace.clone();
+    let workspace = state.active_workspace()?;
     let jobs = state.scanner_jobs.clone();
     tauri::async_runtime::spawn_blocking(move || {
         run_scanner_worker(app, workspace, jobs, job_id, operation, config)
@@ -3855,25 +4129,33 @@ fn delete_runtime_file(state: State<'_, AppState>, path: String) -> Result<(), S
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let workspace = open_workspace().expect("SBK Tools workspace could not be opened");
-    for module in MODULES {
-        if workspace.is_editor() {
-            open_database(&workspace.root, module)
-                .unwrap_or_else(|error| panic!("SBK Tools could not initialize {module}: {error}"));
-        } else {
-            open_database_read_only(&workspace.root, module)
-                .unwrap_or_else(|error| panic!("SBK Tools could not read {module}: {error}"));
+    #[cfg(feature = "installed-fast-start")]
+    let workspace = Arc::new(StartupWorkspace::new());
+    #[cfg(not(feature = "installed-fast-start"))]
+    let workspace = {
+        let workspace = open_workspace().expect("SBK Tools workspace could not be opened");
+        for module in MODULES {
+            if workspace.is_editor() {
+                open_database(&workspace.root, module).unwrap_or_else(|error| {
+                    panic!("SBK Tools could not initialize {module}: {error}")
+                });
+            } else {
+                open_database_read_only(&workspace.root, module)
+                    .unwrap_or_else(|error| panic!("SBK Tools could not read {module}: {error}"));
+            }
         }
-    }
-    if workspace.is_editor() {
-        intelligence::recover_interrupted_jobs(&workspace.root)
-            .expect("SBK Tools intelligence queue could not be recovered");
-    }
+        if workspace.is_editor() {
+            intelligence::recover_interrupted_jobs(&workspace.root)
+                .expect("SBK Tools intelligence queue could not be recovered");
+        }
+        Arc::new(workspace)
+    };
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             start_runtime_verification(app.handle());
+            #[cfg(not(feature = "installed-fast-start"))]
             if let Some(marker) = gui_ready_marker_path() {
                 let window = app.get_webview_window("main").ok_or_else(|| {
                     std::io::Error::other("SBK Tools main window was not created")
@@ -3885,14 +4167,22 @@ pub fn run() {
                 }
                 fs::write(marker, b"ready\n")?;
             }
+            #[cfg(feature = "installed-fast-start")]
+            {
+                let startup = app.state::<AppState>().workspace.clone();
+                initialize_workspace_in_background(startup);
+            }
             Ok(())
         })
         .manage(AppState {
-            workspace: Arc::new(workspace),
+            workspace,
             scanner_jobs: Arc::new(Mutex::new(HashMap::new())),
             maintenance: Arc::new(Mutex::new(())),
         })
         .invoke_handler(tauri::generate_handler![
+            report_startup_ui_visible,
+            startup_status,
+            retry_workspace_initialization,
             workspace_info,
             switch_workspace_mode,
             set_workspace_access_password,
@@ -3967,6 +4257,29 @@ mod tests {
             format!("SBKTools-ready-{token}.marker")
         );
         assert!(gui_ready_marker_path_for("not-a-token", &temp).is_none());
+    }
+
+    #[cfg(feature = "installed-fast-start")]
+    #[test]
+    fn startup_status_is_visible_and_retryable_after_failure() {
+        let startup = StartupWorkspace::new();
+        let initial = startup.snapshot();
+        assert_eq!(initial.stage, "Запускаем СБК Инструменты");
+        assert_eq!(initial.stage_index, 0);
+        assert!(!initial.ready);
+        assert!(!initial.failed);
+
+        assert!(startup.begin());
+        assert!(!startup.begin(), "parallel initialization must be rejected");
+        startup.set_stage("Открываем базы данных", 2);
+        assert_eq!(startup.snapshot().stage_index, 2);
+
+        startup.fail("Сетевая папка недоступна".to_string(), true);
+        let failed = startup.snapshot();
+        assert!(failed.failed);
+        assert!(failed.needs_workspace);
+        assert_eq!(failed.error.as_deref(), Some("Сетевая папка недоступна"));
+        assert!(startup.begin(), "failure must allow an explicit retry");
     }
 
     #[test]

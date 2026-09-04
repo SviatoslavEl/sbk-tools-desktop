@@ -6,6 +6,9 @@ authors = ["Sviatoslav"]
 license = "GPL-3.0-only"
 edition = "2024"
 
+[features]
+installed-fast-start = []
+
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [lib]

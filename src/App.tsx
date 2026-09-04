@@ -14,11 +14,15 @@ import { TenderCalendar } from "./modules/tender-calendar/TenderCalendar";
 import { chooseDirectory } from "./lib/files";
 import {
   createBackup,
+  getStartupStatus,
   getWorkspaceInfo,
   quitApplication,
+  reportStartupUiVisible,
+  retryWorkspaceInitialization,
   rotateBackups,
   setWorkspaceLocation,
   workspaceAccessInvalidatedEvent,
+  type StartupStatus,
   type WorkspaceInfo,
 } from "./lib/storage";
 import {
@@ -58,6 +62,9 @@ const tools: Array<{ id: ToolId; icon: string; label: string }> = [
   { id: "counterparties", icon: "⌕", label: "Контрагенты" },
   { id: "staff", icon: "●", label: "Кадры" },
 ];
+
+const installedFastStart =
+  import.meta.env.VITE_SBK_INSTALLED_FAST_START === "true";
 
 const toolTitles: Record<ToolId, [string, string]> = {
   dashboard: ["Главная", "Сроки, риски и готовность рабочих данных"],
@@ -118,32 +125,70 @@ const helpText: Record<ToolId, string> = {
 
 function App() {
   const [workspace, setWorkspace] = useState<WorkspaceInfo | null>(null);
-  const [startupDelayElapsed, setStartupDelayElapsed] = useState(false);
+  const [startup, setStartup] = useState<StartupStatus>({
+    stage: "Запускаем СБК Инструменты",
+    stageIndex: 0,
+    ready: false,
+    failed: false,
+    needsWorkspace: false,
+  });
+  const [startupDelayElapsed, setStartupDelayElapsed] = useState(
+    installedFastStart,
+  );
   const [workspaceError, setWorkspaceError] = useState("");
   const [workspaceReady, setWorkspaceReady] = useState("");
   const [accessTimers, setAccessTimers] =
     useState<AccessTimers>(readAccessTimers);
   useEffect(() => {
+    if (installedFastStart) void reportStartupUiVisible();
+  }, []);
+  useEffect(() => {
+    if (installedFastStart) return;
     const timer = window.setTimeout(() => setStartupDelayElapsed(true), 3500);
     return () => window.clearTimeout(timer);
   }, []);
   useEffect(() => {
-    let generation = 0;
+    let stopped = false;
+    let timer = 0;
     const refreshWorkspace = () => {
-      const current = ++generation;
-      void getWorkspaceInfo()
-        .then((value) => {
-          if (current === generation) setWorkspace(value);
+      window.clearTimeout(timer);
+      if (!installedFastStart) {
+        void getWorkspaceInfo()
+          .then((value) => {
+            if (!stopped) setWorkspace(value);
+          })
+          .catch((reason) => {
+            if (!stopped) setWorkspaceError(String(reason));
+          });
+        return;
+      }
+      void getStartupStatus()
+        .then(async (status) => {
+          if (stopped) return;
+          setStartup(status);
+          if (status.ready) {
+            const value = await getWorkspaceInfo();
+            if (stopped) return;
+            setWorkspace(value);
+            setWorkspaceError("");
+            return;
+          }
+          setWorkspace(null);
+          if (!status.failed)
+            timer = window.setTimeout(refreshWorkspace, 140);
         })
         .catch((reason) => {
-          if (current === generation) setWorkspaceError(String(reason));
+          if (stopped) return;
+          setWorkspaceError(String(reason));
+          timer = window.setTimeout(refreshWorkspace, 500);
         });
     };
     refreshWorkspace();
     window.addEventListener("sbk-workspace-refresh", refreshWorkspace);
     window.addEventListener(workspaceAccessInvalidatedEvent, refreshWorkspace);
     return () => {
-      generation += 1;
+      stopped = true;
+      window.clearTimeout(timer);
       window.removeEventListener("sbk-workspace-refresh", refreshWorkspace);
       window.removeEventListener(
         workspaceAccessInvalidatedEvent,
@@ -225,9 +270,29 @@ function App() {
     );
     if (!selected) return;
     try {
-      const root = await setWorkspaceLocation(selected);
-      setWorkspaceReady(root);
+      const root = await setWorkspaceLocation(selected, installedFastStart);
       setWorkspaceError("");
+      if (installedFastStart) {
+        setStartup({
+          stage: "Проверяем рабочую папку",
+          stageIndex: 1,
+          ready: false,
+          failed: false,
+          needsWorkspace: false,
+        });
+        window.dispatchEvent(new Event("sbk-workspace-refresh"));
+      } else {
+        setWorkspaceReady(root);
+      }
+    } catch (reason) {
+      setWorkspaceError(String(reason));
+    }
+  };
+  const retryStartup = async () => {
+    setWorkspaceError("");
+    try {
+      setStartup(await retryWorkspaceInitialization());
+      window.dispatchEvent(new Event("sbk-workspace-refresh"));
     } catch (reason) {
       setWorkspaceError(String(reason));
     }
@@ -252,14 +317,119 @@ function App() {
   };
   const [title, subtitle] = toolTitles[activeTool];
 
-  if (!workspace || !startupDelayElapsed)
+  if (!installedFastStart && (!workspace || !startupDelayElapsed))
     return (
       <div className="startup-screen">
         <div className="startup-card">
           <div className="brand-mark large">СБК</div>
           <h1>Подготавливаем рабочее пространство</h1>
-          <p>{workspaceError || "Проверяем папку данных, доступ редактора и встроенные модули…"}</p>
-          {!workspaceError && <><div className="startup-progress" aria-hidden="true"><span /></div><div className="startup-steps"><span>Рабочая папка</span><span>Базы</span><span>Модули</span></div></>}
+          <p>
+            {workspaceError ||
+              "Проверяем папку данных, доступ редактора и встроенные модули…"}
+          </p>
+          {!workspaceError && (
+            <>
+              <div className="startup-progress" aria-hidden="true">
+                <span />
+              </div>
+              <div className="startup-steps">
+                <span>Рабочая папка</span>
+                <span>Базы</span>
+                <span>Модули</span>
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+    );
+  if (installedFastStart && (!workspace || !startup.ready))
+    return (
+      <div className="startup-screen">
+        <div className="startup-card">
+          <div className="brand-mark large">СБК</div>
+          <h1>
+            {startup.needsWorkspace
+              ? "Где будем работать?"
+              : startup.failed || workspaceError
+                ? "Не удалось завершить запуск"
+                : "Запускаем СБК Инструменты"}
+          </h1>
+          {startup.needsWorkspace && (
+            <p>
+              Выберите постоянную папку для баз, документов и резервных копий.
+              Существующие данные не перемещаются и не удаляются.
+            </p>
+          )}
+          {(startup.failed || workspaceError) ? (
+            <>
+              <div className="notice error" role="alert">
+                <strong>{startup.stage}</strong>
+                <span>{workspaceError || startup.error}</span>
+              </div>
+              <div className="startup-actions">
+                <button
+                  className="primary"
+                  type="button"
+                  onClick={() => void retryStartup()}
+                >
+                  Повторить
+                </button>
+                <button
+                  className="secondary"
+                  type="button"
+                  onClick={() => void chooseFirstWorkspace()}
+                >
+                  Выбрать другую папку
+                </button>
+                <button
+                  className="secondary"
+                  type="button"
+                  onClick={() => void quitApplication()}
+                >
+                  Закрыть
+                </button>
+              </div>
+            </>
+          ) : (
+            <>
+              <p aria-live="polite">{startup.stage}</p>
+              <div className="startup-progress" aria-hidden="true">
+                <span />
+              </div>
+              <div
+                className="startup-steps staged"
+                aria-label="Этапы запуска"
+              >
+                {[
+                  "Запускаем СБК Инструменты",
+                  "Проверяем рабочую папку",
+                  "Открываем базы данных",
+                  "Готовим модули",
+                  "Готово",
+                ].map((step, index) => (
+                  <span
+                    className={index <= startup.stageIndex ? "active" : ""}
+                    key={step}
+                  >
+                    {step}
+                  </span>
+                ))}
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+    );
+  if (!workspace)
+    return (
+      <div className="startup-screen">
+        <div className="startup-card">
+          <div className="brand-mark large">СБК</div>
+          <h1>Запускаем СБК Инструменты</h1>
+          <p>Ожидаем готовность рабочей папки…</p>
+          <div className="startup-progress" aria-hidden="true">
+            <span />
+          </div>
         </div>
       </div>
     );
