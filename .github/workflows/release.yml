@@ -3,6 +3,7 @@ name: Release desktop builds
 on:
   workflow_dispatch:
   push:
+    branches: [codex/v2.8.0-demo-fixes]
     tags: ["v*"]
 
 permissions:
