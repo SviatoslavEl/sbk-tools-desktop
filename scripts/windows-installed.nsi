@@ -69,13 +69,15 @@ Section "!${PRODUCT_NAME}" MainSection
   File /oname=payload.tar.zst "payload.tar.zst"
   File /oname=sbk-installed-extractor.exe "sbk-installed-extractor.exe"
 
-  nsExec::ExecToStack '"$PLUGINSDIR\sbk-installed-extractor.exe" "$PLUGINSDIR\payload.tar.zst" "$INSTDIR"'
+  nsExec::ExecToStack '"$PLUGINSDIR\sbk-installed-extractor.exe" "$PLUGINSDIR\payload.tar.zst" "$INSTDIR" "$TEMP\SBK-Tools-Fast-Install-Error.log"'
   Pop $0
   Pop $1
   ${If} $0 != "0"
-    FileOpen $2 "$TEMP\SBK-Tools-Fast-Install-Error.log" w
-    FileWrite $2 "$1$\r$\n"
-    FileClose $2
+    ${If} $1 != ""
+      FileOpen $2 "$TEMP\SBK-Tools-Fast-Install-Error.log" a
+      FileWrite $2 "$1$\r$\n"
+      FileClose $2
+    ${EndIf}
     IfSilent silent_install_failure
     MessageBox MB_ICONSTOP|MB_OK "Не удалось установить ${PRODUCT_NAME}.$\r$\n$\r$\n$1"
     Abort

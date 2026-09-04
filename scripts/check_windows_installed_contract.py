@@ -120,6 +120,7 @@ def main() -> None:
         "IfSilent silent_install_failure",
         "SBK-Tools-Fast-Install-Error.log",
         "SetErrorLevel 1",
+        '"$TEMP\\SBK-Tools-Fast-Install-Error.log"',
     ):
         if required not in nsis_template:
             raise SystemExit(f"Installed NSIS contract is missing: {required}")

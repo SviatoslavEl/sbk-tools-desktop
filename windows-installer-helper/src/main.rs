@@ -116,6 +116,7 @@ fn run() -> Result<(), String> {
             .next()
             .ok_or_else(|| "Не указан каталог установки".to_string())?,
     );
+    let _diagnostic_path = arguments.next();
     if arguments.next().is_some() {
         return Err("Переданы лишние параметры установки".to_string());
     }
@@ -123,9 +124,21 @@ fn run() -> Result<(), String> {
 }
 
 fn main() -> ExitCode {
+    let diagnostic_path = std::env::args_os().nth(3).map(PathBuf::from);
+    if let Some(path) = &diagnostic_path {
+        let _ = fs::write(path, "Распаковщик запущен\n");
+    }
     match run() {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(()) => {
+            if let Some(path) = &diagnostic_path {
+                let _ = fs::write(path, "Установка файлов завершена успешно\n");
+            }
+            ExitCode::SUCCESS
+        }
         Err(error) => {
+            if let Some(path) = &diagnostic_path {
+                let _ = fs::write(path, format!("{error}\n"));
+            }
             eprintln!("{error}");
             ExitCode::FAILURE
         }
