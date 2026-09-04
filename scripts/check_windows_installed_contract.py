@@ -143,6 +143,7 @@ def main() -> None:
         "SBK-Tools-Windows-x64-Installed-Diagnostics",
         "SBK-Tools-Fast-Smoke.log",
         "Start-Transcript",
+        "Fast-start smoke failure",
     ):
         if required not in release_workflow:
             raise SystemExit(f"Installed smoke timeout protection is missing: {required}")

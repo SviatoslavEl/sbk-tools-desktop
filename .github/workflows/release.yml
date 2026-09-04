@@ -598,6 +598,13 @@ jobs:
         run: |
           $smokeLog = Join-Path $env:RUNNER_TEMP 'SBK-Tools-Fast-Smoke.log'
           Start-Transcript -Path $smokeLog -Force
+          trap {
+            $failure = ($_ | Out-String).Trim()
+            $escapedFailure = $failure.Replace('%', '%25').Replace("`r", '').Replace("`n", '%0A')
+            Write-Output "::error title=Fast-start smoke failure::$escapedFailure"
+            try { Stop-Transcript } catch { }
+            exit 1
+          }
           $installer = Get-ChildItem release-artifacts -Filter 'SBK-Tools-Fast-Setup-*-x64.exe' | Select-Object -First 1
           if (-not $installer) { throw 'Installed Windows artifact is missing' }
           $installDir = Join-Path $env:LOCALAPPDATA 'SBKToolsFastCi'
