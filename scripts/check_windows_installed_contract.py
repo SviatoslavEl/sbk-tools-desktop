@@ -136,6 +136,10 @@ def main() -> None:
         "Wait-InstallerProcess",
         "SBK-Tools-Fast-Install-Error.log",
         "timeout-minutes: 35",
+        "Release build-only Windows runtimes before install smoke",
+        "Free space before installer smoke",
+        "Fast-start installer failed",
+        "SBK-Tools-Windows-x64-Installed-Diagnostics",
     ):
         if required not in release_workflow:
             raise SystemExit(f"Installed smoke timeout protection is missing: {required}")

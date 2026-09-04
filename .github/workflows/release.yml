@@ -580,6 +580,18 @@ jobs:
         shell: pwsh
         run: |
           Remove-Item (Join-Path $env:GITHUB_WORKSPACE 'portable-stage') -Recurse -Force
+      - name: Release build-only Windows runtimes before install smoke
+        shell: pwsh
+        run: |
+          $releaseTree = Join-Path $env:GITHUB_WORKSPACE "src-tauri\target\$env:TARGET"
+          $webViewTree = Join-Path $env:GITHUB_WORKSPACE 'src-tauri\webview2-runtime'
+          $runtimeTree = Join-Path $env:GITHUB_WORKSPACE 'src-tauri\runtime-resources'
+          $workerBinary = Join-Path $env:GITHUB_WORKSPACE "src-tauri\binaries\sbk-scanner-worker-$env:TARGET.exe"
+          foreach ($path in @($releaseTree, $webViewTree, $runtimeTree, $workerBinary)) {
+            Remove-Item $path -Recurse -Force -ErrorAction SilentlyContinue
+          }
+          $drive = Get-PSDrive -Name ([IO.Path]::GetPathRoot($env:GITHUB_WORKSPACE).TrimEnd(':\'))
+          Write-Host "Free space before installer smoke: $([math]::Round($drive.Free / 1GB, 2)) GiB"
       - name: Install, launch twice, verify shared locking and uninstall safely
         timeout-minutes: 35
         shell: pwsh
@@ -620,6 +632,8 @@ jobs:
             } else {
               'No installer diagnostic was produced'
             }
+            $escapedDetails = $details.Replace('%', '%25').Replace("`r", '').Replace("`n", '%0A')
+            Write-Output "::error title=Fast-start installer failed::$escapedDetails"
             throw "Installer failed with exit code ${installExitCode}: $details"
           }
           $application = Join-Path $installDir 'SBK-Tools-Fast.exe'
@@ -742,6 +756,13 @@ jobs:
           if (-not (Test-Path (Join-Path $workspace 'uninstall-must-preserve.txt'))) {
             throw 'Uninstall removed user ProductData'
           }
+      - name: Upload fast-start installer diagnostics
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: SBK-Tools-Windows-x64-Installed-Diagnostics
+          path: ${{ runner.temp }}/SBK-Tools-Fast-Install-Error.log
+          if-no-files-found: ignore
       - name: Sign and verify installed Windows package when configured
         if: startsWith(github.ref, 'refs/tags/v')
         shell: pwsh
