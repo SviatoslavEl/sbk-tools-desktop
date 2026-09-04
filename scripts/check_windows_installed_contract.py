@@ -70,6 +70,7 @@ def main() -> None:
         'VITE_SBK_INSTALLED_FAST_START = "true"',
         "create_payload_archive.py",
         "windows-installer-helper\\Cargo.toml",
+        'Copy-Item $Extractor (Join-Path $NsisStage "sbk-installed-extractor.exe")',
         "nsis-3.11.zip",
     ):
         if required not in installed_script:

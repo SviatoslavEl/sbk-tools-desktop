@@ -154,7 +154,7 @@ Copy-Item (Join-Path $Root "LICENSE") (Join-Path $NsisStage "LICENSE.txt")
 Copy-Item (Join-Path $Root "src-tauri\icons\icon.ico") $NsisStage
 Copy-Item (Join-Path $NsisHome "COPYING") (Join-Path $NsisStage "NSIS-COPYING")
 Copy-Item $Archive $NsisStage
-Copy-Item $Extractor $NsisStage
+Copy-Item $Extractor (Join-Path $NsisStage "sbk-installed-extractor.exe")
 
 $SafeVersion = $Version.TrimStart("v")
 $VersionParts = [regex]::Match($SafeVersion, '^(\d+)\.(\d+)\.(\d+)')
