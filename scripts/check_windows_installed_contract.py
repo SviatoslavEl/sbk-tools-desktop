@@ -116,6 +116,7 @@ def main() -> None:
         "sbk-installed-extractor.exe",
         "$LOCALAPPDATA\\Programs\\SBK Tools Fast",
         "Section /o \"Ярлык на рабочем столе\"",
+        'StrCpy $StartMenuFolder "СБК Инструменты"',
         "IfSilent silent_install_failure",
         "SBK-Tools-Fast-Install-Error.log",
         "SetErrorLevel 1",
@@ -140,6 +141,8 @@ def main() -> None:
         "Free space before installer smoke",
         "Fast-start installer failed",
         "SBK-Tools-Windows-x64-Installed-Diagnostics",
+        "SBK-Tools-Fast-Smoke.log",
+        "Start-Transcript",
     ):
         if required not in release_workflow:
             raise SystemExit(f"Installed smoke timeout protection is missing: {required}")

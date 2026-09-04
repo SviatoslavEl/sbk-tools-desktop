@@ -53,6 +53,7 @@ Var StartMenuFolder
 !insertmacro MUI_LANGUAGE "English"
 
 Function .onInit
+  StrCpy $StartMenuFolder "СБК Инструменты"
   IfSilent installation_allowed
   IfFileExists "$INSTDIR\${PRODUCT_EXE}" 0 installation_allowed
   MessageBox MB_ICONQUESTION|MB_YESNO|MB_DEFBUTTON2 \
