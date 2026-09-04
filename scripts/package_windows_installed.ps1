@@ -14,6 +14,7 @@ $Worker = Join-Path $Root "src-tauri\binaries\sbk-scanner-worker-$Target.exe"
 $Runtime = Join-Path $Root "src-tauri\runtime-resources"
 $WebView = Join-Path $Root "src-tauri\webview2-runtime\Microsoft.WebView2.FixedVersionRuntime.151.0.4129.107.x64"
 $InspectionRoot = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { [IO.Path]::GetTempPath() }
+$BuildLog = Join-Path $InspectionRoot "sbk-fast-installed-build.log"
 
 if (-not $IsWindows -and $env:OS -ne "Windows_NT") { throw "Installed Windows package must be built on Windows" }
 if ($Version -notmatch '^v?[0-9A-Za-z][0-9A-Za-z._-]*$') { throw "Invalid artifact version: $Version" }
@@ -50,10 +51,22 @@ function Get-ManifestTool {
 
 $ManifestTool = Get-ManifestTool
 
-function Set-AsInvoker([string]$Executable) {
-    $manifest = Join-Path $Root "scripts\windows-as-invoker.manifest"
-    & $ManifestTool -nologo -manifest $manifest "-outputresource:$Executable;#1"
-    if ($LASTEXITCODE -ne 0) { throw "Failed to embed asInvoker manifest into installed application" }
+function Write-BuildFailure([string]$Stage, [string]$Fallback) {
+    $details = if (Test-Path $BuildLog -PathType Leaf) {
+        (Get-Content $BuildLog -Tail 30) -join "`n"
+    } else {
+        $Fallback
+    }
+    $escaped = $details.Replace('%', '%25').Replace("`r", '').Replace("`n", '%0A')
+    Write-Output "::error file=scripts/package_windows_installed.ps1,title=${Stage}::$escaped"
+    throw $Fallback
+}
+
+function Invoke-Tauri([string]$Stage, [string[]]$Arguments) {
+    & npm run tauri -- @Arguments 2>&1 | Tee-Object -FilePath $BuildLog -Append
+    if ($LASTEXITCODE -ne 0) {
+        Write-BuildFailure $Stage "$Stage failed with exit code $LASTEXITCODE"
+    }
 }
 
 function Assert-AsInvoker([string]$Executable, [string]$Label) {
@@ -76,16 +89,20 @@ Push-Location $Root
 $PreviousFastStart = $env:VITE_SBK_INSTALLED_FAST_START
 $env:VITE_SBK_INSTALLED_FAST_START = "true"
 try {
-    npm run tauri -- build --target $Target --no-bundle --features installed-fast-start --config $Config --ci
-    if ($LASTEXITCODE -ne 0) { throw "Installed Windows application build failed" }
+    Remove-Item $BuildLog -Force -ErrorAction SilentlyContinue
+    Invoke-Tauri "Installed Windows application build" @(
+        "build", "--target", $Target, "--no-bundle", "--features", "installed-fast-start",
+        "--config", $Config, "--ci"
+    )
     if (-not (Test-Path $Application -PathType Leaf)) {
         throw "Installed application binary was not produced: $Application"
     }
-    Set-AsInvoker $Application
     Assert-AsInvoker $Application "application"
 
-    npm run tauri -- bundle --target $Target --bundles nsis --features installed-fast-start --config $Config --ci
-    if ($LASTEXITCODE -ne 0) { throw "Installed Windows NSIS packaging failed" }
+    Invoke-Tauri "Installed Windows NSIS packaging" @(
+        "bundle", "--target", $Target, "--bundles", "nsis", "--features", "installed-fast-start",
+        "--config", $Config, "--ci", "--verbose"
+    )
 } finally {
     if ($null -eq $PreviousFastStart) {
         Remove-Item Env:VITE_SBK_INSTALLED_FAST_START -ErrorAction SilentlyContinue

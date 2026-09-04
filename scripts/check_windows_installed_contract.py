@@ -64,8 +64,7 @@ def main() -> None:
         "SBK-Tools-Fast-Setup-$SafeVersion-x64.exe",
         "verify_runtime_manifest.py",
         "resource-manifest.json",
-        "windows-as-invoker.manifest",
-        "--features installed-fast-start",
+        '"--features", "installed-fast-start"',
         'VITE_SBK_INSTALLED_FAST_START = "true"',
     ):
         if required not in installed_script:
@@ -97,6 +96,11 @@ def main() -> None:
     cargo_manifest = (ROOT / "src-tauri/Cargo.toml").read_text(encoding="utf-8")
     if "installed-fast-start = []" not in cargo_manifest:
         raise SystemExit("Installed startup feature is missing from the Rust build")
+    build_script = (ROOT / "src-tauri/build.rs").read_text(encoding="utf-8")
+    if '#[cfg(feature = "installed-fast-start")]' not in build_script or (
+        'include_str!("../scripts/windows-as-invoker.manifest")' not in build_script
+    ):
+        raise SystemExit("Installed asInvoker manifest must be embedded during compilation")
 
     print("Windows packaging contract: portable preserved, installed flavor isolated, startup staged")
 
