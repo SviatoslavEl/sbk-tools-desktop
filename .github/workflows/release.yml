@@ -567,11 +567,19 @@ jobs:
         run: |
           $version = $env:ARTIFACT_VERSION.TrimStart('v')
           ./scripts/package_windows_installed.ps1 -Target $env:TARGET -Version $version
+      - name: Release installed packaging workspace
+        shell: pwsh
+        run: |
+          Remove-Item (Join-Path $env:GITHUB_WORKSPACE 'installed-stage') -Recurse -Force
       - name: Build preserved portable package for cross-flavor locking test
         shell: pwsh
         run: |
           npm run tauri build -- --target $env:TARGET --no-bundle
           ./scripts/package_windows_portable.ps1 -Target $env:TARGET -Version 'cross-flavor-test'
+      - name: Release portable packaging workspace
+        shell: pwsh
+        run: |
+          Remove-Item (Join-Path $env:GITHUB_WORKSPACE 'portable-stage') -Recurse -Force
       - name: Install, launch twice, verify shared locking and uninstall safely
         shell: pwsh
         run: |
