@@ -30,6 +30,7 @@ jobs:
           workspaces: |
             src-tauri
             windows-launcher
+            windows-installer-helper
       - name: Install Linux desktop dependencies
         run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf
       - run: npm ci
@@ -56,6 +57,9 @@ jobs:
       - run: cargo fmt --manifest-path windows-launcher/Cargo.toml --check
       - run: cargo test --manifest-path windows-launcher/Cargo.toml --all-targets
       - run: cargo clippy --manifest-path windows-launcher/Cargo.toml --all-targets -- -D warnings
+      - run: cargo fmt --manifest-path windows-installer-helper/Cargo.toml --check
+      - run: cargo test --manifest-path windows-installer-helper/Cargo.toml --all-targets
+      - run: cargo clippy --manifest-path windows-installer-helper/Cargo.toml --all-targets -- -D warnings
       - run: python scripts/generate_sbom.py
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -493,6 +497,7 @@ jobs:
           workspaces: |
             src-tauri
             windows-launcher
+            windows-installer-helper
       - run: npm ci
       - name: Verify release tag, versions and independent packaging contract
         shell: pwsh
@@ -585,6 +590,13 @@ jobs:
           if (Test-Path (Join-Path $installDir 'ScanDocument.exe')) { throw 'Installed flavor contains the portable launcher name' }
           if (Get-ChildItem $installDir -Recurse -Filter '*onefile*launcher*' -ErrorAction SilentlyContinue) {
             throw 'Installed flavor contains the portable extraction launcher'
+          }
+          if (Get-ChildItem $installDir -Recurse -File -Include 'payload.tar.zst', 'sbk-installed-extractor.exe' -ErrorAction SilentlyContinue) {
+            throw 'Installer-only payload files were copied into the application directory'
+          }
+          $installParent = Split-Path -Parent $installDir
+          if (Get-ChildItem $installParent -Directory -Filter '.sbk-tools-fast-*' -ErrorAction SilentlyContinue) {
+            throw 'Installer left a staging or backup directory behind'
           }
           $shortcut = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\СБК Инструменты\СБК Инструменты — быстрый запуск.lnk'
           if (-not (Test-Path $shortcut -PathType Leaf)) { throw 'Start menu shortcut is missing' }

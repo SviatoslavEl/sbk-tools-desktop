@@ -30,7 +30,11 @@ def main() -> int:
         name = value.get("name") or path.rsplit("node_modules/", 1)[-1]
         item = component(name, value["version"], "npm", value.get("license"))
         components[item["purl"]] = item
-    for lock_path in (root / "src-tauri" / "Cargo.lock", root / "windows-launcher" / "Cargo.lock"):
+    for lock_path in (
+        root / "src-tauri" / "Cargo.lock",
+        root / "windows-launcher" / "Cargo.lock",
+        root / "windows-installer-helper" / "Cargo.lock",
+    ):
         cargo = tomllib.loads(lock_path.read_text(encoding="utf-8"))
         for value in cargo.get("package", []):
             item = component(value["name"], value["version"], "cargo")
@@ -41,6 +45,7 @@ def main() -> int:
         item = component(name, version, "pypi")
         components[item["purl"]] = item
     bundled = [
+        component("NSIS", "3.11", "generic", "zlib/libpng"),
         component("LibreOffice", "26.2.5", "generic", "MPL-2.0 OR LGPL-3.0-or-later"),
         component("Tesseract OCR", "5", "generic", "Apache-2.0"),
         component("tessdata-fast-rus", "4.1.0", "generic", "Apache-2.0"),

@@ -29,7 +29,7 @@
         "installMode": "currentUser",
         "languages": ["Russian", "English"],
         "displayLanguageSelector": false,
-        "compression": "lzma",
+        "compression": "none",
         "startMenuFolder": "СБК Инструменты"
       }
     }

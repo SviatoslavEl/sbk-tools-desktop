@@ -19,7 +19,9 @@ jobs:
           components: clippy, rustfmt
       - uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          workspaces: src-tauri
+          workspaces: |
+            src-tauri
+            windows-installer-helper
       - name: Install Linux desktop build dependencies
         run: |
           sudo apt-get update
@@ -41,6 +43,9 @@ jobs:
       - run: cargo fmt --manifest-path windows-launcher/Cargo.toml --check
       - run: cargo test --manifest-path windows-launcher/Cargo.toml --all-targets
       - run: cargo clippy --manifest-path windows-launcher/Cargo.toml --all-targets -- -D warnings
+      - run: cargo fmt --manifest-path windows-installer-helper/Cargo.toml --check
+      - run: cargo test --manifest-path windows-installer-helper/Cargo.toml --all-targets
+      - run: cargo clippy --manifest-path windows-installer-helper/Cargo.toml --all-targets -- -D warnings
       - name: Generate release SBOM
         run: python3 scripts/generate_sbom.py --output=release-artifacts/SBK-Tools.cyclonedx.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

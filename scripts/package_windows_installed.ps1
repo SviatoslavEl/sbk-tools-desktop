@@ -7,8 +7,11 @@ $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $Config = Join-Path $Root "src-tauri\tauri.installed.windows.conf.json"
 $ReleaseDir = Join-Path $Root "src-tauri\target\$Target\release"
-$BundleDir = Join-Path $ReleaseDir "bundle\nsis"
 $Output = Join-Path $Root "release-artifacts"
+$Stage = Join-Path $Root "installed-stage"
+$Payload = Join-Path $Stage "payload"
+$NsisStage = Join-Path $Stage "nsis"
+$ExtractorTarget = Join-Path $Stage "extractor-target"
 $Application = Join-Path $ReleaseDir "SBK-Tools-Fast.exe"
 $Worker = Join-Path $Root "src-tauri\binaries\sbk-scanner-worker-$Target.exe"
 $Runtime = Join-Path $Root "src-tauri\runtime-resources"
@@ -98,11 +101,6 @@ try {
         throw "Installed application binary was not produced: $Application"
     }
     Assert-AsInvoker $Application "application"
-
-    Invoke-Tauri "Installed Windows NSIS packaging" @(
-        "bundle", "--target", $Target, "--bundles", "nsis", "--features", "installed-fast-start",
-        "--config", $Config, "--ci", "--verbose"
-    )
 } finally {
     if ($null -eq $PreviousFastStart) {
         Remove-Item Env:VITE_SBK_INSTALLED_FAST_START -ErrorAction SilentlyContinue
@@ -112,19 +110,79 @@ try {
     Pop-Location
 }
 
-$Installer = Get-ChildItem $BundleDir -Filter "*-setup.exe" -File |
-    Sort-Object LastWriteTime -Descending |
-    Select-Object -First 1
+if (Test-Path $Stage) { Remove-Item -Recurse -Force $Stage }
+New-Item -ItemType Directory -Force $Payload, $NsisStage, $Output | Out-Null
+Copy-Item $Application (Join-Path $Payload "SBK-Tools-Fast.exe")
+Copy-Item $Worker (Join-Path $Payload "sbk-scanner-worker.exe")
+Copy-Item -Recurse $Runtime (Join-Path $Payload "scanner-runtime")
+Copy-Item -Recurse (Join-Path $Root "src-tauri\webview2-runtime") (Join-Path $Payload "webview2-runtime")
+Copy-Item (Join-Path $Root "LICENSE") $Payload
+Copy-Item (Join-Path $Root "THIRD_PARTY_LICENSES.md") $Payload
+
+$Archive = Join-Path $Stage "payload.tar.zst"
+python (Join-Path $Root "scripts\create_payload_archive.py") --root $Payload --output $Archive
+if ($LASTEXITCODE -ne 0) { throw "Installed payload compression failed" }
+if ((Get-Item $Archive).Length -ge 1800MB) {
+    throw "Compressed installed payload is too large for a single NSIS executable"
+}
+
+cargo build `
+    --manifest-path (Join-Path $Root "windows-installer-helper\Cargo.toml") `
+    --release `
+    --target $Target `
+    --target-dir $ExtractorTarget
+if ($LASTEXITCODE -ne 0) { throw "Installed payload extractor build failed" }
+$Extractor = Join-Path $ExtractorTarget "$Target\release\sbk-tools-installed-extractor.exe"
+if (-not (Test-Path $Extractor -PathType Leaf)) { throw "Installed payload extractor is missing" }
+Assert-AsInvoker $Extractor "extractor"
+
+$NsisZip = Join-Path $Stage "nsis-3.11.zip"
+$NsisTools = Join-Path $Stage "nsis-tools"
+$NsisUrl = "https://github.com/tauri-apps/binary-releases/releases/download/nsis-3.11/nsis-3.11.zip"
+Invoke-WebRequest $NsisUrl -OutFile $NsisZip
+$NsisHash = (Get-FileHash -Algorithm SHA1 $NsisZip).Hash.ToUpperInvariant()
+if ($NsisHash -ne "EF7FF767E5CBD9EDD22ADD3A32C9B8F4500BB10D") {
+    throw "NSIS toolset checksum mismatch: $NsisHash"
+}
+Expand-Archive $NsisZip -DestinationPath $NsisTools -Force
+$NsisHome = Join-Path $NsisTools "nsis-3.11"
+$MakeNsis = Join-Path $NsisHome "makensis.exe"
+if (-not (Test-Path $MakeNsis -PathType Leaf)) { throw "Pinned makensis.exe is missing" }
+
+Copy-Item (Join-Path $Root "scripts\windows-installed.nsi") $NsisStage
+Copy-Item (Join-Path $Root "LICENSE") (Join-Path $NsisStage "LICENSE.txt")
+Copy-Item (Join-Path $Root "src-tauri\icons\icon.ico") $NsisStage
+Copy-Item (Join-Path $NsisHome "COPYING") (Join-Path $NsisStage "NSIS-COPYING")
+Copy-Item $Archive $NsisStage
+Copy-Item $Extractor $NsisStage
+
+$SafeVersion = $Version.TrimStart("v")
+$VersionParts = [regex]::Match($SafeVersion, '^(\d+)\.(\d+)\.(\d+)')
+if (-not $VersionParts.Success) { throw "Installer version must start with three numeric parts" }
+$VersionQuad = "$($VersionParts.Groups[1].Value).$($VersionParts.Groups[2].Value).$($VersionParts.Groups[3].Value).0"
+$NsisLog = Join-Path $InspectionRoot "sbk-fast-nsis.log"
+Remove-Item $NsisLog -Force -ErrorAction SilentlyContinue
+Push-Location $NsisStage
+try {
+    & $MakeNsis "/DPRODUCT_VERSION=$SafeVersion" "/DVERSION_QUAD=$VersionQuad" "-V4" "windows-installed.nsi" 2>&1 |
+        Tee-Object -FilePath $NsisLog
+    if ($LASTEXITCODE -ne 0) {
+        $BuildLog = $NsisLog
+        Write-BuildFailure "Installed Windows NSIS packaging" "Installed Windows NSIS packaging failed"
+    }
+} finally {
+    Pop-Location
+}
+
+$Installer = Get-Item (Join-Path $NsisStage "SBK-Tools-Fast-Setup.exe") -ErrorAction SilentlyContinue
 if (-not $Installer) { throw "NSIS installer was not produced" }
-if ($Installer.Name -eq "ScanDocument.exe") { throw "Installed artifact must not use the portable filename" }
+if ($Installer.Length -ge 1900MB) { throw "NSIS installer exceeds its safe single-file limit" }
 Assert-AsInvoker $Installer.FullName "installer"
 
-New-Item -ItemType Directory -Force $Output | Out-Null
-$SafeVersion = $Version.TrimStart("v")
 $Destination = Join-Path $Output "SBK-Tools-Fast-Setup-$SafeVersion-x64.exe"
 Copy-Item $Installer.FullName $Destination -Force
 $Hash = (Get-FileHash -Algorithm SHA256 $Destination).Hash.ToLowerInvariant()
 Set-Content -Encoding ASCII -Path "$Destination.sha256" -Value "$Hash  $(Split-Path -Leaf $Destination)"
 
-Write-Output "Verified: separate current-user NSIS installer, fixed offline runtimes, asInvoker application and installer"
+Write-Output "Verified: separate current-user NSIS installer, compressed offline payload, asInvoker application and installer"
 Write-Output $Destination

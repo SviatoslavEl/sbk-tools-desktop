@@ -54,6 +54,8 @@ def main() -> None:
         raise SystemExit("Installed package must include an offline WebView2 runtime")
     if nsis["startMenuFolder"] != "СБК Инструменты":
         raise SystemExit("Installed package must create the documented Start menu shortcut")
+    if nsis["compression"] != "none":
+        raise SystemExit("Installed package must not recompress the pre-compressed payload")
 
     installed_script = (ROOT / "scripts/package_windows_installed.ps1").read_text(
         encoding="utf-8"
@@ -66,6 +68,9 @@ def main() -> None:
         "resource-manifest.json",
         '"--features", "installed-fast-start"',
         'VITE_SBK_INSTALLED_FAST_START = "true"',
+        "create_payload_archive.py",
+        "windows-installer-helper\\Cargo.toml",
+        "nsis-3.11.zip",
     ):
         if required not in installed_script:
             raise SystemExit(f"Installed packaging check is missing: {required}")
@@ -101,6 +106,20 @@ def main() -> None:
         'include_str!("../scripts/windows-as-invoker.manifest")' not in build_script
     ):
         raise SystemExit("Installed asInvoker manifest must be embedded during compilation")
+
+    nsis_template = (ROOT / "scripts/windows-installed.nsi").read_text(encoding="utf-8")
+    for required in (
+        "RequestExecutionLevel user",
+        "SetCompress off",
+        "SBK-Tools-Fast.exe",
+        "sbk-installed-extractor.exe",
+        "$LOCALAPPDATA\\Programs\\SBK Tools Fast",
+        "Section /o \"Ярлык на рабочем столе\"",
+    ):
+        if required not in nsis_template:
+            raise SystemExit(f"Installed NSIS contract is missing: {required}")
+    if "ProductData" in nsis_template.split('Section "Uninstall"', maxsplit=1)[-1]:
+        raise SystemExit("Installed uninstaller must not target ProductData")
 
     print("Windows packaging contract: portable preserved, installed flavor isolated, startup staged")
 

@@ -16,6 +16,7 @@ def main() -> None:
         "scanner-worker/pyproject.toml": re.search(r'^version = "([^"]+)"', (root / "scanner-worker/pyproject.toml").read_text(encoding="utf-8"), re.MULTILINE).group(1),
         "scanner-worker/src/scandocument/__init__.py": re.search(r'^__version__ = "([^"]+)"', (root / "scanner-worker/src/scandocument/__init__.py").read_text(encoding="utf-8"), re.MULTILINE).group(1),
         "windows-launcher/Cargo.toml": re.search(r'^version = "([^"]+)"', (root / "windows-launcher/Cargo.toml").read_text(encoding="utf-8"), re.MULTILINE).group(1),
+        "windows-installer-helper/Cargo.toml": re.search(r'^version = "([^"]+)"', (root / "windows-installer-helper/Cargo.toml").read_text(encoding="utf-8"), re.MULTILINE).group(1),
     }
     mismatches = {name: value for name, value in checks.items() if value != version}
     if mismatches:

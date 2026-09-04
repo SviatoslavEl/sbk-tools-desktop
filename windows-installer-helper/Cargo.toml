@@ -1,0 +1,19 @@
+[package]
+name = "sbk-tools-installed-extractor"
+version = "2.8.3"
+edition = "2024"
+build = "build.rs"
+
+[dependencies]
+tar = "0.4"
+uuid = { version = "1", features = ["v4"] }
+zstd = { version = "0.13", default-features = false }
+
+[build-dependencies]
+embed-resource = "3"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+panic = "abort"

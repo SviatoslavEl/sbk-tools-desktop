@@ -30,7 +30,7 @@ python scripts/generate_runtime_manifest.py --root src-tauri/runtime-resources -
 ./scripts/package_windows_installed.ps1 -Target x86_64-pc-windows-msvc -Version 2.8.3
 ```
 
-Скрипт проверяет наличие офлайн-компонентов и лицензий, проверяет trusted runtime manifest, собирает приложение с отдельной Tauri-конфигурацией, закрепляет `asInvoker`, создаёт NSIS и публикует файл `release-artifacts/SBK-Tools-Fast-Setup-2.8.3-x64.exe` с SHA-256. `scripts/package_windows_portable.ps1` вызывается отдельно и продолжает создавать только `release-artifacts/ScanDocument.exe`.
+Скрипт проверяет наличие офлайн-компонентов и лицензий, проверяет trusted runtime manifest, собирает приложение с отдельной Tauri-конфигурацией, закрепляет `asInvoker`, создаёт NSIS и публикует файл `release-artifacts/SBK-Tools-Fast-Setup-2.8.3-x64.exe` с SHA-256. Полный runtime превышает внутренний предел NSIS в 2 ГБ, поэтому он заранее упаковывается в один проверяемый `tar.zst`; маленький отдельный `windows-installer-helper` разворачивает его непосредственно в каталог установки. Архив используется только при установке: ежедневный запуск открывает `SBK-Tools-Fast.exe` напрямую и ничего не распаковывает в `%TEMP%`. `scripts/package_windows_portable.ps1` вызывается отдельно и продолжает создавать только `release-artifacts/ScanDocument.exe`.
 
 ## Обновление и удаление
 
