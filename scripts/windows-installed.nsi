@@ -72,8 +72,15 @@ Section "!${PRODUCT_NAME}" MainSection
   Pop $0
   Pop $1
   ${If} $0 != "0"
+    FileOpen $2 "$TEMP\SBK-Tools-Fast-Install-Error.log" w
+    FileWrite $2 "$1$\r$\n"
+    FileClose $2
+    IfSilent silent_install_failure
     MessageBox MB_ICONSTOP|MB_OK "Не удалось установить ${PRODUCT_NAME}.$\r$\n$\r$\n$1"
     Abort
+silent_install_failure:
+    SetErrorLevel 1
+    Quit
   ${EndIf}
 
   SetOutPath "$INSTDIR"

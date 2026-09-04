@@ -581,6 +581,7 @@ jobs:
         run: |
           Remove-Item (Join-Path $env:GITHUB_WORKSPACE 'portable-stage') -Recurse -Force
       - name: Install, launch twice, verify shared locking and uninstall safely
+        timeout-minutes: 35
         shell: pwsh
         run: |
           $installer = Get-ChildItem release-artifacts -Filter 'SBK-Tools-Fast-Setup-*-x64.exe' | Select-Object -First 1
@@ -591,8 +592,36 @@ jobs:
           New-Item -ItemType Directory -Force $workspace | Out-Null
           Set-Content -Encoding UTF8 (Join-Path $workspace 'uninstall-must-preserve.txt') 'preserve ProductData'
 
-          $install = Start-Process -FilePath $installer.FullName -ArgumentList @('/S', "/D=$installDir") -Wait -PassThru
-          if ($install.ExitCode -ne 0) { throw "Installer failed: $($install.ExitCode)" }
+          function Wait-InstallerProcess(
+            [System.Diagnostics.Process]$Process,
+            [int]$MaximumSeconds = 1200
+          ) {
+            $deadline = (Get-Date).AddSeconds($MaximumSeconds)
+            while ((Get-Date) -lt $deadline) {
+              $Process.Refresh()
+              if ($Process.HasExited) { return $Process.ExitCode }
+              Start-Sleep -Seconds 1
+            }
+            & taskkill.exe /PID $Process.Id /T /F 2>&1 | Write-Host
+            $diagnostic = Join-Path $env:TEMP 'SBK-Tools-Fast-Install-Error.log'
+            if (Test-Path $diagnostic -PathType Leaf) {
+              Write-Error "Installer diagnostic: $(Get-Content -Raw $diagnostic)"
+            }
+            throw "Installer did not complete within $MaximumSeconds seconds"
+          }
+
+          $installDiagnostic = Join-Path $env:TEMP 'SBK-Tools-Fast-Install-Error.log'
+          Remove-Item $installDiagnostic -Force -ErrorAction SilentlyContinue
+          $install = Start-Process -FilePath $installer.FullName -ArgumentList @('/S', "/D=$installDir") -PassThru
+          $installExitCode = Wait-InstallerProcess $install
+          if ($installExitCode -ne 0) {
+            $details = if (Test-Path $installDiagnostic -PathType Leaf) {
+              Get-Content -Raw $installDiagnostic
+            } else {
+              'No installer diagnostic was produced'
+            }
+            throw "Installer failed with exit code ${installExitCode}: $details"
+          }
           $application = Join-Path $installDir 'SBK-Tools-Fast.exe'
           if (-not (Test-Path $application -PathType Leaf)) { throw 'Fast-start executable is not in the install directory' }
           if (Test-Path (Join-Path $installDir 'ScanDocument.exe')) { throw 'Installed flavor contains the portable launcher name' }

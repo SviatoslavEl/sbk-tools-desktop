@@ -116,11 +116,29 @@ def main() -> None:
         "sbk-installed-extractor.exe",
         "$LOCALAPPDATA\\Programs\\SBK Tools Fast",
         "Section /o \"Ярлык на рабочем столе\"",
+        "IfSilent silent_install_failure",
+        "SBK-Tools-Fast-Install-Error.log",
+        "SetErrorLevel 1",
     ):
         if required not in nsis_template:
             raise SystemExit(f"Installed NSIS contract is missing: {required}")
     if "ProductData" in nsis_template.split('Section "Uninstall"', maxsplit=1)[-1]:
         raise SystemExit("Installed uninstaller must not target ProductData")
+
+    extractor_manifest = (ROOT / "windows-installer-helper/app.manifest").read_text(
+        encoding="utf-8"
+    )
+    if "<longPathAware" not in extractor_manifest:
+        raise SystemExit("Installed extractor must support long Windows runtime paths")
+
+    release_workflow = (ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
+    for required in (
+        "Wait-InstallerProcess",
+        "SBK-Tools-Fast-Install-Error.log",
+        "timeout-minutes: 35",
+    ):
+        if required not in release_workflow:
+            raise SystemExit(f"Installed smoke timeout protection is missing: {required}")
 
     print("Windows packaging contract: portable preserved, installed flavor isolated, startup staged")
 
