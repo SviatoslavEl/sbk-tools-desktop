@@ -95,10 +95,11 @@ silent_install_failure:
   WriteRegDWORD HKCU "${UNINSTALL_KEY}" "NoRepair" 1
 
   Delete "$DESKTOP\${PRODUCT_NAME}.lnk"
-  WriteRegStr HKCU "${PRODUCT_KEY}" "StartMenuFolder" "$StartMenuFolder"
-  CreateDirectory "$SMPROGRAMS\$StartMenuFolder"
-  CreateShortcut "$SMPROGRAMS\$StartMenuFolder\${PRODUCT_NAME}.lnk" "$INSTDIR\${PRODUCT_EXE}"
-  CreateShortcut "$SMPROGRAMS\$StartMenuFolder\Удалить ${PRODUCT_NAME}.lnk" "$INSTDIR\uninstall.exe"
+  SetShellVarContext current
+  WriteRegStr HKCU "${PRODUCT_KEY}" "StartMenuFolder" "СБК Инструменты"
+  CreateDirectory "$SMPROGRAMS\СБК Инструменты"
+  CreateShortcut "$SMPROGRAMS\СБК Инструменты\${PRODUCT_NAME}.lnk" "$INSTDIR\${PRODUCT_EXE}"
+  CreateShortcut "$SMPROGRAMS\СБК Инструменты\Удалить ${PRODUCT_NAME}.lnk" "$INSTDIR\uninstall.exe"
 SectionEnd
 
 Section /o "Ярлык на рабочем столе" DesktopShortcutSection
@@ -106,6 +107,7 @@ Section /o "Ярлык на рабочем столе" DesktopShortcutSection
 SectionEnd
 
 Section "Uninstall"
+  SetShellVarContext current
   Delete "$DESKTOP\${PRODUCT_NAME}.lnk"
   ReadRegStr $StartMenuFolder HKCU "${PRODUCT_KEY}" "StartMenuFolder"
   Delete "$SMPROGRAMS\$StartMenuFolder\${PRODUCT_NAME}.lnk"
