@@ -97,9 +97,9 @@ silent_install_failure:
   Delete "$DESKTOP\${PRODUCT_NAME}.lnk"
   SetShellVarContext current
   WriteRegStr HKCU "${PRODUCT_KEY}" "StartMenuFolder" "СБК Инструменты"
-  CreateDirectory "$SMPROGRAMS\СБК Инструменты"
-  CreateShortcut "$SMPROGRAMS\СБК Инструменты\${PRODUCT_NAME}.lnk" "$INSTDIR\${PRODUCT_EXE}"
-  CreateShortcut "$SMPROGRAMS\СБК Инструменты\Удалить ${PRODUCT_NAME}.lnk" "$INSTDIR\uninstall.exe"
+  CreateDirectory "$APPDATA\Microsoft\Windows\Start Menu\Programs\СБК Инструменты"
+  CreateShortcut "$APPDATA\Microsoft\Windows\Start Menu\Programs\СБК Инструменты\${PRODUCT_NAME}.lnk" "$INSTDIR\${PRODUCT_EXE}"
+  CreateShortcut "$APPDATA\Microsoft\Windows\Start Menu\Programs\СБК Инструменты\Удалить ${PRODUCT_NAME}.lnk" "$INSTDIR\uninstall.exe"
 SectionEnd
 
 Section /o "Ярлык на рабочем столе" DesktopShortcutSection
@@ -110,9 +110,9 @@ Section "Uninstall"
   SetShellVarContext current
   Delete "$DESKTOP\${PRODUCT_NAME}.lnk"
   ReadRegStr $StartMenuFolder HKCU "${PRODUCT_KEY}" "StartMenuFolder"
-  Delete "$SMPROGRAMS\$StartMenuFolder\${PRODUCT_NAME}.lnk"
-  Delete "$SMPROGRAMS\$StartMenuFolder\Удалить ${PRODUCT_NAME}.lnk"
-  RMDir "$SMPROGRAMS\$StartMenuFolder"
+  Delete "$APPDATA\Microsoft\Windows\Start Menu\Programs\$StartMenuFolder\${PRODUCT_NAME}.lnk"
+  Delete "$APPDATA\Microsoft\Windows\Start Menu\Programs\$StartMenuFolder\Удалить ${PRODUCT_NAME}.lnk"
+  RMDir "$APPDATA\Microsoft\Windows\Start Menu\Programs\$StartMenuFolder"
   DeleteRegKey HKCU "${UNINSTALL_KEY}"
   DeleteRegKey HKCU "${PRODUCT_KEY}"
   RMDir /r "$INSTDIR"
