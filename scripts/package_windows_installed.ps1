@@ -164,7 +164,7 @@ $NsisLog = Join-Path $InspectionRoot "sbk-fast-nsis.log"
 Remove-Item $NsisLog -Force -ErrorAction SilentlyContinue
 Push-Location $NsisStage
 try {
-    & $MakeNsis "/DPRODUCT_VERSION=$SafeVersion" "/DVERSION_QUAD=$VersionQuad" "-V4" "windows-installed.nsi" 2>&1 |
+    & $MakeNsis "/INPUTCHARSET" "UTF8" "/DPRODUCT_VERSION=$SafeVersion" "/DVERSION_QUAD=$VersionQuad" "-V4" "windows-installed.nsi" 2>&1 |
         Tee-Object -FilePath $NsisLog
     if ($LASTEXITCODE -ne 0) {
         $BuildLog = $NsisLog

@@ -42,7 +42,6 @@ Var StartMenuFolder
 !insertmacro MUI_PAGE_LICENSE "LICENSE.txt"
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_COMPONENTS
-!insertmacro MUI_PAGE_STARTMENU Application $StartMenuFolder
 !insertmacro MUI_PAGE_INSTFILES
 !insertmacro MUI_PAGE_FINISH
 
@@ -100,6 +99,17 @@ silent_install_failure:
   CreateDirectory "$APPDATA\Microsoft\Windows\Start Menu\Programs\СБК Инструменты"
   CreateShortcut "$APPDATA\Microsoft\Windows\Start Menu\Programs\СБК Инструменты\${PRODUCT_NAME}.lnk" "$INSTDIR\${PRODUCT_EXE}"
   CreateShortcut "$APPDATA\Microsoft\Windows\Start Menu\Programs\СБК Инструменты\Удалить ${PRODUCT_NAME}.lnk" "$INSTDIR\uninstall.exe"
+  IfFileExists "$APPDATA\Microsoft\Windows\Start Menu\Programs\СБК Инструменты\${PRODUCT_NAME}.lnk" shortcut_ready 0
+  FileOpen $2 "$TEMP\SBK-Tools-Fast-Install-Error.log" w
+  FileWrite $2 "Не удалось создать ярлык меню Пуск: $APPDATA\Microsoft\Windows\Start Menu\Programs\СБК Инструменты\${PRODUCT_NAME}.lnk$\r$\n"
+  FileClose $2
+  IfSilent silent_shortcut_failure
+  MessageBox MB_ICONSTOP|MB_OK "Не удалось создать ярлык меню Пуск."
+  Abort
+silent_shortcut_failure:
+  SetErrorLevel 1
+  Quit
+shortcut_ready:
 SectionEnd
 
 Section /o "Ярлык на рабочем столе" DesktopShortcutSection
@@ -108,6 +118,23 @@ SectionEnd
 
 Section "Uninstall"
   SetShellVarContext current
+  StrCpy $0 ""
+  IfFileExists "$INSTDIR\ProductData\*.*" 0 remove_program_files
+  StrCpy $0 "$INSTDIR.__sbk_product_data"
+  IfFileExists $0 preserve_collision 0
+  ClearErrors
+  Rename "$INSTDIR\ProductData" $0
+  IfErrors preserve_failure 0
+remove_program_files:
+  ClearErrors
+  RMDir /r "$INSTDIR"
+  IfErrors removal_failure 0
+  StrCmp $0 "" uninstall_complete
+  CreateDirectory "$INSTDIR"
+  ClearErrors
+  Rename $0 "$INSTDIR\ProductData"
+  IfErrors restore_failure 0
+uninstall_complete:
   Delete "$DESKTOP\${PRODUCT_NAME}.lnk"
   ReadRegStr $StartMenuFolder HKCU "${PRODUCT_KEY}" "StartMenuFolder"
   Delete "$APPDATA\Microsoft\Windows\Start Menu\Programs\$StartMenuFolder\${PRODUCT_NAME}.lnk"
@@ -115,5 +142,35 @@ Section "Uninstall"
   RMDir "$APPDATA\Microsoft\Windows\Start Menu\Programs\$StartMenuFolder"
   DeleteRegKey HKCU "${UNINSTALL_KEY}"
   DeleteRegKey HKCU "${PRODUCT_KEY}"
-  RMDir /r "$INSTDIR"
+  Goto uninstall_done
+preserve_collision:
+  IfSilent silent_preserve_collision
+  MessageBox MB_ICONSTOP|MB_OK "Не удалось безопасно удалить программу: временный каталог ProductData уже существует."
+silent_preserve_collision:
+  SetErrorLevel 1
+  Quit
+preserve_failure:
+  IfSilent silent_preserve_failure
+  MessageBox MB_ICONSTOP|MB_OK "Не удалось безопасно сохранить ProductData. Удаление отменено."
+silent_preserve_failure:
+  SetErrorLevel 1
+  Quit
+restore_failure:
+  IfSilent silent_restore_failure
+  MessageBox MB_ICONSTOP|MB_OK "Программа удалена, но ProductData осталась в безопасном каталоге: $0"
+silent_restore_failure:
+  SetErrorLevel 1
+  Quit
+removal_failure:
+  StrCmp $0 "" silent_removal_failure
+  CreateDirectory "$INSTDIR"
+  ClearErrors
+  Rename $0 "$INSTDIR\ProductData"
+  IfErrors restore_failure 0
+  IfSilent silent_removal_failure
+  MessageBox MB_ICONSTOP|MB_OK "Не удалось полностью удалить файлы программы. ProductData восстановлена."
+silent_removal_failure:
+  SetErrorLevel 1
+  Quit
+uninstall_done:
 SectionEnd

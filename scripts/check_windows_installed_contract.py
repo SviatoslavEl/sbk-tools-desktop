@@ -72,6 +72,7 @@ def main() -> None:
         "windows-installer-helper\\Cargo.toml",
         'Copy-Item $Extractor (Join-Path $NsisStage "sbk-installed-extractor.exe")',
         "nsis-3.11.zip",
+        '"/INPUTCHARSET" "UTF8"',
     ):
         if required not in installed_script:
             raise SystemExit(f"Installed packaging check is missing: {required}")
@@ -122,11 +123,20 @@ def main() -> None:
         "SetErrorLevel 1",
         '"$TEMP\\SBK-Tools-Fast-Install-Error.log"',
         "ExecWait",
+        ".__sbk_product_data",
     ):
         if required not in nsis_template:
             raise SystemExit(f"Installed NSIS contract is missing: {required}")
-    if "ProductData" in nsis_template.split('Section "Uninstall"', maxsplit=1)[-1]:
-        raise SystemExit("Installed uninstaller must not target ProductData")
+    uninstall_section = nsis_template.split('Section "Uninstall"', maxsplit=1)[-1]
+    for required in (
+        'Rename "$INSTDIR\\ProductData" $0',
+        'Rename $0 "$INSTDIR\\ProductData"',
+        "preserve_failure:",
+    ):
+        if required not in uninstall_section:
+            raise SystemExit("Installed uninstaller must preserve adjacent ProductData")
+    if 'RMDir /r "$INSTDIR\\ProductData"' in uninstall_section:
+        raise SystemExit("Installed uninstaller must not remove ProductData")
 
     extractor_manifest = (ROOT / "windows-installer-helper/app.manifest").read_text(
         encoding="utf-8"
@@ -146,6 +156,14 @@ def main() -> None:
         "SBK-Tools-Fast-Smoke.log",
         "Start-Transcript",
         "Fast-start smoke failure",
+        "Installed runtime manifest verification failed",
+        "Wait-DatabaseSettle",
+        "Portable cleanup recovery failed",
+        "Uninstall removed adjacent ProductData",
+        "Update removed adjacent ProductData",
+        "Repeated installed launch left stale editor ownership",
+        "Installed database schema is incomplete",
+        "Reinstall after uninstall lost adjacent ProductData",
     ):
         if required not in release_workflow:
             raise SystemExit(f"Installed smoke timeout protection is missing: {required}")

@@ -662,6 +662,15 @@ jobs:
           $shortcut = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\СБК Инструменты\СБК Инструменты — быстрый запуск.lnk'
           if (-not (Test-Path $shortcut -PathType Leaf)) { throw 'Start menu shortcut is missing' }
           Write-Host "Installed files and Start menu shortcut verified at $(Get-Date -Format o)"
+          $updateProductData = Join-Path $installDir 'ProductData'
+          New-Item -ItemType Directory -Force $updateProductData | Out-Null
+          Set-Content -Encoding UTF8 (Join-Path $updateProductData 'update-must-preserve.txt') 'preserve adjacent ProductData on update'
+          $update = Start-Process -FilePath $installer.FullName -ArgumentList @('/S', "/D=$installDir") -PassThru
+          $updateExitCode = Wait-InstallerProcess $update
+          if ($updateExitCode -ne 0) { throw "Silent update failed: $updateExitCode" }
+          if (-not (Test-Path (Join-Path $updateProductData 'update-must-preserve.txt'))) {
+            throw 'Update removed adjacent ProductData'
+          }
           foreach ($license in @('LICENSE', 'THIRD_PARTY_LICENSES.md')) {
             if (-not (Get-ChildItem $installDir -Recurse -File -Filter $license -ErrorAction SilentlyContinue)) {
               throw "Installed license is missing: $license"
@@ -673,6 +682,7 @@ jobs:
           if (-not $worker -or -not $manifest) { throw 'Installed scanner runtime or manifest is missing' }
           $runtime = $manifest.Directory.Parent.FullName
           python scripts/verify_runtime_manifest.py --root $runtime --worker $worker.FullName
+          if ($LASTEXITCODE -ne 0) { throw 'Installed runtime manifest verification failed' }
           & $worker.FullName info
           if ($LASTEXITCODE -ne 0) { throw 'Installed scanner worker cannot run offline' }
           $env:SCANDOCUMENT_RESOURCE_ROOT = $runtime
@@ -712,6 +722,36 @@ jobs:
             return $process
           }
 
+          function Wait-DatabaseSettle(
+            [string]$Workspace,
+            [int]$MaximumSeconds = 45
+          ) {
+            $deadline = (Get-Date).AddSeconds($MaximumSeconds)
+            $previous = $null
+            $stableSamples = 0
+            while ((Get-Date) -lt $deadline) {
+              $files = @(Get-ChildItem $Workspace -Recurse -Filter '*.sqlite3' -File -ErrorAction SilentlyContinue)
+              if ($files.Count -ge 7) {
+                $current = ($files | Sort-Object FullName | ForEach-Object {
+                  "$($_.FullName):$($_.Length):$($_.LastWriteTimeUtc.Ticks)"
+                }) -join '|'
+                if ($current -eq $previous) { $stableSamples++ } else { $stableSamples = 0 }
+                if ($stableSamples -ge 4) {
+                  foreach ($file in $files) {
+                    $schemaVersion = python -c 'import sqlite3,sys; print(sqlite3.connect(sys.argv[1]).execute("PRAGMA user_version").fetchone()[0])' $file.FullName
+                    if ($LASTEXITCODE -ne 0 -or [int]$schemaVersion -ne 3) {
+                      throw "Installed database schema is incomplete: $($file.FullName) version=$schemaVersion"
+                    }
+                  }
+                  return
+                }
+                $previous = $current
+              }
+              Start-Sleep -Milliseconds 500
+            }
+            throw 'Installed databases did not settle after initialization'
+          }
+
           $tempBefore = @(Get-ChildItem $env:TEMP -Directory -Filter $portableTempPattern -ErrorAction SilentlyContinue | ForEach-Object FullName)
           $env:SBK_TOOLS_WORKSPACE = '\\192.0.2.1\unavailable\ProductData'
           $slowNetwork = Start-VisibleApplication $application 'Installed launch with unavailable network workspace' 15
@@ -719,34 +759,33 @@ jobs:
           Start-Sleep -Seconds 1
 
           $env:SBK_TOOLS_WORKSPACE = $workspace
+          $presence = Join-Path $workspace '.workspace-editor.json'
           $first = Start-VisibleApplication $application 'First installed launch'
-          $databaseDeadline = (Get-Date).AddSeconds(45)
-          while ((Get-Date) -lt $databaseDeadline -and @(Get-ChildItem $workspace -Recurse -Filter '*.sqlite3' -File -ErrorAction SilentlyContinue).Count -lt 7) {
-            Start-Sleep -Milliseconds 250
-          }
-          if (@(Get-ChildItem $workspace -Recurse -Filter '*.sqlite3' -File).Count -lt 7) {
-            throw 'Installed application did not finish database initialization'
-          }
-          Start-Sleep -Seconds 2
+          Wait-DatabaseSettle $workspace
+          if (-not (Test-Path $presence)) { throw 'First installed launch did not acquire the editor lock' }
+          $firstOwner = Get-Content -Raw $presence
           Stop-Process -Id $first.Id -Force
+          Wait-Process -Id $first.Id -Timeout 15 -ErrorAction SilentlyContinue
           $baseline = @{}
           Get-ChildItem $workspace -Recurse -Filter '*.sqlite3' -File | ForEach-Object {
             $baseline[$_.FullName] = (Get-FileHash -Algorithm SHA256 $_.FullName).Hash
           }
 
           $second = Start-VisibleApplication $application 'Repeated installed launch'
-          Start-Sleep -Seconds 3
+          Wait-DatabaseSettle $workspace
+          $second.Refresh()
+          if ($second.HasExited) { throw 'Repeated installed launch exited during initialization' }
           foreach ($path in $baseline.Keys) {
             if ((Get-FileHash -Algorithm SHA256 $path).Hash -ne $baseline[$path]) {
               throw "Current database changed on repeated launch: $path"
             }
           }
-          $presence = Join-Path $workspace '.workspace-editor.json'
           if (-not (Test-Path $presence)) { throw 'Installed version did not acquire the shared editor lock' }
           $ownerBefore = Get-Content -Raw $presence
+          if ($ownerBefore -eq $firstOwner) { throw 'Repeated installed launch left stale editor ownership' }
 
           $portable = Resolve-Path 'release-artifacts/ScanDocument.exe'
-          $portableProcess = Start-VisibleApplication $portable 'Portable launch beside installed version'
+          $portableProcess = Start-VisibleApplication $portable 'Portable launch beside installed version' 240
           Start-Sleep -Seconds 2
           if ((Get-Content -Raw $presence) -ne $ownerBefore) {
             throw 'Portable version replaced the installed version editor lock'
@@ -754,6 +793,8 @@ jobs:
           Stop-Process -Id $portableProcess.Id -Force -ErrorAction SilentlyContinue
           Stop-Process -Id $second.Id -Force -ErrorAction SilentlyContinue
           Start-Sleep -Seconds 2
+          $portableRecovery = Start-Process -FilePath $portable -ArgumentList '--self-test' -Wait -PassThru
+          if ($portableRecovery.ExitCode -ne 0) { throw "Portable cleanup recovery failed: $($portableRecovery.ExitCode)" }
           Remove-Item Env:SBK_TOOLS_WORKSPACE
 
           $tempAfter = @(Get-ChildItem $env:TEMP -Directory -Filter $portableTempPattern -ErrorAction SilentlyContinue | ForEach-Object FullName)
@@ -762,12 +803,27 @@ jobs:
 
           $uninstaller = Join-Path $installDir 'uninstall.exe'
           if (-not (Test-Path $uninstaller -PathType Leaf)) { throw 'Uninstaller is missing' }
+          $internalProductData = Join-Path $installDir 'ProductData'
+          New-Item -ItemType Directory -Force $internalProductData | Out-Null
+          Set-Content -Encoding UTF8 (Join-Path $internalProductData 'uninstall-must-preserve.txt') 'preserve adjacent ProductData'
           $uninstall = Start-Process -FilePath $uninstaller -ArgumentList '/S' -Wait -PassThru
           if ($uninstall.ExitCode -ne 0) { throw "Uninstaller failed: $($uninstall.ExitCode)" }
           if (Test-Path $application) { throw 'Application executable remains after uninstall' }
           if (-not (Test-Path (Join-Path $workspace 'uninstall-must-preserve.txt'))) {
             throw 'Uninstall removed user ProductData'
           }
+          if (-not (Test-Path (Join-Path $internalProductData 'uninstall-must-preserve.txt'))) {
+            throw 'Uninstall removed adjacent ProductData'
+          }
+          $reinstall = Start-Process -FilePath $installer.FullName -ArgumentList @('/S', "/D=$installDir") -PassThru
+          $reinstallExitCode = Wait-InstallerProcess $reinstall
+          if ($reinstallExitCode -ne 0) { throw "Reinstall after uninstall failed: $reinstallExitCode" }
+          if (-not (Test-Path (Join-Path $internalProductData 'uninstall-must-preserve.txt'))) {
+            throw 'Reinstall after uninstall lost adjacent ProductData'
+          }
+          $finalUninstall = Start-Process -FilePath (Join-Path $installDir 'uninstall.exe') -ArgumentList '/S' -Wait -PassThru
+          if ($finalUninstall.ExitCode -ne 0) { throw "Final uninstaller failed: $($finalUninstall.ExitCode)" }
+          if (Test-Path $application) { throw 'Application executable remains after final uninstall' }
           Write-Host "Install smoke and ProductData preservation checks completed at $(Get-Date -Format o)"
           Stop-Transcript
       - name: Upload fast-start installer diagnostics

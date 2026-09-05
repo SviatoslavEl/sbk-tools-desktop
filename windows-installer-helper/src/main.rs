@@ -15,6 +15,8 @@ const REQUIRED_FILES: &[&str] = &[
     "LICENSE",
     "THIRD_PARTY_LICENSES.md",
 ];
+const INSTALL_MARKER: &str = ".sbk-tools-fast-installation";
+const PRODUCT_DATA: &str = "ProductData";
 
 fn safe_archive_path(path: &Path) -> bool {
     !path.as_os_str().is_empty()
@@ -63,12 +65,49 @@ fn verify_payload(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn directory_is_empty(path: &Path) -> Result<bool, String> {
+    Ok(fs::read_dir(path)
+        .map_err(|error| format!("Не удалось проверить каталог установки: {error}"))?
+        .next()
+        .is_none())
+}
+
+fn verify_existing_install(destination: &Path) -> Result<(), String> {
+    if destination.exists() && !destination.is_dir() {
+        return Err("Путь установки занят файлом. Выберите другой каталог.".to_string());
+    }
+    let product_data_only = if destination.is_dir() {
+        let entries = fs::read_dir(destination)
+            .map_err(|error| format!("Не удалось проверить каталог установки: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("Не удалось проверить каталог установки: {error}"))?;
+        entries.len() == 1 && entries[0].file_name() == PRODUCT_DATA && entries[0].path().is_dir()
+    } else {
+        false
+    };
+    if destination.is_dir()
+        && !directory_is_empty(destination)?
+        && !destination.join(INSTALL_MARKER).is_file()
+        && !product_data_only
+    {
+        return Err(
+            "Выбран непустой каталог, который не принадлежит СБК Инструментам. Выберите другой каталог, чтобы не потерять файлы."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 fn install(archive: &Path, destination: &Path) -> Result<(), String> {
     let parent = destination
         .parent()
         .ok_or_else(|| "Не удалось определить каталог установки".to_string())?;
     fs::create_dir_all(parent)
         .map_err(|error| format!("Не удалось создать каталог установки: {error}"))?;
+    let had_previous = destination.exists();
+    if had_previous {
+        verify_existing_install(destination)?;
+    }
 
     let suffix = Uuid::new_v4();
     let staging = parent.join(format!(".sbk-tools-fast-installing-{suffix}"));
@@ -81,8 +120,11 @@ fn install(archive: &Path, destination: &Path) -> Result<(), String> {
         let _ = fs::remove_dir_all(&staging);
         return Err(error);
     }
+    if let Err(error) = fs::write(staging.join(INSTALL_MARKER), b"SBK Tools Fast\n") {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(format!("Не удалось записать маркер установки: {error}"));
+    }
 
-    let had_previous = destination.exists();
     if had_previous && let Err(error) = fs::rename(destination, &backup) {
         let _ = fs::remove_dir_all(&staging);
         return Err(format!(
@@ -90,11 +132,38 @@ fn install(archive: &Path, destination: &Path) -> Result<(), String> {
         ));
     }
 
+    let previous_product_data = backup.join(PRODUCT_DATA);
+    let staged_product_data = staging.join(PRODUCT_DATA);
+    let preserved_product_data = had_previous && previous_product_data.exists();
+    if preserved_product_data && staged_product_data.exists() {
+        let _ = fs::rename(&backup, destination);
+        let _ = fs::remove_dir_all(&staging);
+        return Err("Пакет установки не должен содержать ProductData".to_string());
+    }
+    if preserved_product_data
+        && let Err(error) = fs::rename(&previous_product_data, &staged_product_data)
+    {
+        let _ = fs::rename(&backup, destination);
+        let _ = fs::remove_dir_all(&staging);
+        return Err(format!(
+            "Не удалось сохранить ProductData при обновлении: {error}"
+        ));
+    }
+
     if let Err(error) = fs::rename(&staging, destination) {
+        let product_data_restored = !preserved_product_data
+            || fs::rename(&staged_product_data, &previous_product_data).is_ok();
         if had_previous {
             let _ = fs::rename(&backup, destination);
         }
-        let _ = fs::remove_dir_all(&staging);
+        if product_data_restored {
+            let _ = fs::remove_dir_all(&staging);
+        } else {
+            return Err(format!(
+                "Не удалось завершить установку: {error}. ProductData сохранена для ручного восстановления в {}",
+                staged_product_data.display()
+            ));
+        }
         return Err(format!("Не удалось завершить установку: {error}"));
     }
 
@@ -166,5 +235,31 @@ mod tests {
                 .all(|path| !path.contains("ProductData"))
         );
         assert!(REQUIRED_FILES.contains(&"SBK-Tools-Fast.exe"));
+    }
+
+    #[test]
+    fn install_marker_and_product_data_are_separate() {
+        assert_ne!(INSTALL_MARKER, PRODUCT_DATA);
+        assert!(!REQUIRED_FILES.contains(&PRODUCT_DATA));
+    }
+
+    #[test]
+    fn rejects_unowned_nonempty_install_directory() {
+        let root = std::env::temp_dir().join(format!("sbk-installer-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("user-file.txt"), b"keep").unwrap();
+        assert!(verify_existing_install(&root).is_err());
+        fs::write(root.join(INSTALL_MARKER), b"owned").unwrap();
+        assert!(verify_existing_install(&root).is_ok());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn accepts_product_data_only_after_uninstall() {
+        let root = std::env::temp_dir().join(format!("sbk-installer-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(root.join(PRODUCT_DATA)).unwrap();
+        fs::write(root.join(PRODUCT_DATA).join("keep.txt"), b"keep").unwrap();
+        assert!(verify_existing_install(&root).is_ok());
+        fs::remove_dir_all(root).unwrap();
     }
 }
