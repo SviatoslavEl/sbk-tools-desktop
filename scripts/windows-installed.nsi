@@ -56,6 +56,9 @@ Var StartMenuFolder
 !insertmacro MUI_LANGUAGE "English"
 
 Function .onInit
+  FileOpen $4 "$TEMP\SBK-Tools-Fast-Install-Error.log" w
+  FileWrite $4 "Installer initialized. Destination: $INSTDIR$\r$\n"
+  FileClose $4
   StrCpy $StartMenuFolder "СБК Инструменты"
   ; Silent installs skip the directory page. Validate before NSIS prepares $INSTDIR.
   IfSilent 0 interactive_initialization
@@ -93,6 +96,9 @@ probe_install_parent:
   Delete "$2"
   Return
 invalid_install_directory:
+  FileOpen $4 "$TEMP\SBK-Tools-Fast-Install-Error.log" a
+  FileWrite $4 "Directory is not writable: $INSTDIR (parent: $1)$\r$\n"
+  FileClose $4
   IfSilent silent_directory_failure
   MessageBox MB_ICONEXCLAMATION|MB_OK "В выбранную папку нельзя установить программу: нет прав записи или путь недоступен.$\r$\n$\r$\nСистемные папки (например, Program Files и Windows) обычно требуют прав администратора.$\r$\n$\r$\nВыберите папку с обычными правами записи, например:$\r$\n$LOCALAPPDATA\Programs\SBK Tools Fast"
   Abort
@@ -104,6 +110,7 @@ FunctionEnd
 Section "!${PRODUCT_NAME}" MainSection
   SectionIn RO
   Call ValidateInstallDirectory
+  InitPluginsDir
   SetOutPath "$PLUGINSDIR"
   File /oname=payload.tar.zst "payload.tar.zst"
   File /oname=sbk-installed-extractor.exe "sbk-installed-extractor.exe"

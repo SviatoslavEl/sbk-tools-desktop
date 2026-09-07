@@ -1,0 +1,44 @@
+name: Windows installer preflight
+on:
+  push:
+    branches: [codex/v2.8.4-corrections]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  preflight:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Compile and exercise real NSIS directory validation with tiny fixture
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $stage = Join-Path $env:RUNNER_TEMP 'sbk-nsis-preflight'
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          Copy-Item scripts/windows-installed.nsi $stage
+          Copy-Item LICENSE (Join-Path $stage 'LICENSE.txt')
+          Copy-Item LICENSE (Join-Path $stage 'NSIS-COPYING')
+          Copy-Item src-tauri/icons/icon.ico $stage
+          [IO.File]::WriteAllBytes((Join-Path $stage 'payload.tar.zst'), [byte[]](1,2,3))
+          Copy-Item "$env:WINDIR\System32\whoami.exe" (Join-Path $stage 'sbk-installed-extractor.exe')
+          $compiler = 'C:\Program Files (x86)\NSIS\makensis.exe'
+          & $compiler /INPUTCHARSET UTF8 /DPRODUCT_VERSION=2.8.4 /DVERSION_QUAD=2.8.4.0 (Join-Path $stage 'windows-installed.nsi')
+          if ($LASTEXITCODE -ne 0) { throw 'NSIS fixture compilation failed' }
+          $denied = Join-Path $stage 'denied'
+          New-Item -ItemType Directory $denied | Out-Null
+          & icacls.exe $denied /deny '*S-1-1-0:(W)'
+          try {
+            $probe = Join-Path $denied 'probe.txt'
+            try { [IO.File]::WriteAllText($probe, 'probe'); throw 'ACL did not deny writing' }
+            catch [System.UnauthorizedAccessException] { Write-Host 'ACL denies writes as expected' }
+            $p = Start-Process (Join-Path $stage 'SBK-Tools-Fast-Setup.exe') -ArgumentList @('/S', "/D=$denied\SBK Tools") -PassThru
+            if (-not $p.WaitForExit(60000)) { $p.Kill(); throw 'Installer timed out' }
+            $p.Refresh()
+            Write-Host "Installer exit: $($p.ExitCode)"
+            $diagnostic = Join-Path $env:TEMP 'SBK-Tools-Fast-Install-Error.log'
+            if (Test-Path $diagnostic) { Get-Content $diagnostic }
+            if ($p.ExitCode -ne 5) { throw 'Expected access-denied exit code 5' }
+          } finally {
+            & icacls.exe $denied /remove:d '*S-1-1-0'
+          }
