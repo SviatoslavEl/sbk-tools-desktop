@@ -158,7 +158,7 @@ def main() -> None:
         "Fast-start smoke failure",
         "Installed runtime manifest verification failed",
         "Wait-DatabaseSettle",
-        "Portable cleanup recovery failed",
+        "Concurrent installed viewer replaced the editor lock",
         "Uninstall removed adjacent ProductData",
         "Update removed adjacent ProductData",
         "Repeated installed launch left stale editor ownership",
