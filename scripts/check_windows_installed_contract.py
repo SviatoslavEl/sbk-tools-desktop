@@ -123,6 +123,9 @@ def main() -> None:
         "SetErrorLevel 1",
         '"$TEMP\\SBK-Tools-Fast-Install-Error.log"',
         "ExecWait",
+        "InitPluginsDir",
+        "kernel32::GetFileAttributesW",
+        "SetErrorLevel 5",
         ".__sbk_product_data",
     ):
         if required not in nsis_template:
