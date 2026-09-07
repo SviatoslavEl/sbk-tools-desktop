@@ -25,6 +25,7 @@ jobs:
           Copy-Item LICENSE (Join-Path $stage 'NSIS-COPYING')
           Copy-Item src-tauri/icons/icon.ico $stage
           python scripts/create_installer_smoke_payload.py (Join-Path $stage 'payload.tar.zst')
+          if ($LASTEXITCODE -ne 0) { throw 'Fixture creation failed' }
           Copy-Item windows-installer-helper/target/release/sbk-tools-installed-extractor.exe (Join-Path $stage 'sbk-installed-extractor.exe')
           $nsisZip = Join-Path $stage 'nsis.zip'
           Invoke-WebRequest 'https://github.com/tauri-apps/binary-releases/releases/download/nsis-3.11/nsis-3.11.zip' -OutFile $nsisZip
