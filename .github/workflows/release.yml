@@ -598,6 +598,8 @@ jobs:
         shell: pwsh
         run: |
           $smokeLog = Join-Path $env:RUNNER_TEMP 'SBK-Tools-Fast-Smoke.log'
+          # NSIS resolves TMP before TEMP; keep diagnostic and child runtime paths aligned.
+          $env:TMP = $env:TEMP
           Start-Transcript -Path $smokeLog -Force
           trap {
             $failure = ($_ | Out-String).Trim()
@@ -696,16 +698,16 @@ jobs:
           $runtime = $manifest.Directory.Parent.FullName
           python scripts/verify_runtime_manifest.py --root $runtime --worker $worker.FullName
           if ($LASTEXITCODE -ne 0) { throw 'Installed runtime manifest verification failed' }
-          & $worker.FullName info
+          & $worker.FullName info | Out-Host
           if ($LASTEXITCODE -ne 0) { throw 'Installed scanner worker cannot run offline' }
           $env:SCANDOCUMENT_RESOURCE_ROOT = $runtime
           $env:HTTP_PROXY = 'http://127.0.0.1:9'
           $env:HTTPS_PROXY = 'http://127.0.0.1:9'
-          & $worker.FullName preview --config scanner-worker/tests/fixtures/preview.json
+          & $worker.FullName preview --config scanner-worker/tests/fixtures/preview.json | Out-Host
           if ($LASTEXITCODE -ne 0) { throw 'Installed PDF processing failed offline' }
-          & $worker.FullName process --config scanner-worker/tests/fixtures/process-docx.json
+          & $worker.FullName process --config scanner-worker/tests/fixtures/process-docx.json | Out-Host
           if ($LASTEXITCODE -ne 0) { throw 'Installed DOCX/LibreOffice processing failed offline' }
-          & $worker.FullName process --config scanner-worker/tests/fixtures/process-ocr.json
+          & $worker.FullName process --config scanner-worker/tests/fixtures/process-ocr.json | Out-Host
           if ($LASTEXITCODE -ne 0) { throw 'Installed OCR processing failed offline' }
           Remove-Item Env:SCANDOCUMENT_RESOURCE_ROOT, Env:HTTP_PROXY, Env:HTTPS_PROXY
           Write-Host "Installed offline scanner checks completed at $(Get-Date -Format o)"
@@ -827,7 +829,11 @@ jobs:
           }
           $reinstall = Start-Process -FilePath $installer.FullName -ArgumentList @('/S', "/D=$installDir") -PassThru
           $reinstallExitCode = Wait-InstallerProcess $reinstall
-          if ($reinstallExitCode -ne 0) { throw "Reinstall after uninstall failed: $reinstallExitCode" }
+          if ($reinstallExitCode -ne 0) {
+            if (Test-Path $installDiagnostic) { Get-Content $installDiagnostic | Write-Host }
+            Get-ChildItem $installDir -Force | Out-Host
+            throw "Reinstall after uninstall failed: $reinstallExitCode"
+          }
           if (-not (Test-Path (Join-Path $internalProductData 'uninstall-must-preserve.txt'))) {
             throw 'Reinstall after uninstall lost adjacent ProductData'
           }
