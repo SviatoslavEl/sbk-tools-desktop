@@ -5042,7 +5042,7 @@ mod tests {
         let final_relative = payload["document"]["relativePath"]
             .as_str()
             .expect("final path");
-        assert!(final_relative.starts_with("attachments/staff/"));
+        assert!(Path::new(final_relative).starts_with(Path::new("attachments").join("staff")));
         assert!(root.join(final_relative).is_file());
         assert!(!source.exists());
         rollback_attachment_moves(&moves);

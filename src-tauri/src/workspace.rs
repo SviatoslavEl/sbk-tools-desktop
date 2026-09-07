@@ -941,10 +941,21 @@ mod tests {
         let root = std::env::temp_dir().join(format!("sbk-shared-token-{}", Uuid::new_v4()));
         fs::create_dir_all(&root).expect("temp workspace");
         let workspace = Workspace::for_test(root.clone(), true);
-        fs::write(root.join(".workspace.edit.lock"), b"foreign-owner").expect("corrupt token");
+        {
+            // Windows enforces byte-range locks even for another handle in the
+            // same process. Inject corruption through the owning handle so the
+            // test exercises token verification on every supported platform.
+            let mut lease = workspace.editor_lease.lock().unwrap();
+            let file = lease.edit.as_mut().expect("editor lock");
+            file.set_len(0).expect("truncate token");
+            file.seek(SeekFrom::Start(0)).expect("seek token");
+            file.write_all(b"foreign-owner").expect("corrupt token");
+            file.sync_all().expect("flush token");
+        }
         assert!(workspace.require_editor().is_err());
         assert!(!workspace.is_editor());
         assert!(workspace.require_editor().is_err());
+        drop(workspace);
         let _ = fs::remove_dir_all(root);
     }
 
