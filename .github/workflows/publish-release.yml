@@ -60,6 +60,11 @@ jobs:
 
           $mac_note
           EOF
+          # Use version-specific notes when the release provides them.
+          if gh api "repos/SviatoslavEl/sbk-tools-desktop/contents/docs/releases/${RELEASE_TAG}.md?ref=${RELEASE_TAG}" --jq .content > version-notes.base64; then
+            base64 --decode version-notes.base64 > release-notes.md
+            printf '\n%s\n' "$mac_note" >> release-notes.md
+          fi
           gh release view "$RELEASE_TAG" --repo SviatoslavEl/sbk-tools-desktop >/dev/null 2>&1 || \
             gh release create "$RELEASE_TAG" --repo SviatoslavEl/sbk-tools-desktop --draft --title "СБК Инструменты $RELEASE_TAG" --notes-file release-notes.md
           gh release upload "$RELEASE_TAG" "$windows" "$windows.sha256" "$mac" "$mac.sha256" --repo SviatoslavEl/sbk-tools-desktop --clobber
