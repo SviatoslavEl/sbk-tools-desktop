@@ -1,20 +1,17 @@
 name: Publish verified desktop release
-
 on:
   workflow_run:
     workflows: ["Release desktop builds"]
     types: [completed]
-
 permissions:
   actions: read
   contents: write
-
 jobs:
   publish:
     if: github.event.workflow_run.conclusion == 'success' && startsWith(github.event.workflow_run.head_branch, 'v')
     runs-on: ubuntu-latest
     steps:
-      - name: Download verified desktop artifacts
+      - name: Download verified macOS and Windows installer
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RUN_ID: ${{ github.event.workflow_run.id }}
@@ -22,74 +19,46 @@ jobs:
           set -euo pipefail
           mkdir -p release-artifacts
           gh run download "$RUN_ID" --repo SviatoslavEl/sbk-tools-desktop --name SBK-Tools-aarch64-apple-darwin-App --dir release-artifacts
-          gh run download "$RUN_ID" --repo SviatoslavEl/sbk-tools-desktop --name SBK-Tools-Windows-x64-Portable --dir release-artifacts
           gh run download "$RUN_ID" --repo SviatoslavEl/sbk-tools-desktop --name SBK-Tools-Windows-x64-Installed --dir release-artifacts
-
-      - name: Publish release
+      - name: Publish only macOS and Windows installer
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ github.event.workflow_run.head_branch }}
         run: |
           set -euo pipefail
+          repo=SviatoslavEl/sbk-tools-desktop
           version="${RELEASE_TAG#v}"
           mac="$(find release-artifacts -maxdepth 1 -type f -name "SBK-Tools-${RELEASE_TAG}-aarch64-apple-darwin*.app.zip" -print -quit)"
-          windows="release-artifacts/ScanDocument.exe"
-          windows_installed="release-artifacts/SBK-Tools-Fast-Setup-${version}-x64.exe"
+          installer="release-artifacts/SBK-Tools-Fast-Setup-${version}-x64.exe"
           test -n "$mac"
           test -f "$mac"
           test -f "$mac.sha256"
-          test -f "$windows"
-          test -f "$windows.sha256"
-          test -f "$windows_installed"
-          test -f "$windows_installed.sha256"
-          if [[ "$mac" == *-unsigned.app.zip ]]; then
-            mac_note='macOS-архив подписан ad-hoc, поскольку в репозитории не настроен сертификат Apple Developer ID. Если Gatekeeper блокирует первый запуск, распакуйте приложение в «Программы» и выполните: `xattr -dr com.apple.quarantine "/Applications/СБК Инструменты.app"`'
-          else
-            mac_note='macOS-архив подписан сертификатом Apple Developer ID, прошёл нотариальную проверку Apple и готов к обычному запуску.'
-          fi
-          cat > release-notes.md <<EOF
-          Версия $version для Windows x64 и macOS Apple Silicon.
-
-          Для Windows доступны два независимых варианта. `ScanDocument.exe` остаётся прежней переносной однофайловой сборкой. `SBK-Tools-Fast-Setup-${version}-x64.exe` один раз устанавливает отдельное приложение «СБК Инструменты — быстрый запуск» для текущего пользователя и затем запускает его напрямую из `%LOCALAPPDATA%`, без полной распаковки компонентов в `%TEMP%` при каждом старте. Установленная версия имеет отдельный идентификатор и не заменяет переносную.
-
-          Обе Windows-версии используют существующую рабочую папку `SBKTools/ProductData` и одну блокировку редактора. Удаление быстрой версии удаляет только программу и ярлыки; базы, документы и резервные копии не удаляются. WebView2, OCR на русском и английском, LibreOffice и scanner worker входят в установщик и работают без интернета.
-
-          При запуске окно теперь появляется до открытия сетевой папки и баз. Заставка показывает фактические этапы инициализации, а при недоступной рабочей папке предлагает повторить попытку, выбрать другую папку или закрыть приложение. Искусственная задержка 3,5 секунды удалена.
-
-          В сканере маркер, штрих и оба вида размытия перенесены в компактную панель над документом. Добавленные эффекты собраны в отдельном раскрывающемся списке с регулировкой прозрачности и силы; устаревшее безвозвратное скрытие убрано. При объединении PDF и DOCX теперь можно свободно смешивать и переставлять отдельные страницы разных файлов.
-
-          Исправлена совместная работа двух одновременно запущенных версий: каждая копия использует собственную временную область, а закрытие одной не удаляет файлы другой. Проверка блокировки редактора больше не освобождает её во время сохранения. Просмотр документов продолжает работать и для общей папки, доступной только для чтения.
-
-          В реестре договоров стадии, оплата и акты получили самостоятельные цветовые схемы. Возвращены справочные настройки конфиденциальности отдельных реквизитов, добавлены структурированные поля контактного лица и безопасное массовое архивирование только отмеченных договоров с подтверждением.
-
-          В справочнике контрагентов добавлен явный переключатель внешних и внутренних компаний; в кадрах основания сотрудничества различаются цветом. В архиве появились чекбоксы для группового восстановления и удаления. Главное окно удерживается в границах экрана, а длинные списки прокручиваются внутри рабочей области.
-
-          Пароль рабочей папки теперь проверяется до отправки: интерфейс явно сообщает допустимую длину от 6 до 128 символов и причину отказа. Формат базы остаётся обратно совместимым: существующие поля не переименовываются и не удаляются, новые контактные реквизиты добавлены как необязательные.
-
-          Финальные пакеты проверены на чистых GitHub Actions-агентах. Windows: запущен итоговый единый EXE, проверены окно приложения, встроенный сканер и восстановление после аварийного завершения. macOS: из итогового APP обработаны PDF, DOCX, OCR и факсимиле.
-
-          $mac_note
-          EOF
-          # Use version-specific notes when the release provides them.
-          if gh api "repos/SviatoslavEl/sbk-tools-desktop/contents/docs/releases/${RELEASE_TAG}.md?ref=${RELEASE_TAG}" --jq .content > version-notes.base64; then
+          test -f "$installer"
+          test -f "$installer.sha256"
+          if gh api "repos/$repo/contents/docs/releases/${RELEASE_TAG}.md?ref=${RELEASE_TAG}" --jq .content > version-notes.base64; then
             base64 --decode version-notes.base64 > release-notes.md
-            printf '\n%s\n' "$mac_note" >> release-notes.md
+          else
+            printf 'СБК Инструменты %s для Windows x64 и macOS Apple Silicon.\n' "$version" > release-notes.md
           fi
-          gh release view "$RELEASE_TAG" --repo SviatoslavEl/sbk-tools-desktop >/dev/null 2>&1 || \
-            gh release create "$RELEASE_TAG" --repo SviatoslavEl/sbk-tools-desktop --draft --title "СБК Инструменты $RELEASE_TAG" --notes-file release-notes.md
-          gh release upload "$RELEASE_TAG" "$windows" "$windows.sha256" "$windows_installed" "$windows_installed.sha256" "$mac" "$mac.sha256" --repo SviatoslavEl/sbk-tools-desktop --clobber
-          gh release edit "$RELEASE_TAG" --repo SviatoslavEl/sbk-tools-desktop --title "СБК Инструменты $RELEASE_TAG" --notes-file release-notes.md --draft=false
-
-      - name: Verify published assets
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ github.event.workflow_run.head_branch }}
-        run: |
-          set -euo pipefail
-          assets="$(gh release view "$RELEASE_TAG" --repo SviatoslavEl/sbk-tools-desktop --json assets,isDraft,url)"
-          test "$(jq -r '.isDraft' <<<"$assets")" = false
-          jq -e '.assets | map(.name) | index("ScanDocument.exe")' <<<"$assets" >/dev/null
-          jq -e '.assets | map(.name) | index("ScanDocument.exe.sha256")' <<<"$assets" >/dev/null
-          jq -e --arg tag "$RELEASE_TAG" '.assets | map(.name) | index("SBK-Tools-Fast-Setup-" + ($tag | ltrimstr("v")) + "-x64.exe")' <<<"$assets" >/dev/null
-          jq -e --arg tag "$RELEASE_TAG" '.assets | map(.name) | index("SBK-Tools-Fast-Setup-" + ($tag | ltrimstr("v")) + "-x64.exe.sha256")' <<<"$assets" >/dev/null
-          jq -e --arg tag "$RELEASE_TAG" '.assets | map(.name) | any(. == ("SBK-Tools-" + $tag + "-aarch64-apple-darwin.app.zip") or . == ("SBK-Tools-" + $tag + "-aarch64-apple-darwin-unsigned.app.zip"))' <<<"$assets" >/dev/null
+          sed -i '/^Состав:/c\Состав: установщик Windows с быстрым запуском и архив приложения macOS. Portable-версия больше не выпускается.' release-notes.md
+          if [[ "$mac" == *-unsigned.app.zip ]]; then
+            printf '\nmacOS: подпись ad-hoc, без Apple Developer ID и нотариальной проверки Apple. Gatekeeper может ограничить первый запуск.\n' >> release-notes.md
+          else
+            printf '\nmacOS: подпись Apple Developer ID и нотариальная проверка Apple.\n' >> release-notes.md
+          fi
+          gh release view "$RELEASE_TAG" --repo "$repo" >/dev/null 2>&1 || gh release create "$RELEASE_TAG" --repo "$repo" --draft --title "СБК Инструменты $RELEASE_TAG" --notes-file release-notes.md
+          names="$(gh release view "$RELEASE_TAG" --repo "$repo" --json assets --jq '.assets[].name')"
+          for obsolete in ScanDocument.exe ScanDocument.exe.sha256; do
+            if grep -Fxq "$obsolete" <<<"$names"; then
+              gh release delete-asset "$RELEASE_TAG" "$obsolete" --repo "$repo" --yes
+            fi
+          done
+          gh release upload "$RELEASE_TAG" "$installer" "$installer.sha256" "$mac" "$mac.sha256" --repo "$repo" --clobber
+          gh release edit "$RELEASE_TAG" --repo "$repo" --title "СБК Инструменты $RELEASE_TAG" --notes-file release-notes.md --draft=false
+          assets="$(gh release view "$RELEASE_TAG" --repo "$repo" --json assets,isDraft,url)"
+          jq -e '.isDraft == false' <<<"$assets" >/dev/null
+          jq -e --arg v "$version" '.assets | map(.name) | index("SBK-Tools-Fast-Setup-" + $v + "-x64.exe")' <<<"$assets" >/dev/null
+          jq -e --arg v "$version" '.assets | map(.name) | index("SBK-Tools-Fast-Setup-" + $v + "-x64.exe.sha256")' <<<"$assets" >/dev/null
+          jq -e --arg mac "$(basename "$mac")" '.assets | map(.name) | index($mac)' <<<"$assets" >/dev/null
+          jq -e --arg mac "$(basename "$mac").sha256" '.assets | map(.name) | index($mac)' <<<"$assets" >/dev/null
+          jq -e '.assets | map(.name) | all(. != "ScanDocument.exe" and . != "ScanDocument.exe.sha256")' <<<"$assets" >/dev/null
