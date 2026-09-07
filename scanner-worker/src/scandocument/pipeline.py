@@ -367,6 +367,7 @@ def make_preview(
 
     from scandocument.filters import apply_scan_effect
     from scandocument.pdf_engine import render_page
+    from scandocument.preview_cache import raster_key, read_raster, write_raster
 
     token = cancellation or CancellationToken()
     token.check()
@@ -435,7 +436,11 @@ def make_preview(
                 (float(width), float(height)),
                 int(dpi),
             )
-            original, _ = render_page(document, index, int(dpi))
+            key = raster_key(pdf_source, index, int(dpi))
+            original = read_raster(preview_cache_dir, key)
+            if original is None:
+                original, _ = render_page(document, index, int(dpi))
+                write_raster(preview_cache_dir, key, original)
             token.check()
             processed = apply_scan_effect(original.copy(), settings, seed, index)
             token.check()

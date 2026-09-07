@@ -3,9 +3,11 @@ name: Release desktop builds
 on:
   workflow_dispatch:
   push:
+    branches: [codex/v2.8.0-demo-fixes]
     tags: ["v*"]
 
 permissions:
+  actions: read
   contents: write
 
 jobs:
@@ -29,12 +31,14 @@ jobs:
           workspaces: |
             src-tauri
             windows-launcher
+            windows-installer-helper
       - name: Install Linux desktop dependencies
         run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf
       - run: npm ci
       - run: pip install -r requirements-dev.lock
         working-directory: scanner-worker
       - run: python scripts/check_versions.py
+      - run: python scripts/check_windows_installed_contract.py
       - run: python scripts/check_windows_manifest.py
       - run: python scripts/validate_intelligence_contract.py
       - run: npm test
@@ -54,6 +58,9 @@ jobs:
       - run: cargo fmt --manifest-path windows-launcher/Cargo.toml --check
       - run: cargo test --manifest-path windows-launcher/Cargo.toml --all-targets
       - run: cargo clippy --manifest-path windows-launcher/Cargo.toml --all-targets -- -D warnings
+      - run: cargo fmt --manifest-path windows-installer-helper/Cargo.toml --check
+      - run: cargo test --manifest-path windows-installer-helper/Cargo.toml --all-targets
+      - run: cargo clippy --manifest-path windows-installer-helper/Cargo.toml --all-targets -- -D warnings
       - run: python scripts/generate_sbom.py
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -67,7 +74,7 @@ jobs:
   build:
     needs: quality-gate
     env:
-      ARTIFACT_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('2.8.3-test.{0}', github.run_number) }}
+      ARTIFACT_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('2.8.4-test.{0}', github.run_number) }}
     strategy:
       fail-fast: false
       matrix:
@@ -75,9 +82,6 @@ jobs:
           - platform: macos-15
             target: aarch64-apple-darwin
             args: --target aarch64-apple-darwin
-          - platform: windows-latest
-            target: x86_64-pc-windows-msvc
-            args: --target x86_64-pc-windows-msvc
     runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -101,7 +105,14 @@ jobs:
         shell: bash
         run: python scripts/check_versions.py --tag='${{ github.ref_name }}'
       - run: python -m pip install -e scanner-worker Nuitka==2.8.10 ordered-set==4.1.0 zstandard==0.23.0
+      - name: Reuse verified unchanged Windows scanner worker
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: ./scripts/reuse_verified_windows_worker.ps1 -Target '${{ matrix.target }}'
       - name: Build scanner sidecar
+        if: runner.os != 'Windows'
         run: python scripts/build_scanner_worker.py --target ${{ matrix.target }}
       - name: Stage macOS OCR runtime
         if: runner.os == 'macOS'
@@ -465,3 +476,404 @@ jobs:
         if: runner.os == 'Windows' && steps.windows_portable_smoke.outcome == 'failure'
         shell: pwsh
         run: throw 'Portable Windows artifact was preserved for diagnosis, but the release remains blocked by its smoke test.'
+
+  build-installed-windows:
+    name: Windows x64 installed fast start
+    needs: quality-gate
+    runs-on: windows-latest
+    env:
+      TARGET: x86_64-pc-windows-msvc
+      ARTIFACT_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '2.8.4' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: |
+            src-tauri
+            windows-launcher
+            windows-installer-helper
+      - run: npm ci
+      - name: Verify release tag, versions and independent packaging contract
+        shell: pwsh
+        run: |
+          if ('${{ github.ref }}'.StartsWith('refs/tags/v')) {
+            python scripts/check_versions.py --tag='${{ github.ref_name }}'
+          } else {
+            python scripts/check_versions.py
+          }
+          python scripts/check_windows_installed_contract.py
+      - run: python -m pip install -e scanner-worker Nuitka==2.8.10 ordered-set==4.1.0 zstandard==0.23.0
+      - name: Reuse verified unchanged Windows scanner worker
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: ./scripts/reuse_verified_windows_worker.ps1 -Target $env:TARGET
+      - name: Stage Windows OCR runtime
+        shell: pwsh
+        run: |
+          choco install tesseract --version=5.5.3.20260724 --no-progress -y
+          New-Item -ItemType Directory -Force src-tauri/runtime-resources/resources/ocr/windows/bin | Out-Null
+          New-Item -ItemType Directory -Force src-tauri/runtime-resources/resources/ocr/windows/tessdata | Out-Null
+          Copy-Item 'C:\Program Files\Tesseract-OCR\*.exe' src-tauri/runtime-resources/resources/ocr/windows/bin/
+          Copy-Item 'C:\Program Files\Tesseract-OCR\*.dll' src-tauri/runtime-resources/resources/ocr/windows/bin/
+          $eng = 'src-tauri/runtime-resources/resources/ocr/windows/tessdata/eng.traineddata'
+          $rus = 'src-tauri/runtime-resources/resources/ocr/windows/tessdata/rus.traineddata'
+          Invoke-WebRequest 'https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/4.1.0/eng.traineddata' -OutFile $eng
+          Invoke-WebRequest 'https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/4.1.0/rus.traineddata' -OutFile $rus
+          $engHash = (Get-FileHash -Algorithm SHA256 $eng).Hash.ToLowerInvariant()
+          $rusHash = (Get-FileHash -Algorithm SHA256 $rus).Hash.ToLowerInvariant()
+          if ($engHash -ne '7d4322bd2a7749724879683fc3912cb542f19906c83bcc1a52132556427170b2') { throw "English OCR model checksum mismatch: $engHash" }
+          if ($rusHash -ne 'e16e5e036cce1d9ec2b00063cf8b54472625b9e14d893a169e2b0dedeb4df225') { throw "Russian OCR model checksum mismatch: $rusHash" }
+      - name: Stage pinned WebView2 Fixed Runtime
+        shell: pwsh
+        run: |
+          $version = '151.0.4129.107'
+          $cab = Join-Path $env:RUNNER_TEMP "Microsoft.WebView2.FixedVersionRuntime.$version.x64.cab"
+          $url = 'https://msedge.sf.dl.delivery.mp.microsoft.com/filestreamingservice/files/ab25c23c-1b43-4759-826f-75267a2235d9/Microsoft.WebView2.FixedVersionRuntime.151.0.4129.107.x64.cab'
+          Invoke-WebRequest $url -OutFile $cab
+          $actual = (Get-FileHash -Algorithm SHA256 $cab).Hash.ToLowerInvariant()
+          if ($actual -ne 'f1e1c2c9b34c79ba4d88df77fb79a05441e1bd7481d6a985d76dd377cda45f33') { throw "WebView2 checksum mismatch: $actual" }
+          New-Item -ItemType Directory -Force src-tauri/webview2-runtime | Out-Null
+          & expand.exe $cab -F:* src-tauri/webview2-runtime
+          if ($LASTEXITCODE -ne 0) { throw 'WebView2 Fixed Runtime extraction failed' }
+          if (-not (Test-Path "src-tauri/webview2-runtime/Microsoft.WebView2.FixedVersionRuntime.$version.x64/msedgewebview2.exe")) {
+            throw 'WebView2 Fixed Runtime executable is missing'
+          }
+      - name: Stage pinned LibreOffice runtime
+        run: python scripts/stage_libreoffice.py --target $env:TARGET
+      - name: Exercise offline PDF, DOCX, OCR, LibreOffice and facsimile before packaging
+        shell: bash
+        run: |
+          mkdir -p scanner-worker/tests/output
+          worker="src-tauri/binaries/sbk-scanner-worker-${TARGET}.exe"
+          "$worker" info
+          SCANDOCUMENT_RESOURCE_ROOT=src-tauri/runtime-resources "$worker" preview --config scanner-worker/tests/fixtures/preview.json
+          SCANDOCUMENT_RESOURCE_ROOT=src-tauri/runtime-resources "$worker" process --config scanner-worker/tests/fixtures/process.json
+          SCANDOCUMENT_RESOURCE_ROOT=src-tauri/runtime-resources "$worker" preview --config scanner-worker/tests/fixtures/preview-docx.json
+          SCANDOCUMENT_RESOURCE_ROOT=src-tauri/runtime-resources "$worker" process --config scanner-worker/tests/fixtures/process-docx.json
+          SCANDOCUMENT_RESOURCE_ROOT=src-tauri/runtime-resources "$worker" process --config scanner-worker/tests/fixtures/process-ocr.json
+          SCANDOCUMENT_RESOURCE_ROOT=src-tauri/runtime-resources "$worker" process --config scanner-worker/tests/fixtures/process-facsimile.json
+      - name: Generate and verify trusted runtime manifest
+        shell: pwsh
+        run: |
+          $worker = "src-tauri/binaries/sbk-scanner-worker-$env:TARGET.exe"
+          python scripts/generate_runtime_manifest.py --root src-tauri/runtime-resources --worker $worker
+          python scripts/verify_runtime_manifest.py --root src-tauri/runtime-resources --worker $worker
+      - name: Build independent installed fast-start package
+        shell: pwsh
+        run: |
+          cargo test --manifest-path src-tauri/Cargo.toml --lib
+          if ($LASTEXITCODE -ne 0) { throw 'Windows database/editor regression tests failed' }
+          $version = $env:ARTIFACT_VERSION.TrimStart('v')
+          ./scripts/package_windows_installed.ps1 -Target $env:TARGET -Version $version
+      - name: Release installed packaging workspace
+        shell: pwsh
+        run: |
+          Remove-Item (Join-Path $env:GITHUB_WORKSPACE 'installed-stage') -Recurse -Force
+      - name: Release build-only Windows runtimes before install smoke
+        shell: pwsh
+        run: |
+          $releaseTree = Join-Path $env:GITHUB_WORKSPACE "src-tauri\target\$env:TARGET"
+          $webViewTree = Join-Path $env:GITHUB_WORKSPACE 'src-tauri\webview2-runtime'
+          $runtimeTree = Join-Path $env:GITHUB_WORKSPACE 'src-tauri\runtime-resources'
+          $workerBinary = Join-Path $env:GITHUB_WORKSPACE "src-tauri\binaries\sbk-scanner-worker-$env:TARGET.exe"
+          foreach ($path in @($releaseTree, $webViewTree, $runtimeTree, $workerBinary)) {
+            Remove-Item $path -Recurse -Force -ErrorAction SilentlyContinue
+          }
+          $drive = Get-PSDrive -Name ([IO.Path]::GetPathRoot($env:GITHUB_WORKSPACE).TrimEnd(':\'))
+          Write-Host "Free space before installer smoke: $([math]::Round($drive.Free / 1GB, 2)) GiB"
+      - name: Install, launch twice, verify shared locking and uninstall safely
+        timeout-minutes: 35
+        shell: pwsh
+        run: |
+          $smokeLog = Join-Path $env:RUNNER_TEMP 'SBK-Tools-Fast-Smoke.log'
+          Start-Transcript -Path $smokeLog -Force
+          trap {
+            $failure = ($_ | Out-String).Trim()
+            $escapedFailure = $failure.Replace('%', '%25').Replace("`r", '').Replace("`n", '%0A')
+            Write-Output "::error title=Fast-start smoke failure::$escapedFailure"
+            try { Stop-Transcript } catch { }
+            exit 1
+          }
+          $installer = Get-ChildItem release-artifacts -Filter 'SBK-Tools-Fast-Setup-*-x64.exe' | Select-Object -First 1
+          if (-not $installer) { throw 'Installed Windows artifact is missing' }
+          $installDir = Join-Path $env:LOCALAPPDATA 'SBKToolsFastCi'
+          $workspace = Join-Path $env:RUNNER_TEMP 'sbk-fast-product-data'
+          $portableTempPattern = 'SBKTools-runtime-*'
+          New-Item -ItemType Directory -Force $workspace | Out-Null
+          Set-Content -Encoding UTF8 (Join-Path $workspace 'uninstall-must-preserve.txt') 'preserve ProductData'
+
+          function Wait-InstallerProcess(
+            [System.Diagnostics.Process]$Process,
+            [int]$MaximumSeconds = 1200
+          ) {
+            $deadline = (Get-Date).AddSeconds($MaximumSeconds)
+            while ((Get-Date) -lt $deadline) {
+              $Process.Refresh()
+              if ($Process.HasExited) { return $Process.ExitCode }
+              Start-Sleep -Seconds 1
+            }
+            & taskkill.exe /PID $Process.Id /T /F 2>&1 | Write-Host
+            $diagnostic = Join-Path $env:TEMP 'SBK-Tools-Fast-Install-Error.log'
+            if (Test-Path $diagnostic -PathType Leaf) {
+              Write-Error "Installer diagnostic: $(Get-Content -Raw $diagnostic)"
+            }
+            throw "Installer did not complete within $MaximumSeconds seconds"
+          }
+
+          $installDiagnostic = Join-Path $env:TEMP 'SBK-Tools-Fast-Install-Error.log'
+          # Exercise an actual write-denied directory without modifying Windows/Program Files.
+          $deniedParent = Join-Path $env:RUNNER_TEMP 'sbk-installer-denied-directory'
+          New-Item -ItemType Directory -Force $deniedParent | Out-Null
+          & icacls.exe $deniedParent /deny '*S-1-1-0:(W)' | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'Could not prepare write-denied installer test' }
+          try {
+            $deniedInstall = Start-Process -FilePath $installer.FullName -ArgumentList @('/S', "/D=$deniedParent\SBK Tools") -PassThru
+            $deniedExitCode = Wait-InstallerProcess $deniedInstall 60
+            if ($deniedExitCode -ne 5) { throw "Write-denied installation should explain/reject access (code 5), got $deniedExitCode" }
+          } finally {
+            & icacls.exe $deniedParent /remove:d '*S-1-1-0' | Out-Null
+          }
+          Remove-Item $installDiagnostic -Force -ErrorAction SilentlyContinue
+          $install = Start-Process -FilePath $installer.FullName -ArgumentList @('/S', "/D=$installDir") -PassThru
+          $installExitCode = Wait-InstallerProcess $install
+          if ($installExitCode -ne 0) {
+            $details = if (Test-Path $installDiagnostic -PathType Leaf) {
+              Get-Content -Raw $installDiagnostic
+            } else {
+              'No installer diagnostic was produced'
+            }
+            $escapedDetails = $details.Replace('%', '%25').Replace("`r", '').Replace("`n", '%0A')
+            Write-Output "::error title=Fast-start installer failed::$escapedDetails"
+            throw "Installer failed with exit code ${installExitCode}: $details"
+          }
+          Write-Host "Installer completed successfully at $(Get-Date -Format o)"
+          $application = Join-Path $installDir 'SBK-Tools-Fast.exe'
+          if (-not (Test-Path $application -PathType Leaf)) { throw 'Fast-start executable is not in the install directory' }
+          if (Test-Path (Join-Path $installDir 'ScanDocument.exe')) { throw 'Installed flavor contains the portable launcher name' }
+          if (Get-ChildItem $installDir -Recurse -Filter '*onefile*launcher*' -ErrorAction SilentlyContinue) {
+            throw 'Installed flavor contains the portable extraction launcher'
+          }
+          if (Get-ChildItem $installDir -Recurse -File -Include 'payload.tar.zst', 'sbk-installed-extractor.exe' -ErrorAction SilentlyContinue) {
+            throw 'Installer-only payload files were copied into the application directory'
+          }
+          $installParent = Split-Path -Parent $installDir
+          if (Get-ChildItem $installParent -Directory -Filter '.sbk-tools-fast-*' -ErrorAction SilentlyContinue) {
+            throw 'Installer left a staging or backup directory behind'
+          }
+          $shortcut = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\СБК Инструменты\СБК Инструменты — быстрый запуск.lnk'
+          if (-not (Test-Path $shortcut -PathType Leaf)) { throw 'Start menu shortcut is missing' }
+          Write-Host "Installed files and Start menu shortcut verified at $(Get-Date -Format o)"
+          $updateProductData = Join-Path $installDir 'ProductData'
+          New-Item -ItemType Directory -Force $updateProductData | Out-Null
+          Set-Content -Encoding UTF8 (Join-Path $updateProductData 'update-must-preserve.txt') 'preserve adjacent ProductData on update'
+          $update = Start-Process -FilePath $installer.FullName -ArgumentList @('/S', "/D=$installDir") -PassThru
+          $updateExitCode = Wait-InstallerProcess $update
+          if ($updateExitCode -ne 0) { throw "Silent update failed: $updateExitCode" }
+          if (-not (Test-Path (Join-Path $updateProductData 'update-must-preserve.txt'))) {
+            throw 'Update removed adjacent ProductData'
+          }
+          foreach ($license in @('LICENSE', 'THIRD_PARTY_LICENSES.md')) {
+            if (-not (Get-ChildItem $installDir -Recurse -File -Filter $license -ErrorAction SilentlyContinue)) {
+              throw "Installed license is missing: $license"
+            }
+          }
+
+          $worker = Get-ChildItem $installDir -Recurse -File -Filter 'sbk-scanner-worker.exe' | Select-Object -First 1
+          $manifest = Get-ChildItem $installDir -Recurse -File -Filter 'resource-manifest.json' | Select-Object -First 1
+          if (-not $worker -or -not $manifest) { throw 'Installed scanner runtime or manifest is missing' }
+          $runtime = $manifest.Directory.Parent.FullName
+          python scripts/verify_runtime_manifest.py --root $runtime --worker $worker.FullName
+          if ($LASTEXITCODE -ne 0) { throw 'Installed runtime manifest verification failed' }
+          & $worker.FullName info
+          if ($LASTEXITCODE -ne 0) { throw 'Installed scanner worker cannot run offline' }
+          $env:SCANDOCUMENT_RESOURCE_ROOT = $runtime
+          $env:HTTP_PROXY = 'http://127.0.0.1:9'
+          $env:HTTPS_PROXY = 'http://127.0.0.1:9'
+          & $worker.FullName preview --config scanner-worker/tests/fixtures/preview.json
+          if ($LASTEXITCODE -ne 0) { throw 'Installed PDF processing failed offline' }
+          & $worker.FullName process --config scanner-worker/tests/fixtures/process-docx.json
+          if ($LASTEXITCODE -ne 0) { throw 'Installed DOCX/LibreOffice processing failed offline' }
+          & $worker.FullName process --config scanner-worker/tests/fixtures/process-ocr.json
+          if ($LASTEXITCODE -ne 0) { throw 'Installed OCR processing failed offline' }
+          Remove-Item Env:SCANDOCUMENT_RESOURCE_ROOT, Env:HTTP_PROXY, Env:HTTPS_PROXY
+          Write-Host "Installed offline scanner checks completed at $(Get-Date -Format o)"
+
+          function Start-VisibleApplication(
+            [string]$Executable,
+            [string]$Label,
+            [int]$MaximumVisibleSeconds = 30
+          ) {
+            $token = [guid]::NewGuid().ToString()
+            $marker = Join-Path $env:TEMP "SBKTools-ready-$token.marker"
+            Remove-Item $marker -Force -ErrorAction SilentlyContinue
+            $env:SBK_ONEFILE_GUI_READY_TOKEN = $token
+            $started = Get-Date
+            $process = Start-Process -FilePath $Executable -PassThru
+            Remove-Item Env:SBK_ONEFILE_GUI_READY_TOKEN
+            $deadline = (Get-Date).AddSeconds($MaximumVisibleSeconds)
+            while ((Get-Date) -lt $deadline -and -not (Test-Path $marker)) {
+              $process.Refresh()
+              if ($process.HasExited) { throw "$Label exited before showing a window" }
+              Start-Sleep -Milliseconds 100
+            }
+            if (-not (Test-Path $marker)) { throw "$Label did not react visually within $MaximumVisibleSeconds seconds" }
+            $elapsed = ((Get-Date) - $started).TotalSeconds
+            Write-Host "$Label visible after $([math]::Round($elapsed, 2)) seconds"
+            Remove-Item $marker -Force
+            return $process
+          }
+
+          function Wait-DatabaseSettle(
+            [string]$Workspace,
+            [int]$MaximumSeconds = 45
+          ) {
+            $deadline = (Get-Date).AddSeconds($MaximumSeconds)
+            $previous = $null
+            $stableSamples = 0
+            while ((Get-Date) -lt $deadline) {
+              $files = @(Get-ChildItem $Workspace -Recurse -Filter '*.sqlite3' -File -ErrorAction SilentlyContinue)
+              if ($files.Count -ge 7) {
+                $current = ($files | Sort-Object FullName | ForEach-Object {
+                  "$($_.FullName):$($_.Length):$($_.LastWriteTimeUtc.Ticks)"
+                }) -join '|'
+                if ($current -eq $previous) { $stableSamples++ } else { $stableSamples = 0 }
+                if ($stableSamples -ge 4) {
+                  foreach ($file in $files) {
+                    $schemaVersion = python -c 'import sqlite3,sys; print(sqlite3.connect(sys.argv[1]).execute("PRAGMA user_version").fetchone()[0])' $file.FullName
+                    if ($LASTEXITCODE -ne 0 -or [int]$schemaVersion -ne 3) {
+                      throw "Installed database schema is incomplete: $($file.FullName) version=$schemaVersion"
+                    }
+                  }
+                  return
+                }
+                $previous = $current
+              }
+              Start-Sleep -Milliseconds 500
+            }
+            throw 'Installed databases did not settle after initialization'
+          }
+
+          $tempBefore = @(Get-ChildItem $env:TEMP -Directory -Filter $portableTempPattern -ErrorAction SilentlyContinue | ForEach-Object FullName)
+          $env:SBK_TOOLS_WORKSPACE = '\\192.0.2.1\unavailable\ProductData'
+          $slowNetwork = Start-VisibleApplication $application 'Installed launch with unavailable network workspace' 15
+          Stop-Process -Id $slowNetwork.Id -Force
+          Start-Sleep -Seconds 1
+
+          $env:SBK_TOOLS_WORKSPACE = $workspace
+          $presence = Join-Path $workspace '.workspace-editor.json'
+          $first = Start-VisibleApplication $application 'First installed launch'
+          Wait-DatabaseSettle $workspace
+          if (-not (Test-Path $presence)) { throw 'First installed launch did not acquire the editor lock' }
+          $firstOwner = Get-Content -Raw $presence
+          Stop-Process -Id $first.Id -Force
+          Wait-Process -Id $first.Id -Timeout 15 -ErrorAction SilentlyContinue
+          $baseline = @{}
+          Get-ChildItem $workspace -Recurse -Filter '*.sqlite3' -File | ForEach-Object {
+            $baseline[$_.FullName] = (Get-FileHash -Algorithm SHA256 $_.FullName).Hash
+          }
+
+          $second = Start-VisibleApplication $application 'Repeated installed launch'
+          Wait-DatabaseSettle $workspace
+          $second.Refresh()
+          if ($second.HasExited) { throw 'Repeated installed launch exited during initialization' }
+          foreach ($path in $baseline.Keys) {
+            if ((Get-FileHash -Algorithm SHA256 $path).Hash -ne $baseline[$path]) {
+              throw "Current database changed on repeated launch: $path"
+            }
+          }
+          if (-not (Test-Path $presence)) { throw 'Installed version did not acquire the shared editor lock' }
+          $ownerBefore = Get-Content -Raw $presence
+          if ($ownerBefore -eq $firstOwner) { throw 'Repeated installed launch left stale editor ownership' }
+
+          $concurrent = Start-VisibleApplication $application 'Concurrent installed viewer'
+          Start-Sleep -Seconds 2
+          if ((Get-Content -Raw $presence) -ne $ownerBefore) {
+            throw 'Concurrent installed viewer replaced the editor lock'
+          }
+          Stop-Process -Id $concurrent.Id -Force -ErrorAction SilentlyContinue
+          Stop-Process -Id $second.Id -Force -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 2
+          Remove-Item Env:SBK_TOOLS_WORKSPACE
+
+          $tempAfter = @(Get-ChildItem $env:TEMP -Directory -Filter $portableTempPattern -ErrorAction SilentlyContinue | ForEach-Object FullName)
+          $newExtraction = @($tempAfter | Where-Object { $_ -notin $tempBefore })
+          if ($newExtraction.Count -gt 0) { throw "Temporary portable extraction was not cleaned: $($newExtraction -join ', ')" }
+
+          $uninstaller = Join-Path $installDir 'uninstall.exe'
+          if (-not (Test-Path $uninstaller -PathType Leaf)) { throw 'Uninstaller is missing' }
+          $internalProductData = Join-Path $installDir 'ProductData'
+          New-Item -ItemType Directory -Force $internalProductData | Out-Null
+          Set-Content -Encoding UTF8 (Join-Path $internalProductData 'uninstall-must-preserve.txt') 'preserve adjacent ProductData'
+          $uninstall = Start-Process -FilePath $uninstaller -ArgumentList '/S' -Wait -PassThru
+          if ($uninstall.ExitCode -ne 0) { throw "Uninstaller failed: $($uninstall.ExitCode)" }
+          if (Test-Path $application) { throw 'Application executable remains after uninstall' }
+          if (-not (Test-Path (Join-Path $workspace 'uninstall-must-preserve.txt'))) {
+            throw 'Uninstall removed user ProductData'
+          }
+          if (-not (Test-Path (Join-Path $internalProductData 'uninstall-must-preserve.txt'))) {
+            throw 'Uninstall removed adjacent ProductData'
+          }
+          $reinstall = Start-Process -FilePath $installer.FullName -ArgumentList @('/S', "/D=$installDir") -PassThru
+          $reinstallExitCode = Wait-InstallerProcess $reinstall
+          if ($reinstallExitCode -ne 0) { throw "Reinstall after uninstall failed: $reinstallExitCode" }
+          if (-not (Test-Path (Join-Path $internalProductData 'uninstall-must-preserve.txt'))) {
+            throw 'Reinstall after uninstall lost adjacent ProductData'
+          }
+          $finalUninstall = Start-Process -FilePath (Join-Path $installDir 'uninstall.exe') -ArgumentList '/S' -Wait -PassThru
+          if ($finalUninstall.ExitCode -ne 0) { throw "Final uninstaller failed: $($finalUninstall.ExitCode)" }
+          if (Test-Path $application) { throw 'Application executable remains after final uninstall' }
+          Write-Host "Install smoke and ProductData preservation checks completed at $(Get-Date -Format o)"
+          Stop-Transcript
+      - name: Upload fast-start installer diagnostics
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: SBK-Tools-Windows-x64-Installed-Diagnostics
+          path: |
+            ${{ runner.temp }}/SBK-Tools-Fast-Install-Error.log
+            ${{ runner.temp }}/SBK-Tools-Fast-Smoke.log
+          if-no-files-found: ignore
+      - name: Sign and verify installed Windows package when configured
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          $installer = Get-ChildItem release-artifacts -Filter 'SBK-Tools-Fast-Setup-*-x64.exe' | Select-Object -First 1
+          if (-not $env:WINDOWS_CERTIFICATE -or -not $env:WINDOWS_CERTIFICATE_PASSWORD) {
+            Write-Warning 'Authenticode signing skipped because WINDOWS_CERTIFICATE secrets are not configured'
+          } else {
+            $certificate = Join-Path $env:RUNNER_TEMP 'windows-signing.pfx'
+            [IO.File]::WriteAllBytes($certificate, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
+            $kits = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin'
+            $signtool = Get-ChildItem $kits -Filter signtool.exe -File -Recurse |
+              Where-Object { $_.FullName -match '\\x64\\signtool\.exe$' } |
+              Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if (-not $signtool) { throw 'Windows SDK signtool.exe not found' }
+            & $signtool.FullName sign /fd SHA256 /f $certificate /p $env:WINDOWS_CERTIFICATE_PASSWORD /tr http://timestamp.digicert.com /td SHA256 $installer.FullName
+            if ($LASTEXITCODE -ne 0) { throw 'Authenticode signing failed' }
+            & $signtool.FullName verify /pa /v $installer.FullName
+            if ($LASTEXITCODE -ne 0) { throw 'Authenticode verification failed' }
+          }
+          $hash = (Get-FileHash -Algorithm SHA256 $installer.FullName).Hash.ToLowerInvariant()
+          Set-Content -Encoding ASCII -Path "$($installer.FullName).sha256" -Value "$hash  $($installer.Name)"
+      - name: Upload installed Windows artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: SBK-Tools-Windows-x64-Installed
+          path: |
+            release-artifacts/SBK-Tools-Fast-Setup-*-x64.exe
+            release-artifacts/SBK-Tools-Fast-Setup-*-x64.exe.sha256

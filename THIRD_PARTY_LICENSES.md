@@ -5,6 +5,7 @@
 | Компонент | Назначение | Лицензия |
 |---|---|---|
 | Tauri и плагины Tauri | desktop-оболочка | Apache-2.0 / MIT |
+| NSIS | пользовательский Windows-установщик | zlib/libpng |
 | Microsoft Edge WebView2 Fixed Version Runtime | встроенный Windows webview | Microsoft Edge WebView2 Runtime license; разрешено распространение только как части приложения |
 | Microsoft Visual C++ Redistributable | app-local библиотеки для LibreOffice на чистой Windows | Microsoft Visual Studio licensing terms; распространяется только как часть приложения |
 | React, React DOM, Vite | пользовательский интерфейс | MIT |

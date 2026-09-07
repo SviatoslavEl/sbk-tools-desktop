@@ -15,6 +15,8 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
+#[cfg(feature = "installed-fast-start")]
+use std::ops::Deref;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -55,11 +57,181 @@ fn gui_ready_marker_path() -> Option<PathBuf> {
     gui_ready_marker_path_for(&token, &std::env::temp_dir())
 }
 
+#[tauri::command]
+fn report_startup_ui_visible(app: AppHandle) -> Result<(), String> {
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "Главное окно приложения не создано".to_string())?;
+    if !window.is_visible().map_err(|error| error.to_string())? {
+        return Err("Главное окно приложения ещё не показано".to_string());
+    }
+    if let Some(marker) = gui_ready_marker_path() {
+        fs::write(marker, b"ready\n").map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 struct AppState {
+    #[cfg(feature = "installed-fast-start")]
+    workspace: Arc<StartupWorkspace>,
+    #[cfg(not(feature = "installed-fast-start"))]
     workspace: Arc<Workspace>,
     scanner_jobs: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     maintenance: Arc<Mutex<()>>,
+}
+
+impl AppState {
+    fn active_workspace(&self) -> Result<Arc<Workspace>, String> {
+        #[cfg(feature = "installed-fast-start")]
+        {
+            self.workspace.workspace()
+        }
+        #[cfg(not(feature = "installed-fast-start"))]
+        {
+            Ok(self.workspace.clone())
+        }
+    }
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StartupStatus {
+    stage: String,
+    stage_index: u8,
+    ready: bool,
+    failed: bool,
+    needs_workspace: bool,
+    error: Option<String>,
+}
+
+#[cfg(feature = "installed-fast-start")]
+struct StartupWorkspace {
+    value: OnceLock<Arc<Workspace>>,
+    status: Mutex<StartupStatus>,
+    initializing: AtomicBool,
+}
+
+#[cfg(feature = "installed-fast-start")]
+impl StartupWorkspace {
+    fn new() -> Self {
+        Self {
+            value: OnceLock::new(),
+            status: Mutex::new(StartupStatus {
+                stage: "Запускаем СБК Инструменты".to_string(),
+                stage_index: 0,
+                ready: false,
+                failed: false,
+                needs_workspace: false,
+                error: None,
+            }),
+            initializing: AtomicBool::new(false),
+        }
+    }
+
+    fn snapshot(&self) -> StartupStatus {
+        self.status
+            .lock()
+            .map(|status| status.clone())
+            .unwrap_or_else(|_| StartupStatus {
+                stage: "Не удалось прочитать состояние запуска".to_string(),
+                stage_index: 0,
+                ready: false,
+                failed: true,
+                needs_workspace: false,
+                error: Some("Внутренняя ошибка состояния запуска".to_string()),
+            })
+    }
+
+    fn workspace(&self) -> Result<Arc<Workspace>, String> {
+        self.value.get().cloned().ok_or_else(|| {
+            self.snapshot()
+                .error
+                .unwrap_or_else(|| "Рабочее пространство ещё загружается".to_string())
+        })
+    }
+
+    fn begin(&self) -> bool {
+        if self.value.get().is_some()
+            || self
+                .initializing
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+        {
+            return false;
+        }
+        self.set_status("Запускаем СБК Инструменты", 0, false, false, None);
+        true
+    }
+
+    fn set_stage(&self, stage: &str, stage_index: u8) {
+        self.set_status(stage, stage_index, false, false, None);
+    }
+
+    fn set_status(
+        &self,
+        stage: &str,
+        stage_index: u8,
+        failed: bool,
+        needs_workspace: bool,
+        error: Option<String>,
+    ) {
+        if let Ok(mut status) = self.status.lock() {
+            *status = StartupStatus {
+                stage: stage.to_string(),
+                stage_index,
+                ready: false,
+                failed,
+                needs_workspace,
+                error,
+            };
+        }
+    }
+
+    fn finish(&self, workspace: Workspace) -> Result<(), String> {
+        self.value
+            .set(Arc::new(workspace))
+            .map_err(|_| "Рабочее пространство уже открыто".to_string())?;
+        if let Ok(mut status) = self.status.lock() {
+            *status = StartupStatus {
+                stage: "Готово".to_string(),
+                stage_index: 4,
+                ready: true,
+                failed: false,
+                needs_workspace: false,
+                error: None,
+            };
+        }
+        self.initializing.store(false, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn fail(&self, error: String, needs_workspace: bool) {
+        self.set_status(
+            if needs_workspace {
+                "Проверяем рабочую папку"
+            } else {
+                "Запуск не завершён"
+            },
+            1,
+            true,
+            needs_workspace,
+            Some(error),
+        );
+        self.initializing.store(false, Ordering::SeqCst);
+    }
+}
+
+#[cfg(feature = "installed-fast-start")]
+impl Deref for StartupWorkspace {
+    type Target = Workspace;
+
+    fn deref(&self) -> &Self::Target {
+        self.value
+            .get()
+            .expect("workspace commands are unavailable until startup completes")
+            .as_ref()
+    }
 }
 
 #[derive(Serialize)]
@@ -272,22 +444,119 @@ fn parse_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredRecord> {
     })
 }
 
+#[cfg(feature = "installed-fast-start")]
+fn initialize_workspace_in_background(startup: Arc<StartupWorkspace>) {
+    if !startup.begin() {
+        return;
+    }
+    thread::spawn(move || {
+        startup.set_stage("Проверяем рабочую папку", 1);
+        let workspace = match open_workspace() {
+            Ok(workspace) => workspace,
+            Err(error) => {
+                startup.fail(error, false);
+                return;
+            }
+        };
+        if !workspace.configured {
+            let message = workspace.warning.clone().unwrap_or_else(|| {
+                "Выберите постоянную рабочую папку для баз, документов и резервных копий."
+                    .to_string()
+            });
+            drop(workspace);
+            startup.fail(message, true);
+            return;
+        }
+
+        startup.set_stage("Открываем базы данных", 2);
+        for module in MODULES {
+            let result = if workspace.is_editor() {
+                open_database(&workspace.root, module).map(|_| ())
+            } else {
+                open_database_read_only(&workspace.root, module).map(|_| ())
+            };
+            if let Err(error) = result {
+                startup.fail(
+                    format!("Не удалось открыть раздел «{module}»: {error}"),
+                    false,
+                );
+                return;
+            }
+        }
+
+        startup.set_stage("Готовим модули", 3);
+        if workspace.is_editor()
+            && let Err(error) = intelligence::recover_interrupted_jobs(&workspace.root)
+        {
+            startup.fail(
+                format!("Не удалось восстановить очередь обработки: {error}"),
+                false,
+            );
+            return;
+        }
+        if let Err(error) = startup.finish(workspace) {
+            startup.fail(error, false);
+        }
+    });
+}
+
+#[tauri::command]
+fn startup_status(state: State<'_, AppState>) -> StartupStatus {
+    #[cfg(feature = "installed-fast-start")]
+    {
+        state.workspace.snapshot()
+    }
+    #[cfg(not(feature = "installed-fast-start"))]
+    {
+        let _ = state;
+        StartupStatus {
+            stage: "Готово".to_string(),
+            stage_index: 4,
+            ready: true,
+            failed: false,
+            needs_workspace: false,
+            error: None,
+        }
+    }
+}
+
+#[tauri::command]
+fn retry_workspace_initialization(state: State<'_, AppState>) -> StartupStatus {
+    #[cfg(feature = "installed-fast-start")]
+    {
+        initialize_workspace_in_background(state.workspace.clone());
+        state.workspace.snapshot()
+    }
+    #[cfg(not(feature = "installed-fast-start"))]
+    {
+        startup_status(state)
+    }
+}
+
 #[tauri::command]
 fn workspace_info(state: State<'_, AppState>) -> Result<WorkspaceInfo, String> {
-    let editor = state.workspace.is_editor();
-    let access_message = state.workspace.access_message();
+    let _maintenance = state
+        .maintenance
+        .lock()
+        .map_err(|_| "Хранилище временно недоступно".to_string())?;
+    let workspace = state.active_workspace()?;
+    if workspace.is_editor() {
+        let _ = workspace.require_editor();
+    }
+    let editor = workspace.is_editor();
+    let access_message = workspace.access_message();
     Ok(WorkspaceInfo {
-        root: state.workspace.root.to_string_lossy().into_owned(),
-        portable: state.workspace.portable,
-        configured: state.workspace.configured,
-        warning: state.workspace.warning.clone(),
-        writable: state.workspace.writable,
+        root: workspace.root.to_string_lossy().into_owned(),
+        portable: workspace.portable,
+        configured: workspace.configured,
+        warning: workspace.warning.clone(),
+        writable: workspace.writable,
         editor,
-        access_controlled: state.workspace.access_controlled(),
+        access_controlled: workspace.access_controlled(),
         access_message,
-        editor_owner: state.workspace.editor_owner(),
+        editor_owner: workspace.editor_owner(),
         schema_version: SCHEMA_VERSION,
-        free_space_bytes: fs2::available_space(&state.workspace.root).unwrap_or(0),
+        free_space_bytes: fs2::available_space(&workspace.root).unwrap_or(0),
     })
 }
 
@@ -297,10 +566,15 @@ fn switch_workspace_mode(
     editor: bool,
     password: String,
 ) -> Result<(), String> {
+    let _maintenance = state
+        .maintenance
+        .lock()
+        .map_err(|_| "Хранилище временно недоступно".to_string())?;
+    let workspace = state.active_workspace()?;
     if editor {
-        state.workspace.acquire_editor_with_password(&password)
+        workspace.acquire_editor_with_password(&password)
     } else {
-        state.workspace.release_editor_with_password(&password)
+        workspace.release_editor_with_password(&password)
     }
 }
 
@@ -310,18 +584,33 @@ fn set_workspace_access_password(
     current_password: String,
     new_password: String,
 ) -> Result<(), String> {
+    let _maintenance = state
+        .maintenance
+        .lock()
+        .map_err(|_| "Хранилище временно недоступно".to_string())?;
     state
-        .workspace
+        .active_workspace()?
         .set_access_password(&current_password, &new_password)
 }
 
 #[tauri::command]
-fn set_workspace_location(path: String) -> Result<String, String> {
+fn set_workspace_location(
+    state: State<'_, AppState>,
+    path: String,
+    reopen: Option<bool>,
+) -> Result<String, String> {
     let selected = PathBuf::from(path.trim());
     if selected.as_os_str().is_empty() {
         return Err("Выберите папку".to_string());
     }
-    configure_workspace_location(&selected, &workspace_pointer_path()?)
+    let root = configure_workspace_location(&selected, &workspace_pointer_path()?)?;
+    #[cfg(feature = "installed-fast-start")]
+    if reopen.unwrap_or(false) && state.workspace.value.get().is_none() {
+        initialize_workspace_in_background(state.workspace.clone());
+    }
+    #[cfg(not(feature = "installed-fast-start"))]
+    let _ = (state, reopen);
+    Ok(root)
 }
 
 fn configure_workspace_location(selected: &Path, pointer: &Path) -> Result<String, String> {
@@ -906,11 +1195,11 @@ fn restore_history_version(
     id: String,
     history_id: i64,
 ) -> Result<StoredRecord, String> {
-    state.workspace.require_editor()?;
     let _maintenance = state
         .maintenance
         .lock()
         .map_err(|_| "Хранилище временно недоступно".to_string())?;
+    state.workspace.require_editor()?;
     let mut connection = open_database(&state.workspace.root, &module)?;
     let transaction = connection
         .transaction()
@@ -950,11 +1239,11 @@ fn upsert_record(
     title: String,
     mut payload: Value,
 ) -> Result<StoredRecord, String> {
-    state.workspace.require_editor()?;
     let _maintenance = state
         .maintenance
         .lock()
         .map_err(|_| "Хранилище временно недоступно".to_string())?;
+    state.workspace.require_editor()?;
     if title.trim().is_empty() {
         return Err("Укажите название записи".to_string());
     }
@@ -1117,7 +1406,6 @@ fn configured_history_limit(root: &Path) -> i64 {
 
 #[tauri::command]
 fn prune_history(state: State<'_, AppState>, limit: i64) -> Result<usize, String> {
-    state.workspace.require_editor()?;
     if !(10..=1000).contains(&limit) {
         return Err("Хранить можно от 10 до 1000 изменений на запись".to_string());
     }
@@ -1125,6 +1413,7 @@ fn prune_history(state: State<'_, AppState>, limit: i64) -> Result<usize, String
         .maintenance
         .lock()
         .map_err(|_| "Хранилище временно недоступно".to_string())?;
+    state.workspace.require_editor()?;
     let mut removed = 0;
     for module in MODULES {
         let connection = open_database(&state.workspace.root, module)?;
@@ -1149,7 +1438,6 @@ fn import_records_atomic(
     module: String,
     records: Vec<ImportRecord>,
 ) -> Result<usize, String> {
-    state.workspace.require_editor()?;
     if records.is_empty() || records.len() > 10_000 {
         return Err("Пакет должен содержать от 1 до 10 000 записей".to_string());
     }
@@ -1157,6 +1445,7 @@ fn import_records_atomic(
         .maintenance
         .lock()
         .map_err(|_| "Хранилище временно недоступно".to_string())?;
+    state.workspace.require_editor()?;
     let mut ids = HashSet::new();
     if records.iter().any(|record| {
         record.title.trim().is_empty()
@@ -1194,7 +1483,6 @@ fn update_records_atomic(
     module: String,
     records: Vec<ImportRecord>,
 ) -> Result<usize, String> {
-    state.workspace.require_editor()?;
     if records.is_empty() || records.len() > 10_000 {
         return Err("Пакет обновления должен содержать от 1 до 10 000 записей".to_string());
     }
@@ -1202,6 +1490,7 @@ fn update_records_atomic(
         .maintenance
         .lock()
         .map_err(|_| "Хранилище временно недоступно".to_string())?;
+    state.workspace.require_editor()?;
     let history_limit = configured_history_limit(&state.workspace.root);
     let mut connection = open_database(&state.workspace.root, &module)?;
     let transaction = connection
@@ -1536,11 +1825,11 @@ fn import_contracts_with_company_directory_atomic(
     records: Vec<ImportRecord>,
     directory: Value,
 ) -> Result<usize, String> {
-    state.workspace.require_editor()?;
     let _maintenance = state
         .maintenance
         .lock()
         .map_err(|_| "Хранилище временно недоступно".to_string())?;
+    state.workspace.require_editor()?;
     let mut connection = open_database(&state.workspace.root, "contract-experience")?;
     import_contract_bundle_transaction(&mut connection, records, &directory)
 }
@@ -1616,11 +1905,11 @@ fn update_contracts_and_company_directory_atomic(
     records: Vec<ImportRecord>,
     mut directory: Value,
 ) -> Result<usize, String> {
-    state.workspace.require_editor()?;
     let _maintenance = state
         .maintenance
         .lock()
         .map_err(|_| "Хранилище временно недоступно".to_string())?;
+    state.workspace.require_editor()?;
     let history_limit = configured_history_limit(&state.workspace.root);
     let mut attachment_moves = Vec::new();
     finalize_staged_attachments(
@@ -1717,11 +2006,11 @@ fn save_contract_with_company_directory_atomic(
     mut payload: Value,
     directory: Value,
 ) -> Result<StoredRecord, String> {
-    state.workspace.require_editor()?;
     let _maintenance = state
         .maintenance
         .lock()
         .map_err(|_| "Хранилище временно недоступно".to_string())?;
+    state.workspace.require_editor()?;
     let record_id = id.unwrap_or_else(|| Uuid::new_v4().to_string());
     let history_limit = configured_history_limit(&state.workspace.root);
     let mut attachment_moves = Vec::new();
@@ -1770,11 +2059,11 @@ fn archive_record(
     id: String,
     archived: bool,
 ) -> Result<(), String> {
-    state.workspace.require_editor()?;
     let _maintenance = state
         .maintenance
         .lock()
         .map_err(|_| "Хранилище временно недоступно".to_string())?;
+    state.workspace.require_editor()?;
     let connection = open_database(&state.workspace.root, &module)?;
     let now = Utc::now().to_rfc3339();
     let changed = connection
@@ -1802,7 +2091,6 @@ fn archive_records(
     ids: Vec<String>,
     archived: bool,
 ) -> Result<usize, String> {
-    state.workspace.require_editor()?;
     if ids.is_empty() {
         return Ok(0);
     }
@@ -1813,6 +2101,7 @@ fn archive_records(
         .maintenance
         .lock()
         .map_err(|_| "Хранилище временно недоступно".to_string())?;
+    state.workspace.require_editor()?;
     let mut connection = open_database(&state.workspace.root, &module)?;
     let transaction = connection
         .transaction()
@@ -1845,7 +2134,6 @@ fn save_draft(
     key: String,
     payload: Value,
 ) -> Result<(), String> {
-    state.workspace.require_editor()?;
     if key.trim().is_empty() || key.len() > 100 {
         return Err("Некорректный ключ черновика".to_string());
     }
@@ -1853,6 +2141,7 @@ fn save_draft(
         .maintenance
         .lock()
         .map_err(|_| "Хранилище временно недоступно".to_string())?;
+    state.workspace.require_editor()?;
     let connection = open_database(&state.workspace.root, &module)?;
     connection
         .execute(
@@ -1890,11 +2179,11 @@ fn read_draft(
 
 #[tauri::command]
 fn clear_draft(state: State<'_, AppState>, module: String, key: String) -> Result<(), String> {
-    state.workspace.require_editor()?;
     let _maintenance = state
         .maintenance
         .lock()
         .map_err(|_| "Хранилище временно недоступно".to_string())?;
+    state.workspace.require_editor()?;
     let connection = open_database(&state.workspace.root, &module)?;
     connection
         .execute("DELETE FROM drafts WHERE key = ?1", [key])
@@ -1904,11 +2193,11 @@ fn clear_draft(state: State<'_, AppState>, module: String, key: String) -> Resul
 
 #[tauri::command]
 fn delete_record(state: State<'_, AppState>, module: String, id: String) -> Result<(), String> {
-    state.workspace.require_editor()?;
     let _maintenance = state
         .maintenance
         .lock()
         .map_err(|_| "Хранилище временно недоступно".to_string())?;
+    state.workspace.require_editor()?;
     let mut connection = open_database(&state.workspace.root, &module)?;
     let transaction = connection
         .transaction()
@@ -1947,7 +2236,6 @@ fn delete_records(
     module: String,
     ids: Vec<String>,
 ) -> Result<usize, String> {
-    state.workspace.require_editor()?;
     if ids.is_empty() {
         return Ok(0);
     }
@@ -1958,6 +2246,7 @@ fn delete_records(
         .maintenance
         .lock()
         .map_err(|_| "Хранилище временно недоступно".to_string())?;
+    state.workspace.require_editor()?;
     let mut connection = open_database(&state.workspace.root, &module)?;
     let transaction = connection
         .transaction()
@@ -2032,11 +2321,11 @@ fn copy_attachment(
     module: String,
     record_id: String,
 ) -> Result<AttachmentInfo, String> {
-    state.workspace.require_editor()?;
     let _maintenance = state
         .maintenance
         .lock()
         .map_err(|_| "Хранилище временно недоступно".to_string())?;
+    state.workspace.require_editor()?;
     validated_module(&module)?;
     let source = PathBuf::from(source_path);
     if !source.is_file() {
@@ -2112,11 +2401,11 @@ fn discard_staged_attachments(
     module: String,
     record_id: String,
 ) -> Result<(), String> {
-    state.workspace.require_editor()?;
     let _maintenance = state
         .maintenance
         .lock()
         .map_err(|_| "Хранилище временно недоступно".to_string())?;
+    state.workspace.require_editor()?;
     validated_module(&module)?;
     if !valid_attachment_session_id(&record_id) {
         return Err("Некорректный идентификатор сессии вложений".to_string());
@@ -2135,11 +2424,11 @@ fn discard_staged_attachments(
 
 #[tauri::command]
 fn delete_attachment(state: State<'_, AppState>, relative_path: String) -> Result<(), String> {
-    state.workspace.require_editor()?;
     let _maintenance = state
         .maintenance
         .lock()
         .map_err(|_| "Хранилище временно недоступно".to_string())?;
+    state.workspace.require_editor()?;
     let relative = Path::new(&relative_path);
     let parts: Vec<_> = relative.components().collect();
     if parts.len() < 4
@@ -2167,13 +2456,13 @@ fn delete_attachment(state: State<'_, AppState>, relative_path: String) -> Resul
 
 #[tauri::command]
 fn audit_attachments(state: State<'_, AppState>, remove: bool) -> Result<AttachmentAudit, String> {
-    if remove {
-        state.workspace.require_editor()?;
-    }
     let _maintenance = state
         .maintenance
         .lock()
         .map_err(|_| "Хранилище временно недоступно".to_string())?;
+    if remove {
+        state.workspace.require_editor()?;
+    }
     attachments::audit(&state.workspace.root, &MODULES, remove)
 }
 
@@ -2444,11 +2733,11 @@ fn create_backup_impl(workspace: &Workspace, module: Option<String>) -> Result<B
 
 #[tauri::command]
 fn create_backup(state: State<'_, AppState>, module: Option<String>) -> Result<BackupInfo, String> {
-    state.workspace.require_editor()?;
     let _maintenance = state
         .maintenance
         .lock()
         .map_err(|_| "Хранилище временно недоступно".to_string())?;
+    state.workspace.require_editor()?;
     create_backup_impl(&state.workspace, module)
 }
 
@@ -2695,11 +2984,11 @@ fn create_encrypted_backup(
     module: Option<String>,
     password: String,
 ) -> Result<BackupInfo, String> {
-    state.workspace.require_editor()?;
     let _maintenance = state
         .maintenance
         .lock()
         .map_err(|_| "Хранилище временно недоступно".to_string())?;
+    state.workspace.require_editor()?;
     let plain = create_backup_impl(&state.workspace, module)?;
     let source = PathBuf::from(&plain.path);
     let destination = PathBuf::from(format!("{}.enc", plain.path));
@@ -2820,11 +3109,11 @@ fn set_backup_pinned(
     file_name: String,
     pinned: bool,
 ) -> Result<(), String> {
-    state.workspace.require_editor()?;
     let _maintenance = state
         .maintenance
         .lock()
         .map_err(|_| "Хранилище временно недоступно".to_string())?;
+    state.workspace.require_editor()?;
     let name = safe_backup_name(&file_name)?;
     if !state.workspace.root.join("backups").join(name).is_file() {
         return Err("Резервная копия не найдена".to_string());
@@ -2840,11 +3129,11 @@ fn set_backup_pinned(
 
 #[tauri::command]
 fn delete_backup(state: State<'_, AppState>, file_name: String) -> Result<(), String> {
-    state.workspace.require_editor()?;
     let _maintenance = state
         .maintenance
         .lock()
         .map_err(|_| "Хранилище временно недоступно".to_string())?;
+    state.workspace.require_editor()?;
     let name = safe_backup_name(&file_name)?;
     if pinned_backups(&state.workspace.root).contains(name) {
         return Err("Сначала открепите резервную копию".to_string());
@@ -2862,7 +3151,6 @@ fn rotate_backups(
     keep: usize,
     max_age_days: u64,
 ) -> Result<usize, String> {
-    state.workspace.require_editor()?;
     if !(1..=100).contains(&keep) {
         return Err("Хранить можно от 1 до 100 незакреплённых копий".to_string());
     }
@@ -2873,6 +3161,7 @@ fn rotate_backups(
         .maintenance
         .lock()
         .map_err(|_| "Хранилище временно недоступно".to_string())?;
+    state.workspace.require_editor()?;
     rotate_backups_impl(&state.workspace.root, keep, max_age_days)
 }
 
@@ -3079,11 +3368,11 @@ fn rollback_workspace_swaps(swaps: &[(PathBuf, PathBuf, bool)]) {
 
 #[tauri::command]
 fn restore_backup(state: State<'_, AppState>, path: String) -> Result<(), String> {
-    state.workspace.require_editor()?;
     let _maintenance = state
         .maintenance
         .lock()
         .map_err(|_| "Хранилище временно недоступно".to_string())?;
+    state.workspace.require_editor()?;
     const MAX_BACKUP_BYTES: u64 = 2 * 1024 * 1024 * 1024;
     const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
     let archive_size = fs::metadata(&path)
@@ -3814,7 +4103,7 @@ async fn scanner_run(
     operation: String,
     config: Value,
 ) -> Result<Value, String> {
-    let workspace = state.workspace.clone();
+    let workspace = state.active_workspace()?;
     let jobs = state.scanner_jobs.clone();
     tauri::async_runtime::spawn_blocking(move || {
         run_scanner_worker(app, workspace, jobs, job_id, operation, config)
@@ -3855,25 +4144,33 @@ fn delete_runtime_file(state: State<'_, AppState>, path: String) -> Result<(), S
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let workspace = open_workspace().expect("SBK Tools workspace could not be opened");
-    for module in MODULES {
-        if workspace.is_editor() {
-            open_database(&workspace.root, module)
-                .unwrap_or_else(|error| panic!("SBK Tools could not initialize {module}: {error}"));
-        } else {
-            open_database_read_only(&workspace.root, module)
-                .unwrap_or_else(|error| panic!("SBK Tools could not read {module}: {error}"));
+    #[cfg(feature = "installed-fast-start")]
+    let workspace = Arc::new(StartupWorkspace::new());
+    #[cfg(not(feature = "installed-fast-start"))]
+    let workspace = {
+        let workspace = open_workspace().expect("SBK Tools workspace could not be opened");
+        for module in MODULES {
+            if workspace.is_editor() {
+                open_database(&workspace.root, module).unwrap_or_else(|error| {
+                    panic!("SBK Tools could not initialize {module}: {error}")
+                });
+            } else {
+                open_database_read_only(&workspace.root, module)
+                    .unwrap_or_else(|error| panic!("SBK Tools could not read {module}: {error}"));
+            }
         }
-    }
-    if workspace.is_editor() {
-        intelligence::recover_interrupted_jobs(&workspace.root)
-            .expect("SBK Tools intelligence queue could not be recovered");
-    }
+        if workspace.is_editor() {
+            intelligence::recover_interrupted_jobs(&workspace.root)
+                .expect("SBK Tools intelligence queue could not be recovered");
+        }
+        Arc::new(workspace)
+    };
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             start_runtime_verification(app.handle());
+            #[cfg(not(feature = "installed-fast-start"))]
             if let Some(marker) = gui_ready_marker_path() {
                 let window = app.get_webview_window("main").ok_or_else(|| {
                     std::io::Error::other("SBK Tools main window was not created")
@@ -3885,14 +4182,22 @@ pub fn run() {
                 }
                 fs::write(marker, b"ready\n")?;
             }
+            #[cfg(feature = "installed-fast-start")]
+            {
+                let startup = app.state::<AppState>().workspace.clone();
+                initialize_workspace_in_background(startup);
+            }
             Ok(())
         })
         .manage(AppState {
-            workspace: Arc::new(workspace),
+            workspace,
             scanner_jobs: Arc::new(Mutex::new(HashMap::new())),
             maintenance: Arc::new(Mutex::new(())),
         })
         .invoke_handler(tauri::generate_handler![
+            report_startup_ui_visible,
+            startup_status,
+            retry_workspace_initialization,
             workspace_info,
             switch_workspace_mode,
             set_workspace_access_password,
@@ -3967,6 +4272,29 @@ mod tests {
             format!("SBKTools-ready-{token}.marker")
         );
         assert!(gui_ready_marker_path_for("not-a-token", &temp).is_none());
+    }
+
+    #[cfg(feature = "installed-fast-start")]
+    #[test]
+    fn startup_status_is_visible_and_retryable_after_failure() {
+        let startup = StartupWorkspace::new();
+        let initial = startup.snapshot();
+        assert_eq!(initial.stage, "Запускаем СБК Инструменты");
+        assert_eq!(initial.stage_index, 0);
+        assert!(!initial.ready);
+        assert!(!initial.failed);
+
+        assert!(startup.begin());
+        assert!(!startup.begin(), "parallel initialization must be rejected");
+        startup.set_stage("Открываем базы данных", 2);
+        assert_eq!(startup.snapshot().stage_index, 2);
+
+        startup.fail("Сетевая папка недоступна".to_string(), true);
+        let failed = startup.snapshot();
+        assert!(failed.failed);
+        assert!(failed.needs_workspace);
+        assert_eq!(failed.error.as_deref(), Some("Сетевая папка недоступна"));
+        assert!(startup.begin(), "failure must allow an explicit retry");
     }
 
     #[test]
@@ -4706,15 +5034,18 @@ mod tests {
         let source = root.join(&relative);
         fs::create_dir_all(source.parent().expect("parent")).expect("staging directory");
         fs::write(&source, b"attachment").expect("staged attachment");
-        let mut payload =
-            serde_json::json!({ "document": { "relativePath": relative.to_string_lossy() } });
+        // Attachment commands serialize portable slash-separated paths on all
+        // platforms. Exercise the same wire format, not Windows PathBuf syntax.
+        let mut payload = serde_json::json!({ "document": {
+            "relativePath": relative.to_string_lossy().replace('\\', "/")
+        } });
         let mut moves = Vec::new();
         finalize_staged_attachments(&mut payload, &root, "staff", &record_id, &mut moves)
             .expect("finalize");
         let final_relative = payload["document"]["relativePath"]
             .as_str()
             .expect("final path");
-        assert!(final_relative.starts_with("attachments/staff/"));
+        assert!(Path::new(final_relative).starts_with(Path::new("attachments").join("staff")));
         assert!(root.join(final_relative).is_file());
         assert!(!source.exists());
         rollback_attachment_moves(&moves);

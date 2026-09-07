@@ -170,3 +170,5 @@
   .split-block-row label { grid-column: 1 / -1; }
   .split-block-row .icon-button { grid-column: 2; grid-row: 1; }
 }
+.facsimile-size-presets { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.facsimile-size-presets > span { flex-basis: 100%; font-weight: 600; }
