@@ -22,7 +22,11 @@ jobs:
           Copy-Item src-tauri/icons/icon.ico $stage
           [IO.File]::WriteAllBytes((Join-Path $stage 'payload.tar.zst'), [byte[]](1,2,3))
           Copy-Item "$env:WINDIR\System32\whoami.exe" (Join-Path $stage 'sbk-installed-extractor.exe')
-          $compiler = 'C:\Program Files (x86)\NSIS\makensis.exe'
+          $nsisZip = Join-Path $stage 'nsis.zip'
+          Invoke-WebRequest 'https://github.com/tauri-apps/binary-releases/releases/download/nsis-3.11/nsis-3.11.zip' -OutFile $nsisZip
+          if ((Get-FileHash -Algorithm SHA1 $nsisZip).Hash -ne 'EF7FF767E5CBD9EDD22ADD3A32C9B8F4500BB10D') { throw 'NSIS checksum mismatch' }
+          Expand-Archive $nsisZip (Join-Path $stage 'tools')
+          $compiler = Join-Path $stage 'tools\nsis-3.11\makensis.exe'
           & $compiler /INPUTCHARSET UTF8 /DPRODUCT_VERSION=2.8.4 /DVERSION_QUAD=2.8.4.0 (Join-Path $stage 'windows-installed.nsi')
           if ($LASTEXITCODE -ne 0) { throw 'NSIS fixture compilation failed' }
           $denied = Join-Path $stage 'denied'
