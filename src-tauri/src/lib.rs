@@ -535,7 +535,14 @@ fn retry_workspace_initialization(state: State<'_, AppState>) -> StartupStatus {
 
 #[tauri::command]
 fn workspace_info(state: State<'_, AppState>) -> Result<WorkspaceInfo, String> {
+    let _maintenance = state
+        .maintenance
+        .lock()
+        .map_err(|_| "Хранилище временно недоступно".to_string())?;
     let workspace = state.active_workspace()?;
+    if workspace.is_editor() {
+        let _ = workspace.require_editor();
+    }
     let editor = workspace.is_editor();
     let access_message = workspace.access_message();
     Ok(WorkspaceInfo {
@@ -559,6 +566,10 @@ fn switch_workspace_mode(
     editor: bool,
     password: String,
 ) -> Result<(), String> {
+    let _maintenance = state
+        .maintenance
+        .lock()
+        .map_err(|_| "Хранилище временно недоступно".to_string())?;
     let workspace = state.active_workspace()?;
     if editor {
         workspace.acquire_editor_with_password(&password)
@@ -573,6 +584,10 @@ fn set_workspace_access_password(
     current_password: String,
     new_password: String,
 ) -> Result<(), String> {
+    let _maintenance = state
+        .maintenance
+        .lock()
+        .map_err(|_| "Хранилище временно недоступно".to_string())?;
     state
         .active_workspace()?
         .set_access_password(&current_password, &new_password)
@@ -1180,11 +1195,11 @@ fn restore_history_version(
     id: String,
     history_id: i64,
 ) -> Result<StoredRecord, String> {
-    state.workspace.require_editor()?;
     let _maintenance = state
         .maintenance
         .lock()
         .map_err(|_| "Хранилище временно недоступно".to_string())?;
+    state.workspace.require_editor()?;
     let mut connection = open_database(&state.workspace.root, &module)?;
     let transaction = connection
         .transaction()
@@ -1224,11 +1239,11 @@ fn upsert_record(
     title: String,
     mut payload: Value,
 ) -> Result<StoredRecord, String> {
-    state.workspace.require_editor()?;
     let _maintenance = state
         .maintenance
         .lock()
         .map_err(|_| "Хранилище временно недоступно".to_string())?;
+    state.workspace.require_editor()?;
     if title.trim().is_empty() {
         return Err("Укажите название записи".to_string());
     }
@@ -1391,7 +1406,6 @@ fn configured_history_limit(root: &Path) -> i64 {
 
 #[tauri::command]
 fn prune_history(state: State<'_, AppState>, limit: i64) -> Result<usize, String> {
-    state.workspace.require_editor()?;
     if !(10..=1000).contains(&limit) {
         return Err("Хранить можно от 10 до 1000 изменений на запись".to_string());
     }
@@ -1399,6 +1413,7 @@ fn prune_history(state: State<'_, AppState>, limit: i64) -> Result<usize, String
         .maintenance
         .lock()
         .map_err(|_| "Хранилище временно недоступно".to_string())?;
+    state.workspace.require_editor()?;
     let mut removed = 0;
     for module in MODULES {
         let connection = open_database(&state.workspace.root, module)?;
@@ -1423,7 +1438,6 @@ fn import_records_atomic(
     module: String,
     records: Vec<ImportRecord>,
 ) -> Result<usize, String> {
-    state.workspace.require_editor()?;
     if records.is_empty() || records.len() > 10_000 {
         return Err("Пакет должен содержать от 1 до 10 000 записей".to_string());
     }
@@ -1431,6 +1445,7 @@ fn import_records_atomic(
         .maintenance
         .lock()
         .map_err(|_| "Хранилище временно недоступно".to_string())?;
+    state.workspace.require_editor()?;
     let mut ids = HashSet::new();
     if records.iter().any(|record| {
         record.title.trim().is_empty()
@@ -1468,7 +1483,6 @@ fn update_records_atomic(
     module: String,
     records: Vec<ImportRecord>,
 ) -> Result<usize, String> {
-    state.workspace.require_editor()?;
     if records.is_empty() || records.len() > 10_000 {
         return Err("Пакет обновления должен содержать от 1 до 10 000 записей".to_string());
     }
@@ -1476,6 +1490,7 @@ fn update_records_atomic(
         .maintenance
         .lock()
         .map_err(|_| "Хранилище временно недоступно".to_string())?;
+    state.workspace.require_editor()?;
     let history_limit = configured_history_limit(&state.workspace.root);
     let mut connection = open_database(&state.workspace.root, &module)?;
     let transaction = connection
@@ -1810,11 +1825,11 @@ fn import_contracts_with_company_directory_atomic(
     records: Vec<ImportRecord>,
     directory: Value,
 ) -> Result<usize, String> {
-    state.workspace.require_editor()?;
     let _maintenance = state
         .maintenance
         .lock()
         .map_err(|_| "Хранилище временно недоступно".to_string())?;
+    state.workspace.require_editor()?;
     let mut connection = open_database(&state.workspace.root, "contract-experience")?;
     import_contract_bundle_transaction(&mut connection, records, &directory)
 }
@@ -1890,11 +1905,11 @@ fn update_contracts_and_company_directory_atomic(
     records: Vec<ImportRecord>,
     mut directory: Value,
 ) -> Result<usize, String> {
-    state.workspace.require_editor()?;
     let _maintenance = state
         .maintenance
         .lock()
         .map_err(|_| "Хранилище временно недоступно".to_string())?;
+    state.workspace.require_editor()?;
     let history_limit = configured_history_limit(&state.workspace.root);
     let mut attachment_moves = Vec::new();
     finalize_staged_attachments(
@@ -1991,11 +2006,11 @@ fn save_contract_with_company_directory_atomic(
     mut payload: Value,
     directory: Value,
 ) -> Result<StoredRecord, String> {
-    state.workspace.require_editor()?;
     let _maintenance = state
         .maintenance
         .lock()
         .map_err(|_| "Хранилище временно недоступно".to_string())?;
+    state.workspace.require_editor()?;
     let record_id = id.unwrap_or_else(|| Uuid::new_v4().to_string());
     let history_limit = configured_history_limit(&state.workspace.root);
     let mut attachment_moves = Vec::new();
@@ -2044,11 +2059,11 @@ fn archive_record(
     id: String,
     archived: bool,
 ) -> Result<(), String> {
-    state.workspace.require_editor()?;
     let _maintenance = state
         .maintenance
         .lock()
         .map_err(|_| "Хранилище временно недоступно".to_string())?;
+    state.workspace.require_editor()?;
     let connection = open_database(&state.workspace.root, &module)?;
     let now = Utc::now().to_rfc3339();
     let changed = connection
@@ -2076,7 +2091,6 @@ fn archive_records(
     ids: Vec<String>,
     archived: bool,
 ) -> Result<usize, String> {
-    state.workspace.require_editor()?;
     if ids.is_empty() {
         return Ok(0);
     }
@@ -2087,6 +2101,7 @@ fn archive_records(
         .maintenance
         .lock()
         .map_err(|_| "Хранилище временно недоступно".to_string())?;
+    state.workspace.require_editor()?;
     let mut connection = open_database(&state.workspace.root, &module)?;
     let transaction = connection
         .transaction()
@@ -2119,7 +2134,6 @@ fn save_draft(
     key: String,
     payload: Value,
 ) -> Result<(), String> {
-    state.workspace.require_editor()?;
     if key.trim().is_empty() || key.len() > 100 {
         return Err("Некорректный ключ черновика".to_string());
     }
@@ -2127,6 +2141,7 @@ fn save_draft(
         .maintenance
         .lock()
         .map_err(|_| "Хранилище временно недоступно".to_string())?;
+    state.workspace.require_editor()?;
     let connection = open_database(&state.workspace.root, &module)?;
     connection
         .execute(
@@ -2164,11 +2179,11 @@ fn read_draft(
 
 #[tauri::command]
 fn clear_draft(state: State<'_, AppState>, module: String, key: String) -> Result<(), String> {
-    state.workspace.require_editor()?;
     let _maintenance = state
         .maintenance
         .lock()
         .map_err(|_| "Хранилище временно недоступно".to_string())?;
+    state.workspace.require_editor()?;
     let connection = open_database(&state.workspace.root, &module)?;
     connection
         .execute("DELETE FROM drafts WHERE key = ?1", [key])
@@ -2178,11 +2193,11 @@ fn clear_draft(state: State<'_, AppState>, module: String, key: String) -> Resul
 
 #[tauri::command]
 fn delete_record(state: State<'_, AppState>, module: String, id: String) -> Result<(), String> {
-    state.workspace.require_editor()?;
     let _maintenance = state
         .maintenance
         .lock()
         .map_err(|_| "Хранилище временно недоступно".to_string())?;
+    state.workspace.require_editor()?;
     let mut connection = open_database(&state.workspace.root, &module)?;
     let transaction = connection
         .transaction()
@@ -2221,7 +2236,6 @@ fn delete_records(
     module: String,
     ids: Vec<String>,
 ) -> Result<usize, String> {
-    state.workspace.require_editor()?;
     if ids.is_empty() {
         return Ok(0);
     }
@@ -2232,6 +2246,7 @@ fn delete_records(
         .maintenance
         .lock()
         .map_err(|_| "Хранилище временно недоступно".to_string())?;
+    state.workspace.require_editor()?;
     let mut connection = open_database(&state.workspace.root, &module)?;
     let transaction = connection
         .transaction()
@@ -2306,11 +2321,11 @@ fn copy_attachment(
     module: String,
     record_id: String,
 ) -> Result<AttachmentInfo, String> {
-    state.workspace.require_editor()?;
     let _maintenance = state
         .maintenance
         .lock()
         .map_err(|_| "Хранилище временно недоступно".to_string())?;
+    state.workspace.require_editor()?;
     validated_module(&module)?;
     let source = PathBuf::from(source_path);
     if !source.is_file() {
@@ -2386,11 +2401,11 @@ fn discard_staged_attachments(
     module: String,
     record_id: String,
 ) -> Result<(), String> {
-    state.workspace.require_editor()?;
     let _maintenance = state
         .maintenance
         .lock()
         .map_err(|_| "Хранилище временно недоступно".to_string())?;
+    state.workspace.require_editor()?;
     validated_module(&module)?;
     if !valid_attachment_session_id(&record_id) {
         return Err("Некорректный идентификатор сессии вложений".to_string());
@@ -2409,11 +2424,11 @@ fn discard_staged_attachments(
 
 #[tauri::command]
 fn delete_attachment(state: State<'_, AppState>, relative_path: String) -> Result<(), String> {
-    state.workspace.require_editor()?;
     let _maintenance = state
         .maintenance
         .lock()
         .map_err(|_| "Хранилище временно недоступно".to_string())?;
+    state.workspace.require_editor()?;
     let relative = Path::new(&relative_path);
     let parts: Vec<_> = relative.components().collect();
     if parts.len() < 4
@@ -2441,13 +2456,13 @@ fn delete_attachment(state: State<'_, AppState>, relative_path: String) -> Resul
 
 #[tauri::command]
 fn audit_attachments(state: State<'_, AppState>, remove: bool) -> Result<AttachmentAudit, String> {
-    if remove {
-        state.workspace.require_editor()?;
-    }
     let _maintenance = state
         .maintenance
         .lock()
         .map_err(|_| "Хранилище временно недоступно".to_string())?;
+    if remove {
+        state.workspace.require_editor()?;
+    }
     attachments::audit(&state.workspace.root, &MODULES, remove)
 }
 
@@ -2718,11 +2733,11 @@ fn create_backup_impl(workspace: &Workspace, module: Option<String>) -> Result<B
 
 #[tauri::command]
 fn create_backup(state: State<'_, AppState>, module: Option<String>) -> Result<BackupInfo, String> {
-    state.workspace.require_editor()?;
     let _maintenance = state
         .maintenance
         .lock()
         .map_err(|_| "Хранилище временно недоступно".to_string())?;
+    state.workspace.require_editor()?;
     create_backup_impl(&state.workspace, module)
 }
 
@@ -2969,11 +2984,11 @@ fn create_encrypted_backup(
     module: Option<String>,
     password: String,
 ) -> Result<BackupInfo, String> {
-    state.workspace.require_editor()?;
     let _maintenance = state
         .maintenance
         .lock()
         .map_err(|_| "Хранилище временно недоступно".to_string())?;
+    state.workspace.require_editor()?;
     let plain = create_backup_impl(&state.workspace, module)?;
     let source = PathBuf::from(&plain.path);
     let destination = PathBuf::from(format!("{}.enc", plain.path));
@@ -3094,11 +3109,11 @@ fn set_backup_pinned(
     file_name: String,
     pinned: bool,
 ) -> Result<(), String> {
-    state.workspace.require_editor()?;
     let _maintenance = state
         .maintenance
         .lock()
         .map_err(|_| "Хранилище временно недоступно".to_string())?;
+    state.workspace.require_editor()?;
     let name = safe_backup_name(&file_name)?;
     if !state.workspace.root.join("backups").join(name).is_file() {
         return Err("Резервная копия не найдена".to_string());
@@ -3114,11 +3129,11 @@ fn set_backup_pinned(
 
 #[tauri::command]
 fn delete_backup(state: State<'_, AppState>, file_name: String) -> Result<(), String> {
-    state.workspace.require_editor()?;
     let _maintenance = state
         .maintenance
         .lock()
         .map_err(|_| "Хранилище временно недоступно".to_string())?;
+    state.workspace.require_editor()?;
     let name = safe_backup_name(&file_name)?;
     if pinned_backups(&state.workspace.root).contains(name) {
         return Err("Сначала открепите резервную копию".to_string());
@@ -3136,7 +3151,6 @@ fn rotate_backups(
     keep: usize,
     max_age_days: u64,
 ) -> Result<usize, String> {
-    state.workspace.require_editor()?;
     if !(1..=100).contains(&keep) {
         return Err("Хранить можно от 1 до 100 незакреплённых копий".to_string());
     }
@@ -3147,6 +3161,7 @@ fn rotate_backups(
         .maintenance
         .lock()
         .map_err(|_| "Хранилище временно недоступно".to_string())?;
+    state.workspace.require_editor()?;
     rotate_backups_impl(&state.workspace.root, keep, max_age_days)
 }
 
@@ -3353,11 +3368,11 @@ fn rollback_workspace_swaps(swaps: &[(PathBuf, PathBuf, bool)]) {
 
 #[tauri::command]
 fn restore_backup(state: State<'_, AppState>, path: String) -> Result<(), String> {
-    state.workspace.require_editor()?;
     let _maintenance = state
         .maintenance
         .lock()
         .map_err(|_| "Хранилище временно недоступно".to_string())?;
+    state.workspace.require_editor()?;
     const MAX_BACKUP_BYTES: u64 = 2 * 1024 * 1024 * 1024;
     const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
     let archive_size = fs::metadata(&path)

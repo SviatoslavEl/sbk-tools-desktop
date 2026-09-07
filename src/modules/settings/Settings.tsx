@@ -82,6 +82,11 @@ export function Settings({
       .then(setBackups)
       .catch(() => setBackups([]));
   useEffect(() => {
+    const update = (event: Event) => setWorkspace((event as CustomEvent<WorkspaceInfo>).detail);
+    window.addEventListener("sbk-workspace-access-status", update);
+    return () => window.removeEventListener("sbk-workspace-access-status", update);
+  }, []);
+  useEffect(() => {
     void getWorkspaceInfo().then((value) => {
       setWorkspace(value);
       const timers = readAccessTimers(value.root);
@@ -111,7 +116,7 @@ export function Settings({
     return next;
   };
   const changeWorkspaceMode = async (editor: boolean) => {
-    const validationError = workspacePasswordError(workspacePassword);
+    const validationError = workspace?.accessControlled ? workspacePasswordError(workspacePassword) : "";
     if (validationError) {
       setMessage(`Недопустимый пароль: ${validationError} ${workspacePasswordHint}`);
       return;
@@ -286,14 +291,15 @@ export function Settings({
               <label>Пароль рабочей папки<input type="password" autoComplete="current-password" aria-invalid={Boolean(currentWorkspacePasswordError)} aria-describedby="workspace-password-hint" value={workspacePassword} onChange={(event) => setWorkspacePassword(event.target.value)} />{currentWorkspacePasswordError && <small className="field-error">{currentWorkspacePasswordError}</small>}</label>
               <p className="help-text" id="workspace-password-hint">{workspacePasswordHint}</p>
               <div className="button-row">
-                <button className="primary" type="button" disabled={!workspacePassword} onClick={() => void changeWorkspaceMode(!workspace?.editor)}>{workspace?.editor ? "Перейти в режим просмотра" : "Войти в режим редактирования"}</button>
+                <button className="primary" type="button" disabled={!workspacePassword || (!workspace?.editor && Boolean(workspace?.editorOwner))} onClick={() => void changeWorkspaceMode(!workspace?.editor)}>{workspace?.editor ? "Перейти в режим просмотра" : "Войти в режим редактирования"}</button>
               </div>
+              {!workspace?.editor && workspace?.editorOwner && <p className="notice warning">Права заняты: {workspace.editorOwner.displayName}. Попросите редактора перейти в режим просмотра или закрыть программу. Пароль не даёт права принудительно завершать чужую работу. Статус обновляется автоматически.</p>}
               {workspace?.editor && <><label>Новый пароль<input type="password" autoComplete="new-password" aria-invalid={Boolean(newWorkspacePasswordError)} value={newWorkspacePassword} onChange={(event) => setNewWorkspacePassword(event.target.value)} />{newWorkspacePasswordError && <small className="field-error">{newWorkspacePasswordError}</small>}</label><button className="secondary" type="button" disabled={!workspacePassword || !newWorkspacePassword || Boolean(newWorkspacePasswordError)} onClick={() => void saveWorkspacePassword()}>Сменить пароль</button></>}
             </> : workspace?.editor ? <>
               <label>Новый пароль рабочей папки<input type="password" autoComplete="new-password" aria-invalid={Boolean(newWorkspacePasswordError)} aria-describedby="new-workspace-password-hint" value={newWorkspacePassword} onChange={(event) => setNewWorkspacePassword(event.target.value)} placeholder="От 6 до 128 символов" />{newWorkspacePasswordError && <small className="field-error">{newWorkspacePasswordError}</small>}</label>
               <p className="help-text" id="new-workspace-password-hint">{workspacePasswordHint}</p>
               <button className="primary" type="button" disabled={!newWorkspacePassword || Boolean(newWorkspacePasswordError)} onClick={() => void saveWorkspacePassword()}>Включить вход по паролю</button>
-            </> : <div className="notice warning">Сейчас режим редактирования занят другим экземпляром. После его закрытия текущий экземпляр сможет войти в режим редактирования.</div>}
+            </> : <><div className="notice warning">{workspace?.editorOwner ? `Сейчас базу редактирует ${workspace.editorOwner.displayName}. Дождитесь освобождения прав.` : "Редактор свободен. Можно включить редактирование без перезапуска программы."}</div><button className="primary" type="button" disabled={Boolean(workspace?.editorOwner) || !workspace?.writable} onClick={() => void changeWorkspaceMode(true)}>Войти в режим редактирования</button></>}
           </div>
           <div className="settings-row">
             <span>Версия базы</span>
@@ -711,6 +717,7 @@ export function About() {
             <span>GPL-3.0</span>
             <span>Windows · macOS</span>
           </div>
+          <p>Издатель: СБК · Автор: {packageInfo.author}</p>
         </div>
       </section>
       <section className="surface">

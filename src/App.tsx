@@ -200,6 +200,33 @@ function App() {
     if (workspace?.root) setAccessTimers(readAccessTimers(workspace.root));
   }, [workspace?.root]);
   useEffect(() => {
+    if (!workspace?.root) return;
+    let stopped = false;
+    let running = false;
+    const refreshAccess = async () => {
+      if (running) return;
+      running = true;
+      try {
+        const next = await getWorkspaceInfo();
+        if (!stopped) {
+          setWorkspace(next);
+          window.dispatchEvent(new CustomEvent("sbk-workspace-access-status", { detail: next }));
+        }
+      } catch {
+        if (!stopped) setWorkspace((current) => current ? { ...current, editor: false, accessMessage: "Не удалось проверить доступ к общей папке. До восстановления связи доступен только просмотр." } : current);
+      } finally {
+        running = false;
+      }
+    };
+    const timer = window.setInterval(() => void refreshAccess(), 3000);
+    window.addEventListener("focus", refreshAccess);
+    return () => {
+      stopped = true;
+      window.clearInterval(timer);
+      window.removeEventListener("focus", refreshAccess);
+    };
+  }, [workspace?.root]);
+  useEffect(() => {
     const update = (event: Event) =>
       setAccessTimers(
         (event as CustomEvent<AccessTimers>).detail || readAccessTimers(),

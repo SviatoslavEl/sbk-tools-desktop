@@ -73,7 +73,7 @@ jobs:
   build:
     needs: quality-gate
     env:
-      ARTIFACT_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('2.8.3-test.{0}', github.run_number) }}
+      ARTIFACT_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('2.8.4-test.{0}', github.run_number) }}
     strategy:
       fail-fast: false
       matrix:
@@ -478,7 +478,7 @@ jobs:
     runs-on: windows-latest
     env:
       TARGET: x86_64-pc-windows-msvc
-      ARTIFACT_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '2.8.3' }}
+      ARTIFACT_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '2.8.4' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
@@ -565,6 +565,8 @@ jobs:
       - name: Build independent installed fast-start package
         shell: pwsh
         run: |
+          cargo test --manifest-path src-tauri/Cargo.toml --lib
+          if ($LASTEXITCODE -ne 0) { throw 'Windows database/editor regression tests failed' }
           $version = $env:ARTIFACT_VERSION.TrimStart('v')
           ./scripts/package_windows_installed.ps1 -Target $env:TARGET -Version $version
       - name: Release installed packaging workspace
@@ -632,6 +634,18 @@ jobs:
           }
 
           $installDiagnostic = Join-Path $env:TEMP 'SBK-Tools-Fast-Install-Error.log'
+          # Exercise an actual write-denied directory without modifying Windows/Program Files.
+          $deniedParent = Join-Path $env:RUNNER_TEMP 'sbk-installer-denied-directory'
+          New-Item -ItemType Directory -Force $deniedParent | Out-Null
+          & icacls.exe $deniedParent /deny '*S-1-1-0:(W)' | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'Could not prepare write-denied installer test' }
+          try {
+            $deniedInstall = Start-Process -FilePath $installer.FullName -ArgumentList @('/S', "/D=$deniedParent\SBK Tools") -PassThru
+            $deniedExitCode = Wait-InstallerProcess $deniedInstall 60
+            if ($deniedExitCode -ne 5) { throw "Write-denied installation should explain/reject access (code 5), got $deniedExitCode" }
+          } finally {
+            & icacls.exe $deniedParent /remove:d '*S-1-1-0' | Out-Null
+          }
           Remove-Item $installDiagnostic -Force -ErrorAction SilentlyContinue
           $install = Start-Process -FilePath $installer.FullName -ArgumentList @('/S', "/D=$installDir") -PassThru
           $installExitCode = Wait-InstallerProcess $install

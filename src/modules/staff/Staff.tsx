@@ -205,6 +205,8 @@ export function StaffRegistry() {
   const [selectionOpen, setSelectionOpen] = useState(false);
   const [sort, setSort] = useState<{ key: StaffSortKey; direction: SortDirection }>({ key: "department", direction: "asc" });
   const [selectedStaff, setSelectedStaff] = useState<Set<string>>(new Set());
+  const [selectedRegistryStaff, setSelectedRegistryStaff] = useState<Set<string>>(new Set());
+  const [bulkArchiveIds, setBulkArchiveIds] = useState<string[]>([]);
   const [selectionDocumentCategories, setSelectionDocumentCategories] = useState<Set<StaffDocument["category"]>>(
     () => new Set(staffDocumentCategories),
   );
@@ -379,7 +381,15 @@ export function StaffRegistry() {
     Boolean(urgentDocument(record.payload.documents, expiryDays)),
   ).length;
 
+  const selectedRegistryRecords = normalizedRecords.filter((record) => selectedRegistryStaff.has(record.id));
+  useEffect(() => {
+    setSelectedRegistryStaff((current) => {
+      const next = new Set([...current].filter((id) => normalizedRecords.some((record) => record.id === id)));
+      return next.size === current.size ? current : next;
+    });
+  }, [normalizedRecords]);
   const exportSelection = async () => {
+    if (!selectedRegistryRecords.length) return;
     await exportText(
       "Экспорт кадров",
       "кадры.csv",
@@ -401,7 +411,7 @@ export function StaffRegistry() {
           "Документов",
           "Примечания",
         ],
-        filtered.map(({ payload: item }) => {
+        selectedRegistryRecords.map(({ payload: item }) => {
           const assignment = primaryAssignment(item);
           return [
             item.fullName,
@@ -424,6 +434,7 @@ export function StaffRegistry() {
     );
   };
   const exportXlsx = async () => {
+    if (!selectedRegistryRecords.length) return;
     const path = await chooseSavePath("Экспорт кадров в Excel", "кадры.xlsx", [
       "xlsx",
     ]);
@@ -446,7 +457,7 @@ export function StaffRegistry() {
           "Стаж",
           "Примечания",
         ],
-        ...filtered.map(({ payload: item }) => {
+        ...selectedRegistryRecords.map(({ payload: item }) => {
           const assignment = primaryAssignment(item);
           return [
             item.fullName,
@@ -468,7 +479,7 @@ export function StaffRegistry() {
     });
   };
   const exportArchive = async (
-    recordIds = filtered.map((record) => record.id),
+    recordIds = selectedRegistryRecords.map((record) => record.id),
     documentCategories?: Iterable<StaffDocument["category"]>,
   ) => {
     if (!recordIds.length) return window.alert("Нет сотрудников для экспорта.");
@@ -850,9 +861,9 @@ export function StaffRegistry() {
           <div className="toolbar-action-group"><span>Обмен</span>
             {!readOnly && <button className="secondary" type="button" onClick={() => void openImport("add")}>Добавить из файла</button>}
             {!readOnly && <button className="secondary" type="button" onClick={() => void openImport("update")}>Обновить из файла</button>}
-            <button className="secondary" type="button" onClick={() => void exportArchive()}>Экспорт ZIP</button>
-            <button className="secondary" type="button" onClick={() => void exportSelection()}>CSV</button>
-            <button className="secondary" type="button" onClick={() => void exportXlsx()}>XLSX</button>
+            <button className="secondary" type="button" disabled={!selectedRegistryRecords.length} onClick={() => void exportArchive()}>Экспорт ZIP ({selectedRegistryRecords.length})</button>
+            <button className="secondary" type="button" disabled={!selectedRegistryRecords.length} onClick={() => void exportSelection()}>CSV ({selectedRegistryRecords.length})</button>
+            <button className="secondary" type="button" disabled={!selectedRegistryRecords.length} onClick={() => void exportXlsx()}>XLSX ({selectedRegistryRecords.length})</button>
           </div>
           <button
             className="secondary"
@@ -864,7 +875,8 @@ export function StaffRegistry() {
           >
             Подбор под закупку
           </button>
-          {!readOnly && filtered.length > 0 && <button className="secondary danger" type="button" onClick={() => { if (window.confirm(`Перенести в архив все найденные кадровые карточки (${filtered.length})?`)) void store.archiveMany(filtered.map((record) => record.id)); }}>В архив все найденные</button>}
+          {!!selectedRegistryRecords.length && <button className="secondary" type="button" onClick={() => setSelectedRegistryStaff(new Set())}>Снять выбор ({selectedRegistryRecords.length})</button>}
+          {!readOnly && selectedRegistryRecords.length > 1 && <button className="secondary danger" type="button" onClick={() => setBulkArchiveIds(selectedRegistryRecords.map((record) => record.id))}>В архив выбранные ({selectedRegistryRecords.length})</button>}
           {!readOnly && (
             <button
               className="primary"
@@ -876,6 +888,7 @@ export function StaffRegistry() {
           )}
         </div>
       </div>
+      {!readOnly && bulkArchiveIds.length > 0 && <ConfirmDialog title="Перенести выбранные карточки в архив?" message={`Будут перенесены только отмеченные кадровые карточки: ${bulkArchiveIds.length}. Их можно восстановить в архиве.`} confirmLabel="Перенести в архив" onClose={() => setBulkArchiveIds([])} onConfirm={async () => { await store.archiveMany(bulkArchiveIds); setBulkArchiveIds([]); }} />}
       {store.error && (
         <div className="notice error">
           <strong>Не удалось открыть кадровый реестр.</strong>
@@ -887,6 +900,7 @@ export function StaffRegistry() {
           <table>
             <thead>
               <tr>
+                <th className="selection-cell"><input type="checkbox" aria-label="Выбрать все найденные кадровые карточки" checked={filtered.length > 0 && filtered.every((record) => selectedRegistryStaff.has(record.id))} ref={(input) => { if (input) input.indeterminate = filtered.some((record) => selectedRegistryStaff.has(record.id)) && !filtered.every((record) => selectedRegistryStaff.has(record.id)); }} onChange={(event) => { const checked = event.target.checked; setSelectedRegistryStaff((current) => { const next = new Set(current); filtered.forEach((record) => checked ? next.add(record.id) : next.delete(record.id)); return next; }); }} /></th>
                 {([[
                   "name", "ФИО"], ["legalEntity", "Юрлицо"], ["department", "Отдел"],
                   ["position", "Должность / роль"], ["basis", "Основание"], ["status", "Статус"],
@@ -911,7 +925,7 @@ export function StaffRegistry() {
                   <Fragment key={record.id}>
                     {sort.key === "department" && department !== previousDepartment && (
                       <tr className="department-group-row">
-                        <td colSpan={10}>{department}</td>
+                        <td colSpan={11}>{department}</td>
                       </tr>
                     )}
                     <tr
@@ -919,6 +933,7 @@ export function StaffRegistry() {
                         if (!readOnly) setEditing(record);
                       }}
                     >
+                      <td className="selection-cell" onDoubleClick={(event) => event.stopPropagation()}><input type="checkbox" aria-label={`Выбрать сотрудника ${item.fullName}`} checked={selectedRegistryStaff.has(record.id)} onChange={(event) => { const checked = event.target.checked; setSelectedRegistryStaff((current) => { const next = new Set(current); if (checked) next.add(record.id); else next.delete(record.id); return next; }); }} /></td>
                       <td className="sticky-cell">
                         {readOnly ? (
                           <>

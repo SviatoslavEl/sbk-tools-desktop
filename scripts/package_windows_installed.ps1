@@ -1,6 +1,6 @@
 param(
     [string]$Target = "x86_64-pc-windows-msvc",
-    [string]$Version = "2.8.3"
+    [string]$Version = "2.8.4"
 )
 
 $ErrorActionPreference = "Stop"
@@ -150,7 +150,8 @@ $MakeNsis = Join-Path $NsisHome "makensis.exe"
 if (-not (Test-Path $MakeNsis -PathType Leaf)) { throw "Pinned makensis.exe is missing" }
 
 Copy-Item (Join-Path $Root "scripts\windows-installed.nsi") $NsisStage
-Copy-Item (Join-Path $Root "LICENSE") (Join-Path $NsisStage "LICENSE.txt")
+$LicenseText = Get-Content -Raw -Encoding UTF8 (Join-Path $Root "LICENSE")
+[IO.File]::WriteAllText((Join-Path $NsisStage "LICENSE.txt"), $LicenseText, [Text.Encoding]::Unicode)
 Copy-Item (Join-Path $Root "src-tauri\icons\icon.ico") $NsisStage
 Copy-Item (Join-Path $NsisHome "COPYING") (Join-Path $NsisStage "NSIS-COPYING")
 Copy-Item $Archive $NsisStage

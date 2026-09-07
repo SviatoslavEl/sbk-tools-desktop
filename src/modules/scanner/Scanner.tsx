@@ -1,5 +1,9 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { ConfirmDialog, Dialog } from "../../components/Dialog";
+import { droppedDocumentPaths } from "./fileDrop";
+import { facsimileWidthFromMm, imageDimensions, suggestedFacsimileWidthMm } from "./facsimileSize";
 import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { useEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent, type PointerEvent } from "react";
 import { useRecords } from "../../hooks/useRecords";
@@ -115,6 +119,20 @@ function InfoHint({ label, children }: { label: string; children: string }) {
 }
 
 export function Scanner() {
+  const [fileDragActive, setFileDragActive] = useState(false);
+  const [pendingDroppedPaths, setPendingDroppedPaths] = useState<string[]>([]);
+  const dropHandler = useRef<(paths: string[]) => void>(() => undefined);
+  useEffect(() => {
+    if (!("__TAURI_INTERNALS__" in window)) return;
+    let stopped = false;
+    let unlisten: (() => void) | undefined;
+    void getCurrentWebview().onDragDropEvent(({ payload }) => {
+      if (stopped) return;
+      setFileDragActive(payload.type === "enter" || payload.type === "over");
+      if (payload.type === "drop") dropHandler.current(payload.paths);
+    }).then((stop) => { if (stopped) stop(); else unlisten = stop; }).catch((reason) => { if (!stopped) setError(`Перетаскивание файлов недоступно: ${String(reason)}. Используйте кнопку выбора файла.`); });
+    return () => { stopped = true; unlisten?.(); };
+  }, []);
   const workspaceAccess = useWorkspaceAccess();
   const templates = useRecords<ScannerRecord>("scanner");
   const [inputPath, setInputPath] = useState("");
@@ -175,8 +193,9 @@ export function Scanner() {
   const latestPreviewJob = useRef("");
   const latestMergePreviewJob = useRef("");
   const activeJobRef = useRef("");
-  const previewCache = useRef(new BoundedPreviewCache<PreviewResult>(8));
+  const previewCache = useRef(new BoundedPreviewCache<PreviewResult>(16));
   const lastFacsimileWidth = useRef(0.22);
+  const lastFacsimileWidthMm = useRef<number | null>(null);
   const journal = templates.records.filter((record) => record.payload.kind === "processing-journal").slice(0, 10);
 
   useEffect(() => {
@@ -281,6 +300,7 @@ export function Scanner() {
         try { original = await invoke<string>("read_binary_file", { path: response.originalPath, maxBytes: 24 * 1024 * 1024 }); }
         finally { void invoke("delete_runtime_file", { path: response.originalPath }).catch(() => undefined); }
       }
+      if (latestPreviewJob.current !== jobId) return;
       const result: PreviewResult = {
         previewUrl: url,
         originalUrl: original,
@@ -308,6 +328,9 @@ export function Scanner() {
   const chooseDocument = async () => {
     const path = await chooseOpenPath("Выберите PDF или DOCX", ["pdf", "docx"]);
     if (!path) return;
+    await openDocumentPath(path);
+  };
+  const openDocumentPath = async (path: string) => {
     setWorkspaceMode("document");
     previewCache.current.clear();
     setInputPath(path); setDocumentName(path.split(/[\\/]/).pop() || path); setPageIndex(0); setPageOrder([]); setOutputPageMode("all"); setOutputPageRange(""); setOutputBlocks([]); setPageRotations({}); setResultPath(""); setResultKind(""); setWarnings([]); setFacsimile(null); setSavedFacsimiles([]); setEditingFacsimileId(""); setRedactions([]); setAnnotations([]); setSelectedOverlay(null); setOriginalBytes(0); setEstimatedOutputBytes(0); setEstimatedSavingsPercent(0); setOcrConfidence(null); setOcrText(""); setLowConfidenceWords([]); setPreviewZoom(1);
@@ -346,6 +369,10 @@ export function Scanner() {
   const chooseMerge = async () => {
     setWorkspaceMode("merge");
     const paths = await chooseOpenPaths("Выберите документы в порядке объединения", ["pdf", "docx"]);
+    await addMergePaths(paths);
+  };
+  const addMergePaths = async (paths: string[]) => {
+    setWorkspaceMode("merge");
     const newPaths = paths.filter((path) => !mergePaths.includes(path));
     if (!newPaths.length) return;
     setMergeInspecting(true); setError(""); setResultPath(""); setResultKind("");
@@ -472,10 +499,16 @@ export function Scanner() {
   };
 
   const chooseFacsimile = async () => {
+    try {
     const path = await chooseOpenPath("Выберите факсимиле", ["png", "jpg", "jpeg"]);
     if (!path) return;
     const imageUrl = await invoke<string>("read_binary_file", { path, maxBytes: 12 * 1024 * 1024 });
-    setFacsimile(initialFacsimile(path, imageUrl, path.split(/[\\/]/).pop() || "Факсимиле", lastFacsimileWidth.current));
+    const [imageWidth, imageHeight] = await imageDimensions(imageUrl);
+    const imageAspect = imageWidth / Math.max(1, imageHeight);
+    const width = facsimileWidthFromMm(lastFacsimileWidthMm.current ?? suggestedFacsimileWidthMm(imageAspect), pageSizeMm?.[0] || 210);
+    const base = initialFacsimile(path, imageUrl, path.split(/[\\/]/).pop() || "Факсимиле", width);
+    setFacsimile({ ...base, imageAspect, ...normalizeFacsimile(base, previewAspect, imageAspect) });
+    } catch (reason) { setError(String(reason)); }
   };
 
   const useTemplate = async (template: ScannerRecord) => {
@@ -523,7 +556,10 @@ export function Scanner() {
       if (!current) return current;
       const pageGeometries = Object.fromEntries(Object.entries(current.pageGeometries).map(([page, geometry]) => [page, { ...geometry, ...update }]));
       const next = { ...current, ...update, pageGeometries };
-      if (update.width != null) lastFacsimileWidth.current = update.width;
+      if (update.width != null) {
+        lastFacsimileWidth.current = update.width;
+        lastFacsimileWidthMm.current = update.width * (pageSizeMm?.[0] || 210);
+      }
       return next;
     });
   };
@@ -532,6 +568,7 @@ export function Scanner() {
     if (!facsimile || !facsimileSelection.selection) return;
     if (!editingFacsimileId && facsimile.applyTo === "all" && pageCount > 1 && !window.confirm(`Зафиксировать факсимиле на всех ${pageCount} страницах?`)) return;
     lastFacsimileWidth.current = facsimile.width;
+    lastFacsimileWidthMm.current = facsimile.width * (pageSizeMm?.[0] || 210);
     const committed = { ...facsimile, lockedSelection: facsimileSelection.selection };
     setSavedFacsimiles((current) => editingFacsimileId
       ? current.map((entry) => entry.id === editingFacsimileId ? committed : entry)
@@ -823,7 +860,19 @@ export function Scanner() {
     })
     .filter(({ placement }) => facsimileAppliesTo(placement, pageIndex));
   const selectedMergePage = mergePageOrder.find((entry) => entry.id === selectedMergePageId) || mergePageOrder[0];
+  dropHandler.current = (paths) => {
+    if (activeJob || mergeInspecting) { setError("Дождитесь завершения текущей обработки, затем перетащите файлы ещё раз."); return; }
+    try {
+      const documents = droppedDocumentPaths(paths);
+      if (workspaceMode === "merge") void addMergePaths(documents);
+      else if (documents.length === 1 && !inputPath) void openDocumentPath(documents[0]);
+      else setPendingDroppedPaths(documents);
+    } catch (reason) { setError(String(reason)); }
+  };
   return <div className="scanner-layout">
+    {fileDragActive && <div className="scanner-file-drop-overlay" role="status"><strong>Отпустите PDF или DOCX здесь</strong><span>{workspaceMode === "merge" ? "Документы добавятся к объединению" : "Один документ откроется в сканере; для нескольких можно выбрать объединение или пакетную обработку"}</span></div>}
+    {pendingDroppedPaths.length === 1 && <ConfirmDialog title="Открыть другой документ?" message="Текущие несохранённые настройки страниц и факсимиле будут сброшены. Исходные файлы сохранятся." confirmLabel="Открыть документ" onClose={() => setPendingDroppedPaths([])} onConfirm={() => { const path = pendingDroppedPaths[0]; setPendingDroppedPaths([]); void openDocumentPath(path); }} />}
+    {pendingDroppedPaths.length > 1 && <Dialog title="Добавить перетащенные документы" onClose={() => setPendingDroppedPaths([])} width="560px"><div className="dialog-body"><p>Файлов: {pendingDroppedPaths.length}. Объединить страницы в один PDF или обработать каждый документ отдельно?</p></div><footer className="dialog-actions"><button className="secondary" type="button" onClick={() => { setBatchPaths(pendingDroppedPaths); setPendingDroppedPaths([]); setError(""); }}>Обработать отдельно</button><button className="primary" type="button" onClick={() => { const paths = pendingDroppedPaths; setPendingDroppedPaths([]); void addMergePaths(paths); }}>Объединить</button></footer></Dialog>}
     <section className="surface scanner-controls"><div className="surface-title"><h2>Настройки</h2></div><div className="surface-body scanner-control-stack">
       <button className="primary full-width" type="button" onClick={() => void chooseDocument()}>{inputPath ? "Заменить файл" : "Выбрать PDF или DOCX"}</button>
       <button className="secondary full-width" type="button" onClick={() => void chooseBatch()}>Пакетная обработка</button>{batchPaths.length > 0 && <div className="notice success"><span>Выбрано файлов: {batchPaths.length}</span><button className="primary small" type="button" onClick={() => void processBatch()}>Обработать пакет в папку</button></div>}{documentName && <p className="selected-file">▧ {documentName}</p>}
@@ -840,6 +889,11 @@ export function Scanner() {
           {facsimile.applyTo === "range" && <label>Страницы<input aria-invalid={!!facsimileSelection.error} value={facsimile.pageRange} placeholder="1-3, 5" onChange={(event) => setFacsimile({ ...facsimile, pageRange: event.target.value, lockedSelection: undefined })} />{facsimileSelection.error && <small className="field-error">{facsimileSelection.error}</small>}</label>}
           {facsimile.applyTo !== "current" && <><label>Размещение<select value={facsimile.placementMode || "manual"} onChange={(event) => setFacsimile({ ...facsimile, placementMode: event.target.value as NonNullable<FacsimileState["placementMode"]> })}><option value="manual">Одинаковое положение</option><option value="region">В выбранной области</option><option value="random-region">Случайно внутри области</option></select></label>{facsimile.placementMode !== "manual" && facsimile.region && <p className="help-text">Область перемещается и растягивается прямо на документе. Координаты вводить не нужно.</p>}<label className="checkbox-row"><input type="checkbox" checked={(facsimile.randomRotationDegrees || 0) > 0} onChange={(event) => setFacsimile({ ...facsimile, randomRotationDegrees: event.target.checked ? 8 : 0 })} /> Случайный поворот на разных страницах</label>{(facsimile.randomRotationDegrees || 0) > 0 && <label>Разброс поворота <input type="range" min="1" max="30" value={facsimile.randomRotationDegrees || 8} onChange={(event) => setFacsimile({ ...facsimile, randomRotationDegrees: event.target.valueAsNumber })} /> ±{Math.round(facsimile.randomRotationDegrees || 8)}°</label>}</>}
           {visibleOnCurrentPage && currentFacsimileGeometry && <>
+            <div className="facsimile-size-presets" role="group" aria-label="Примерить размер факсимиле">
+              <span>Примерить размер</span>
+              {[40, 60].map((mm) => <button className="secondary small" type="button" key={mm} disabled={!pageSizeMm} onClick={() => updateSharedFacsimileAppearance({ width: facsimileWidthFromMm(mm, pageSizeMm![0]) })}>{mm === 40 ? "Печать · 40 мм" : "Подпись · 60 мм"}</button>)}
+            </div>
+            <p className="help-text">Ширина изображения на бумаге; для круглой печати — диаметр. Это ориентиры, не обязательный стандарт. Пропорции сохраняются. Белые поля внутри картинки входят в размер.</p>
             <label>Размер на всех выбранных страницах <input type="range" min="8" max="60" value={currentFacsimileGeometry.width * 100} onChange={(event) => updateSharedFacsimileAppearance({ width: normalizeFacsimile({ ...currentFacsimileGeometry, width: Number(event.target.value) / 100 }, previewAspect, facsimile.imageAspect).width })} /> {Math.round(currentFacsimileGeometry.width * 100)}%{pageSizeMm ? ` · ${(pageSizeMm[0] * currentFacsimileGeometry.width).toFixed(1)} мм` : ""}</label>
             <label>Поворот <input type="range" min="-180" max="180" value={currentFacsimileGeometry.rotation} onChange={(event) => updateCurrentFacsimileGeometry(normalizeFacsimile({ ...currentFacsimileGeometry, rotation: Number(event.target.value) }, previewAspect, facsimile.imageAspect))} /> {currentFacsimileGeometry.rotation}°</label>
             <label>Прозрачность на всех выбранных страницах <input type="range" min="10" max="100" value={currentFacsimileGeometry.opacity * 100} onChange={(event) => updateSharedFacsimileAppearance({ opacity: Number(event.target.value) / 100 })} /> {Math.round(currentFacsimileGeometry.opacity * 100)}%</label>

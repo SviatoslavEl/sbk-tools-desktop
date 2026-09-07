@@ -6,10 +6,12 @@ CRCCheck on
 
 !include "MUI2.nsh"
 !include "LogicLib.nsh"
+!include "FileFunc.nsh"
 
 !define PRODUCT_NAME "СБК Инструменты — быстрый запуск"
 !define PRODUCT_ID "ru.sbk.tools.fast"
 !define PRODUCT_PUBLISHER "СБК"
+!define PRODUCT_AUTHOR "Elbakide S.E."
 !define PRODUCT_EXE "SBK-Tools-Fast.exe"
 !define UNINSTALL_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCT_ID}"
 !define PRODUCT_KEY "Software\SBK\ToolsFast"
@@ -23,7 +25,7 @@ VIProductVersion "${VERSION_QUAD}"
 VIAddVersionKey "ProductName" "${PRODUCT_NAME}"
 VIAddVersionKey "FileDescription" "Установщик ${PRODUCT_NAME}"
 VIAddVersionKey "CompanyName" "${PRODUCT_PUBLISHER}"
-VIAddVersionKey "LegalCopyright" "© СБК"
+VIAddVersionKey "LegalCopyright" "© 2026 ${PRODUCT_AUTHOR} · ${PRODUCT_PUBLISHER}"
 VIAddVersionKey "FileVersion" "${PRODUCT_VERSION}"
 VIAddVersionKey "ProductVersion" "${PRODUCT_VERSION}"
 
@@ -40,6 +42,8 @@ Var StartMenuFolder
 
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_LICENSE "LICENSE.txt"
+!define MUI_DIRECTORYPAGE_TEXT_TOP "Установка не требует прав администратора. Выберите папку, в которую вам разрешено записывать файлы. Рекомендуется папка по умолчанию в профиле пользователя."
+!define MUI_PAGE_CUSTOMFUNCTION_LEAVE ValidateInstallDirectory
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_COMPONENTS
 !insertmacro MUI_PAGE_INSTFILES
@@ -62,8 +66,35 @@ Function .onInit
 installation_allowed:
 FunctionEnd
 
+Function ValidateInstallDirectory
+  ; Updates are staged beside the installation, so the parent must be writable.
+  ${GetParent} "$INSTDIR" $1
+find_existing_parent:
+  IfFileExists "$1\*.*" probe_install_parent
+  ${GetParent} "$1" $2
+  StrCmp $1 $2 invalid_install_directory
+  StrCmp $2 "" invalid_install_directory
+  StrCpy $1 $2
+  Goto find_existing_parent
+probe_install_parent:
+  ClearErrors
+  GetTempFileName $2 "$1"
+  IfErrors invalid_install_directory
+  StrCmp $2 "" invalid_install_directory
+  Delete "$2"
+  Return
+invalid_install_directory:
+  IfSilent silent_directory_failure
+  MessageBox MB_ICONEXCLAMATION|MB_OK "В выбранную папку нельзя установить программу: нет прав записи или путь недоступен.$\r$\n$\r$\nСистемные папки (например, Program Files и Windows) обычно требуют прав администратора.$\r$\n$\r$\nВыберите папку с обычными правами записи, например:$\r$\n$LOCALAPPDATA\Programs\SBK Tools Fast"
+  Abort
+silent_directory_failure:
+  SetErrorLevel 5
+  Quit
+FunctionEnd
+
 Section "!${PRODUCT_NAME}" MainSection
   SectionIn RO
+  Call ValidateInstallDirectory
   SetOutPath "$PLUGINSDIR"
   File /oname=payload.tar.zst "payload.tar.zst"
   File /oname=sbk-installed-extractor.exe "sbk-installed-extractor.exe"
@@ -71,7 +102,7 @@ Section "!${PRODUCT_NAME}" MainSection
   ExecWait '"$PLUGINSDIR\sbk-installed-extractor.exe" "$PLUGINSDIR\payload.tar.zst" "$INSTDIR" "$TEMP\SBK-Tools-Fast-Install-Error.log"' $0
   ${If} $0 != "0"
     IfSilent silent_install_failure
-    MessageBox MB_ICONSTOP|MB_OK "Не удалось установить ${PRODUCT_NAME}. Код ошибки: $0"
+    MessageBox MB_ICONSTOP|MB_OK "Не удалось установить ${PRODUCT_NAME}.$\r$\n$\r$\nПроверьте, что выбранная папка доступна для записи, на диске достаточно места и программа закрыта. Для установки без прав администратора выберите:$\r$\n$LOCALAPPDATA\Programs\SBK Tools Fast$\r$\n$\r$\nПодробности: $TEMP\SBK-Tools-Fast-Install-Error.log$\r$\nКод ошибки: $0"
     Abort
 silent_install_failure:
     SetErrorLevel 1

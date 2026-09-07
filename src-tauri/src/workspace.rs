@@ -134,10 +134,9 @@ fn write_editor_presence(root: &Path, token: &str, owner: &EditorOwner) -> Optio
 fn read_editor_presence(root: &Path) -> Option<EditorOwner> {
     let lock = OpenOptions::new()
         .read(true)
-        .write(true)
         .open(root.join(".workspace.edit.lock"))
         .ok()?;
-    if lock.try_lock_exclusive().is_ok() {
+    if FileExt::try_lock_shared(&lock).is_ok() {
         let _ = FileExt::unlock(&lock);
         return None;
     }
@@ -556,7 +555,9 @@ impl Workspace {
     }
 
     pub(crate) fn access_controlled(&self) -> bool {
+        // A different instance can enable protection after this viewer starts.
         self.access_controlled.load(Ordering::SeqCst)
+            || self.root.join(ACCESS_CONTROL_FILE).exists()
     }
 
     pub(crate) fn access_message(&self) -> String {
@@ -597,7 +598,12 @@ impl Workspace {
         }
         let next = acquire_editor_lease(&self.root, true);
         if !next.active {
-            return Err("Режим редактирования уже занят другим пользователем. Дождитесь его выхода и повторите попытку.".to_string());
+            let owner = read_editor_presence(&self.root)
+                .map(|owner| owner.display_name)
+                .unwrap_or_else(|| "другой пользователь".to_string());
+            return Err(format!(
+                "Сейчас базу редактирует {owner}. Пароль не позволяет забрать его права. Попросите редактора перейти в режим просмотра или закрыть программу и повторите вход."
+            ));
         }
         *lease = next;
         Ok(())
@@ -627,9 +633,9 @@ impl Workspace {
         current_password: &str,
         new_password: &str,
     ) -> Result<(), String> {
-        if !self.is_editor() {
-            return Err("Установить или сменить пароль может только текущий редактор".to_string());
-        }
+        self.require_editor().map_err(|_| {
+            "Установить или сменить пароль может только текущий редактор".to_string()
+        })?;
         if self.access_controlled() {
             verify_access_password(&self.root, current_password)?;
         }
@@ -690,7 +696,7 @@ impl Workspace {
         }
         result.map_err(|error: String| {
             format!(
-                "Блокировка общей папки потеряна; до перезапуска доступен только просмотр: {error}"
+                "Блокировка общей папки потеряна; включён просмотр. Повторно войдите в режим редактирования в настройках, когда он освободится: {error}"
             )
         })
     }
@@ -729,6 +735,11 @@ mod tests {
                 == "true";
             let lease = acquire_editor_lease(Path::new(&root), true);
             assert_eq!(lease.active, expected);
+            if !expected {
+                let owner = read_editor_presence(Path::new(&root))
+                    .expect("viewer sees editor identity even without write access");
+                assert!(!owner.display_name.is_empty());
+            }
             return;
         }
         let root = std::env::temp_dir().join(format!("sbk-shared-lock-{}", Uuid::new_v4()));
@@ -755,6 +766,50 @@ mod tests {
         drop(first);
         run_child(true);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn password_cannot_take_over_another_editor_and_viewer_detects_new_password() {
+        let root = std::env::temp_dir().join(format!("sbk-password-handoff-{}", Uuid::new_v4()));
+        let editor = Workspace::for_test(root.clone(), true);
+        let viewer = Workspace::for_test(root.clone(), true);
+        assert!(editor.is_editor());
+        assert!(!viewer.is_editor());
+        assert!(!viewer.access_controlled());
+        editor.set_access_password("", "editor-password").unwrap();
+        assert!(viewer.access_controlled());
+        assert!(
+            viewer
+                .acquire_editor_with_password("wrong-password")
+                .is_err()
+        );
+        let reason = viewer
+            .acquire_editor_with_password("editor-password")
+            .unwrap_err();
+        assert!(reason.contains("Пароль не позволяет забрать его права"));
+        assert!(editor.require_editor().is_ok());
+        assert!(!viewer.is_editor());
+        assert_eq!(
+            editor.editor_owner().unwrap().started_at,
+            viewer.editor_owner().unwrap().started_at
+        );
+        editor
+            .release_editor_with_password("editor-password")
+            .unwrap();
+        assert!(viewer.editor_owner().is_none());
+        assert!(
+            viewer
+                .acquire_editor_with_password("wrong-password")
+                .is_err()
+        );
+        viewer
+            .acquire_editor_with_password("editor-password")
+            .unwrap();
+        assert!(viewer.require_editor().is_ok());
+        assert!(!editor.is_editor());
+        drop(viewer);
+        drop(editor);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
