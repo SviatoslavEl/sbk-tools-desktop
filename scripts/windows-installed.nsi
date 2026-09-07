@@ -57,7 +57,11 @@ Var StartMenuFolder
 
 Function .onInit
   StrCpy $StartMenuFolder "СБК Инструменты"
-  IfSilent installation_allowed
+  ; Silent installs skip the directory page. Validate before NSIS prepares $INSTDIR.
+  IfSilent 0 interactive_initialization
+  Call ValidateInstallDirectory
+  Goto installation_allowed
+interactive_initialization:
   IfFileExists "$INSTDIR\${PRODUCT_EXE}" 0 installation_allowed
   MessageBox MB_ICONQUESTION|MB_YESNO|MB_DEFBUTTON2 \
     "${PRODUCT_NAME} уже установлена.$\r$\n$\r$\nОбновить файлы программы? Пользовательские данные ProductData затронуты не будут." \
@@ -81,6 +85,11 @@ probe_install_parent:
   GetTempFileName $2 "$1"
   IfErrors invalid_install_directory
   StrCmp $2 "" invalid_install_directory
+  ; Verify an actual writable handle, not just a generated temporary name.
+  ClearErrors
+  FileOpen $3 "$2" w
+  IfErrors invalid_install_directory
+  FileClose $3
   Delete "$2"
   Return
 invalid_install_directory:
