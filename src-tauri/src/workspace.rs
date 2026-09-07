@@ -578,7 +578,7 @@ impl Workspace {
         } else if self.access_controlled() {
             "Только просмотр. Для редактирования введите пароль рабочей папки.".to_string()
         } else {
-            "Только просмотр и экспорт: редактор уже работает с общей папкой.".to_string()
+            "Только просмотр и экспорт. Редактирование в этом экземпляре не включено.".to_string()
         }
     }
 
@@ -766,6 +766,28 @@ mod tests {
         drop(first);
         run_child(true);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn viewer_message_updates_after_editor_exits() {
+        let root = std::env::temp_dir().join(format!("sbk-viewer-message-{}", Uuid::new_v4()));
+        let editor = Workspace::for_test(root.clone(), true);
+        let viewer = Workspace::for_test(root.clone(), true);
+        assert!(
+            viewer
+                .access_message()
+                .contains("режим редактирования сейчас у")
+        );
+        drop(editor);
+        assert!(viewer.editor_owner().is_none());
+        assert_eq!(
+            viewer.access_message(),
+            "Только просмотр и экспорт. Редактирование в этом экземпляре не включено."
+        );
+        viewer.acquire_editor_with_password("").unwrap();
+        assert!(viewer.is_editor());
+        drop(viewer);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
