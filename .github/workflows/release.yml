@@ -7,6 +7,7 @@ on:
     tags: ["v*"]
 
 permissions:
+  actions: read
   contents: write
 
 jobs:
@@ -107,7 +108,14 @@ jobs:
         shell: bash
         run: python scripts/check_versions.py --tag='${{ github.ref_name }}'
       - run: python -m pip install -e scanner-worker Nuitka==2.8.10 ordered-set==4.1.0 zstandard==0.23.0
+      - name: Reuse verified unchanged Windows scanner worker
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: ./scripts/reuse_verified_windows_worker.ps1 -Target '${{ matrix.target }}'
       - name: Build scanner sidecar
+        if: runner.os != 'Windows'
         run: python scripts/build_scanner_worker.py --target ${{ matrix.target }}
       - name: Stage macOS OCR runtime
         if: runner.os == 'macOS'
@@ -509,8 +517,11 @@ jobs:
           }
           python scripts/check_windows_installed_contract.py
       - run: python -m pip install -e scanner-worker Nuitka==2.8.10 ordered-set==4.1.0 zstandard==0.23.0
-      - name: Build scanner sidecar
-        run: python scripts/build_scanner_worker.py --target $env:TARGET
+      - name: Reuse verified unchanged Windows scanner worker
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: ./scripts/reuse_verified_windows_worker.ps1 -Target $env:TARGET
       - name: Stage Windows OCR runtime
         shell: pwsh
         run: |

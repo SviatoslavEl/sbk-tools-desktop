@@ -5034,8 +5034,11 @@ mod tests {
         let source = root.join(&relative);
         fs::create_dir_all(source.parent().expect("parent")).expect("staging directory");
         fs::write(&source, b"attachment").expect("staged attachment");
-        let mut payload =
-            serde_json::json!({ "document": { "relativePath": relative.to_string_lossy() } });
+        // Attachment commands serialize portable slash-separated paths on all
+        // platforms. Exercise the same wire format, not Windows PathBuf syntax.
+        let mut payload = serde_json::json!({ "document": {
+            "relativePath": relative.to_string_lossy().replace('\\', "/")
+        } });
         let mut moves = Vec::new();
         finalize_staged_attachments(&mut payload, &root, "staff", &record_id, &mut moves)
             .expect("finalize");
