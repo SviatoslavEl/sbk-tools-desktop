@@ -77,7 +77,12 @@ Function ValidateInstallDirectory
   ; Updates are staged beside the installation, so the parent must be writable.
   ${GetParent} "$INSTDIR" $1
 find_existing_parent:
-  IfFileExists "$1\*.*" probe_install_parent
+  ; A wildcard can report an empty directory as absent. Inspect the directory itself.
+  System::Call 'kernel32::GetFileAttributesW(w r1) i.r2'
+  StrCmp $2 -1 missing_install_parent
+  IntOp $2 $2 & 0x10
+  StrCmp $2 0 invalid_install_directory probe_install_parent
+missing_install_parent:
   ${GetParent} "$1" $2
   StrCmp $1 $2 invalid_install_directory
   StrCmp $2 "" invalid_install_directory
