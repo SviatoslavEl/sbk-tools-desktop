@@ -10,18 +10,22 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+      - run: cargo build --release --manifest-path windows-installer-helper/Cargo.toml
+      - run: pip install zstandard==0.23.0
       - name: Compile and exercise real NSIS directory validation with tiny fixture
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          $env:TMP = $env:TEMP
           $stage = Join-Path $env:RUNNER_TEMP 'sbk-nsis-preflight'
           New-Item -ItemType Directory -Force $stage | Out-Null
           Copy-Item scripts/windows-installed.nsi $stage
           Copy-Item LICENSE (Join-Path $stage 'LICENSE.txt')
           Copy-Item LICENSE (Join-Path $stage 'NSIS-COPYING')
           Copy-Item src-tauri/icons/icon.ico $stage
-          [IO.File]::WriteAllBytes((Join-Path $stage 'payload.tar.zst'), [byte[]](1,2,3))
-          Copy-Item "$env:WINDIR\System32\whoami.exe" (Join-Path $stage 'sbk-installed-extractor.exe')
+          python scripts/create_installer_smoke_payload.py (Join-Path $stage 'payload.tar.zst')
+          Copy-Item windows-installer-helper/target/release/sbk-tools-installed-extractor.exe (Join-Path $stage 'sbk-installed-extractor.exe')
           $nsisZip = Join-Path $stage 'nsis.zip'
           Invoke-WebRequest 'https://github.com/tauri-apps/binary-releases/releases/download/nsis-3.11/nsis-3.11.zip' -OutFile $nsisZip
           if ((Get-FileHash -Algorithm SHA1 $nsisZip).Hash -ne 'EF7FF767E5CBD9EDD22ADD3A32C9B8F4500BB10D') { throw 'NSIS checksum mismatch' }
@@ -45,4 +49,18 @@ jobs:
             if ($p.ExitCode -ne 5) { throw 'Expected access-denied exit code 5' }
           } finally {
             & icacls.exe $denied /remove:d '*S-1-1-0'
+          }
+          $destination = Join-Path $stage 'installed'
+          for ($iteration = 0; $iteration -lt 2; $iteration++) {
+            $p = Start-Process (Join-Path $stage 'SBK-Tools-Fast-Setup.exe') -ArgumentList @('/S', "/D=$destination") -PassThru
+            if (-not $p.WaitForExit(60000)) { $p.Kill(); throw 'Installation timed out' }
+            Get-Content $diagnostic -ErrorAction SilentlyContinue
+            if ($p.ExitCode -ne 0) { throw "Install iteration $iteration failed: $($p.ExitCode)" }
+            New-Item -ItemType Directory -Force (Join-Path $destination 'ProductData') | Out-Null
+            Set-Content (Join-Path $destination 'ProductData/preserve.txt') 'preserve'
+            $u = Start-Process (Join-Path $destination 'uninstall.exe') -ArgumentList '/S' -Wait -PassThru
+            Write-Host "Uninstall exit: $($u.ExitCode)"
+            Get-ChildItem $destination -Force
+            if ($u.ExitCode -ne 0) { throw 'Uninstall failed' }
+            if (-not (Test-Path (Join-Path $destination 'ProductData/preserve.txt'))) { throw 'Data preservation failed' }
           }
