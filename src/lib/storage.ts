@@ -27,6 +27,8 @@ export interface WorkspaceInfo {
   editor: boolean;
   accessControlled: boolean;
   accessMessage: string;
+  ownerConfigured?: boolean;
+  administrationNotice?: string;
   editorOwner?: {
     displayName: string;
     userName: string;
@@ -89,7 +91,7 @@ export interface HistoryEntry {
   id: number;
   action: "created" | "updated" | "archived" | "restored" | "version-restored";
   createdAt: string;
-  snapshot?: true;
+  snapshot?: Record<string, unknown> | null;
 }
 
 const isTauri = () => "__TAURI_INTERNALS__" in window;

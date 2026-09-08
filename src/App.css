@@ -265,6 +265,25 @@ details label { display: block; margin-top: 10px; }
 .stat span, .stat strong { display: block; }
 .stat span { color: #64776b; font-size: 10px; }
 .stat strong { margin-top: 3px; font-size: 21px; }
+.registry-stats-compact { display: flex; flex-wrap: wrap; gap: 6px 18px; margin-bottom: 0; padding: 7px 12px; border: 1px solid #d6e4d9; border-radius: 8px; background: #fff; }
+.registry-stats-compact .stat { display: flex; align-items: baseline; gap: 8px; padding: 0; border: 0; background: transparent; }
+.registry-stats-compact .stat span { font-size: 12px; }
+.registry-stats-compact .stat strong { margin: 0; font-size: 16px; }
+[hidden] { display: none !important; }
+.calculator-mode-switch, .calculator-step-actions { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.calculator-mode-switch span { color: #64776b; font-size: 12px; }
+.calculator-mode-switch button[aria-pressed="true"], .calculator-guide button[aria-current="step"] { background: #235b3d; color: white; }
+.calculator-guide { padding: 16px; }
+.calculator-guide nav { display: flex; flex-wrap: wrap; gap: 6px; }
+.calculator-guide h2 { margin: 14px 0 6px; }
+.calculator-guide p { margin: 0; max-width: 90ch; line-height: 1.6; }
+.calculator-step-actions { justify-content: space-between; padding: 12px 0; }
+.version-history { padding: 18px; display: grid; gap: 14px; }
+.version-history p { margin: 0; line-height: 1.5; }
+.version-history td, .version-history th { white-space: pre-wrap; overflow-wrap: anywhere; max-width: 250px; }
+.history-entry-list { display: flex; flex-wrap: wrap; gap: 6px; max-height: 170px; overflow: auto; }
+.history-entry-list [aria-pressed="true"] { background: #235b3d; color: #fff; }
+.calculator-guided .calculator-layout:has(.input-column[hidden]) { grid-template-columns: 1fr; }
 .registry-toolbar { display: flex; align-items: end; gap: 8px; flex-wrap: wrap; }
 .portable-export-row { display: flex; align-items: center; justify-content: flex-end; gap: 10px; color: #65786b; font-size: 10px; }
 .registry-toolbar > label { min-width: 150px; }
@@ -487,3 +506,11 @@ tbody tr:hover .sticky-cell { background: #f6fbf7; }
   letter-spacing: .03em;
   text-transform: uppercase;
 }
+/* Shared-folder owner controls never overflow their settings surface. */
+.owner-panel { padding: 18px; display: grid; gap: 12px; min-width: 0; }
+.owner-panel label { display: grid; gap: 6px; }
+.owner-panel input, .owner-panel textarea { width: 100%; min-width: 0; }
+.owner-panel .button-row { display: flex; flex-wrap: wrap; gap: 8px; }
+.owner-panel td { overflow-wrap: anywhere; }
+.administration-notice { position: fixed; left: 16px; bottom: 16px; z-index: 500; width: min(370px, calc(100vw - 32px)); max-height: 50vh; overflow: auto; box-shadow: 0 6px 26px #173d3038; }
+.administration-notice .icon-button { float: right; }

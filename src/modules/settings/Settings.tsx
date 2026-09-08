@@ -35,6 +35,7 @@ import {
 } from "../../lib/sharedWorkspace";
 import { useWorkspaceAccess } from "../../lib/workspaceAccess";
 import { workspacePasswordError, workspacePasswordHint } from "./passwordPolicy";
+import { OwnerPanel } from "./OwnerPanel";
 
 interface AppSettings {
   expiryDays: 30 | 60 | 90;
@@ -335,6 +336,7 @@ export function Settings({
           </div>
         </div>
       </section>
+      <OwnerPanel key={workspace?.root} workspace={workspace} />
       <section className="surface">
         <div className="surface-title">
           <h2>Обновление и архивирование</h2>

@@ -9,6 +9,8 @@ import { parseCsv, toCsv } from "../../lib/csv";
 import { chooseOpenPath, chooseSavePath, exportText } from "../../lib/files";
 import { compareSortValues, toggleSort, type SortDirection } from "../../lib/tableSort";
 import { actsStatusTone, contractStageTone, paymentStatusTone } from "../../lib/statusTone";
+import { VersionHistory } from "../../components/VersionHistory";
+import { useWorkspaceAccess } from "../../lib/workspaceAccess";
 import {
   copyAttachment,
   createBackup,
@@ -1006,7 +1008,7 @@ export function ContractsRegistry() {
           </span>
         </div>
       )}
-      <div className="stats-row">
+      <div className="stats-row registry-stats-compact">
         <div className="stat">
           <span>Всего договоров</span>
           <strong>{stats.total}</strong>
@@ -1163,6 +1165,7 @@ export function ContractsRegistry() {
                           <small>{date(item.date)}</small>
                         </button>
                       )}
+                      <VersionHistory module="contract-experience" id={record.id} title={record.title} payload={record.payload} />
                     </td>
                     <td>
                       {item.performingLegalEntity || (
@@ -1264,7 +1267,7 @@ export function ContractsRegistry() {
           </div>
         )}
       </div>
-      {!readOnly && editing && (
+      {editing && (
         <ContractEditor
           companies={companyDirectory.companies}
           record={editing === "new" ? undefined : editing}
@@ -1882,8 +1885,7 @@ export function ContractsRegistry() {
           </footer>
         </Dialog>
       )}
-      {!readOnly &&
-        importRows &&
+      {importRows &&
         importEditingIndex !== null &&
         importRows[importEditingIndex] && (
           <ContractEditor
@@ -1933,6 +1935,7 @@ function ContractEditor({
   onSave: (item: ContractData, id?: string) => Promise<void>;
   onClose: () => void;
 }) {
+  const editorAccess = useWorkspaceAccess();
   const [recordId] = useState(() => record?.id || crypto.randomUUID());
   const [item, setItem] = useState<ContractData>(
     record
@@ -1965,6 +1968,7 @@ function ContractEditor({
     onClose();
   });
   const submit = async () => {
+    if (!editorAccess.editor) { setError("Режим редактора завершён. Введённые поля сохранены в открытом окне, но запись в общую базу запрещена."); return; }
     if (
       !item.performingLegalEntity.trim() ||
       !item.number.trim() ||
@@ -2384,7 +2388,7 @@ function ContractEditor({
         >
           Отмена
         </button>
-        <button className="primary" type="button" onClick={() => void submit()}>
+        <button className="primary" type="button" disabled={!editorAccess.editor} onClick={() => void submit()}>
           Сохранить договор
         </button>
       </footer>

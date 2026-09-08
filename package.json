@@ -3,7 +3,7 @@
   "author": "Elbakide S.E.",
   "description": "Open-source portable desktop toolkit for tenders and business operations",
   "private": true,
-  "version": "2.8.4",
+  "version": "2.8.5",
   "type": "module",
   "scripts": {
     "dev": "vite",

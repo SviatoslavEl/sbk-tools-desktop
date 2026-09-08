@@ -23,11 +23,11 @@ pub(crate) struct EditorOwner {
     pub(crate) started_at: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct EditorPresence {
-    token: String,
-    owner: EditorOwner,
+pub(crate) struct EditorPresence {
+    pub(crate) token: String,
+    pub(crate) owner: EditorOwner,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -64,6 +64,7 @@ pub(crate) struct Workspace {
     pub(crate) writable: bool,
     access_controlled: AtomicBool,
     editor_lease: Mutex<EditorLease>,
+    admin_notice: Mutex<Option<String>>,
 }
 
 struct EditorLease {
@@ -531,6 +532,7 @@ pub(crate) fn open_workspace() -> Result<Workspace, String> {
         writable,
         access_controlled: AtomicBool::new(access_controlled),
         editor_lease: Mutex::new(editor_lease),
+        admin_notice: Mutex::new(None),
     })
 }
 
@@ -606,6 +608,9 @@ impl Workspace {
             ));
         }
         *lease = next;
+        if let Ok(mut notice) = self.admin_notice.lock() {
+            *notice = None;
+        }
         Ok(())
     }
 
@@ -659,6 +664,27 @@ impl Workspace {
         read_editor_presence(&self.root)
     }
 
+    pub(crate) fn actor_name(&self) -> String {
+        current_editor_owner().display_name
+    }
+
+    pub(crate) fn editor_presence(&self) -> Option<EditorPresence> {
+        let lease = self.editor_lease.lock().ok()?;
+        if lease.active {
+            return Some(EditorPresence {
+                token: lease.token.clone(),
+                owner: lease.owner.clone()?,
+            });
+        }
+        drop(lease);
+        read_editor_presence(&self.root)?;
+        serde_json::from_slice(&fs::read(self.root.join(EDITOR_PRESENCE_FILE)).ok()?).ok()
+    }
+
+    pub(crate) fn admin_notice(&self) -> Option<String> {
+        self.admin_notice.lock().ok()?.clone()
+    }
+
     pub(crate) fn require_editor(&self) -> Result<(), String> {
         let mut lease = self
             .editor_lease
@@ -666,6 +692,41 @@ impl Workspace {
             .map_err(|_| "Проверка блокировки недоступна".to_string())?;
         if !lease.active {
             return Err("Общая база открыта только для просмотра. Для изменения нужны права записи на папку и свободная блокировка редактора.".to_string());
+        }
+        if let Some(request) = crate::administration::latest_request(&self.root, &lease.token)? {
+            let revoked = request.action == "revoke-requested";
+            let message = format!(
+                "{} {}: {}. {}",
+                request.actor,
+                if revoked {
+                    "отозвал текущий режим редактора"
+                } else {
+                    "просит освободить режим редактора"
+                },
+                request.reason,
+                if revoked {
+                    "Включён просмотр. Несохранённый ввод не удалён; для новой записи требуется обычный вход в режим редактора"
+                } else {
+                    "Завершите работу и перейдите в режим просмотра в настройках"
+                }
+            );
+            if let Ok(mut notice) = self.admin_notice.lock() {
+                *notice = Some(message.clone());
+            }
+            if revoked {
+                // Called under AppState.maintenance: outstanding writes finish
+                // before this cooperative release. Never rewrite/remove another
+                // process's lock or bypass the ordinary workspace password.
+                *lease = EditorLease {
+                    active: false,
+                    token: uuid::Uuid::new_v4().to_string(),
+                    edit: None,
+                    guard: None,
+                    presence_path: None,
+                    owner: None,
+                };
+                return Err(message);
+            }
         }
         // Verify the ownership markers through the already locked handles.
         // Reopening them here used to release both exclusive locks for a brief
@@ -717,6 +778,7 @@ impl Workspace {
             writable: editor,
             access_controlled: AtomicBool::new(false),
             editor_lease: Mutex::new(lease),
+            admin_notice: Mutex::new(None),
         }
     }
 }
@@ -841,6 +903,62 @@ mod tests {
         assert!(!acquire_editor_lease(&root, false).active);
         assert!(!root.join(".workspace.edit.lock").exists());
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cooperative_owner_revoke_releases_only_target_lease_without_password_bypass() {
+        let root = std::env::temp_dir().join(format!("sbk-cooperative-owner-{}", Uuid::new_v4()));
+        let editor = Workspace::for_test(root.clone(), true);
+        let next = Workspace::for_test(root.clone(), true);
+        editor
+            .set_access_password("", "ordinary-editor-password")
+            .unwrap();
+        crate::administration::setup(&root, "separate-owner-password", "owner").unwrap();
+        let target = editor.editor_presence().unwrap();
+        crate::administration::record_request(
+            &root,
+            "viewer",
+            &target.token,
+            "Просьба освободить",
+            false,
+        )
+        .unwrap();
+        assert!(
+            editor.require_editor().is_ok(),
+            "ordinary request cannot revoke"
+        );
+        assert!(editor.admin_notice().unwrap().contains("просит"));
+        crate::administration::record_request(
+            &root,
+            "owner",
+            &target.token,
+            "Завершить редактирование",
+            true,
+        )
+        .unwrap();
+        assert!(
+            next.acquire_editor_with_password("ordinary-editor-password")
+                .is_err(),
+            "no forced unlocking of another process"
+        );
+        assert!(editor.require_editor().is_err());
+        assert!(!editor.is_editor());
+        assert!(editor.admin_notice().unwrap().contains("отозвал"));
+        assert!(
+            next.acquire_editor_with_password("separate-owner-password")
+                .is_err(),
+            "owner password is not a workspace credential"
+        );
+        next.acquire_editor_with_password("ordinary-editor-password")
+            .unwrap();
+        assert!(
+            next.require_editor().is_ok(),
+            "new lease is not targeted by prior revoke"
+        );
+        assert!(editor.require_editor().is_err());
+        drop(next);
+        drop(editor);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

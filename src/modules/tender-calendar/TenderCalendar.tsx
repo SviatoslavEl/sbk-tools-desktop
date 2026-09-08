@@ -66,6 +66,12 @@ export function TenderCalendar() {
   const procurements = useRecords<ProcurementData>("procurement");
   const staff = useRecords<StaffData>("staff");
   const [view, setView] = useState<View>("calendar");
+  const [selectedDate, setSelectedDate] = useState("");
+  const scheduleDay = (date: string) => {
+    if (readOnly) return;
+    setSelectedDate(date);
+    setEditing("new");
+  };
   const [month, setMonth] = useState(() => {
     const now = new Date();
     return new Date(now.getFullYear(), now.getMonth(), 1);
@@ -187,7 +193,7 @@ export function TenderCalendar() {
             <button
               className="primary"
               type="button"
-              onClick={() => setEditing("new")}
+              onClick={() => { setSelectedDate(""); setEditing("new"); }}
             >
               Запланировать заявку
             </button>
@@ -217,6 +223,10 @@ export function TenderCalendar() {
               return (
                 <div
                   key={cell.date}
+                  tabIndex={0}
+                  aria-label={`День ${cell.date}${readOnly ? "" : ": назначить закупку двойным щелчком или Enter"}`}
+                  onDoubleClick={(event) => { if (!(event.target as HTMLElement).closest("button")) scheduleDay(cell.date); }}
+                  onKeyDown={(event) => { if (event.key === "Enter" && event.target === event.currentTarget) { event.preventDefault(); scheduleDay(cell.date); } }}
                   className={`calendar-day ${cell.current ? "" : "outside"} ${cell.date === dateKey(new Date()) ? "today" : ""}`}
                 >
                   <time>{Number(cell.date.slice(-2))}</time>
@@ -427,6 +437,8 @@ export function TenderCalendar() {
 
       {!readOnly && editing && (
         <ScheduleEditor
+          key={editing === "new" ? `new-${selectedDate}` : editing.id}
+          initialDate={selectedDate}
           record={editing === "new" ? undefined : editing}
           procurements={procurements.records}
           staff={staff.records}
@@ -472,6 +484,7 @@ function EmptyCalendar({ onCreate }: { onCreate: () => void }) {
 
 function ScheduleEditor({
   record,
+  initialDate = "",
   procurements,
   staff,
   allSchedules,
@@ -479,6 +492,7 @@ function ScheduleEditor({
   onClose,
 }: {
   record?: StoredRecord<TenderScheduleData>;
+  initialDate?: string;
   procurements: StoredRecord<ProcurementData>[];
   staff: StoredRecord<StaffData>[];
   allSchedules: TenderScheduleData[];
@@ -492,7 +506,7 @@ function ScheduleEditor({
           ...structuredClone(record.payload),
           source: record.payload.procurementId ? "procurement" : "manual",
         }
-      : emptyTenderSchedule(),
+      : { ...emptyTenderSchedule(), ...(initialDate ? { preparationStart: initialDate, internalDeadline: initialDate, submissionDeadline: initialDate } : {}) },
   );
   const [savedSnapshot, setSavedSnapshot] = useState(() => JSON.stringify(item));
   const [error, setError] = useState("");

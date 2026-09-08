@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import "./App.css";
 import { Dialog } from "./components/Dialog";
+import { AdministrationNotice } from "./components/AdministrationNotice";
 import { Archive } from "./modules/archive/Archive";
 import { Calculator } from "./modules/calculator/Calculator";
 import { ContractsRegistry } from "./modules/contracts/Contracts";
@@ -42,7 +43,6 @@ import {
 type ToolId =
   | "dashboard"
   | "procurement"
-  | "tender-calendar"
   | "calculator"
   | "scanner"
   | "contracts"
@@ -55,7 +55,6 @@ type ToolId =
 const tools: Array<{ id: ToolId; icon: string; label: string }> = [
   { id: "dashboard", icon: "▦", label: "Главная" },
   { id: "procurement", icon: "◆", label: "Закупки" },
-  { id: "tender-calendar", icon: "▣", label: "Календарь тендеров" },
   { id: "calculator", icon: "₽", label: "Тендерный калькулятор" },
   { id: "scanner", icon: "▤", label: "Сканирование документов" },
   { id: "contracts", icon: "✓", label: "Опыт по договорам" },
@@ -71,10 +70,6 @@ const toolTitles: Record<ToolId, [string, string]> = {
   procurement: [
     "Закупки",
     "Требования, расчёты, команда, документы и переторжка",
-  ],
-  "tender-calendar": [
-    "Календарь тендеров",
-    "Распределение заявок, контроль сроков и загрузка специалистов",
   ],
   calculator: [
     "Тендерный калькулятор",
@@ -103,8 +98,6 @@ const helpText: Record<ToolId, string> = {
     "Главная показывает ближайшие сроки и риски из локальных реестров. Данные не отправляются в сеть.",
   procurement:
     "Карточка закупки хранит только явно добавленные снимки расчётов, опыта и команды. Исходные реестры автоматически не связываются.",
-  "tender-calendar":
-    "Руководитель группы распределяет подготовку заявок между менеджерами и специалистами. Рекомендации учитывают сложность, навыки, опыт, доступность и уже назначенную загрузку.",
   calculator:
     "Введите себестоимость и выберите режим расчёта. Дополнительные расходы можно задавать суммой или процентом от выбранной базы. Графики обновляются сразу.",
   scanner:
@@ -333,8 +326,10 @@ function App() {
   const [collapsed, setCollapsed] = useState(
     () => localStorage.getItem("sbk-tools:sidebar-collapsed") === "true",
   );
+  const [scannerOpened, setScannerOpened] = useState(activeTool === "scanner");
   const [showHelp, setShowHelp] = useState(false);
   const selectTool = (tool: ToolId) => {
+    if (tool === "scanner") setScannerOpened(true);
     setActiveTool(tool);
     localStorage.setItem("sbk-tools:last-tool", tool);
   };
@@ -626,15 +621,16 @@ function App() {
             </button>
           </header>
           <div className="tool-content">
-            <ReadOnlyWorkspaceBoundary
-              allowMutations={activeTool === "scanner"}
-              disableFormControls={activeTool === "calculator"}
-            >
-              {activeTool === "dashboard" && <Dashboard />}
+            <AdministrationNotice key={workspace.root} message={workspace.administrationNotice} />
+            {scannerOpened && <div hidden={activeTool !== "scanner"} key={workspace.root}>
+              <ReadOnlyWorkspaceBoundary allowMutations>
+                <Scanner active={activeTool === "scanner"} />
+              </ReadOnlyWorkspaceBoundary>
+            </div>}
+            <ReadOnlyWorkspaceBoundary>
+              {activeTool === "dashboard" && <div className="module-stack"><Dashboard /><section aria-label="Календарь тендеров"><h2>Календарь тендеров</h2><p className="help-text">Дважды щёлкните по дню, чтобы назначить закупку. С клавиатуры — Enter на выбранном дне.</p><TenderCalendar /></section></div>}
               {activeTool === "procurement" && <ProcurementRegistry />}
-              {activeTool === "tender-calendar" && <TenderCalendar />}
               {activeTool === "calculator" && <Calculator />}
-              {activeTool === "scanner" && <Scanner />}
               {activeTool === "contracts" && <ContractsRegistry />}
               {activeTool === "counterparties" && <CounterpartiesRegistry />}
               {activeTool === "staff" && <StaffRegistry />}
