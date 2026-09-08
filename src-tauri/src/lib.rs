@@ -30,6 +30,7 @@ use walkdir::WalkDir;
 use zeroize::Zeroizing;
 use zip::write::SimpleFileOptions;
 
+mod administration;
 mod attachments;
 mod database;
 mod intelligence;
@@ -246,6 +247,8 @@ struct WorkspaceInfo {
     access_controlled: bool,
     access_message: String,
     editor_owner: Option<EditorOwner>,
+    owner_configured: bool,
+    administration_notice: Option<String>,
     schema_version: i64,
     free_space_bytes: u64,
 }
@@ -555,6 +558,8 @@ fn workspace_info(state: State<'_, AppState>) -> Result<WorkspaceInfo, String> {
         access_controlled: workspace.access_controlled(),
         access_message,
         editor_owner: workspace.editor_owner(),
+        owner_configured: administration::configured(&workspace.root).unwrap_or(true),
+        administration_notice: workspace.admin_notice(),
         schema_version: SCHEMA_VERSION,
         free_space_bytes: fs2::available_space(&workspace.root).unwrap_or(0),
     })
@@ -591,6 +596,87 @@ fn set_workspace_access_password(
     state
         .active_workspace()?
         .set_access_password(&current_password, &new_password)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OwnerInfo {
+    editor: Option<workspace::EditorPresence>,
+    events: Vec<administration::AdminEvent>,
+}
+
+#[tauri::command]
+fn setup_workspace_owner(
+    state: State<'_, AppState>,
+    password: String,
+    workspace_password: String,
+    confirmation: String,
+) -> Result<(), String> {
+    let _maintenance = state
+        .maintenance
+        .lock()
+        .map_err(|_| "Хранилище недоступно".to_string())?;
+    let workspace = state.active_workspace()?;
+    if confirmation != "НАЗНАЧИТЬ ВЛАДЕЛЬЦА" {
+        return Err("Подтвердите первичную настройку владельца".into());
+    }
+    workspace.require_editor()?;
+    // Recheck the ordinary workspace credential before claiming ownership.
+    workspace.acquire_editor_with_password(&Zeroizing::new(workspace_password))?;
+    administration::setup(
+        &workspace.root,
+        &Zeroizing::new(password),
+        &workspace.actor_name(),
+    )
+}
+
+#[tauri::command]
+fn workspace_owner_info(state: State<'_, AppState>, password: String) -> Result<OwnerInfo, String> {
+    let workspace = state.active_workspace()?;
+    administration::authenticate(&workspace.root, &Zeroizing::new(password))?;
+    Ok(OwnerInfo {
+        editor: workspace.editor_presence(),
+        events: administration::events(&workspace.root)?,
+    })
+}
+
+#[tauri::command]
+fn request_editor_release(
+    state: State<'_, AppState>,
+    password: Option<String>,
+    target_token: String,
+    reason: String,
+    revoke: bool,
+) -> Result<(), String> {
+    let _maintenance = state
+        .maintenance
+        .lock()
+        .map_err(|_| "Хранилище недоступно".to_string())?;
+    let workspace = state.active_workspace()?;
+    if !workspace.writable {
+        return Err("Нет прав записи в сетевую папку".into());
+    }
+    if revoke {
+        administration::authenticate(
+            &workspace.root,
+            &Zeroizing::new(password.unwrap_or_default()),
+        )?;
+    }
+    let target = workspace
+        .editor_presence()
+        .ok_or("Редактор уже освободил базу")?;
+    // Ordinary requests do not need an exposed session token; revocations must
+    // refer to exactly the editor whose identity the owner confirmed in the UI.
+    if revoke && target.token != target_token {
+        return Err("Текущий редактор изменился. Обновите список и подтвердите заново.".into());
+    }
+    administration::record_request(
+        &workspace.root,
+        &workspace.actor_name(),
+        &target.token,
+        &reason,
+        revoke,
+    )
 }
 
 #[tauri::command]
@@ -1170,7 +1256,7 @@ fn record_history(
 ) -> Result<Vec<HistoryEntry>, String> {
     let connection = open_database_read_only(&state.workspace.root, &module)?;
     let mut statement = connection.prepare(
-        "SELECT id, action, created_at, snapshot FROM history WHERE record_id = ?1 ORDER BY created_at DESC LIMIT 100",
+        "SELECT id, action, created_at, snapshot FROM history WHERE record_id = ?1 ORDER BY id DESC LIMIT 100",
     ).map_err(|error| error.to_string())?;
     statement
         .query_map([id], |row| {
@@ -1215,10 +1301,34 @@ fn restore_history_version(
         })
         .map_err(|_| "Запись не найдена".to_string())?;
     let now = Utc::now().to_rfc3339();
+    let restored_payload: Value =
+        serde_json::from_str(&snapshot).map_err(|_| "Снимок истории повреждён".to_string())?;
+    let restored_title = match module.as_str() {
+        "staff" => restored_payload
+            .get("fullName")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        "contract-experience" => {
+            restored_payload
+                .get("number")
+                .and_then(Value::as_str)
+                .map(|number| {
+                    format!(
+                        "{} — {}",
+                        number,
+                        restored_payload
+                            .get("customer")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                    )
+                })
+        }
+        _ => None,
+    };
     transaction
         .execute(
-            "UPDATE records SET payload = ?1, updated_at = ?2 WHERE id = ?3",
-            params![snapshot, now, id],
+            "UPDATE records SET payload = ?1, updated_at = ?2, title = COALESCE(?4, title) WHERE id = ?3",
+            params![snapshot, now, id, restored_title],
         )
         .map_err(|error| error.to_string())?;
     transaction.execute(
@@ -1709,6 +1819,45 @@ fn write_company_directory(
     now: &str,
 ) -> Result<(), String> {
     validate_company_directory_payload(directory)?;
+    let previous: Option<String> = transaction
+        .query_row(
+            "SELECT payload FROM drafts WHERE key = ?1",
+            [COMPANY_DIRECTORY_DRAFT_KEY],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let previous: Value = previous
+        .as_deref()
+        .map(serde_json::from_str)
+        .transpose()
+        .map_err(|error| format!("Не удалось прочитать историю справочника: {error}"))?
+        .unwrap_or(Value::Null);
+    let old_companies = previous
+        .get("companies")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for company in directory
+        .get("companies")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(id) = company.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let old = old_companies
+            .iter()
+            .find(|entry| entry.get("id").and_then(Value::as_str) == Some(id));
+        if old == Some(company) {
+            continue;
+        }
+        transaction.execute(
+            "INSERT INTO history(record_id, action, snapshot, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![format!("company:{id}"), if old.is_some() { "updated" } else { "created" }, old.map(Value::to_string), now],
+        ).map_err(|error| format!("Не удалось записать историю компании: {error}"))?;
+    }
     transaction
         .execute(
             "INSERT INTO drafts(key, payload, updated_at) VALUES (?1, ?2, ?3)
@@ -4201,6 +4350,9 @@ pub fn run() {
             workspace_info,
             switch_workspace_mode,
             set_workspace_access_password,
+            setup_workspace_owner,
+            workspace_owner_info,
+            request_editor_release,
             intelligence_provider_status,
             validate_intelligence_configuration,
             analysis_job_list,
@@ -4326,6 +4478,60 @@ mod tests {
             "schemaVersion": 1,
             "companies": [{ "id": company_id, "name": name }]
         })
+    }
+
+    #[test]
+    fn company_history_is_atomic_and_preserves_prior_payload() {
+        let root = std::env::temp_dir().join(format!("sbk-company-history-{}", Uuid::new_v4()));
+        fs::create_dir_all(root.join("contract-experience")).unwrap();
+        let mut connection = open_database(&root, "contract-experience").expect("database");
+        let id = Uuid::new_v4().to_string();
+        let before = company_directory_value(&id, "До");
+        let after = company_directory_value(&id, "После");
+        {
+            let tx = connection.transaction().unwrap();
+            write_company_directory(&tx, &before, "1").unwrap();
+            write_company_directory(&tx, &after, "2").unwrap();
+            write_company_directory(&tx, &after, "3").unwrap();
+            tx.commit().unwrap();
+        }
+        let count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM history WHERE record_id=?1",
+                [format!("company:{id}")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 2,
+            "unchanged directory must not create an extra revision"
+        );
+        let snapshot: String = connection
+            .query_row(
+                "SELECT snapshot FROM history WHERE record_id=?1 AND action='updated'",
+                [format!("company:{id}")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&snapshot).unwrap()["name"],
+            "До"
+        );
+        {
+            let tx = connection.transaction().unwrap();
+            write_company_directory(&tx, &before, "4").unwrap();
+            tx.rollback().unwrap();
+        }
+        let count_after: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM history WHERE record_id=?1",
+                [format!("company:{id}")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count_after, count);
+        drop(connection);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]

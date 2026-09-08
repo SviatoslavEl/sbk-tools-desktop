@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 import { createPortal } from "react-dom";
 import { ConfirmDialog } from "../../components/Dialog";
+import { VersionHistory } from "../../components/VersionHistory";
 import { useRecords } from "../../hooks/useRecords";
 import { useWorkspaceAccess } from "../../lib/workspaceAccess";
 import { CompanyEditor, useCompanyDirectory } from "./CompanyDirectory";
@@ -67,7 +68,7 @@ export function CounterpartiesRegistry() {
         <td>{company.scope === "internal" && company.authorizedSigners.length ? company.authorizedSigners.map((person) => <div className="decision-maker-summary" key={person.id}><strong>{person.fullName}</strong><small>{person.powerOfAttorneyNumber ? `Доверенность ${person.powerOfAttorneyNumber}` : "Номер не указан"}{person.document.fileName ? ` · ${person.document.fileName}` : ""}</small></div>) : "—"}</td>
         <td>{company.decisionMakers.map((person) => <small className="company-relation" key={person.id}>{[person.phone, person.email].filter(Boolean).join(" · ")}</small>)}{!company.decisionMakers.length && (company.contact || "—")}</td>
         <td>{companyRelationshipLabel(company, directory.companies).map((label) => <small className="company-relation" key={label}>{label}</small>)}</td>
-        <td><button className="secondary small" type="button" onClick={() => setEditing(company)}>{access.editor ? "Редактировать" : "Открыть"}</button></td>
+        <td><button className="secondary small" type="button" onClick={() => setEditing(company)}>{access.editor ? "Редактировать" : "Открыть"}</button><VersionHistory module="contract-experience" id={`company:${company.id}`} title={company.name} payload={company} onRestore={async (snapshot) => { await directory.save({ ...(snapshot as CompanyCard), id: company.id }, company, contracts.records); }} /></td>
       </tr>)}</tbody></table></div>
       {!directory.loading && filtered.length === 0 && <div className="empty-state"><h2>Ничего не найдено</h2><p>Измените строку поиска или выбранный раздел.</p></div>}
     </section>

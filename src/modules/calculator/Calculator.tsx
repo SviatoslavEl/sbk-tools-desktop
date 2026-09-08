@@ -1,4 +1,4 @@
-import { createContext, useCallback, useContext, useEffect, useId, useMemo, useState, type Dispatch, type SetStateAction } from "react";
+import { createContext, useCallback, useContext, useEffect, useId, useMemo, useRef, useState, type Dispatch, type SetStateAction } from "react";
 import { useRecords } from "../../hooks/useRecords";
 import { exportText, importText } from "../../lib/files";
 import { clearDraft, readDraft, saveDraft } from "../../lib/storage";
@@ -69,6 +69,21 @@ function NumberField({ value, onChange, min, max, suffix }: {
 
 export function Calculator() {
   const workspaceAccess = useWorkspaceAccess();
+  const [experienceMode, setExperienceMode] = useState<"guided" | "expert">("guided");
+  const [step, setStep] = useState(0);
+  const guideRef = useRef<HTMLElement>(null);
+  useEffect(() => {
+    if (experienceMode === "guided") guideRef.current?.scrollIntoView({ block: "start" });
+  }, [step, experienceMode]);
+  const steps = ["Основа и цель", "Дополнительные расходы", "Условия сделки", "Конкуренты и риски", "Итоговая цена"];
+  const guidance = [
+    "Укажите себестоимость, включён ли в неё НДС, и желаемую маржу. Маржа — доля прибыли в цене без НДС; наценка — процент сверх затрат. Если цена уже известна, выберите расчёт прибыли по цене.",
+    "Добавьте логистику, комиссию площадки и другие расходы. Проверьте, не включены ли они уже в себестоимость, чтобы не посчитать их дважды. Необязательные расходы можно отключить.",
+    "Если есть агент, соисполнители, валютные закупки или отсрочка оплаты, включите соответствующие блоки. Суммы гарантий и ставки вводятся по вашим условиям, а не подставляются как обязательные нормы.",
+    "При наличии предложений конкурентов добавьте их и выберите одинаковую базу сравнения. Установите минимально допустимую маржу и порог предупреждения. Этот шаг можно пройти без конкурентов.",
+    "Проверьте цену, прибыль и предупреждения. Раскройте формулу, чтобы увидеть состав затрат. Можно вернуться на любой шаг без потери введённых значений. Результат — расчёт по вашим данным, не гарантия победы в закупке.",
+  ];
+  const visibleStep = (index: number) => experienceMode === "expert" || step === index;
   const saved = useRecords<CalculatorData>("calculator");
   const [data, setData] = useState<CalculatorData>(() => restoredCalculatorData(null));
   const [draftReady, setDraftReady] = useState(false);
@@ -103,19 +118,6 @@ export function Calculator() {
   }, []);
 
   useEffect(() => {
-    if (workspaceAccess.editor) return;
-    let generation = 0;
-    const refresh = () => {
-      const current = ++generation;
-      void readDraft<unknown>("calculator", recordId || "new").then((draft) => {
-        if (current === generation && draft) setData(restoredCalculatorData(draft));
-      });
-    };
-    window.addEventListener("sbk-workspace-refresh", refresh);
-    return () => { generation += 1; window.removeEventListener("sbk-workspace-refresh", refresh); };
-  }, [workspaceAccess.editor, recordId]);
-
-  useEffect(() => {
     if (!draftReady || !workspaceAccess.editor) return;
     if (!calculationValid) {
       setSavedStatus("Исправьте поля — черновик не сохранён");
@@ -134,6 +136,7 @@ export function Calculator() {
     setData((current) => ({ ...current, [key]: value }));
 
   const saveCalculation = async (duplicate = false) => {
+    if (!workspaceAccess.editor) { setFormError("Расчёт доступен локально. Для сохранения в общую базу необходим режим редактора."); return; }
     if (!calculationValid) {
       setFormError(result.issues.find((issue) => issue.blocking)?.message || "Исправьте неверно заполненные числовые поля перед сохранением.");
       return;
@@ -174,7 +177,10 @@ export function Calculator() {
     }
   };
 
-  return <NumberValidityContext.Provider value={reportNumberValidity}><div className="module-stack">
+  return <NumberValidityContext.Provider value={reportNumberValidity}><div className={`module-stack calculator-${experienceMode}`}>
+    <div className="calculator-mode-switch" role="group" aria-label="Уровень калькулятора"><button type="button" aria-pressed={experienceMode === "guided"} onClick={() => setExperienceMode("guided")}>Пошаговый расчёт</button><button type="button" aria-pressed={experienceMode === "expert"} onClick={() => setExperienceMode("expert")}>Экспертный режим</button><span>Один расчёт — переключение без потери данных</span></div>
+    {!workspaceAccess.editor && <div className="notice"><strong>Локальный расчёт в режиме просмотра</strong><span>Все параметры и экспорт доступны. Сохранение в общую базу и автоматическая запись черновика отключены.</span></div>}
+    {experienceMode === "guided" && <section ref={guideRef} className="surface calculator-guide" aria-label="Шаги расчёта"><nav aria-label="Этапы калькулятора">{steps.map((label, index) => <button type="button" key={label} aria-current={step === index ? "step" : undefined} onClick={() => setStep(index)}>{index + 1}. {label}</button>)}</nav><h2>Шаг {step + 1}. {steps[step]}</h2><p>{guidance[step]}</p></section>}
     <div className="module-toolbar">
       <div className="record-switcher">
         <label>Текущий расчёт
@@ -189,22 +195,22 @@ export function Calculator() {
             {saved.records.map((record) => <option key={record.id} value={record.id}>{record.title}</option>)}
           </select>
         </label>
-        <span className="autosave-status">✓ {savedStatus}</span>
+        <span className="autosave-status">{workspaceAccess.editor ? savedStatus : "Локальная копия · без записи в базу"}</span>
       </div>
       <div className="toolbar-actions">
         <button className="secondary" type="button" onClick={newCalculation}>Новый</button>
         <button className="secondary" type="button" onClick={() => void importCalculation()}>Импорт</button>
         <button className="secondary" disabled={!calculationValid} type="button" onClick={() => void exportCalculation()}>Экспорт</button>
-        {recordId && <button className="secondary danger" type="button" onClick={() => { if (window.confirm("Переместить расчёт в архив?")) void saved.archive(recordId).then(newCalculation); }}>В архив</button>}
-        <button className="primary" disabled={!calculationValid} type="button" onClick={() => void saveCalculation(false)}>Сохранить расчёт</button>
+        {recordId && <button data-workspace-mutation className="secondary danger" disabled={!workspaceAccess.editor} type="button" onClick={() => { if (workspaceAccess.editor && window.confirm("Переместить расчёт в архив?")) void saved.archive(recordId).then(newCalculation); }}>В архив</button>}
+        <button data-workspace-mutation className="primary" disabled={!calculationValid || !workspaceAccess.editor} type="button" onClick={() => void saveCalculation(false)}>Сохранить расчёт</button>
       </div>
     </div>
 
     {saved.error && <div className="notice error"><strong>База недоступна.</strong><span>{saved.error}</span></div>}
     {formError && <div className="notice error"><strong>Расчёт не сохранён.</strong><span>{formError}</span></div>}
     <div className="calculator-layout">
-      <section className="input-column">
-        <div className="surface">
+      <section className="input-column" hidden={experienceMode === "guided" && step === 4}>
+        <div className="surface" hidden={!visibleStep(0)}>
           <div className="surface-title"><h2>Основные параметры</h2></div>
           <div className="surface-body form-grid">
             <label className="wide">Название расчёта<input value={data.name} onChange={(event) => update("name", event.target.value)} /></label>
@@ -234,9 +240,9 @@ export function Calculator() {
           </div>
         </div>
 
-        <ExpensesTable data={data} setData={setData} result={result} />
+        <div hidden={!visibleStep(1)}><ExpensesTable data={data} setData={setData} result={result} /></div>
 
-        <details className="surface advanced-card">
+        <details className="surface advanced-card" hidden={!visibleStep(2)} open={experienceMode === "guided" ? true : undefined}>
           <summary>Условия сделки, агент и соисполнители</summary>
           <div className="surface-body advanced-sections">
             <label className="checkbox-row"><input type="checkbox" checked={data.hasAgent} onChange={(event) => update("hasAgent", event.target.checked)} /> Учитывать агента</label>
@@ -268,7 +274,7 @@ export function Calculator() {
           </div>
         </details>
 
-        <details className="surface advanced-card">
+        <details className="surface advanced-card" hidden={!visibleStep(3)} open={experienceMode === "guided" ? true : undefined}>
           <summary>Конкуренты и пороги</summary>
           <div className="surface-body advanced-sections">
             <label>База сравнения цен<select value={data.comparisonBasis} onChange={(event) => update("comparisonBasis", event.target.value as CalculatorData["comparisonBasis"])}><option value="gross">Полная цена договора с НДС</option><option value="net">Цена без НДС</option><option value="adjusted">Приведённая цена по корректировке</option></select></label>
@@ -307,12 +313,13 @@ export function Calculator() {
             {calculationValid && result.status === "danger" && <div className="notice warning"><strong>Проверьте цену.</strong><span>Расчёт убыточный или находится ниже установленного порога.</span></div>}
             {recommendation && !recommendation.valid && <div className="notice error"><strong>Рекомендация недоступна.</strong><span>{recommendation.issue?.message}</span></div>}
             {recommendation?.valid && <div className="recommendation-card"><span>Рекомендованная цена с НДС</span><strong>{money(recommendation.priceGross)}</strong><small>База: {recommendation.basisLabel}. Ближайшее сравнимое предложение: {money(recommendation.lowestCompetitor)}. {recommendation.limitedByMargin ? `Ниже опускаться рискованно: защита маржи ${percent(data.minMargin)}.` : `Шаг ниже конкурента; расчётная маржа ${percent(recommendation.margin)}.`}</small><button className="secondary" type="button" onClick={() => setData((current) => ({ ...current, mode: "price-to-margin", proposedPrice: recommendation.priceGross, priceAmountType: "with-vat" }))}>Применить рекомендацию</button></div>}
-            <div className="button-row"><button className="primary grow" disabled={!calculationValid} type="button" onClick={() => void saveCalculation(false)}>Сохранить</button><button className="secondary" disabled={!calculationValid} type="button" onClick={() => void saveCalculation(true)}>Дублировать</button></div>
+            <div className="button-row" data-workspace-mutation><button className="primary grow" disabled={!calculationValid || !workspaceAccess.editor} type="button" onClick={() => void saveCalculation(false)}>Сохранить</button><button className="secondary" disabled={!calculationValid || !workspaceAccess.editor} type="button" onClick={() => void saveCalculation(true)}>Дублировать</button></div>
           </div>
         </div>
         <CalculatorCharts data={data} result={result} scenarios={scenarios} active={activeChart} onActive={setActiveChart} />
       </section>
     </div>
+    {experienceMode === "guided" && <div className="calculator-step-actions"><button type="button" className="secondary" disabled={step === 0} onClick={() => setStep((value) => value - 1)}>Назад</button><span>{step + 1} из {steps.length}</span>{step < 4 ? <button type="button" className="primary" disabled={invalidNumberFields.size > 0} onClick={() => setStep((value) => value + 1)}>{step === 3 ? "Получить итог" : "Далее"}</button> : <button type="button" className="primary" disabled={!calculationValid} onClick={() => void exportCalculation()}>Экспортировать результат</button>}</div>}
   </div></NumberValidityContext.Provider>;
 }
 

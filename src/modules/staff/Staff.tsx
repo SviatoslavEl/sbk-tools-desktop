@@ -18,6 +18,7 @@ import {
 import { chooseOpenPath, chooseSavePath, exportText } from "../../lib/files";
 import { compareSortValues, toggleSort, type SortDirection } from "../../lib/tableSort";
 import { staffBasisTone } from "../../lib/statusTone";
+import { VersionHistory } from "../../components/VersionHistory";
 import {
   copyAttachment,
   createBackup,
@@ -747,7 +748,7 @@ export function StaffRegistry() {
 
   return (
     <div className="module-stack">
-      <div className="stats-row">
+      <div className="stats-row registry-stats-compact">
         <div className="stat">
           <span>Людей в реестре</span>
           <strong>{normalizedRecords.length}</strong>
@@ -1026,6 +1027,7 @@ export function StaffRegistry() {
                             </button>
                           </div>
                         )}
+                        <VersionHistory module="staff" id={record.id} title={record.title} payload={record.payload} />
                       </td>
                     </tr>
                   </Fragment>
@@ -1059,7 +1061,7 @@ export function StaffRegistry() {
           </div>
         )}
       </div>
-      {!readOnly && editing && (
+      {editing && (
         <StaffEditor
           record={editing === "new" ? undefined : editing}
           onClose={() => setEditing(null)}
@@ -1796,8 +1798,7 @@ export function StaffRegistry() {
           </footer>
         </Dialog>
       )}
-      {!readOnly &&
-        importRows &&
+      {importRows &&
         importEditingIndex !== null &&
         importRows[importEditingIndex] && (
           <StaffEditor
@@ -1867,6 +1868,7 @@ function StaffEditor({
   onSave: (item: StaffData, id: string) => Promise<void>;
   onClose: () => void;
 }) {
+  const editorAccess = useWorkspaceAccess();
   const [recordId] = useState(() => record?.id || crypto.randomUUID());
   const [item, setItem] = useState<StaffData>(() =>
     normalizeStaffData(record?.payload || initialValue || emptyStaff()),
@@ -1887,6 +1889,7 @@ function StaffEditor({
   const update = <K extends keyof StaffData>(key: K, value: StaffData[K]) =>
     setItem((current) => ({ ...current, [key]: value }));
   const save = async () => {
+    if (!editorAccess.editor) { setError("Режим редактора завершён. Введённые поля сохранены в открытом окне, но запись в общую базу запрещена."); return; }
     if (!item.fullName.trim()) {
       setError("Заполните ФИО.");
       setTab("general");
@@ -2340,7 +2343,7 @@ function StaffEditor({
         >
           Отмена
         </button>
-        <button className="primary" type="button" onClick={() => void save()}>
+        <button className="primary" type="button" disabled={!editorAccess.editor} onClick={() => void save()}>
           Сохранить карточку
         </button>
       </footer>

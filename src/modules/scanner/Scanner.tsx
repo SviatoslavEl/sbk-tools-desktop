@@ -118,12 +118,17 @@ function InfoHint({ label, children }: { label: string; children: string }) {
   return <button className="scanner-info" type="button" aria-label={`${label}. ${children}`} onPointerDown={(event) => event.stopPropagation()} onClick={suppressLabelActivation}>i<span className="scanner-info-text" role="tooltip">{children}</span></button>;
 }
 
-export function Scanner() {
+export function wheelPreviewZoom(current: number, delta: number, mode = 0) {
+  const pixels = delta * (mode === 1 ? 16 : mode === 2 ? 400 : 1);
+  return Math.max(.5, Math.min(3, Number((current * Math.exp(-Math.max(-120, Math.min(120, pixels)) * .002)).toFixed(3))));
+}
+
+export function Scanner({ active = true }: { active?: boolean }) {
   const [fileDragActive, setFileDragActive] = useState(false);
   const [pendingDroppedPaths, setPendingDroppedPaths] = useState<string[]>([]);
   const dropHandler = useRef<(paths: string[]) => void>(() => undefined);
   useEffect(() => {
-    if (!("__TAURI_INTERNALS__" in window)) return;
+    if (!active || !("__TAURI_INTERNALS__" in window)) return;
     let stopped = false;
     let unlisten: (() => void) | undefined;
     void getCurrentWebview().onDragDropEvent(({ payload }) => {
@@ -132,7 +137,7 @@ export function Scanner() {
       if (payload.type === "drop") dropHandler.current(payload.paths);
     }).then((stop) => { if (stopped) stop(); else unlisten = stop; }).catch((reason) => { if (!stopped) setError(`Перетаскивание файлов недоступно: ${String(reason)}. Используйте кнопку выбора файла.`); });
     return () => { stopped = true; unlisten?.(); };
-  }, []);
+  }, [active]);
   const workspaceAccess = useWorkspaceAccess();
   const templates = useRecords<ScannerRecord>("scanner");
   const [inputPath, setInputPath] = useState("");
@@ -189,6 +194,7 @@ export function Scanner() {
   const [selectedOverlay, setSelectedOverlay] = useState<OverlaySelection>(null);
   const [drawingTool, setDrawingTool] = useState<DrawingTool | null>(null);
   const pageElement = useRef<HTMLDivElement | null>(null);
+  const stageElement = useRef<HTMLDivElement | null>(null);
   const dragState = useRef<DragState | null>(null);
   const latestPreviewJob = useRef("");
   const latestMergePreviewJob = useRef("");
@@ -196,6 +202,30 @@ export function Scanner() {
   const previewCache = useRef(new BoundedPreviewCache<PreviewResult>(16));
   const lastFacsimileWidth = useRef(0.22);
   const lastFacsimileWidthMm = useRef<number | null>(null);
+  useEffect(() => {
+    if (!active) { setFullscreen(false); setFileDragActive(false); dragState.current = null; }
+  }, [active]);
+  useEffect(() => {
+    const stage = stageElement.current;
+    if (!stage || !active) return;
+    const wheel = (event: WheelEvent) => {
+      if (event.shiftKey || !event.deltaY) return;
+      event.preventDefault();
+      const page = pageElement.current;
+      const before = page?.getBoundingClientRect();
+      const x = before ? (event.clientX - before.left) / before.width : .5;
+      const y = before ? (event.clientY - before.top) / before.height : .5;
+      setPreviewZoom((value) => wheelPreviewZoom(value, event.deltaY, event.deltaMode));
+      requestAnimationFrame(() => {
+        if (!page || !before) return;
+        const after = page.getBoundingClientRect();
+        stage.scrollLeft += after.left + x * after.width - event.clientX;
+        stage.scrollTop += after.top + y * after.height - event.clientY;
+      });
+    };
+    stage.addEventListener("wheel", wheel, { passive: false });
+    return () => stage.removeEventListener("wheel", wheel);
+  }, [active, inputPath, workspaceMode]);
   const journal = templates.records.filter((record) => record.payload.kind === "processing-journal").slice(0, 10);
 
   useEffect(() => {
@@ -943,7 +973,7 @@ export function Scanner() {
       </>}
       {!inputPath ? <div className="drop-empty" onClick={() => void chooseDocument()}><span>▧</span><h2>Выберите документ</h2><p>PDF или DOCX до 1 ГБ и до 5000 страниц. Исходный файл не изменяется.</p><button className="primary" type="button">Выбрать файл</button></div> : <div className={`preview-workspace ${pageCount > 1 ? "" : "single-page"}`}>
         {pageCount > 1 && <aside className="page-strip" aria-label="Страницы">{pageWindow.omittedBefore > 0 && <span className="page-gap">+{pageWindow.omittedBefore}</span>}{pageWindow.pages.map((sourceIndex) => <button key={sourceIndex} className={pageIndex === sourceIndex ? "active" : ""} type="button" onClick={() => { setPageIndex(sourceIndex); void makePreview(inputPath, preset, sourceIndex); }}><span>{sourceIndex + 1}</span></button>)}{pageWindow.omittedAfter > 0 && <span className="page-gap">+{pageWindow.omittedAfter}</span>}</aside>}
-        <div className="document-stage">
+        <div ref={stageElement} className="document-stage" title="Колёсико — масштаб, Shift + колёсико — прокрутка">
           <div ref={pageElement} className={`document-page real-preview ${drawingTool ? "drawing-tool-active" : ""}`} role="group" tabIndex={0} aria-label={drawingTool ? `Полотно документа: применить инструмент «${{ redaction: "Скрытие", marker: "Маркер", stroke: "Штрих", blur: "Размытие", print_blur: "Размытие для печати" }[drawingTool]}» клавишей Enter или протянуть мышью` : "Полотно документа"} style={{ aspectRatio: String(previewAspect), width: `${72 * previewZoom}%`, maxWidth: `${720 * previewZoom}px` }} onKeyDown={drawFromKeyboard} onPointerDown={startDrawingOnPage} onPointerMove={moveInteractive} onPointerUp={stopInteractive} onPointerCancel={stopInteractive} onLostPointerCapture={stopInteractive}>
             {previewUrl && <img className="page-image" draggable={false} src={showOriginal && originalUrl ? originalUrl : previewUrl} alt={`${showOriginal ? "Оригинал" : "Обработка"} страницы ${pageIndex + 1}`} onLoad={(event) => setPreviewAspect(event.currentTarget.naturalWidth / Math.max(1, event.currentTarget.naturalHeight))} />}
             {previewing && <div className="preview-loader" role="status" aria-live="polite"><span className="loading-spinner" aria-hidden="true" /><strong>Загружаем документ</strong><small>Подготавливаем страницу и рассчитываем весь файл…</small></div>}
