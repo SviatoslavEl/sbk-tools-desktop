@@ -201,8 +201,8 @@ export function Calculator() {
         <button className="secondary" type="button" onClick={newCalculation}>Новый</button>
         <button className="secondary" type="button" onClick={() => void importCalculation()}>Импорт</button>
         <button className="secondary" disabled={!calculationValid} type="button" onClick={() => void exportCalculation()}>Экспорт</button>
-        {recordId && <button data-workspace-mutation className="secondary danger" disabled={!workspaceAccess.editor} type="button" onClick={() => { if (workspaceAccess.editor && window.confirm("Переместить расчёт в архив?")) void saved.archive(recordId).then(newCalculation); }}>В архив</button>}
-        <button data-workspace-mutation className="primary" disabled={!calculationValid || !workspaceAccess.editor} type="button" onClick={() => void saveCalculation(false)}>Сохранить расчёт</button>
+        {recordId && <button data-workspace-mutation data-workspace-managed-disabled="true" className="secondary danger" disabled={!workspaceAccess.editor} type="button" onClick={() => { if (workspaceAccess.editor && window.confirm("Переместить расчёт в архив?")) void saved.archive(recordId).then(newCalculation); }}>В архив</button>}
+        <button data-workspace-mutation data-workspace-managed-disabled="true" className="primary" disabled={!calculationValid || !workspaceAccess.editor} type="button" onClick={() => void saveCalculation(false)}>Сохранить расчёт</button>
       </div>
     </div>
 
@@ -313,7 +313,7 @@ export function Calculator() {
             {calculationValid && result.status === "danger" && <div className="notice warning"><strong>Проверьте цену.</strong><span>Расчёт убыточный или находится ниже установленного порога.</span></div>}
             {recommendation && !recommendation.valid && <div className="notice error"><strong>Рекомендация недоступна.</strong><span>{recommendation.issue?.message}</span></div>}
             {recommendation?.valid && <div className="recommendation-card"><span>Рекомендованная цена с НДС</span><strong>{money(recommendation.priceGross)}</strong><small>База: {recommendation.basisLabel}. Ближайшее сравнимое предложение: {money(recommendation.lowestCompetitor)}. {recommendation.limitedByMargin ? `Ниже опускаться рискованно: защита маржи ${percent(data.minMargin)}.` : `Шаг ниже конкурента; расчётная маржа ${percent(recommendation.margin)}.`}</small><button className="secondary" type="button" onClick={() => setData((current) => ({ ...current, mode: "price-to-margin", proposedPrice: recommendation.priceGross, priceAmountType: "with-vat" }))}>Применить рекомендацию</button></div>}
-            <div className="button-row" data-workspace-mutation><button className="primary grow" disabled={!calculationValid || !workspaceAccess.editor} type="button" onClick={() => void saveCalculation(false)}>Сохранить</button><button className="secondary" disabled={!calculationValid || !workspaceAccess.editor} type="button" onClick={() => void saveCalculation(true)}>Дублировать</button></div>
+            <div className="button-row" data-workspace-mutation data-workspace-managed-disabled="true"><button className="primary grow" disabled={!calculationValid || !workspaceAccess.editor} type="button" onClick={() => void saveCalculation(false)}>Сохранить</button><button className="secondary" disabled={!calculationValid || !workspaceAccess.editor} type="button" onClick={() => void saveCalculation(true)}>Дублировать</button></div>
           </div>
         </div>
         <CalculatorCharts data={data} result={result} scenarios={scenarios} active={activeChart} onActive={setActiveChart} />

@@ -3,7 +3,7 @@ name: Release desktop builds
 on:
   workflow_dispatch:
   push:
-    branches: [codex/v2.8.0-demo-fixes]
+    branches: [codex/v2.8.6-scanner-shared-lock-fixes]
     tags: ["v*"]
 
 permissions:
@@ -483,7 +483,7 @@ jobs:
     runs-on: windows-latest
     env:
       TARGET: x86_64-pc-windows-msvc
-      ARTIFACT_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '2.8.6' }}
+      ARTIFACT_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('2.8.6-test.{0}', github.run_number) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6

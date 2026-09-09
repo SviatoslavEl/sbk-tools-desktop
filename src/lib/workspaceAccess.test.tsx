@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
 import { WorkspaceAccessProvider, ReadOnlyWorkspaceBoundary, workspaceControlIsBlocked, applyWorkspaceControlAccess } from "./workspaceAccess";
+import { Calculator } from "../modules/calculator/Calculator";
 
 function controlStub({ title, disabled = false }: { title?: string; disabled?: boolean } = {}) {
   const attributes = new Map<string, string>();
@@ -101,5 +102,53 @@ describe("workspace control tooltip lifecycle", () => {
     applyWorkspaceControlAccess(control, true, "Следующий редактор");
     applyWorkspaceControlAccess(control, false, "");
     expect(control.getAttribute("title")).toBe("Обновлённая подсказка");
+  });
+});
+
+describe("component-managed disabled state", () => {
+  it("does not restore a stale viewer disabled flag after React enables a valid calculator", () => {
+    const renderSaveButton = (editor: boolean) => {
+      const html = renderToStaticMarkup(<WorkspaceAccessProvider editor={editor} message={editor ? "Редактор" : "Только просмотр"}><Calculator /></WorkspaceAccessProvider>);
+      const match = html.match(/<button\b([^>]*)>Сохранить расчёт<\/button>/);
+      if (!match) throw new Error("Calculator must render its save button");
+      return match[1];
+    };
+    const viewerAttributes = renderSaveButton(false);
+    const editorAttributes = renderSaveButton(true);
+    expect(viewerAttributes).toContain('data-workspace-managed-disabled="true"');
+    expect(viewerAttributes).toContain('disabled=""');
+    expect(editorAttributes).not.toContain('disabled=""');
+
+    const control = controlStub({ disabled: viewerAttributes.includes('disabled=""') });
+    applyWorkspaceControlAccess(control, true, "Только просмотр", "component");
+    expect(control.disabled).toBe(true);
+    // React applies the new prop before the boundary's effect runs.
+    control.disabled = editorAttributes.includes('disabled=""');
+    applyWorkspaceControlAccess(control, false, "Редактор", "component");
+    expect(control.disabled).toBe(false);
+    expect(control.getAttribute("title")).toBeNull();
+  });
+
+  it("preserves component validation errors when the user becomes editor", () => {
+    const control = controlStub({ disabled: true, title: "Исправьте неверное число" });
+    applyWorkspaceControlAccess(control, true, "Только просмотр", "component");
+    control.disabled = true; // React: the calculation is still invalid.
+    applyWorkspaceControlAccess(control, false, "Редактор", "component");
+    expect(control.disabled).toBe(true);
+    expect(control.getAttribute("title")).toBe("Исправьте неверное число");
+  });
+
+  it("keeps component-owned controls blocked on a later editor-to-viewer transition", () => {
+    const control = controlStub({ title: "Сохранить карточку" });
+    applyWorkspaceControlAccess(control, false, "Редактор", "component");
+    control.disabled = true; // React: workspaceAccess.editor became false.
+    applyWorkspaceControlAccess(control, true, "Только просмотр: другой редактор", "component");
+    expect(control.disabled).toBe(true);
+    expect(control.getAttribute("aria-disabled")).toBe("true");
+    expect(control.getAttribute("title")).toBe("Только просмотр: другой редактор");
+    control.disabled = false;
+    applyWorkspaceControlAccess(control, false, "Редактор", "component");
+    expect(control.disabled).toBe(false);
+    expect(control.getAttribute("title")).toBe("Сохранить карточку");
   });
 });

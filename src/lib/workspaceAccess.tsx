@@ -55,6 +55,7 @@ export function applyWorkspaceControlAccess(
   control: WorkspaceControl,
   blocked: boolean,
   message: string,
+  disabledOwner: "boundary" | "component" = "boundary",
 ): void {
   if (blocked) {
     if (control.dataset.workspaceDisabled !== "true") {
@@ -64,12 +65,17 @@ export function applyWorkspaceControlAccess(
       if (originalTitle !== null) control.dataset.workspaceOriginalTitle = originalTitle;
       control.dataset.workspaceDisabled = "true";
     }
-    control.disabled = true;
+    // Controls opting into component ownership include workspace access in
+    // their own React disabled prop. Do not overwrite that prop's live value
+    // or restore an obsolete viewer/validation snapshot when access changes.
+    if (disabledOwner === "boundary") control.disabled = true;
     control.setAttribute("aria-disabled", "true");
     // The current editor can change while the control stays blocked.
     control.setAttribute("title", message || "Общая база открыта только для просмотра");
   } else if (control.dataset.workspaceDisabled === "true") {
-    control.disabled = control.dataset.workspaceWasDisabled === "true";
+    if (disabledOwner === "boundary") {
+      control.disabled = control.dataset.workspaceWasDisabled === "true";
+    }
     control.removeAttribute("aria-disabled");
     if (control.dataset.workspaceHadTitle === "true") {
       control.setAttribute("title", control.dataset.workspaceOriginalTitle || "");
@@ -123,7 +129,10 @@ export function ReadOnlyWorkspaceBoundary({
             disableFormControls && formControl,
             viewerAllowed,
           );
-          applyWorkspaceControlAccess(control, blocked, access.message);
+          const disabledOwner = control.closest('[data-workspace-managed-disabled="true"]')
+            ? "component"
+            : "boundary";
+          applyWorkspaceControlAccess(control, blocked, access.message, disabledOwner);
         });
     update();
     const observer = new MutationObserver(update);
