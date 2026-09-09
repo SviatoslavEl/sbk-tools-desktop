@@ -313,7 +313,7 @@ export function Settings({
           <div className="settings-row editor-presence" aria-live="polite">
             <span>Текущий редактор</span>
             <strong>
-              {editor.text}
+              {editor.unknown ? "Статус не подтверждён" : editor.text}
               {editor.device && <small>Компьютер: {editor.device}</small>}
               {workspace.editorOwner?.startedAt && <small>с {new Date(workspace.editorOwner.startedAt).toLocaleString("ru-RU")}</small>}
             </strong>

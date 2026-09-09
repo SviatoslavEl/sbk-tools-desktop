@@ -269,6 +269,41 @@ def test_page_tool_intensity_controls_visible_strength(kind: str) -> None:
     assert change_score(apply_annotations(source, [high], 0)) > change_score(apply_annotations(source, [low], 0))
 
 
+@pytest.mark.parametrize("height", [15, 55, 120])
+@pytest.mark.parametrize("opacity", [1.0, .7])
+def test_stroke_fills_the_selected_height_with_opacity_only(height: int, opacity: float) -> None:
+    source = Image.new("RGB", (400, 300), "white")
+    left, top, width = 80, 90, 150
+    annotation = Annotation("stroke", [0], left / 400, top / 300, width / 400, height / 300, "#202020", opacity)
+    result = apply_annotations(source, [annotation], 0)
+    alpha = round(255 * opacity)
+    channel = (32 * alpha + 255 * (255 - alpha) + 127) // 255
+    center_x = left + width // 2
+    # The center column must cover every pixel of the chosen height, not an
+    # intensity-dependent band. At 100% the old page is fully covered here.
+    for y in range(top, top + height):
+        assert result.getpixel((center_x, y)) == (channel, channel, channel)
+    assert result.getpixel((center_x, top - 1)) == (255, 255, 255)
+    assert result.getpixel((center_x, top + height)) == (255, 255, 255)
+    assert ImageChops.difference(source, result).getbbox() == (left, top, left + width, top + height)
+    # Rounded ends leave the outer corners untouched without exceeding bounds.
+    assert result.getpixel((left, top)) == (255, 255, 255)
+    assert result.getpixel((left + width - 1, top + height - 1)) == (255, 255, 255)
+    assert source.getpixel((center_x, top + height // 2)) == (255, 255, 255)
+
+
+def test_stroke_opacity_does_not_change_its_shape_or_footprint() -> None:
+    source = Image.new("RGB", (400, 300), "white")
+    full = Annotation("stroke", [0], .2, .3, .375, 55 / 300, "#202020", 1.0)
+    translucent = Annotation("stroke", [0], .2, .3, .375, 55 / 300, "#202020", .7)
+    masks = [
+        ImageChops.difference(source, apply_annotations(source, [annotation], 0)).convert("L").point(lambda pixel: 255 if pixel else 0)
+        for annotation in (full, translucent)
+    ]
+    assert masks[0].tobytes() == masks[1].tobytes()
+    assert apply_annotations(source, [full], 1).tobytes() == source.tobytes()
+
+
 @pytest.mark.parametrize("kind", ["blur", "print_blur"])
 def test_elliptical_blur_changes_only_pixels_inside_ellipse(kind: str) -> None:
     source = Image.effect_noise((240, 240), 90).convert("RGB")

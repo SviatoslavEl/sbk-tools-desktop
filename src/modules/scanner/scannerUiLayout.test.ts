@@ -4,6 +4,16 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 
 describe("предпросмотр сканера", () => {
+  it("резервирует строку эффектов до первого рисунка и сворачивает список до начала жеста", () => {
+    const component = readFileSync(new URL("./Scanner.tsx", import.meta.url), "utf8");
+    const effectsLine = component.split("\n").find((line: string) => line.includes('className="applied-effects-panel"'));
+    expect(effectsLine).toContain("inputPath && <fieldset");
+    expect(effectsLine).not.toContain("annotations.length > 0 &&");
+    expect(effectsLine).toContain("!annotations.length) event.preventDefault(); else setDrawingTool(null)");
+    const toolsLine = component.split("\n").find((line: string) => line.includes('className="scanner-document-tools"'));
+    expect(toolsLine).toContain("effectsPanel.current.open = false; setDrawingTool");
+  });
+
   it("разворачивает одностраничный документ без пустой колонки миниатюр", () => {
     const component = readFileSync(new URL("./Scanner.tsx", import.meta.url), "utf8");
     const styles = readFileSync(new URL("../../App.css", import.meta.url), "utf8");
@@ -65,11 +75,14 @@ describe("предпросмотр сканера", () => {
     const worker = readFileSync(new URL("../../../scanner-worker/src/scandocument/annotations.py", import.meta.url), "utf8");
     expect(component).toContain("opacity: entry.intensity");
     expect(component).not.toContain("entry.intensity * .65");
-    expect(component).toContain('"--stroke-thickness"');
-    expect(scannerStyles).toContain("height: var(--stroke-thickness, 35%)");
+    expect(component).not.toContain('"--stroke-thickness"');
+    expect(scannerStyles).toContain(".annotation-overlay.stroke::before { content: \"\"; position: absolute; inset: 0; background: currentColor; border-radius: 999px;");
+    expect(scannerStyles).not.toContain("var(--stroke-thickness");
     expect(scannerStyles).not.toContain("border-top: 3px solid");
     expect(worker).toContain("round(255 * annotation.intensity)");
     expect(worker).not.toContain("min(0.7, annotation.intensity * 0.65)");
+    expect(worker).not.toContain("annotation.intensity * 0.35");
+    expect(worker).toContain("radius=min(right - left, bottom - top) / 2");
   });
 
   it("показывает объединение файлов и приветственный экран до инициализации", () => {

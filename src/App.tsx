@@ -607,7 +607,7 @@ function App() {
             </div>
             {!workspace.editor && (
               <span className="status neutral" title={workspace.accessMessage}>
-                {editorStatus(workspace).occupied || editorStatus(workspace).unknown ? `Редактор: ${editorStatus(workspace).text}` : "Только просмотр и экспорт"}
+                {editorStatus(workspace).unknown ? "Редактор: статус не подтверждён" : editorStatus(workspace).occupied ? `Редактор: ${editorStatus(workspace).text}` : "Только просмотр и экспорт"}
               </span>
             )}
             <button
