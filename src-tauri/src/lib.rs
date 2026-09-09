@@ -247,6 +247,8 @@ struct WorkspaceInfo {
     access_controlled: bool,
     access_message: String,
     editor_owner: Option<EditorOwner>,
+    editor_busy: bool,
+    editor_state_message: Option<String>,
     owner_configured: bool,
     administration_notice: Option<String>,
     schema_version: i64,
@@ -547,7 +549,8 @@ fn workspace_info(state: State<'_, AppState>) -> Result<WorkspaceInfo, String> {
         let _ = workspace.require_editor();
     }
     let editor = workspace.is_editor();
-    let access_message = workspace.access_message();
+    let editor_state = workspace.editor_state();
+    let access_message = workspace.access_message_for(&editor_state);
     Ok(WorkspaceInfo {
         root: workspace.root.to_string_lossy().into_owned(),
         portable: workspace.portable,
@@ -557,7 +560,9 @@ fn workspace_info(state: State<'_, AppState>) -> Result<WorkspaceInfo, String> {
         editor,
         access_controlled: workspace.access_controlled(),
         access_message,
-        editor_owner: workspace.editor_owner(),
+        editor_owner: editor_state.presence.map(|presence| presence.owner),
+        editor_busy: editor_state.busy,
+        editor_state_message: editor_state.message,
         owner_configured: administration::configured(&workspace.root).unwrap_or(true),
         administration_notice: workspace.admin_notice(),
         schema_version: SCHEMA_VERSION,
@@ -602,6 +607,8 @@ fn set_workspace_access_password(
 #[serde(rename_all = "camelCase")]
 struct OwnerInfo {
     editor: Option<workspace::EditorPresence>,
+    editor_busy: bool,
+    editor_state_message: Option<String>,
     events: Vec<administration::AdminEvent>,
 }
 
@@ -632,10 +639,20 @@ fn setup_workspace_owner(
 
 #[tauri::command]
 fn workspace_owner_info(state: State<'_, AppState>, password: String) -> Result<OwnerInfo, String> {
+    let _maintenance = state
+        .maintenance
+        .lock()
+        .map_err(|_| "Хранилище недоступно".to_string())?;
     let workspace = state.active_workspace()?;
     administration::authenticate(&workspace.root, &Zeroizing::new(password))?;
+    if workspace.is_editor() {
+        let _ = workspace.require_editor();
+    }
+    let editor_state = workspace.editor_state();
     Ok(OwnerInfo {
-        editor: workspace.editor_presence(),
+        editor: editor_state.presence,
+        editor_busy: editor_state.busy,
+        editor_state_message: editor_state.message,
         events: administration::events(&workspace.root)?,
     })
 }
@@ -662,9 +679,14 @@ fn request_editor_release(
             &Zeroizing::new(password.unwrap_or_default()),
         )?;
     }
-    let target = workspace
-        .editor_presence()
-        .ok_or("Редактор уже освободил базу")?;
+    let editor_state = workspace.editor_state();
+    let target = editor_state.presence.ok_or_else(|| {
+        if editor_state.busy {
+            "Сессия занята, но её владелец не определён. Нельзя отправить запрос без точного адресата.".to_string()
+        } else {
+            "Редактор уже освободил базу".to_string()
+        }
+    })?;
     // Ordinary requests do not need an exposed session token; revocations must
     // refer to exactly the editor whose identity the owner confirmed in the UI.
     if revoke && target.token != target_token {
@@ -4404,8 +4426,19 @@ pub fn run() {
             scanner_cancel,
             delete_runtime_file,
         ])
-        .run(tauri::generate_context!())
-        .expect("SBK Tools could not start");
+        .build(tauri::generate_context!())
+        .expect("SBK Tools could not start")
+        .run(|app, event| {
+            if matches!(event, tauri::RunEvent::Exit)
+                && let Some(state) = app.try_state::<AppState>()
+                && let Ok(_maintenance) = state.maintenance.lock()
+                && let Ok(workspace) = state.active_workspace()
+            {
+                // Finish in-flight writes before releasing only this process's
+                // claim. Tauri exits the process directly, bypassing Drop.
+                let _ = workspace.release_editor_on_exit();
+            }
+        });
 }
 
 #[cfg(test)]

@@ -25,6 +25,8 @@ export interface WorkspaceInfo {
   warning?: string;
   writable: boolean;
   editor: boolean;
+  editorBusy: boolean;
+  editorStateMessage?: string | null;
   accessControlled: boolean;
   accessMessage: string;
   ownerConfigured?: boolean;
@@ -143,6 +145,8 @@ export async function getWorkspaceInfo(): Promise<WorkspaceInfo> {
     configured: true,
     writable: true,
     editor: true,
+    editorBusy: true,
+    editorStateMessage: null,
     accessControlled: false,
     accessMessage: "Режим предпросмотра",
     editorOwner: { displayName: "Локальный предпросмотр", userName: "", deviceName: "", startedAt: "" },

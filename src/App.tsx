@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import "./App.css";
 import { Dialog } from "./components/Dialog";
 import { AdministrationNotice } from "./components/AdministrationNotice";
+import { editorStatus, unavailableWorkspaceInfo } from "./lib/editorStatus";
 import { Archive } from "./modules/archive/Archive";
 import { Calculator } from "./modules/calculator/Calculator";
 import { ContractsRegistry } from "./modules/contracts/Contracts";
@@ -203,10 +204,9 @@ function App() {
         const next = await getWorkspaceInfo();
         if (!stopped) {
           setWorkspace(next);
-          window.dispatchEvent(new CustomEvent("sbk-workspace-access-status", { detail: next }));
         }
       } catch {
-        if (!stopped) setWorkspace((current) => current ? { ...current, editor: false, accessMessage: "Не удалось проверить доступ к общей папке. До восстановления связи доступен только просмотр." } : current);
+        if (!stopped) setWorkspace((current) => current ? unavailableWorkspaceInfo(current) : current);
       } finally {
         running = false;
       }
@@ -219,6 +219,9 @@ function App() {
       window.removeEventListener("focus", refreshAccess);
     };
   }, [workspace?.root]);
+  useEffect(() => {
+    if (workspace) window.dispatchEvent(new CustomEvent("sbk-workspace-access-status", { detail: workspace }));
+  }, [workspace]);
   useEffect(() => {
     const update = (event: Event) =>
       setAccessTimers(
@@ -604,7 +607,7 @@ function App() {
             </div>
             {!workspace.editor && (
               <span className="status neutral" title={workspace.accessMessage}>
-                {workspace.editorOwner ? `Редактор: ${workspace.editorOwner.displayName}` : "Только просмотр и экспорт"}
+                {editorStatus(workspace).occupied || editorStatus(workspace).unknown ? `Редактор: ${editorStatus(workspace).text}` : "Только просмотр и экспорт"}
               </span>
             )}
             <button
@@ -636,7 +639,7 @@ function App() {
               {activeTool === "staff" && <StaffRegistry />}
               {activeTool === "archive" && <Archive />}
               {activeTool === "settings" && (
-                <Settings collapsed={collapsed} onCollapsed={updateCollapsed} />
+                <Settings collapsed={collapsed} onCollapsed={updateCollapsed} workspace={workspace} onWorkspaceChange={setWorkspace} />
               )}
               {activeTool === "about" && <About />}
             </ReadOnlyWorkspaceBoundary>

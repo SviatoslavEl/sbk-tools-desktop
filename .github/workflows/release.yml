@@ -74,7 +74,7 @@ jobs:
   build:
     needs: quality-gate
     env:
-      ARTIFACT_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('2.8.5-test.{0}', github.run_number) }}
+      ARTIFACT_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('2.8.6-test.{0}', github.run_number) }}
     strategy:
       fail-fast: false
       matrix:
@@ -483,7 +483,7 @@ jobs:
     runs-on: windows-latest
     env:
       TARGET: x86_64-pc-windows-msvc
-      ARTIFACT_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '2.8.5' }}
+      ARTIFACT_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '2.8.6' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
@@ -767,6 +767,13 @@ jobs:
             throw 'Installed databases did not settle after initialization'
           }
 
+          function Close-VisibleApplication([System.Diagnostics.Process]$Process) {
+            $Process.Refresh()
+            if ($Process.HasExited) { throw 'Application exited unexpectedly before the normal-close check' }
+            if (-not $Process.CloseMainWindow()) { throw 'Could not request normal application close' }
+            if (-not $Process.WaitForExit(15000)) { throw 'Application did not release its session and exit normally' }
+          }
+
           $tempBefore = @(Get-ChildItem $env:TEMP -Directory -Filter $portableTempPattern -ErrorAction SilentlyContinue | ForEach-Object FullName)
           $env:SBK_TOOLS_WORKSPACE = '\\192.0.2.1\unavailable\ProductData'
           $slowNetwork = Start-VisibleApplication $application 'Installed launch with unavailable network workspace' 15
@@ -779,8 +786,8 @@ jobs:
           Wait-DatabaseSettle $workspace
           if (-not (Test-Path $presence)) { throw 'First installed launch did not acquire the editor lock' }
           $firstOwner = Get-Content -Raw $presence
-          Stop-Process -Id $first.Id -Force
-          Wait-Process -Id $first.Id -Timeout 15 -ErrorAction SilentlyContinue
+          Close-VisibleApplication $first
+          if (Test-Path $presence) { throw 'Normal close did not release its editor claim' }
           $baseline = @{}
           Get-ChildItem $workspace -Recurse -Filter '*.sqlite3' -File | ForEach-Object {
             $baseline[$_.FullName] = (Get-FileHash -Algorithm SHA256 $_.FullName).Hash
@@ -804,9 +811,26 @@ jobs:
           if ((Get-Content -Raw $presence) -ne $ownerBefore) {
             throw 'Concurrent installed viewer replaced the editor lock'
           }
-          Stop-Process -Id $concurrent.Id -Force -ErrorAction SilentlyContinue
-          Stop-Process -Id $second.Id -Force -ErrorAction SilentlyContinue
-          Start-Sleep -Seconds 2
+          Close-VisibleApplication $concurrent
+          if ((Get-Content -Raw $presence) -ne $ownerBefore) { throw 'Closing a viewer removed the editor claim' }
+          Stop-Process -Id $second.Id -Force
+          if (-not $second.WaitForExit(15000)) { throw 'Forced-termination test process is still running' }
+          $afterCrash = Start-VisibleApplication $application 'Fail-closed launch after forced termination'
+          Wait-DatabaseSettle $workspace
+          if ((Get-Content -Raw $presence) -ne $ownerBefore) { throw 'A new instance stole the reserved claim after a crash' }
+          foreach ($path in $baseline.Keys) {
+            if ((Get-FileHash -Algorithm SHA256 $path).Hash -ne $baseline[$path]) { throw "Viewer changed database after a crash: $path" }
+          }
+          Close-VisibleApplication $afterCrash
+          # Recovery is explicit and only in this isolated CI workspace, after all its processes exited.
+          if ((Get-Content -Raw $presence) -ne $ownerBefore) { throw 'Unexpected claim before isolated-test recovery' }
+          $recoveredClaim = Join-Path $workspace ('.workspace-editor.recovered-' + [guid]::NewGuid().ToString() + '.json')
+          Move-Item -LiteralPath $presence -Destination $recoveredClaim
+          $recovered = Start-VisibleApplication $application 'Launch after explicit isolated-test recovery'
+          Wait-DatabaseSettle $workspace
+          if (-not (Test-Path $presence) -or (Get-Content -Raw $presence) -eq $ownerBefore) { throw 'Recovered isolated workspace did not acquire a new claim' }
+          Close-VisibleApplication $recovered
+          if (Test-Path $presence) { throw 'Recovered editor did not release its claim on close' }
           Remove-Item Env:SBK_TOOLS_WORKSPACE
 
           $tempAfter = @(Get-ChildItem $env:TEMP -Directory -Filter $portableTempPattern -ErrorAction SilentlyContinue | ForEach-Object FullName)
