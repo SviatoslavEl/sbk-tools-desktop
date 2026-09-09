@@ -172,3 +172,9 @@
 }
 .facsimile-size-presets { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
 .facsimile-size-presets > span { flex-basis: 100%; font-weight: 600; }
+.scanner-result-action-error { display: flex; align-items: flex-start; gap: 12px; padding: 12px 14px; border-top: 1px solid #e8d0a1; color: #79530d; background: #fff8e8; font-size: 12px; }
+.scanner-result-action-error > div { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.scanner-result-action-error p { margin: 6px 0; }
+.scanner-result-action-error .scanner-result-path { display: block; user-select: text; overflow-wrap: anywhere; }
+.scanner-result-action-error > button { flex: none; }
+@media (max-width: 760px) { .scanner-result-action-error { flex-direction: column; } }

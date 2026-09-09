@@ -25,6 +25,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use std::{collections::HashMap, io::BufRead, io::BufReader};
 use tauri::{AppHandle, Emitter, Manager, State};
+use tauri_plugin_opener::OpenerExt;
 use uuid::Uuid;
 use walkdir::WalkDir;
 use zeroize::Zeroizing;
@@ -34,6 +35,7 @@ mod administration;
 mod attachments;
 mod database;
 mod intelligence;
+mod scanner_outputs;
 mod workspace;
 use attachments::AttachmentAudit;
 use database::{MODULES, SCHEMA_VERSION, open_database, open_database_read_only, validated_module};
@@ -79,6 +81,7 @@ struct AppState {
     #[cfg(not(feature = "installed-fast-start"))]
     workspace: Arc<Workspace>,
     scanner_jobs: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+    scanner_outputs: Arc<scanner_outputs::ScannerOutputs>,
     maintenance: Arc<Mutex<()>>,
 }
 
@@ -4276,11 +4279,54 @@ async fn scanner_run(
 ) -> Result<Value, String> {
     let workspace = state.active_workspace()?;
     let jobs = state.scanner_jobs.clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    let requested_output = if operation == "process" || operation == "merge" {
+        config
+            .get("outputPath")
+            .and_then(Value::as_str)
+            .map(PathBuf::from)
+    } else {
+        None
+    };
+    let result = tauri::async_runtime::spawn_blocking(move || {
         run_scanner_worker(app, workspace, jobs, job_id, operation, config)
     })
     .await
-    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())??;
+    if let Some(requested) = requested_output {
+        let produced = result
+            .get("outputPath")
+            .and_then(Value::as_str)
+            .ok_or("Не удалось подтвердить путь созданного PDF.")?;
+        state
+            .scanner_outputs
+            .register(&requested, Path::new(produced))?;
+    }
+    Ok(result)
+}
+
+#[tauri::command]
+async fn open_scanner_output(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    path: String,
+    reveal: Option<bool>,
+) -> Result<(), String> {
+    let outputs = state.scanner_outputs.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let reveal = reveal.unwrap_or(false);
+        let authorized = outputs.resolve(Path::new(&path), reveal)?;
+        if reveal {
+            app.opener().reveal_item_in_dir(&authorized)
+        } else {
+            app.opener()
+                .open_path(scanner_outputs::shell_path(&authorized)?, None::<&str>)
+        }
+        .map_err(|error| {
+            format!("Результат сохранён, но системное приложение не смогло его открыть: {error}")
+        })
+    })
+    .await
+    .map_err(|error| format!("Не удалось завершить открытие сохранённого результата: {error}"))?
 }
 
 #[tauri::command]
@@ -4363,6 +4409,7 @@ pub fn run() {
         .manage(AppState {
             workspace,
             scanner_jobs: Arc::new(Mutex::new(HashMap::new())),
+            scanner_outputs: Arc::new(scanner_outputs::ScannerOutputs::default()),
             maintenance: Arc::new(Mutex::new(())),
         })
         .invoke_handler(tauri::generate_handler![
@@ -4423,6 +4470,7 @@ pub fn run() {
             verify_backup,
             restore_backup,
             scanner_run,
+            open_scanner_output,
             scanner_cancel,
             delete_runtime_file,
         ])

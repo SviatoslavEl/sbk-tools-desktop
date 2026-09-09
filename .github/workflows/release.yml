@@ -3,7 +3,6 @@ name: Release desktop builds
 on:
   workflow_dispatch:
   push:
-    branches: [codex/v2.8.6-scanner-shared-lock-fixes]
     tags: ["v*"]
 
 permissions:

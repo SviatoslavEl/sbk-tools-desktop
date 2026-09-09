@@ -4,7 +4,6 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { ConfirmDialog, Dialog } from "../../components/Dialog";
 import { droppedDocumentPaths } from "./fileDrop";
 import { facsimileWidthFromMm, imageDimensions, suggestedFacsimileWidthMm } from "./facsimileSize";
-import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { useEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent, type PointerEvent } from "react";
 import { useRecords } from "../../hooks/useRecords";
 import { chooseDirectory, chooseOpenPath, chooseOpenPaths, chooseSavePath } from "../../lib/files";
@@ -97,6 +96,13 @@ const drawingToolLabels: Record<AnnotationState["kind"], string> = {
   print_blur: "Размытие для печати",
 };
 
+const drawingIntensityLabels: Record<AnnotationState["kind"], string> = {
+  marker: "Непрозрачность",
+  stroke: "Непрозрачность",
+  blur: "Сила размытия",
+  print_blur: "Сила размытия",
+};
+
 function DrawingToolIcon({ kind }: { kind: AnnotationState["kind"] }) {
   if (kind === "marker") return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 15 15 5l4 4L9 19H5v-4Z" /><path d="M4 21h16" /></svg>;
   if (kind === "stroke") return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m4 18 16-12" /><path d="M5 20h14" /></svg>;
@@ -118,6 +124,25 @@ function ResizeHandles({ onStart }: { onStart: (handle: ResizeHandle, event: Poi
 
 function InfoHint({ label, children }: { label: string; children: string }) {
   return <button className="scanner-info" type="button" aria-label={`${label}. ${children}`} onPointerDown={(event) => event.stopPropagation()} onClick={suppressLabelActivation}>i<span className="scanner-info-text" role="tooltip">{children}</span></button>;
+}
+
+type ScannerResultAction = "pdf" | "folder" | "reveal";
+interface ScannerResultActionError { path: string; action: ScannerResultAction; message: string }
+
+export async function openScannerResult(path: string, action: ScannerResultAction): Promise<ScannerResultActionError | null> {
+  try {
+    await invoke<void>("open_scanner_output", { path, reveal: action === "reveal" });
+    return null;
+  } catch (reason) {
+    return { path, action, message: String(reason) };
+  }
+}
+
+export function ScannerResultActionNotice({ failure, onDismiss }: { failure: ScannerResultActionError; onDismiss: () => void }) {
+  return <div className="scanner-result-action-error" role="alert">
+    <div><strong>{failure.action === "pdf" ? "Не удалось открыть готовый PDF" : "Не удалось открыть папку с результатом"}</strong><p>Результат был сохранён. Повторно обрабатывать документ не нужно. Проверьте доступ к указанному пути или откройте его вручную.</p><span className="scanner-result-path">{failure.path}</span><details><summary>Подробности ошибки открытия</summary><p>{failure.message}</p></details></div>
+    <button className="secondary small" type="button" onClick={onDismiss}>Закрыть сообщение</button>
+  </div>;
 }
 
 export function Scanner({ active = true }: { active?: boolean }) {
@@ -179,6 +204,13 @@ export function Scanner({ active = true }: { active?: boolean }) {
   const [error, setError] = useState("");
   const [resultPath, setResultPath] = useState("");
   const [resultKind, setResultKind] = useState<ResultKind>("");
+  const [resultActionError, setResultActionError] = useState<ScannerResultActionError | null>(null);
+  const resultActionGeneration = useRef(0);
+  useEffect(() => {
+    resultActionGeneration.current += 1;
+    setResultActionError(null);
+    return () => { resultActionGeneration.current += 1; };
+  }, [resultPath, resultKind]);
   const [warnings, setWarnings] = useState<string[]>([]);
   const [estimatedOutputBytes, setEstimatedOutputBytes] = useState(0);
   const [originalBytes, setOriginalBytes] = useState(0);
@@ -695,23 +727,15 @@ export function Scanner({ active = true }: { active?: boolean }) {
 
   const cancel = async () => { if (activeJob) await invoke("scanner_cancel", { jobId: activeJob }); };
 
-  const openGeneratedPath = async (path: string, label: string) => {
-    try {
-      await openPath(path);
-      setError("");
-    } catch (reason) {
-      setError(`Не удалось открыть ${label}: ${String(reason)}`);
-    }
+  const runResultAction = async (path: string, action: ScannerResultAction) => {
+    const generation = ++resultActionGeneration.current;
+    setResultActionError(null);
+    const failure = await openScannerResult(path, action);
+    if (resultActionGeneration.current === generation) setResultActionError(failure);
   };
 
-  const revealGeneratedFile = async (path: string) => {
-    try {
-      await revealItemInDir(path);
-      setError("");
-    } catch (reason) {
-      setError(`Не удалось открыть папку: ${String(reason)}`);
-    }
-  };
+  const openGeneratedPath = (path: string, label: "PDF" | "папку") => runResultAction(path, label === "PDF" ? "pdf" : "folder");
+  const revealGeneratedFile = (path: string) => runResultAction(path, "reveal");
 
   const addDrawingOverlay = (origin: NormalizedRect) => {
     if (!documentReady || !drawingTool || showOriginal) return "";
@@ -922,11 +946,11 @@ export function Scanner({ active = true }: { active?: boolean }) {
             <p className="help-text">Ширина изображения на бумаге; для круглой печати — диаметр. Это ориентиры, не обязательный стандарт. Пропорции сохраняются. Белые поля внутри картинки входят в размер.</p>
             <label>Размер на всех выбранных страницах <input type="range" min="8" max="60" value={currentFacsimileGeometry.width * 100} onChange={(event) => updateSharedFacsimileAppearance({ width: normalizeFacsimile({ ...currentFacsimileGeometry, width: Number(event.target.value) / 100 }, previewAspect, facsimile.imageAspect).width })} /> {Math.round(currentFacsimileGeometry.width * 100)}%{pageSizeMm ? ` · ${(pageSizeMm[0] * currentFacsimileGeometry.width).toFixed(1)} мм` : ""}</label>
             <label>Поворот <input type="range" min="-180" max="180" value={currentFacsimileGeometry.rotation} onChange={(event) => updateCurrentFacsimileGeometry(normalizeFacsimile({ ...currentFacsimileGeometry, rotation: Number(event.target.value) }, previewAspect, facsimile.imageAspect))} /> {currentFacsimileGeometry.rotation}°</label>
-            <label>Прозрачность на всех выбранных страницах <input type="range" min="10" max="100" value={currentFacsimileGeometry.opacity * 100} onChange={(event) => updateSharedFacsimileAppearance({ opacity: Number(event.target.value) / 100 })} /> {Math.round(currentFacsimileGeometry.opacity * 100)}%</label>
+            <label>Непрозрачность на всех выбранных страницах <input type="range" min="10" max="100" value={currentFacsimileGeometry.opacity * 100} onChange={(event) => updateSharedFacsimileAppearance({ opacity: Number(event.target.value) / 100 })} /> {Math.round(currentFacsimileGeometry.opacity * 100)}%</label>
             <label className="checkbox-row"><input type="checkbox" checked={currentFacsimileGeometry.removeLightBackground} onChange={(event) => updateSharedFacsimileAppearance({ removeLightBackground: event.target.checked })} /> Удалить светлый фон на всех размещениях</label>
           </>}
           {!visibleOnCurrentPage && facsimileSelection.selection && <p className="help-text">Открытая страница не входит в выбранный диапазон факсимиле. Перейдите на одну из выбранных страниц для изменения её положения.</p>}
-          {facsimileSelection.selection && facsimile.applyTo !== "current" && <><p className="help-text">Положение и угол можно настроить отдельно; размер, прозрачность и удаление фона общие для выбранных страниц.</p><button className="secondary small" type="button" onClick={() => setFacsimile((current) => current && facsimileSelection.selection ? applyGeometryToPages(current, pageIndex, selectedFacsimilePages(facsimileSelection.selection, pageCount)) : current)}>Скопировать положение на выбранные страницы</button></>}
+          {facsimileSelection.selection && facsimile.applyTo !== "current" && <><p className="help-text">Положение и угол можно настроить отдельно; размер, непрозрачность и удаление фона общие для выбранных страниц.</p><button className="secondary small" type="button" onClick={() => setFacsimile((current) => current && facsimileSelection.selection ? applyGeometryToPages(current, pageIndex, selectedFacsimilePages(facsimileSelection.selection, pageCount)) : current)}>Скопировать положение на выбранные страницы</button></>}
           <label>Название пресета<input value={facsimilePresetName} placeholder={facsimile.fileName.replace(/\.(png|jpe?g)$/i, "")} onChange={(event) => setFacsimilePresetName(event.target.value)} /></label>
           <button className="secondary small" type="button" onClick={() => void saveFacsimileTemplate()}>Сохранить готовый пресет</button>
           <button className="primary small" type="button" disabled={!facsimileSelection.selection} onClick={() => void commitFacsimile(false)}>{editingFacsimileId ? "Сохранить изменения" : "Зафиксировать"}</button>
@@ -958,7 +982,7 @@ export function Scanner({ active = true }: { active?: boolean }) {
         {resultPath && resultKind === "single" ? <div className="ready-panel"><div><strong>✓ Объединённый PDF готов</strong><span>{resultPath}</span></div><button className="secondary" type="button" onClick={() => void openGeneratedPath(resultPath, "PDF")}>Открыть PDF</button><button className="secondary" type="button" onClick={() => void revealGeneratedFile(resultPath)}>Открыть папку</button><button className="primary" type="button" disabled={!!activeJob} onClick={() => void processMerge()}>Сохранить ещё одну копию</button></div> : <div className="actionbar"><span>К файлам применяются выбранный пресет, OCR и настройки сжатия.</span><button className="primary" type="button" disabled={mergePaths.length < 2 || !mergePageOrder.length || !!activeJob || mergeInspecting} onClick={() => void processMerge()}>Объединить {mergePageOrder.length} стр. из {mergePaths.length} файлов</button></div>}
       </> : <>
       <div className="scanner-document-tools" role="toolbar" aria-label="Инструменты документа"><span>Инструменты</span>{(["marker", "stroke", "blur", "print_blur"] as const).map((kind) => <button key={kind} className={drawingTool === kind ? "selected-tool" : ""} type="button" aria-label={drawingToolLabels[kind]} title={drawingToolLabels[kind]} aria-pressed={drawingTool === kind} disabled={!documentReady || showOriginal} onClick={() => { if (effectsPanel.current) effectsPanel.current.open = false; setDrawingTool((current) => current === kind ? null : kind); }}><DrawingToolIcon kind={kind} /></button>)}</div>
-      {inputPath && <fieldset disabled={!documentReady} style={{ border: 0, margin: 0, padding: 0, minWidth: 0 }}><details ref={effectsPanel} className="applied-effects-panel"><summary aria-disabled={!documentReady || !annotations.length} onClick={(event) => { if (!documentReady || !annotations.length) event.preventDefault(); else setDrawingTool(null); }}>Добавленные эффекты · {annotations.length}</summary><div>{annotations.map((entry) => <section className="geometry-control-card" key={entry.id}><div className="geometry-card-header"><button className="link-button" type="button" onClick={() => { setPageIndex(entry.page); setSelectedOverlay({ kind: "annotation", id: entry.id }); void makePreview(inputPath, preset, entry.page); }}><strong>Стр. {entry.page + 1} · {drawingToolLabels[entry.kind]}</strong></button><button className="icon-button danger" type="button" aria-label={`Удалить эффект ${drawingToolLabels[entry.kind]} со страницы ${entry.page + 1}`} onClick={() => { setAnnotations((items) => items.filter((item) => item.id !== entry.id)); setSelectedOverlay(null); }}>×</button></div><label className="geometry-intensity"><span>Прозрачность / сила</span><span><input aria-label={`Прозрачность эффекта на странице ${entry.page + 1}`} type="range" min="5" max="100" value={Math.round(entry.intensity * 100)} onChange={(event) => updateAnnotationIntensity(entry.id, event.target.valueAsNumber)} /><output>{Math.round(entry.intensity * 100)}%</output></span></label></section>)}</div></details></fieldset>}
+      {inputPath && <fieldset disabled={!documentReady} style={{ border: 0, margin: 0, padding: 0, minWidth: 0 }}><details ref={effectsPanel} className="applied-effects-panel"><summary aria-disabled={!documentReady || !annotations.length} onClick={(event) => { if (!documentReady || !annotations.length) event.preventDefault(); else setDrawingTool(null); }}>Добавленные эффекты · {annotations.length}</summary><div>{annotations.map((entry) => <section className="geometry-control-card" key={entry.id}><div className="geometry-card-header"><button className="link-button" type="button" onClick={() => { setPageIndex(entry.page); setSelectedOverlay({ kind: "annotation", id: entry.id }); void makePreview(inputPath, preset, entry.page); }}><strong>Стр. {entry.page + 1} · {drawingToolLabels[entry.kind]}</strong></button><button className="icon-button danger" type="button" aria-label={`Удалить эффект ${drawingToolLabels[entry.kind]} со страницы ${entry.page + 1}`} onClick={() => { setAnnotations((items) => items.filter((item) => item.id !== entry.id)); setSelectedOverlay(null); }}>×</button></div><label className="geometry-intensity"><span>{drawingIntensityLabels[entry.kind]}</span><span><input aria-label={`${drawingIntensityLabels[entry.kind]} «${drawingToolLabels[entry.kind]}», страница ${entry.page + 1}`} type="range" min="5" max="100" value={Math.round(entry.intensity * 100)} onChange={(event) => updateAnnotationIntensity(entry.id, event.target.valueAsNumber)} /><output>{Math.round(entry.intensity * 100)}%</output></span></label></section>)}</div></details></fieldset>}
       {inputPath && pageCount > 0 && <fieldset disabled={!documentReady} style={{ border: 0, margin: 0, padding: 0, minWidth: 0 }}>
         <div className="page-editor"><span>Итоговый порядок ({pageOrder.length}):</span><div>{pageWindow.omittedBefore > 0 && <span className="page-gap">…{pageWindow.omittedBefore}…</span>}{pageWindow.pages.map((sourceIndex) => <button key={sourceIndex} className={sourceIndex === pageIndex ? "active" : ""} type="button" onClick={() => { setPageIndex(sourceIndex); void makePreview(inputPath, preset, sourceIndex); }}>{sourceIndex + 1}{pageRotations[sourceIndex] ? ` · ${pageRotations[sourceIndex]}°` : ""}</button>)}{pageWindow.omittedAfter > 0 && <span className="page-gap">…{pageWindow.omittedAfter}…</span>}</div><label className="page-jump">К странице<input type="number" min="1" max={pageCount} value={pageIndex + 1} onChange={(event) => { const selected = Math.max(0, Math.min(pageCount - 1, Number(event.target.value) - 1)); setPageIndex(selected); void makePreview(inputPath, preset, selected); }} /></label><button className="secondary small" type="button" onClick={() => moveCurrentPage(-1)}>← Раньше</button><button className="secondary small" type="button" onClick={() => moveCurrentPage(1)}>Позже →</button><button className="secondary small" type="button" onClick={() => rotateCurrentPage(-90)}>↶ 90°</button><button className="secondary small" type="button" onClick={() => rotateCurrentPage(90)}>↷ 90°</button><button className="secondary small danger" type="button" onClick={deleteCurrentPage}>Удалить страницу</button><button className="link-button" type="button" onClick={() => { const rotations = {}; setPageOrder(Array.from({ length: pageCount }, (_, index) => index)); setPageRotations(rotations); void makePreview(inputPath, preset, pageIndex, rotations); }}>Сбросить</button></div>
         <div className="output-page-selection">
@@ -990,6 +1014,7 @@ export function Scanner({ active = true }: { active?: boolean }) {
       {progress && <div className="progress-panel"><div><strong>{progress.stage}</strong><span>{progress.totalPages ? `Страница ${progress.currentPage} из ${progress.totalPages}` : ""}</span></div><progress max="100" value={progress.percent} /><strong>{progress.percent}%</strong>{activeJob && <button className="secondary" type="button" onClick={() => void cancel()}>Отменить</button>}</div>}
       {resultPath ? resultKind === "batch" || resultKind === "split" ? <div className="ready-panel"><div><strong>✓ {resultKind === "split" ? "Блоки PDF готовы" : "Пакет готов"}</strong><span>{resultPath}</span></div><button className="primary" type="button" onClick={() => void openGeneratedPath(resultPath, "папку")}>Открыть папку</button><button className="secondary" type="button" onClick={() => { if (resultKind === "batch") setBatchPaths([]); setResultPath(""); setResultKind(""); setProgress(null); }}>{resultKind === "split" ? "Изменить блоки" : "Другой пакет"}</button></div> : <div className="ready-panel"><div><strong>✓ PDF готов</strong><span>{resultPath}</span></div><button className="secondary" type="button" onClick={() => void openGeneratedPath(resultPath, "PDF")}>Открыть PDF</button><button className="secondary" type="button" onClick={() => void revealGeneratedFile(resultPath)}>Открыть папку</button><button className="primary" disabled={!documentReady || !!activeJob || !!facsimileSelection.error || !!outputPageSelection.error || !!outputBlockSelection.error} type="button" onClick={() => void processDocument()}>Сохранить ещё одну версию</button><button className="secondary" type="button" onClick={() => { setInputPath(""); setPreviewUrl(""); setPageCount(0); setResultPath(""); setResultKind(""); setWarnings([]); setProgress(null); setFacsimile(null); setSavedFacsimiles([]); setEditingFacsimileId(""); previewCache.current.clear(); }}>Другой файл</button></div> : <div className="actionbar"><span>{facsimileSelection.error || outputPageSelection.error || outputBlockSelection.error || (facsimile ? "Факсимиле перемещается и поворачивается мгновенно, без повторной загрузки документа" : outputPageMode === "blocks" ? "Настройте блоки и сохраните несколько PDF" : "Выберите пресет и сохраните новый PDF")}</span><button className="primary" disabled={!documentReady || !!activeJob || !!facsimileSelection.error || !!outputPageSelection.error || !!outputBlockSelection.error} type="button" onClick={() => void processDocument()}>{outputPageMode === "blocks" ? "Сохранить блоки PDF" : "Сохранить PDF"}</button></div>}
       </>}
+      {resultPath && resultActionError?.path === resultPath && <ScannerResultActionNotice failure={resultActionError} onDismiss={() => { resultActionGeneration.current += 1; setResultActionError(null); }} />}
     </section>
   </div>;
 }

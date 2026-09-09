@@ -30,7 +30,7 @@ describe("предпросмотр сканера", () => {
       "utf8",
     );
 
-    expect(component).toContain("await revealItemInDir(path)");
+    expect(component).toContain('"open_scanner_output", { path, reveal: action === "reveal" }');
     expect(component).toContain("revealGeneratedFile(resultPath)");
     expect(capability).toContain('"path": "$HOME/**"');
     expect(capability).toContain('"path": "$TEMP/**"');
@@ -45,7 +45,13 @@ describe("предпросмотр сканера", () => {
     expect(component).toContain("scanner-document-tools");
     expect(component).toContain("DrawingToolIcon");
     expect(component).toContain("Добавленные эффекты");
-    expect(component).toContain("Прозрачность / сила");
+    expect(component).toContain('marker: "Непрозрачность"');
+    expect(component).toContain('stroke: "Непрозрачность"');
+    expect(component).toContain('blur: "Сила размытия"');
+    expect(component).toContain('print_blur: "Сила размытия"');
+    expect(component).toContain("Непрозрачность на всех выбранных страницах");
+    expect(component).toContain('${drawingIntensityLabels[entry.kind]} «${drawingToolLabels[entry.kind]}», страница ${entry.page + 1}');
+    expect(component).not.toContain("Прозрачность / сила");
     expect(component).toContain("updateAnnotationIntensity");
     expect(component).not.toContain("Безвозвратное скрытие");
     expect(component).not.toContain("Точные координаты");
