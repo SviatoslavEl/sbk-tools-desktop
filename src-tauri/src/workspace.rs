@@ -30,6 +30,22 @@ pub(crate) struct EditorPresence {
     pub(crate) owner: EditorOwner,
 }
 
+pub(crate) struct EditorState {
+    pub(crate) busy: bool,
+    pub(crate) presence: Option<EditorPresence>,
+    pub(crate) message: Option<String>,
+}
+
+impl EditorState {
+    fn unknown(message: impl Into<String>) -> Self {
+        Self {
+            busy: true,
+            presence: None,
+            message: Some(message.into()),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct WorkspaceAccessControl {
@@ -76,6 +92,19 @@ struct EditorLease {
     owner: Option<EditorOwner>,
 }
 
+impl EditorLease {
+    fn inactive() -> Self {
+        Self {
+            active: false,
+            token: uuid::Uuid::new_v4().to_string(),
+            edit: None,
+            guard: None,
+            presence_path: None,
+            owner: None,
+        }
+    }
+}
+
 impl Drop for EditorLease {
     fn drop(&mut self) {
         let Some(path) = self.presence_path.take() else {
@@ -104,7 +133,24 @@ fn environment_value(names: &[&str]) -> String {
 
 fn current_editor_owner() -> EditorOwner {
     let user_name = environment_value(&["USERNAME", "USER", "LOGNAME"]);
-    let device_name = environment_value(&["COMPUTERNAME", "HOSTNAME"]);
+    let mut device_name = environment_value(&["COMPUTERNAME", "HOSTNAME"]);
+    if device_name.is_empty() {
+        // Finder-launched macOS applications normally have no HOSTNAME in
+        // their environment. Resolve the OS hostname instead of omitting the
+        // computer from the shared identity. This is display data, not proof
+        // that a remote process is alive or permission to remove its claim.
+        let mut command = std::process::Command::new("hostname");
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        }
+        if let Ok(output) = command.output()
+            && output.status.success()
+        {
+            device_name = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        }
+    }
     let display_name = match (user_name.is_empty(), device_name.is_empty()) {
         (false, false) => format!("{user_name} · {device_name}"),
         (false, true) => user_name.clone(),
@@ -119,32 +165,85 @@ fn current_editor_owner() -> EditorOwner {
     }
 }
 
-fn write_editor_presence(root: &Path, token: &str, owner: &EditorOwner) -> Option<PathBuf> {
+fn write_editor_presence(root: &Path, token: &str, owner: &EditorOwner) -> Result<PathBuf, String> {
     let path = root.join(EDITOR_PRESENCE_FILE);
     let encoded = serde_json::to_vec_pretty(&EditorPresence {
         token: token.to_string(),
         owner: owner.clone(),
     })
-    .ok()?;
-    let mut file = File::create(&path).ok()?;
-    file.write_all(&encoded).ok()?;
-    file.sync_all().ok()?;
-    Some(path)
+    .map_err(|error| error.to_string())?;
+    // CREATE_NEW/O_EXCL is the shared namespace claim, independent of advisory
+    // lock visibility on another SMB client. Never truncate another session's
+    // identity, even when the file server incorrectly grants both byte locks.
+    // A partial/unreadable claim also stays occupied; it is not safe to infer
+    // process death from a local PID, missing metadata or network timeout.
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|error| format!("Не удалось зарезервировать сессию редактора: {error}"))?;
+    file.write_all(&encoded)
+        .and_then(|_| file.sync_all())
+        .map_err(|error| format!("Не удалось опубликовать сведения о редакторе: {error}"))?;
+    Ok(path)
 }
 
-fn read_editor_presence(root: &Path) -> Option<EditorOwner> {
-    let lock = OpenOptions::new()
-        .read(true)
-        .open(root.join(".workspace.edit.lock"))
-        .ok()?;
-    if FileExt::try_lock_shared(&lock).is_ok() {
-        let _ = FileExt::unlock(&lock);
-        return None;
+fn read_editor_state(root: &Path) -> EditorState {
+    if !fs::metadata(root).is_ok_and(|metadata| metadata.is_dir()) {
+        return EditorState::unknown(
+            "Общая папка недоступна. Состояние редактора не подтверждено; вход заблокирован до восстановления подключения.",
+        );
     }
-    let bytes = fs::read(root.join(EDITOR_PRESENCE_FILE)).ok()?;
-    serde_json::from_slice::<EditorPresence>(&bytes)
-        .ok()
-        .map(|presence| presence.owner)
+    match fs::read(root.join(EDITOR_PRESENCE_FILE)) {
+        Ok(bytes) => {
+            return match serde_json::from_slice::<EditorPresence>(&bytes) {
+                Ok(presence)
+                    if uuid::Uuid::parse_str(&presence.token).is_ok()
+                        && !presence.owner.display_name.trim().is_empty() =>
+                {
+                    EditorState {
+                        busy: true,
+                        presence: Some(presence),
+                        message: None,
+                    }
+                }
+                _ => EditorState::unknown(
+                    "Сессия редактора занята, но сведения о пользователе не удалось прочитать. Вход заблокирован; обновите состояние и проверьте доступ к общей папке.",
+                ),
+            };
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => {
+            return EditorState::unknown(
+                "Не удалось проверить сессию редактора в общей папке. Вход заблокирован до восстановления доступа.",
+            );
+        }
+    }
+    // During publication/removal, and with older clients, a byte lock may
+    // exist without readable identity. Unknown ownership must not mean free.
+    for name in [".workspace.edit.lock", ".workspace.edit.guard"] {
+        match OpenOptions::new().read(true).open(root.join(name)) {
+            Ok(lock) => {
+                if FileExt::try_lock_shared(&lock).is_err() {
+                    return EditorState::unknown(
+                        "Общая папка занята редактором, сведения о пользователе пока недоступны. Дождитесь освобождения сессии.",
+                    );
+                }
+                let _ = FileExt::unlock(&lock);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => {
+                return EditorState::unknown(
+                    "Не удалось проверить блокировку общей папки. Вход в режим редактора заблокирован.",
+                );
+            }
+        }
+    }
+    EditorState {
+        busy: false,
+        presence: None,
+        message: None,
+    }
 }
 
 impl Drop for Workspace {
@@ -275,39 +374,22 @@ pub(crate) fn validate_workspace_layout(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn lock_token_file(
-    path: &Path,
-    token: &str,
-    create: bool,
-    initialize: bool,
-) -> Result<File, String> {
+fn lock_editor_file(path: &Path) -> Result<File, String> {
     let mut options = OpenOptions::new();
-    options
-        .read(true)
-        .write(true)
-        .create(create)
-        .truncate(false);
-    let mut file = options.open(path).map_err(|error| error.to_string())?;
+    options.read(true).write(true).create(true).truncate(false);
+    let file = options.open(path).map_err(|error| error.to_string())?;
     file.try_lock_exclusive()
         .map_err(|error| error.to_string())?;
-    if initialize {
-        file.set_len(0).map_err(|error| error.to_string())?;
-        file.seek(SeekFrom::Start(0))
-            .map_err(|error| error.to_string())?;
-        file.write_all(token.as_bytes())
-            .map_err(|error| error.to_string())?;
-        file.sync_all().map_err(|error| error.to_string())?;
-    } else {
-        let mut stored = String::new();
-        file.seek(SeekFrom::Start(0))
-            .map_err(|error| error.to_string())?;
-        file.read_to_string(&mut stored)
-            .map_err(|error| error.to_string())?;
-        if stored != token {
-            return Err("Токен блокировки общей папки изменился".to_string());
-        }
-    }
     Ok(file)
+}
+
+fn initialize_locked_token(file: &mut File, token: &str) -> Result<(), String> {
+    file.set_len(0).map_err(|error| error.to_string())?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| error.to_string())?;
+    file.write_all(token.as_bytes())
+        .map_err(|error| error.to_string())?;
+    file.sync_all().map_err(|error| error.to_string())
 }
 
 fn verify_locked_token(file: &mut File, token: &str) -> Result<(), String> {
@@ -322,35 +404,58 @@ fn verify_locked_token(file: &mut File, token: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn verify_presence_token(root: &Path, token: &str) -> Result<(), String> {
+    let state = read_editor_state(root);
+    if state
+        .presence
+        .is_some_and(|presence| presence.token == token)
+    {
+        Ok(())
+    } else {
+        Err(
+            "Сведения о текущей сессии отсутствуют, недоступны или принадлежат другому редактору"
+                .to_string(),
+        )
+    }
+}
+
 fn acquire_editor_lease(root: &Path, writable: bool) -> EditorLease {
     let token = uuid::Uuid::new_v4().to_string();
     if !writable {
-        return EditorLease {
-            active: false,
-            token,
-            edit: None,
-            guard: None,
-            presence_path: None,
-            owner: None,
-        };
+        return EditorLease::inactive();
     }
-    let edit = lock_token_file(&root.join(".workspace.edit.lock"), &token, true, true).ok();
-    let guard = edit.as_ref().and_then(|_| {
-        lock_token_file(&root.join(".workspace.edit.guard"), &token, true, true).ok()
-    });
-    let active = edit.is_some() && guard.is_some();
-    let owner = active.then(current_editor_owner);
-    let presence_path = owner
-        .as_ref()
-        .and_then(|owner| write_editor_presence(root, &token, owner));
-    EditorLease {
+    // Obtain both handles first, without changing either ownership marker.
+    // A failed contender must never corrupt the incumbent's first token just
+    // because the second lock could not be obtained.
+    let Ok(mut edit) = lock_editor_file(&root.join(".workspace.edit.lock")) else {
+        return EditorLease::inactive();
+    };
+    let Ok(mut guard) = lock_editor_file(&root.join(".workspace.edit.guard")) else {
+        return EditorLease::inactive();
+    };
+    let owner = current_editor_owner();
+    let Ok(presence_path) = write_editor_presence(root, &token, &owner) else {
+        return EditorLease::inactive();
+    };
+    let active = initialize_locked_token(&mut edit, &token)
+        .and_then(|_| initialize_locked_token(&mut guard, &token))
+        .and_then(|_| verify_presence_token(root, &token))
+        .is_ok();
+    let lease = EditorLease {
         active,
         token,
-        edit: if active { edit } else { None },
-        guard: if active { guard } else { None },
-        presence_path,
-        owner,
+        edit: Some(edit),
+        guard: Some(guard),
+        presence_path: Some(presence_path),
+        owner: Some(owner),
+    };
+    if !active {
+        // Only this newly created claim is removed, while both handles remain
+        // held. Drop checks the exact session token before removing it.
+        drop(lease);
+        return EditorLease::inactive();
     }
+    lease
 }
 
 fn read_access_control(root: &Path) -> Result<Option<WorkspaceAccessControl>, String> {
@@ -562,7 +667,12 @@ impl Workspace {
             || self.root.join(ACCESS_CONTROL_FILE).exists()
     }
 
+    #[cfg(test)]
     pub(crate) fn access_message(&self) -> String {
+        self.access_message_for(&self.editor_state())
+    }
+
+    pub(crate) fn access_message_for(&self, state: &EditorState) -> String {
         if self.is_editor() {
             if self.access_controlled() {
                 "Режим редактирования включён по паролю; эксклюзивная блокировка получена."
@@ -572,11 +682,15 @@ impl Workspace {
             .to_string()
         } else if !self.writable {
             "Только просмотр и экспорт: файловая система не разрешает запись.".to_string()
-        } else if let Some(owner) = self.editor_owner() {
+        } else if let Some(presence) = &state.presence {
             format!(
-                "Только просмотр: режим редактирования сейчас у {}. Попросите пользователя выйти из режима редактора.",
-                owner.display_name
+                "Только просмотр: сессия редактора закреплена за {}. Попросите пользователя выйти из режима редактора. После аварийного завершения может потребоваться восстановление сессии.",
+                presence.owner.display_name
             )
+        } else if state.busy {
+            state.message.clone().unwrap_or_else(|| {
+                "Только просмотр: сессия редактора занята. Дождитесь её освобождения.".to_string()
+            })
         } else if self.access_controlled() {
             "Только просмотр. Для редактирования введите пароль рабочей папки.".to_string()
         } else {
@@ -596,15 +710,19 @@ impl Workspace {
             .lock()
             .map_err(|_| "Переключение режима недоступно".to_string())?;
         if lease.active {
-            return Ok(());
+            drop(lease);
+            return self.require_editor();
         }
         let next = acquire_editor_lease(&self.root, true);
         if !next.active {
-            let owner = read_editor_presence(&self.root)
-                .map(|owner| owner.display_name)
+            let state = read_editor_state(&self.root);
+            let owner = state
+                .presence
+                .map(|presence| presence.owner.display_name)
                 .unwrap_or_else(|| "другой пользователь".to_string());
             return Err(format!(
-                "Сейчас базу редактирует {owner}. Пароль не позволяет забрать его права. Попросите редактора перейти в режим просмотра или закрыть программу и повторите вход."
+                "Не удалось получить сессию редактора: {owner}. Пароль не позволяет забрать его права. Попросите редактора перейти в режим просмотра или закрыть программу и повторите вход. После аварийного завершения сессия не освобождается автоматически. {}",
+                state.message.unwrap_or_default()
             ));
         }
         *lease = next;
@@ -618,18 +736,18 @@ impl Workspace {
         if self.access_controlled() {
             verify_access_password(&self.root, password)?;
         }
+        self.release_editor_on_exit()
+    }
+
+    pub(crate) fn release_editor_on_exit(&self) -> Result<(), String> {
+        // Closing the application never needs a password. This only drops the
+        // current process's lease and is also called explicitly by Tauri's Exit
+        // event, because std::process::exit does not run Rust Drop handlers.
         let mut lease = self
             .editor_lease
             .lock()
             .map_err(|_| "Переключение режима недоступно".to_string())?;
-        *lease = EditorLease {
-            active: false,
-            token: uuid::Uuid::new_v4().to_string(),
-            edit: None,
-            guard: None,
-            presence_path: None,
-            owner: None,
-        };
+        *lease = EditorLease::inactive();
         Ok(())
     }
 
@@ -655,30 +773,36 @@ impl Workspace {
             .unwrap_or(false)
     }
 
+    #[cfg(test)]
     pub(crate) fn editor_owner(&self) -> Option<EditorOwner> {
-        let lease = self.editor_lease.lock().ok()?;
-        if lease.active {
-            return lease.owner.clone();
-        }
-        drop(lease);
-        read_editor_presence(&self.root)
+        self.editor_state().presence.map(|presence| presence.owner)
     }
 
     pub(crate) fn actor_name(&self) -> String {
         current_editor_owner().display_name
     }
 
+    #[cfg(test)]
     pub(crate) fn editor_presence(&self) -> Option<EditorPresence> {
-        let lease = self.editor_lease.lock().ok()?;
+        self.editor_state().presence
+    }
+
+    pub(crate) fn editor_state(&self) -> EditorState {
+        let Ok(lease) = self.editor_lease.lock() else {
+            return EditorState::unknown("Проверка текущей сессии редактора недоступна.");
+        };
         if lease.active {
-            return Some(EditorPresence {
-                token: lease.token.clone(),
-                owner: lease.owner.clone()?,
-            });
+            return EditorState {
+                busy: true,
+                presence: lease.owner.clone().map(|owner| EditorPresence {
+                    token: lease.token.clone(),
+                    owner,
+                }),
+                message: None,
+            };
         }
         drop(lease);
-        read_editor_presence(&self.root)?;
-        serde_json::from_slice(&fs::read(self.root.join(EDITOR_PRESENCE_FILE)).ok()?).ok()
+        read_editor_state(&self.root)
     }
 
     pub(crate) fn admin_notice(&self) -> Option<String> {
@@ -693,7 +817,20 @@ impl Workspace {
         if !lease.active {
             return Err("Общая база открыта только для просмотра. Для изменения нужны права записи на папку и свободная блокировка редактора.".to_string());
         }
-        if let Some(request) = crate::administration::latest_request(&self.root, &lease.token)? {
+        let request = match crate::administration::latest_request(&self.root, &lease.token) {
+            Ok(request) => request,
+            Err(error) => {
+                let message = format!(
+                    "Не удалось проверить управление сессией редактора; включён просмотр: {error}"
+                );
+                if let Ok(mut notice) = self.admin_notice.lock() {
+                    *notice = Some(message.clone());
+                }
+                *lease = EditorLease::inactive();
+                return Err(message);
+            }
+        };
+        if let Some(request) = request {
             let revoked = request.action == "revoke-requested";
             let message = format!(
                 "{} {}: {}. {}",
@@ -717,14 +854,7 @@ impl Workspace {
                 // Called under AppState.maintenance: outstanding writes finish
                 // before this cooperative release. Never rewrite/remove another
                 // process's lock or bypass the ordinary workspace password.
-                *lease = EditorLease {
-                    active: false,
-                    token: uuid::Uuid::new_v4().to_string(),
-                    edit: None,
-                    guard: None,
-                    presence_path: None,
-                    owner: None,
-                };
+                *lease = EditorLease::inactive();
                 return Err(message);
             }
         }
@@ -744,16 +874,10 @@ impl Workspace {
                     .as_mut()
                     .ok_or_else(|| "Страхующая блокировка отсутствует".to_string())
                     .and_then(|file| verify_locked_token(file, &token))
-            });
+            })
+            .and_then(|_| verify_presence_token(&self.root, &token));
         if result.is_err() {
-            *lease = EditorLease {
-                active: false,
-                token: uuid::Uuid::new_v4().to_string(),
-                edit: None,
-                guard: None,
-                presence_path: None,
-                owner: None,
-            };
+            *lease = EditorLease::inactive();
         }
         result.map_err(|error: String| {
             format!(
@@ -798,8 +922,10 @@ mod tests {
             let lease = acquire_editor_lease(Path::new(&root), true);
             assert_eq!(lease.active, expected);
             if !expected {
-                let owner = read_editor_presence(Path::new(&root))
-                    .expect("viewer sees editor identity even without write access");
+                let owner = read_editor_state(Path::new(&root))
+                    .presence
+                    .expect("viewer sees editor identity even without write access")
+                    .owner;
                 assert!(!owner.display_name.is_empty());
             }
             return;
@@ -838,7 +964,7 @@ mod tests {
         assert!(
             viewer
                 .access_message()
-                .contains("режим редактирования сейчас у")
+                .contains("сессия редактора закреплена за")
         );
         drop(editor);
         assert!(viewer.editor_owner().is_none());
@@ -849,6 +975,246 @@ mod tests {
         viewer.acquire_editor_with_password("").unwrap();
         assert!(viewer.is_editor());
         drop(viewer);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn remote_presence_remains_authoritative_when_advisory_locks_appear_free() {
+        let root = std::env::temp_dir().join(format!("sbk-remote-presence-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let remote_token = Uuid::new_v4().to_string();
+        let owner = EditorOwner {
+            display_name: "Коллега · REMOTE-PC".into(),
+            user_name: "Коллега".into(),
+            device_name: "REMOTE-PC".into(),
+            // Neither an old timestamp nor a PID not present on this computer
+            // proves that a different computer has stopped editing.
+            started_at: "2020-01-01T00:00:00Z".into(),
+        };
+        write_editor_presence(&root, &remote_token, &owner).unwrap();
+        let mut remote_json: serde_json::Value =
+            serde_json::from_slice(&fs::read(root.join(EDITOR_PRESENCE_FILE)).unwrap()).unwrap();
+        remote_json["processId"] = serde_json::json!(4_000_000_000u64);
+        fs::write(
+            root.join(EDITOR_PRESENCE_FILE),
+            serde_json::to_vec(&remote_json).unwrap(),
+        )
+        .unwrap();
+        for name in [".workspace.edit.lock", ".workspace.edit.guard"] {
+            fs::write(root.join(name), &remote_token).unwrap();
+            let file = lock_editor_file(&root.join(name)).unwrap();
+            drop(file); // Simulate a client that sees no remote advisory lock.
+        }
+        write_access_control(&root, "shared-editor-password").unwrap();
+        let viewer = Workspace::for_test(root.clone(), true);
+        assert!(!viewer.is_editor());
+        let state = viewer.editor_state();
+        assert!(state.busy);
+        assert!(state.message.is_none());
+        let presence = state.presence.unwrap();
+        assert_eq!(presence.owner.device_name, "REMOTE-PC");
+        assert_eq!(presence.token, remote_token);
+        assert!(
+            viewer
+                .acquire_editor_with_password("shared-editor-password")
+                .is_err()
+        );
+        for name in [".workspace.edit.lock", ".workspace.edit.guard"] {
+            assert_eq!(fs::read_to_string(root.join(name)).unwrap(), remote_token);
+        }
+        drop(viewer);
+        assert_eq!(
+            read_editor_state(&root).presence.unwrap().token,
+            remote_token
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn atomic_presence_claim_allows_only_one_contender_without_advisory_locks() {
+        let root = std::env::temp_dir().join(format!("sbk-claim-race-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let children: Vec<_> = (0..2)
+            .map(|_| {
+                let root = root.clone();
+                let start = start.clone();
+                std::thread::spawn(move || {
+                    let token = Uuid::new_v4().to_string();
+                    let owner = current_editor_owner();
+                    start.wait();
+                    write_editor_presence(&root, &token, &owner)
+                        .ok()
+                        .map(|_| token)
+                })
+            })
+            .collect();
+        let winners: Vec<_> = children
+            .into_iter()
+            .filter_map(|child| child.join().unwrap())
+            .collect();
+        assert_eq!(winners.len(), 1);
+        assert_eq!(read_editor_state(&root).presence.unwrap().token, winners[0]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn malformed_or_unreadable_presence_is_busy_and_never_overwritten() {
+        for is_directory in [false, true] {
+            let root =
+                std::env::temp_dir().join(format!("sbk-unknown-presence-{}", Uuid::new_v4()));
+            fs::create_dir_all(&root).unwrap();
+            let path = root.join(EDITOR_PRESENCE_FILE);
+            if is_directory {
+                fs::create_dir(&path).unwrap();
+            } else {
+                fs::write(&path, b"{partial identity").unwrap();
+            }
+            let viewer = Workspace::for_test(root.clone(), true);
+            let state = viewer.editor_state();
+            assert!(state.busy);
+            assert!(state.presence.is_none());
+            assert!(state.message.is_some());
+            assert!(!viewer.is_editor(), "publishing an identity is mandatory");
+            assert!(viewer.acquire_editor_with_password("").is_err());
+            assert!(viewer.access_message().contains("заблокирован"));
+            drop(viewer);
+            if is_directory {
+                assert!(path.is_dir());
+            } else {
+                assert_eq!(fs::read(path).unwrap(), b"{partial identity");
+            }
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn unavailable_workspace_is_unknown_not_free() {
+        let root =
+            std::env::temp_dir().join(format!("sbk-unavailable-workspace-{}", Uuid::new_v4()));
+        let state = read_editor_state(&root);
+        assert!(state.busy);
+        assert!(state.presence.is_none());
+        assert!(state.message.unwrap().contains("недоступна"));
+        assert!(!acquire_editor_lease(&root, true).active);
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn occupied_guard_without_identity_is_unknown_and_preserves_first_token() {
+        let root = std::env::temp_dir().join(format!("sbk-partial-lock-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join(".workspace.edit.lock"), b"incumbent-token").unwrap();
+        let guard = lock_editor_file(&root.join(".workspace.edit.guard")).unwrap();
+        let state = read_editor_state(&root);
+        assert!(state.busy);
+        assert!(state.presence.is_none());
+        assert!(state.message.is_some());
+        assert!(!acquire_editor_lease(&root, true).active);
+        assert_eq!(
+            fs::read(root.join(".workspace.edit.lock")).unwrap(),
+            b"incumbent-token"
+        );
+        drop(guard);
+        // Another concurrently running test may briefly inherit open handles
+        // between fork and exec. Allow that child to reach close-on-exec.
+        for _ in 0..50 {
+            if !read_editor_state(&root).busy {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!read_editor_state(&root).busy);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn lost_presence_demotes_editor_without_removing_another_sessions_claim() {
+        for corrupt in [false, true] {
+            let root = std::env::temp_dir().join(format!("sbk-lost-presence-{}", Uuid::new_v4()));
+            let editor = Workspace::for_test(root.clone(), true);
+            assert!(editor.require_editor().is_ok());
+            let path = root.join(EDITOR_PRESENCE_FILE);
+            fs::remove_file(&path).unwrap();
+            if corrupt {
+                fs::write(&path, b"{partial identity").unwrap();
+            } else {
+                write_editor_presence(&root, &Uuid::new_v4().to_string(), &current_editor_owner())
+                    .unwrap();
+            }
+            let replacement = fs::read(&path).unwrap();
+            assert!(editor.require_editor().is_err());
+            assert!(!editor.is_editor());
+            drop(editor);
+            assert_eq!(fs::read(path).unwrap(), replacement);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn explicit_application_exit_releases_only_its_own_password_protected_session() {
+        let root = std::env::temp_dir().join(format!("sbk-explicit-exit-{}", Uuid::new_v4()));
+        let editor = Workspace::for_test(root.clone(), true);
+        let viewer = Workspace::for_test(root.clone(), true);
+        editor
+            .set_access_password("", "shared-editor-password")
+            .unwrap();
+        let token = editor.editor_presence().unwrap().token;
+        viewer.release_editor_on_exit().unwrap();
+        assert_eq!(editor.editor_presence().unwrap().token, token);
+        assert!(editor.require_editor().is_ok());
+        editor.release_editor_on_exit().unwrap();
+        assert!(!editor.is_editor());
+        assert!(!root.join(EDITOR_PRESENCE_FILE).exists());
+        viewer
+            .acquire_editor_with_password("shared-editor-password")
+            .unwrap();
+        assert!(viewer.require_editor().is_ok());
+        drop(editor);
+        assert!(viewer.require_editor().is_ok());
+        drop(viewer);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn inaccessible_administration_state_demotes_instead_of_reporting_active_editor() {
+        let root = std::env::temp_dir().join(format!("sbk-admin-unavailable-{}", Uuid::new_v4()));
+        let editor = Workspace::for_test(root.clone(), true);
+        fs::write(
+            root.join(".workspace-administration.sqlite3"),
+            b"not a database",
+        )
+        .unwrap();
+        assert!(editor.require_editor().is_err());
+        assert!(!editor.is_editor());
+        assert!(editor.admin_notice().unwrap().contains("включён просмотр"));
+        drop(editor);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn crashed_session_is_not_taken_over_based_on_local_lock_or_pid() {
+        if let Ok(root) = std::env::var("SBK_CRASH_CLAIM_TEST_ROOT") {
+            let lease = acquire_editor_lease(Path::new(&root), true);
+            assert!(lease.active);
+            // Simulate abrupt termination: file locks are released by the OS,
+            // but a Drop handler cannot remove the published session claim.
+            std::process::exit(0);
+        }
+        let root = std::env::temp_dir().join(format!("sbk-crashed-claim-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "workspace::tests::crashed_session_is_not_taken_over_based_on_local_lock_or_pid",
+                "--nocapture",
+            ])
+            .env("SBK_CRASH_CLAIM_TEST_ROOT", &root)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert!(read_editor_state(&root).busy);
+        assert!(!acquire_editor_lease(&root, true).active);
         fs::remove_dir_all(root).unwrap();
     }
 

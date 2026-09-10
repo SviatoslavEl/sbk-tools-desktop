@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { wheelPreviewZoom } from "./Scanner";
+import { wheelPreviewZoom } from "./previewViewport";
 describe("scanner wheel zoom", () => {
   it("zooms in/up and out/down", () => {
     expect(wheelPreviewZoom(1, -100)).toBeGreaterThan(1);

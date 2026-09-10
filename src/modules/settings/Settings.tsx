@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ConfirmDialog } from "../../components/Dialog";
 import { useRecords } from "../../hooks/useRecords";
 import packageInfo from "../../../package.json";
@@ -36,6 +36,7 @@ import {
 import { useWorkspaceAccess } from "../../lib/workspaceAccess";
 import { workspacePasswordError, workspacePasswordHint } from "./passwordPolicy";
 import { OwnerPanel } from "./OwnerPanel";
+import { editorStatus, unavailableWorkspaceInfo } from "../../lib/editorStatus";
 
 interface AppSettings {
   expiryDays: 30 | 60 | 90;
@@ -46,14 +47,21 @@ interface AppSettings {
 export function Settings({
   collapsed,
   onCollapsed,
+  workspace,
+  onWorkspaceChange: setWorkspace,
 }: {
   collapsed: boolean;
   onCollapsed: (value: boolean) => void;
+  workspace: WorkspaceInfo;
+  onWorkspaceChange: (value: WorkspaceInfo) => void;
 }) {
   const workspaceAccess = useWorkspaceAccess();
   const store = useRecords<AppSettings>("settings");
-  const [workspace, setWorkspace] = useState<WorkspaceInfo | null>(null);
+  const [accessBusy, setAccessBusy] = useState(false);
+  const accessOperation = useRef(false);
+  const editor = editorStatus(workspace);
   const [message, setMessage] = useState("");
+  const [accessMessage, setAccessMessage] = useState("");
   const [restorePath, setRestorePath] = useState("");
   const [backups, setBackups] = useState<BackupListItem[]>([]);
   const [retention, setRetention] = useState(10);
@@ -81,23 +89,15 @@ export function Settings({
   const reloadBackups = () =>
     void listBackups()
       .then(setBackups)
-      .catch(() => setBackups([]));
+      .catch(() => setMessage("Не удалось обновить список резервных копий. Показаны последние полученные сведения."));
   useEffect(() => {
-    const update = (event: Event) => setWorkspace((event as CustomEvent<WorkspaceInfo>).detail);
-    window.addEventListener("sbk-workspace-access-status", update);
-    return () => window.removeEventListener("sbk-workspace-access-status", update);
-  }, []);
-  useEffect(() => {
-    void getWorkspaceInfo().then((value) => {
-      setWorkspace(value);
-      const timers = readAccessTimers(value.root);
-      setAccessTimers(timers);
-      setRetention(timers.retentionCount);
-      setRetentionDays(timers.retentionDays);
-    });
+    const timers = readAccessTimers(workspace.root);
+    setAccessTimers(timers);
+    setRetention(timers.retentionCount);
+    setRetentionDays(timers.retentionDays);
     void getIntelligenceProviderStatus().then(setIntelligence);
     reloadBackups();
-  }, []);
+  }, [workspace.root]);
   useEffect(() => {
     if (!workspace?.root) return;
     const current = readAccessTimers(workspace.root);
@@ -111,46 +111,76 @@ export function Settings({
   const updateAccessTimers = (next: AccessTimers) =>
     setAccessTimers(saveAccessTimers(next, workspace?.root));
   const refreshWorkspace = async () => {
-    const next = await getWorkspaceInfo();
-    setWorkspace(next);
-    window.dispatchEvent(new Event("sbk-workspace-refresh"));
-    return next;
+    try {
+      const next = await getWorkspaceInfo();
+      setWorkspace(next);
+      return next;
+    } catch (error) {
+      setWorkspace(unavailableWorkspaceInfo(workspace));
+      throw error;
+    }
   };
-  const changeWorkspaceMode = async (editor: boolean) => {
-    const validationError = workspace?.accessControlled ? workspacePasswordError(workspacePassword) : "";
+  const runAccessOperation = async (action: () => Promise<void>) => {
+    if (accessOperation.current) return;
+    accessOperation.current = true;
+    setAccessBusy(true);
+    try { await action(); }
+    catch (reason) {
+      setAccessMessage(`Ошибка доступа: ${String(reason)}`);
+      try { await refreshWorkspace(); } catch { /* Keep access blocked until status recovers. */ }
+    } finally { accessOperation.current = false; setAccessBusy(false); }
+  };
+  const changeWorkspaceMode = (toEditor: boolean) => runAccessOperation(async () => {
+    const current = await refreshWorkspace();
+    const currentStatus = editorStatus(current);
+    if (currentStatus.unknown || (toEditor && !currentStatus.canAcquire) || (!toEditor && !current.editor)) {
+      throw new Error(currentStatus.unknown ? currentStatus.text : "Режим редактора уже занят или изменился. Дождитесь обновления статуса.");
+    }
+    const validationError = current.accessControlled ? workspacePasswordError(workspacePassword) : "";
     if (validationError) {
-      setMessage(`Недопустимый пароль: ${validationError} ${workspacePasswordHint}`);
+      setAccessMessage(`Недопустимый пароль: ${validationError} ${workspacePasswordHint}`);
       return;
     }
-    setMessage(editor ? "Проверяем пароль и получаем режим редактирования…" : "Освобождаем режим редактирования…");
-    try {
-      await switchWorkspaceMode(editor, workspacePassword);
-      const next = await refreshWorkspace();
-      setWorkspacePassword("");
-      setMessage(next.accessMessage);
-    } catch (reason) { setMessage(`Ошибка доступа: ${String(reason)}`); }
-  };
-  const saveWorkspacePassword = async () => {
+    setAccessMessage(toEditor ? "Проверяем пароль и получаем режим редактирования…" : "Освобождаем режим редактирования…");
+    await switchWorkspaceMode(toEditor, workspacePassword);
+    const next = await refreshWorkspace();
+    setWorkspacePassword("");
+    setAccessMessage(next.accessMessage);
+  });
+  const saveWorkspacePassword = () => runAccessOperation(async () => {
+    const current = await refreshWorkspace();
+    if (!current.editor || editorStatus(current).unknown) throw new Error("Для смены пароля требуется подтверждённый режим редактора.");
     const validationError = workspacePasswordError(newWorkspacePassword);
     if (validationError) {
-      setMessage(`Недопустимый новый пароль: ${validationError} ${workspacePasswordHint}`);
+      setAccessMessage(`Недопустимый новый пароль: ${validationError} ${workspacePasswordHint}`);
       return;
     }
-    if (workspace?.accessControlled) {
+    if (current.accessControlled) {
       const currentValidationError = workspacePasswordError(workspacePassword);
       if (currentValidationError) {
-        setMessage(`Недопустимый текущий пароль: ${currentValidationError} ${workspacePasswordHint}`);
+        setAccessMessage(`Недопустимый текущий пароль: ${currentValidationError} ${workspacePasswordHint}`);
         return;
       }
     }
-    setMessage("Сохраняем пароль рабочей папки…");
+    setAccessMessage("Сохраняем пароль рабочей папки…");
+    await setWorkspaceAccessPassword(workspacePassword, newWorkspacePassword);
+    const next = await refreshWorkspace();
+    setWorkspacePassword(""); setNewWorkspacePassword("");
+    setAccessMessage(next.accessMessage);
+  });
+  const refreshSettings = () => runAccessOperation(async () => {
+    setMessage("Обновляем сведения об общей папке…");
     try {
-      await setWorkspaceAccessPassword(workspacePassword, newWorkspacePassword);
-      const next = await refreshWorkspace();
-      setWorkspacePassword(""); setNewWorkspacePassword("");
-      setMessage(next.accessMessage);
-    } catch (reason) { setMessage(`Ошибка доступа: ${String(reason)}`); }
-  };
+      await refreshWorkspace();
+      const nextBackups = await listBackups();
+      setBackups(nextBackups);
+      window.dispatchEvent(new Event("sbk-workspace-refresh"));
+      setMessage("Статус общей папки и список резервных копий обновлены.");
+    } catch (error) {
+      setMessage("Обновление не завершено. Показаны последние полученные сведения о резервных копиях.");
+      throw error;
+    }
+  });
 
   const saveSettings = async (patch: Partial<AppSettings>) => {
     const existing = store.records.find(
@@ -280,28 +310,32 @@ export function Settings({
                 "Проверяем…"}
             </strong>
           </div>
-          {workspace?.editorOwner && <div className="settings-row">
+          <div className="settings-row editor-presence" aria-live="polite">
             <span>Текущий редактор</span>
             <strong>
-              {workspace.editorOwner.displayName}
-              {workspace.editorOwner.startedAt && <small>с {new Date(workspace.editorOwner.startedAt).toLocaleString("ru-RU")}</small>}
+              {editor.unknown ? "Статус не подтверждён" : editor.text}
+              {editor.device && <small>Компьютер: {editor.device}</small>}
+              {workspace.editorOwner?.startedAt && <small>с {new Date(workspace.editorOwner.startedAt).toLocaleString("ru-RU")}</small>}
             </strong>
-          </div>}
-          <div className="settings-form workspace-password-controls">
+          </div>
+          {!workspace.editor && (editor.occupied || editor.unknown) && <p className="notice warning" role="status">{editor.unknown ? editor.text : `Права заняты: ${editor.text}. Попросите редактора перейти в режим просмотра или закрыть программу.`} Ввод пароля не освобождает чужой сеанс. Статус обновляется автоматически.</p>}
+          <fieldset className="settings-form workspace-password-controls" aria-busy={accessBusy} disabled={accessBusy || editor.unknown || !workspace.writable || (!workspace.editor && !editor.canAcquire)}>
             {workspace?.accessControlled ? <>
               <label>Пароль рабочей папки<input type="password" autoComplete="current-password" aria-invalid={Boolean(currentWorkspacePasswordError)} aria-describedby="workspace-password-hint" value={workspacePassword} onChange={(event) => setWorkspacePassword(event.target.value)} />{currentWorkspacePasswordError && <small className="field-error">{currentWorkspacePasswordError}</small>}</label>
               <p className="help-text" id="workspace-password-hint">{workspacePasswordHint}</p>
               <div className="button-row">
                 <button className="primary" type="button" disabled={!workspacePassword || (!workspace?.editor && Boolean(workspace?.editorOwner))} onClick={() => void changeWorkspaceMode(!workspace?.editor)}>{workspace?.editor ? "Перейти в режим просмотра" : "Войти в режим редактирования"}</button>
               </div>
-              {!workspace?.editor && workspace?.editorOwner && <p className="notice warning">Права заняты: {workspace.editorOwner.displayName}. Попросите редактора перейти в режим просмотра или закрыть программу. Пароль не даёт права принудительно завершать чужую работу. Статус обновляется автоматически.</p>}
               {workspace?.editor && <><label>Новый пароль<input type="password" autoComplete="new-password" aria-invalid={Boolean(newWorkspacePasswordError)} value={newWorkspacePassword} onChange={(event) => setNewWorkspacePassword(event.target.value)} />{newWorkspacePasswordError && <small className="field-error">{newWorkspacePasswordError}</small>}</label><button className="secondary" type="button" disabled={!workspacePassword || !newWorkspacePassword || Boolean(newWorkspacePasswordError)} onClick={() => void saveWorkspacePassword()}>Сменить пароль</button></>}
             </> : workspace?.editor ? <>
               <label>Новый пароль рабочей папки<input type="password" autoComplete="new-password" aria-invalid={Boolean(newWorkspacePasswordError)} aria-describedby="new-workspace-password-hint" value={newWorkspacePassword} onChange={(event) => setNewWorkspacePassword(event.target.value)} placeholder="От 6 до 128 символов" />{newWorkspacePasswordError && <small className="field-error">{newWorkspacePasswordError}</small>}</label>
               <p className="help-text" id="new-workspace-password-hint">{workspacePasswordHint}</p>
               <button className="primary" type="button" disabled={!newWorkspacePassword || Boolean(newWorkspacePasswordError)} onClick={() => void saveWorkspacePassword()}>Включить вход по паролю</button>
-            </> : <><div className="notice warning">{workspace?.editorOwner ? `Сейчас базу редактирует ${workspace.editorOwner.displayName}. Дождитесь освобождения прав.` : "Редактор свободен. Можно включить редактирование без перезапуска программы."}</div><button className="primary" type="button" disabled={Boolean(workspace?.editorOwner) || !workspace?.writable} onClick={() => void changeWorkspaceMode(true)}>Войти в режим редактирования</button></>}
-          </div>
+              <button className="secondary" type="button" onClick={() => void changeWorkspaceMode(false)}>Перейти в режим просмотра</button>
+            </> : <><p className="help-text">{editor.canAcquire ? "Редактор свободен. Можно включить редактирование без перезапуска программы." : "Вход станет доступен после подтверждения свободного режима редактора."}</p><button className="primary" type="button" disabled={!editor.canAcquire} onClick={() => void changeWorkspaceMode(true)}>Войти в режим редактирования</button></>}
+          </fieldset>
+          {accessBusy && <p className="help-text" role="status">Проверяем и обновляем доступ…</p>}
+          {accessMessage && <div className="notice" role="status">{accessMessage}</div>}
           <div className="settings-row">
             <span>Версия базы</span>
             <strong>{workspace?.schemaVersion || "—"}</strong>
@@ -336,7 +370,6 @@ export function Settings({
           </div>
         </div>
       </section>
-      <OwnerPanel key={workspace?.root} workspace={workspace} />
       <section className="surface">
         <div className="surface-title">
           <h2>Обновление и архивирование</h2>
@@ -383,12 +416,8 @@ export function Settings({
             <button
               className="secondary"
               type="button"
-              onClick={() => {
-                window.dispatchEvent(new Event("sbk-workspace-refresh"));
-                void getWorkspaceInfo().then(setWorkspace);
-                reloadBackups();
-                setMessage("Данные перечитаны из общей папки.");
-              }}
+              disabled={accessBusy}
+              onClick={() => void refreshSettings()}
             >
               Обновить сейчас
             </button>
@@ -689,6 +718,7 @@ export function Settings({
           </div>
         </div>
       </section>
+      <OwnerPanel key={workspace.root} workspace={workspace} />
       {workspaceAccess.editor && restorePath && (
         <ConfirmDialog
           title="Проверить и восстановить данные из копии?"

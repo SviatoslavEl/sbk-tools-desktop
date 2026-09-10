@@ -25,6 +25,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use std::{collections::HashMap, io::BufRead, io::BufReader};
 use tauri::{AppHandle, Emitter, Manager, State};
+use tauri_plugin_opener::OpenerExt;
 use uuid::Uuid;
 use walkdir::WalkDir;
 use zeroize::Zeroizing;
@@ -34,6 +35,7 @@ mod administration;
 mod attachments;
 mod database;
 mod intelligence;
+mod scanner_outputs;
 mod workspace;
 use attachments::AttachmentAudit;
 use database::{MODULES, SCHEMA_VERSION, open_database, open_database_read_only, validated_module};
@@ -79,6 +81,7 @@ struct AppState {
     #[cfg(not(feature = "installed-fast-start"))]
     workspace: Arc<Workspace>,
     scanner_jobs: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+    scanner_outputs: Arc<scanner_outputs::ScannerOutputs>,
     maintenance: Arc<Mutex<()>>,
 }
 
@@ -247,6 +250,8 @@ struct WorkspaceInfo {
     access_controlled: bool,
     access_message: String,
     editor_owner: Option<EditorOwner>,
+    editor_busy: bool,
+    editor_state_message: Option<String>,
     owner_configured: bool,
     administration_notice: Option<String>,
     schema_version: i64,
@@ -547,7 +552,8 @@ fn workspace_info(state: State<'_, AppState>) -> Result<WorkspaceInfo, String> {
         let _ = workspace.require_editor();
     }
     let editor = workspace.is_editor();
-    let access_message = workspace.access_message();
+    let editor_state = workspace.editor_state();
+    let access_message = workspace.access_message_for(&editor_state);
     Ok(WorkspaceInfo {
         root: workspace.root.to_string_lossy().into_owned(),
         portable: workspace.portable,
@@ -557,7 +563,9 @@ fn workspace_info(state: State<'_, AppState>) -> Result<WorkspaceInfo, String> {
         editor,
         access_controlled: workspace.access_controlled(),
         access_message,
-        editor_owner: workspace.editor_owner(),
+        editor_owner: editor_state.presence.map(|presence| presence.owner),
+        editor_busy: editor_state.busy,
+        editor_state_message: editor_state.message,
         owner_configured: administration::configured(&workspace.root).unwrap_or(true),
         administration_notice: workspace.admin_notice(),
         schema_version: SCHEMA_VERSION,
@@ -602,6 +610,8 @@ fn set_workspace_access_password(
 #[serde(rename_all = "camelCase")]
 struct OwnerInfo {
     editor: Option<workspace::EditorPresence>,
+    editor_busy: bool,
+    editor_state_message: Option<String>,
     events: Vec<administration::AdminEvent>,
 }
 
@@ -632,10 +642,20 @@ fn setup_workspace_owner(
 
 #[tauri::command]
 fn workspace_owner_info(state: State<'_, AppState>, password: String) -> Result<OwnerInfo, String> {
+    let _maintenance = state
+        .maintenance
+        .lock()
+        .map_err(|_| "Хранилище недоступно".to_string())?;
     let workspace = state.active_workspace()?;
     administration::authenticate(&workspace.root, &Zeroizing::new(password))?;
+    if workspace.is_editor() {
+        let _ = workspace.require_editor();
+    }
+    let editor_state = workspace.editor_state();
     Ok(OwnerInfo {
-        editor: workspace.editor_presence(),
+        editor: editor_state.presence,
+        editor_busy: editor_state.busy,
+        editor_state_message: editor_state.message,
         events: administration::events(&workspace.root)?,
     })
 }
@@ -662,9 +682,14 @@ fn request_editor_release(
             &Zeroizing::new(password.unwrap_or_default()),
         )?;
     }
-    let target = workspace
-        .editor_presence()
-        .ok_or("Редактор уже освободил базу")?;
+    let editor_state = workspace.editor_state();
+    let target = editor_state.presence.ok_or_else(|| {
+        if editor_state.busy {
+            "Сессия занята, но её владелец не определён. Нельзя отправить запрос без точного адресата.".to_string()
+        } else {
+            "Редактор уже освободил базу".to_string()
+        }
+    })?;
     // Ordinary requests do not need an exposed session token; revocations must
     // refer to exactly the editor whose identity the owner confirmed in the UI.
     if revoke && target.token != target_token {
@@ -4254,11 +4279,54 @@ async fn scanner_run(
 ) -> Result<Value, String> {
     let workspace = state.active_workspace()?;
     let jobs = state.scanner_jobs.clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    let requested_output = if operation == "process" || operation == "merge" {
+        config
+            .get("outputPath")
+            .and_then(Value::as_str)
+            .map(PathBuf::from)
+    } else {
+        None
+    };
+    let result = tauri::async_runtime::spawn_blocking(move || {
         run_scanner_worker(app, workspace, jobs, job_id, operation, config)
     })
     .await
-    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())??;
+    if let Some(requested) = requested_output {
+        let produced = result
+            .get("outputPath")
+            .and_then(Value::as_str)
+            .ok_or("Не удалось подтвердить путь созданного PDF.")?;
+        state
+            .scanner_outputs
+            .register(&requested, Path::new(produced))?;
+    }
+    Ok(result)
+}
+
+#[tauri::command]
+async fn open_scanner_output(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    path: String,
+    reveal: Option<bool>,
+) -> Result<(), String> {
+    let outputs = state.scanner_outputs.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let reveal = reveal.unwrap_or(false);
+        let authorized = outputs.resolve(Path::new(&path), reveal)?;
+        if reveal {
+            app.opener().reveal_item_in_dir(&authorized)
+        } else {
+            app.opener()
+                .open_path(scanner_outputs::shell_path(&authorized)?, None::<&str>)
+        }
+        .map_err(|error| {
+            format!("Результат сохранён, но системное приложение не смогло его открыть: {error}")
+        })
+    })
+    .await
+    .map_err(|error| format!("Не удалось завершить открытие сохранённого результата: {error}"))?
 }
 
 #[tauri::command]
@@ -4341,6 +4409,7 @@ pub fn run() {
         .manage(AppState {
             workspace,
             scanner_jobs: Arc::new(Mutex::new(HashMap::new())),
+            scanner_outputs: Arc::new(scanner_outputs::ScannerOutputs::default()),
             maintenance: Arc::new(Mutex::new(())),
         })
         .invoke_handler(tauri::generate_handler![
@@ -4401,11 +4470,23 @@ pub fn run() {
             verify_backup,
             restore_backup,
             scanner_run,
+            open_scanner_output,
             scanner_cancel,
             delete_runtime_file,
         ])
-        .run(tauri::generate_context!())
-        .expect("SBK Tools could not start");
+        .build(tauri::generate_context!())
+        .expect("SBK Tools could not start")
+        .run(|app, event| {
+            if matches!(event, tauri::RunEvent::Exit)
+                && let Some(state) = app.try_state::<AppState>()
+                && let Ok(_maintenance) = state.maintenance.lock()
+                && let Ok(workspace) = state.active_workspace()
+            {
+                // Finish in-flight writes before releasing only this process's
+                // claim. Tauri exits the process directly, bypassing Drop.
+                let _ = workspace.release_editor_on_exit();
+            }
+        });
 }
 
 #[cfg(test)]

@@ -46,6 +46,49 @@ export function workspaceControlIsBlocked(
   );
 }
 
+type WorkspaceControl = Pick<
+  HTMLInputElement,
+  "disabled" | "dataset" | "getAttribute" | "setAttribute" | "removeAttribute"
+>;
+
+export function applyWorkspaceControlAccess(
+  control: WorkspaceControl,
+  blocked: boolean,
+  message: string,
+  disabledOwner: "boundary" | "component" = "boundary",
+): void {
+  if (blocked) {
+    if (control.dataset.workspaceDisabled !== "true") {
+      const originalTitle = control.getAttribute("title");
+      control.dataset.workspaceWasDisabled = String(control.disabled);
+      control.dataset.workspaceHadTitle = String(originalTitle !== null);
+      if (originalTitle !== null) control.dataset.workspaceOriginalTitle = originalTitle;
+      control.dataset.workspaceDisabled = "true";
+    }
+    // Controls opting into component ownership include workspace access in
+    // their own React disabled prop. Do not overwrite that prop's live value
+    // or restore an obsolete viewer/validation snapshot when access changes.
+    if (disabledOwner === "boundary") control.disabled = true;
+    control.setAttribute("aria-disabled", "true");
+    // The current editor can change while the control stays blocked.
+    control.setAttribute("title", message || "Общая база открыта только для просмотра");
+  } else if (control.dataset.workspaceDisabled === "true") {
+    if (disabledOwner === "boundary") {
+      control.disabled = control.dataset.workspaceWasDisabled === "true";
+    }
+    control.removeAttribute("aria-disabled");
+    if (control.dataset.workspaceHadTitle === "true") {
+      control.setAttribute("title", control.dataset.workspaceOriginalTitle || "");
+    } else {
+      control.removeAttribute("title");
+    }
+    delete control.dataset.workspaceDisabled;
+    delete control.dataset.workspaceWasDisabled;
+    delete control.dataset.workspaceHadTitle;
+    delete control.dataset.workspaceOriginalTitle;
+  }
+}
+
 export function ReadOnlyWorkspaceBoundary({
   children,
   allowMutations = false,
@@ -86,19 +129,10 @@ export function ReadOnlyWorkspaceBoundary({
             disableFormControls && formControl,
             viewerAllowed,
           );
-          if (blocked && control.dataset.workspaceDisabled !== "true") {
-            control.dataset.workspaceWasDisabled = String(control.disabled);
-            control.dataset.workspaceDisabled = "true";
-            control.disabled = true;
-            control.setAttribute("aria-disabled", "true");
-            control.title =
-              access.message || "Общая база открыта только для просмотра";
-          } else if (!blocked && control.dataset.workspaceDisabled === "true") {
-            control.disabled = control.dataset.workspaceWasDisabled === "true";
-            control.removeAttribute("aria-disabled");
-            delete control.dataset.workspaceDisabled;
-            delete control.dataset.workspaceWasDisabled;
-          }
+          const disabledOwner = control.closest('[data-workspace-managed-disabled="true"]')
+            ? "component"
+            : "boundary";
+          applyWorkspaceControlAccess(control, blocked, access.message, disabledOwner);
         });
     update();
     const observer = new MutationObserver(update);

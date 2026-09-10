@@ -33,13 +33,16 @@ def apply_annotations(image: Image.Image, annotations: Iterable[Annotation], pag
             )
             result = Image.alpha_composite(result.convert("RGBA"), overlay).convert("RGB")
         elif annotation.kind == "stroke":
+            if right <= left or bottom <= top:
+                continue
             overlay = Image.new("RGBA", result.size, (0, 0, 0, 0))
             color = ImageColor.getrgb(annotation.color)
-            thickness = max(2, round((bottom - top) * max(0.08, annotation.intensity * 0.35)))
-            ImageDraw.Draw(overlay).line(
-                (left, (top + bottom) // 2, right, (top + bottom) // 2),
+            # Geometry defines the full stroke height; intensity affects alpha
+            # only. Pillow's bounds are inclusive, unlike CSS/PDF rectangles.
+            ImageDraw.Draw(overlay).rounded_rectangle(
+                (left, top, right - 1, bottom - 1),
+                radius=min(right - left, bottom - top) / 2,
                 fill=(*color, round(255 * annotation.intensity)),
-                width=thickness,
             )
             result = Image.alpha_composite(result.convert("RGBA"), overlay).convert("RGB")
         else:
