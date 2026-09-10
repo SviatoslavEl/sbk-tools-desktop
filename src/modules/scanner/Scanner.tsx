@@ -32,6 +32,7 @@ import { captureFacsimilePreset, normalizeFacsimilePreset, type FacsimilePresetS
 import { compressionProfile, type CompressionMode } from "./compression";
 import { MAX_PREVIEW_ZOOM, MIN_PREVIEW_ZOOM } from "./previewViewport";
 import { usePreviewViewport } from "./usePreviewViewport";
+import { belongsToScannerResult, useScannerOperationUi, type ScannerProgress, type ScannerWorkspaceMode } from "./scannerOperationState";
 import {
   facsimileHeight,
   drawnRect,
@@ -75,9 +76,7 @@ type DragState =
   | { target: "facsimile"; mode: "move" | "resize" | "rotate"; start: { x: number; y: number }; initial: FacsimileGeometry; center?: { x: number; y: number } }
   | { target: "draw"; tool: DrawingTool; id: string; start: { x: number; y: number } };
 
-interface ProgressState { stage: string; currentPage: number; totalPages: number; percent: number }
 type OutputSaveMode = OutputPageMode | "blocks";
-type ResultKind = "single" | "batch" | "split" | "";
 interface PreviewResult {
   previewUrl: string;
   originalUrl: string;
@@ -157,7 +156,7 @@ export function Scanner({ active = true }: { active?: boolean }) {
       if (stopped) return;
       setFileDragActive(payload.type === "enter" || payload.type === "over");
       if (payload.type === "drop") dropHandler.current(payload.paths);
-    }).then((stop) => { if (stopped) stop(); else unlisten = stop; }).catch((reason) => { if (!stopped) setError(`Перетаскивание файлов недоступно: ${String(reason)}. Используйте кнопку выбора файла.`); });
+    }).then((stop) => { if (stopped) stop(); else unlisten = stop; }).catch((reason) => { if (!stopped) setError(`Перетаскивание файлов недоступно: ${String(reason)}. Используйте кнопку выбора файла.`, workspaceModeRef.current); });
     return () => { stopped = true; unlisten?.(); };
   }, [active]);
   const workspaceAccess = useWorkspaceAccess();
@@ -182,7 +181,9 @@ export function Scanner({ active = true }: { active?: boolean }) {
   const [mergePaths, setMergePaths] = useState<string[]>([]);
   const [mergePageOrder, setMergePageOrder] = useState<MergePageItem[]>([]);
   const [mergeInspecting, setMergeInspecting] = useState(false);
-  const [workspaceMode, setWorkspaceMode] = useState<"document" | "merge">("document");
+  const [workspaceMode, setWorkspaceMode] = useState<ScannerWorkspaceMode>("document");
+  const workspaceModeRef = useRef(workspaceMode);
+  workspaceModeRef.current = workspaceMode;
   const [selectedMergePageId, setSelectedMergePageId] = useState("");
   const [mergePreviewUrl, setMergePreviewUrl] = useState("");
   const [mergePreviewAspect, setMergePreviewAspect] = useState(0.707);
@@ -199,19 +200,15 @@ export function Scanner({ active = true }: { active?: boolean }) {
   const [facsimilePresetName, setFacsimilePresetName] = useState("");
   const [savedFacsimiles, setSavedFacsimiles] = useState<FacsimileState[]>([]);
   const [editingFacsimileId, setEditingFacsimileId] = useState("");
-  const [progress, setProgress] = useState<ProgressState | null>(null);
+  const { progress, setProgress, error, setError, resultPath, setResultPath, resultKind, setResultKind, warnings, setWarnings } = useScannerOperationUi(workspaceMode);
   const [activeJob, setActiveJob] = useState("");
-  const [error, setError] = useState("");
-  const [resultPath, setResultPath] = useState("");
-  const [resultKind, setResultKind] = useState<ResultKind>("");
-  const [resultActionError, setResultActionError] = useState<ScannerResultActionError | null>(null);
+  const [resultActionError, setResultActionError] = useState<(ScannerResultActionError & { mode: ScannerWorkspaceMode }) | null>(null);
   const resultActionGeneration = useRef(0);
   useEffect(() => {
     resultActionGeneration.current += 1;
     setResultActionError(null);
     return () => { resultActionGeneration.current += 1; };
-  }, [resultPath, resultKind]);
-  const [warnings, setWarnings] = useState<string[]>([]);
+  }, [workspaceMode, resultPath, resultKind]);
   const [estimatedOutputBytes, setEstimatedOutputBytes] = useState(0);
   const [originalBytes, setOriginalBytes] = useState(0);
   const [estimatedSavingsPercent, setEstimatedSavingsPercent] = useState(0);
@@ -234,6 +231,7 @@ export function Scanner({ active = true }: { active?: boolean }) {
   const latestPreviewJob = useRef("");
   const latestMergePreviewJob = useRef("");
   const activeJobRef = useRef("");
+  const activeJobModeRef = useRef<ScannerWorkspaceMode>("document");
   const previewCache = useRef(new BoundedPreviewCache<PreviewResult>(16));
   const lastFacsimileWidth = useRef(0.22);
   const lastFacsimileWidthMm = useRef<number | null>(null);
@@ -244,8 +242,8 @@ export function Scanner({ active = true }: { active?: boolean }) {
 
   useEffect(() => {
     let unsubscribe = () => {};
-    void listen<{ jobId: string; event: { type: string } & ProgressState }>("scanner-progress", ({ payload }) => {
-      if (payload.jobId === activeJobRef.current && payload.event.type === "progress") setProgress(payload.event);
+    void listen<{ jobId: string; event: { type: string } & ScannerProgress }>("scanner-progress", ({ payload }) => {
+      if (payload.jobId === activeJobRef.current && payload.event.type === "progress") setProgress(payload.event, activeJobModeRef.current);
     }).then((fn) => { unsubscribe = fn; });
     return () => unsubscribe();
   }, []);
@@ -297,7 +295,7 @@ export function Scanner({ active = true }: { active?: boolean }) {
       : null);
     setPreviewUrl(result.previewUrl);
     setOriginalUrl(result.originalUrl);
-    setWarnings(result.warnings);
+    setWarnings(result.warnings, "document");
   };
 
   const makePreview = async (path = inputPath, selectedPreset = preset, selectedPage = pageIndex, rotations = pageRotations) => {
@@ -321,10 +319,10 @@ export function Scanner({ active = true }: { active?: boolean }) {
       applyPreview(cached);
       setReadyPreviewKey(readyKey);
       setPreviewing(false);
-      setError("");
+      setError("", "document");
       return;
     }
-    setPreviewing(true); setReadyPreviewKey(""); setError("");
+    setPreviewing(true); setReadyPreviewKey(""); setError("", "document");
     dragState.current = null;
     if (latestPreviewJob.current) void invoke("scanner_cancel", { jobId: latestPreviewJob.current }).catch(() => undefined);
     const jobId = crypto.randomUUID();
@@ -362,7 +360,7 @@ export function Scanner({ active = true }: { active?: boolean }) {
       previewCache.current.set(cacheKey, result);
       applyPreview(result);
       setReadyPreviewKey(readyKey);
-    } catch (reason) { if (latestPreviewJob.current === jobId) setError(String(reason)); }
+    } catch (reason) { if (latestPreviewJob.current === jobId) setError(String(reason), "document"); }
     finally { if (latestPreviewJob.current === jobId) setPreviewing(false); }
   };
 
@@ -383,12 +381,12 @@ export function Scanner({ active = true }: { active?: boolean }) {
     setWorkspaceMode("document");
     previewCache.current.clear();
     setPageCount(0); setPreviewUrl(""); setOriginalUrl(""); setLoadedPreviewUrl(""); setReadyPreviewKey(""); setPageSizeMm(null); setDrawingTool(null);
-    setInputPath(path); setDocumentName(path.split(/[\\/]/).pop() || path); setPageIndex(0); setPageOrder([]); setOutputPageMode("all"); setOutputPageRange(""); setOutputBlocks([]); setPageRotations({}); setResultPath(""); setResultKind(""); setWarnings([]); setFacsimile(null); setSavedFacsimiles([]); setEditingFacsimileId(""); setRedactions([]); setAnnotations([]); setSelectedOverlay(null); setOriginalBytes(0); setEstimatedOutputBytes(0); setEstimatedSavingsPercent(0); setOcrConfidence(null); setOcrText(""); setLowConfidenceWords([]); viewport.resetView();
+    setInputPath(path); setDocumentName(path.split(/[\\/]/).pop() || path); setPageIndex(0); setPageOrder([]); setOutputPageMode("all"); setOutputPageRange(""); setOutputBlocks([]); setPageRotations({}); setResultPath("", "document"); setResultKind("", "document"); setProgress(null, "document"); setWarnings([], "document"); setFacsimile(null); setSavedFacsimiles([]); setEditingFacsimileId(""); setRedactions([]); setAnnotations([]); setSelectedOverlay(null); setOriginalBytes(0); setEstimatedOutputBytes(0); setEstimatedSavingsPercent(0); setOcrConfidence(null); setOcrText(""); setLowConfidenceWords([]); viewport.resetView();
     await makePreview(path, preset, 0, {});
   };
   const chooseBatch = async () => {
     const paths = await chooseOpenPaths("Выберите PDF и DOCX для пакета", ["pdf", "docx"]);
-    if (paths.length) { setBatchPaths(paths); setError(""); setResultPath(""); setResultKind(""); }
+    if (paths.length) { setWorkspaceMode("document"); setBatchPaths(paths); setError("", "document"); setResultPath("", "document"); setResultKind("", "document"); setProgress(null, "document"); }
   };
   const previewMergePage = async (page: MergePageItem) => {
     if (latestMergePreviewJob.current) void invoke("scanner_cancel", { jobId: latestMergePreviewJob.current }).catch(() => undefined);
@@ -396,7 +394,7 @@ export function Scanner({ active = true }: { active?: boolean }) {
     latestMergePreviewJob.current = jobId;
     setSelectedMergePageId(page.id);
     setMergePreviewing(true);
-    setError("");
+    setError("", "merge");
     try {
       const response = await invoke<{ outputPath: string; originalPath?: string }>("scanner_run", {
         jobId,
@@ -411,7 +409,7 @@ export function Scanner({ active = true }: { active?: boolean }) {
         if (response.originalPath) void invoke("delete_runtime_file", { path: response.originalPath }).catch(() => undefined);
       }
     } catch (reason) {
-      if (latestMergePreviewJob.current === jobId) setError(`Не удалось показать выбранный лист: ${String(reason)}`);
+      if (latestMergePreviewJob.current === jobId) setError(`Не удалось показать выбранный лист: ${String(reason)}`, "merge");
     } finally {
       if (latestMergePreviewJob.current === jobId) setMergePreviewing(false);
     }
@@ -425,13 +423,13 @@ export function Scanner({ active = true }: { active?: boolean }) {
     setWorkspaceMode("merge");
     const newPaths = paths.filter((path) => !mergePaths.includes(path));
     if (!newPaths.length) return;
-    setMergeInspecting(true); setError(""); setResultPath(""); setResultKind("");
+    setMergeInspecting(true); setError("", "merge"); setResultPath("", "merge"); setResultKind("", "merge"); setWarnings([], "merge");
     const inspected: MergePageItem[] = [];
     try {
       for (const [fileIndex, path] of newPaths.entries()) {
         const jobId = crypto.randomUUID();
-        setActiveJob(jobId); activeJobRef.current = jobId;
-        setProgress({ stage: `Определяем страницы: ${path.split(/[\\/]/).pop()}`, currentPage: fileIndex + 1, totalPages: newPaths.length, percent: Math.round(fileIndex / newPaths.length * 100) });
+        setActiveJob(jobId); activeJobRef.current = jobId; activeJobModeRef.current = "merge";
+        setProgress({ stage: `Определяем страницы: ${path.split(/[\\/]/).pop()}`, currentPage: fileIndex + 1, totalPages: newPaths.length, percent: Math.round(fileIndex / newPaths.length * 100) }, "merge");
         const response = await invoke<{ outputPath: string; originalPath?: string; pageCount: number }>("scanner_run", {
           jobId, operation: "preview", config: { protocolVersion: 2, inputPath: path, preset: "Оригинал", pageIndex: 0, seed: 42, settings: { dpi: 96, jpeg_quality: 50 }, pageRotations: {}, redactions: [], annotations: [] },
         });
@@ -443,10 +441,10 @@ export function Scanner({ active = true }: { active?: boolean }) {
       setMergePaths((current) => [...current, ...newPaths]);
       setMergePageOrder((current) => [...current, ...inspected]);
       if (!selectedMergePageId && inspected[0]) void previewMergePage(inspected[0]);
-      setProgress({ stage: "Страницы готовы к объединению", currentPage: inspected.length, totalPages: inspected.length, percent: 100 });
+      setProgress({ stage: "Страницы готовы к объединению", currentPage: inspected.length, totalPages: inspected.length, percent: 100 }, "merge");
     } catch (reason) {
-      setError(`Не удалось добавить документы к объединению: ${String(reason)}`);
-      setProgress(null);
+      setError(`Не удалось добавить документы к объединению: ${String(reason)}`, "merge");
+      setProgress(null, "merge");
     } finally {
       setActiveJob(""); activeJobRef.current = ""; setMergeInspecting(false);
     }
@@ -456,6 +454,7 @@ export function Scanner({ active = true }: { active?: boolean }) {
     const remaining = mergePageOrder.filter((entry) => entry.path !== path);
     setMergePaths((current) => current.filter((entry) => entry !== path));
     setMergePageOrder(remaining);
+    setResultPath("", "merge"); setResultKind("", "merge"); setProgress(null, "merge");
     if (selectedWasRemoved) {
       setSelectedMergePageId(remaining[0]?.id || "");
       setMergePreviewUrl("");
@@ -469,10 +468,11 @@ export function Scanner({ active = true }: { active?: boolean }) {
     setMergePageOrder([]);
     setSelectedMergePageId("");
     setMergePreviewUrl("");
-    setResultPath("");
-    setResultKind("");
-    setProgress(null);
-    setError("");
+    setResultPath("", "merge");
+    setResultKind("", "merge");
+    setProgress(null, "merge");
+    setError("", "merge");
+    setWarnings([], "merge");
   };
   const moveMergePage = (index: number, target: number) => setMergePageOrder((current) => {
     if (target < 0 || target >= current.length || index === target) return current;
@@ -485,17 +485,18 @@ export function Scanner({ active = true }: { active?: boolean }) {
   const processBatch = async () => {
     if (!batchPaths.length) return;
     const directory = await chooseDirectory("Выберите папку для обработанных PDF"); if (!directory) return;
-    const separator = directory.includes("\\") ? "\\" : "/"; const startedAt = Date.now(); setError(""); setWarnings([]);
+    setWorkspaceMode("document");
+    const separator = directory.includes("\\") ? "\\" : "/"; const startedAt = Date.now(); setError("", "document"); setWarnings([], "document"); setResultPath("", "document"); setResultKind("", "document");
     for (const [index, path] of batchPaths.entries()) {
-      const jobId = crypto.randomUUID(); setActiveJob(jobId); activeJobRef.current = jobId;
-      setProgress({ stage: `Файл ${index + 1} из ${batchPaths.length}`, currentPage: 0, totalPages: 0, percent: Math.round(index / batchPaths.length * 100) });
+      const jobId = crypto.randomUUID(); setActiveJob(jobId); activeJobRef.current = jobId; activeJobModeRef.current = "document";
+      setProgress({ stage: `Файл ${index + 1} из ${batchPaths.length}`, currentPage: 0, totalPages: 0, percent: Math.round(index / batchPaths.length * 100) }, "document");
       const name = (path.split(/[\\/]/).pop() || `документ-${index + 1}`).replace(/\.(pdf|docx)$/i, "");
       const outputPath = `${directory}${separator}${name} — обработано.pdf`;
       try { await invoke("scanner_run", { jobId, operation: "process", config: { protocolVersion: 2, inputPath: path, outputPath, preset, ocrEnabled, ocrLanguages, pdfaEnabled, seed: 42, settings: { dpi, jpeg_quality: quality }, compressionTargetRatio, pageOrder: [], redactions: [], annotations: [] } }); }
-      catch (reason) { setError(`Файл ${index + 1}: ${String(reason)}`); await templates.save(`Пакет: ошибка ${new Date().toLocaleString("ru-RU")}`, { kind: "processing-journal", inputType: path.toLowerCase().endsWith(".docx") ? "DOCX" : "PDF", preset, ocr: ocrEnabled, status: "failed", durationMs: Date.now() - startedAt }).catch(() => undefined); setActiveJob(""); activeJobRef.current = ""; return; }
+      catch (reason) { setError(`Файл ${index + 1}: ${String(reason)}`, "document"); setProgress(null, "document"); await templates.save(`Пакет: ошибка ${new Date().toLocaleString("ru-RU")}`, { kind: "processing-journal", inputType: path.toLowerCase().endsWith(".docx") ? "DOCX" : "PDF", preset, ocr: ocrEnabled, status: "failed", durationMs: Date.now() - startedAt }).catch(() => undefined); setActiveJob(""); activeJobRef.current = ""; return; }
     }
-    setActiveJob(""); activeJobRef.current = ""; setProgress({ stage: "Пакет готов", currentPage: batchPaths.length, totalPages: batchPaths.length, percent: 100 });
-    setResultPath(directory); setResultKind("batch"); if (workspaceAccess.editor) await templates.save(`Пакет ${new Date().toLocaleString("ru-RU")}`, { kind: "processing-journal", inputType: "BATCH", pageCount: batchPaths.length, preset, ocr: ocrEnabled, status: "completed", durationMs: Date.now() - startedAt }).catch(() => undefined);
+    setActiveJob(""); activeJobRef.current = ""; setProgress({ stage: "Пакет готов", currentPage: batchPaths.length, totalPages: batchPaths.length, percent: 100 }, "document");
+    setResultPath(directory, "document"); setResultKind("batch", "document"); if (workspaceAccess.editor) await templates.save(`Пакет ${new Date().toLocaleString("ru-RU")}`, { kind: "processing-journal", inputType: "BATCH", pageCount: batchPaths.length, preset, ocr: ocrEnabled, status: "completed", durationMs: Date.now() - startedAt }).catch(() => undefined);
   };
 
   const processMerge = async () => {
@@ -504,8 +505,8 @@ export function Scanner({ active = true }: { active?: boolean }) {
     if (!outputPath) return;
     const jobId = crypto.randomUUID();
     const startedAt = Date.now();
-    setActiveJob(jobId); activeJobRef.current = jobId; setError(""); setWarnings([]);
-    setProgress({ stage: "Подготавливаем объединение", currentPage: 0, totalPages: mergePaths.length, percent: 0 });
+    setActiveJob(jobId); activeJobRef.current = jobId; activeJobModeRef.current = "merge"; setError("", "merge"); setWarnings([], "merge"); setResultPath("", "merge"); setResultKind("", "merge");
+    setProgress({ stage: "Подготавливаем объединение", currentPage: 0, totalPages: mergePaths.length, percent: 0 }, "merge");
     try {
       const response = await invoke<{ outputPath: string; warnings?: string[]; outputBytes?: number; originalBytes?: number; savingsPercent?: number; pageCount?: number; outputSha256?: string }>("scanner_run", {
         jobId,
@@ -525,20 +526,17 @@ export function Scanner({ active = true }: { active?: boolean }) {
           mergePageOrder: mergePageOrder.map((entry) => ({ sourceIndex: mergePaths.indexOf(entry.path), pageIndex: entry.pageIndex })),
         },
       });
-      setWarnings(response.warnings || []);
-      setOriginalBytes(response.originalBytes || 0);
-      setEstimatedOutputBytes(response.outputBytes || 0);
-      setEstimatedSavingsPercent(response.savingsPercent || 0);
-      setResultPath(response.outputPath);
-      setResultKind("single");
-      setProgress({ stage: "Документы объединены", currentPage: mergePageOrder.length, totalPages: mergePageOrder.length, percent: 100 });
+      setWarnings(response.warnings || [], "merge");
+      setResultPath(response.outputPath, "merge");
+      setResultKind("single", "merge");
+      setProgress({ stage: "Документы объединены", currentPage: mergePageOrder.length, totalPages: mergePageOrder.length, percent: 100 }, "merge");
       if (workspaceAccess.editor) await templates.save(`Объединение ${new Date().toLocaleString("ru-RU")}`, {
         kind: "processing-journal", inputType: "MERGE", pageCount: response.pageCount,
         preset, ocr: ocrEnabled, status: "completed", durationMs: Date.now() - startedAt,
         outputSha256: response.outputSha256, appliedOperations: [`Файлов: ${mergePaths.length}`, `Страниц: ${mergePageOrder.length}`, `Пресет: ${preset}`],
       }).catch(() => undefined);
     } catch (reason) {
-      setError(String(reason)); setProgress(null);
+      setError(String(reason), "merge"); setProgress(null, "merge");
       if (workspaceAccess.editor) await templates.save(`Ошибка объединения ${new Date().toLocaleString("ru-RU")}`, {
         kind: "processing-journal", inputType: "MERGE", pageCount: mergePaths.length,
         preset, ocr: ocrEnabled, status: "failed", durationMs: Date.now() - startedAt,
@@ -690,7 +688,7 @@ export function Scanner({ active = true }: { active?: boolean }) {
       try {
         for (const [index, block] of outputBlockSelection.blocks.entries()) {
           const blockOutputPath = `${outputDirectory}${separator}${base} — ${block.fileName}.pdf`;
-          const jobId = crypto.randomUUID(); setActiveJob(jobId); activeJobRef.current = jobId;
+          const jobId = crypto.randomUUID(); setActiveJob(jobId); activeJobRef.current = jobId; activeJobModeRef.current = "document";
           setProgress({ stage: `Блок ${index + 1} из ${outputBlockSelection.blocks.length}: ${block.name}`, currentPage: completedPages, totalPages, percent: Math.round(completedPages / totalPages * 100) });
           try {
             const response = await invoke<{ outputPath: string; warnings?: string[]; outputBytes?: number }>("scanner_run", { jobId, operation: "process", config: processingConfig(blockOutputPath, block.order) });
@@ -713,7 +711,7 @@ export function Scanner({ active = true }: { active?: boolean }) {
 
     if (!outputPath) return;
     const finalPageOrder = outputPageSelection.order;
-    const jobId = crypto.randomUUID(); setActiveJob(jobId); activeJobRef.current = jobId; setProgress({ stage: "Подготовка", currentPage: 0, totalPages: finalPageOrder.length, percent: 0 }); setError(""); setResultPath(""); setResultKind(""); setWarnings([]);
+    const jobId = crypto.randomUUID(); setActiveJob(jobId); activeJobRef.current = jobId; activeJobModeRef.current = "document"; setProgress({ stage: "Подготовка", currentPage: 0, totalPages: finalPageOrder.length, percent: 0 }); setError(""); setResultPath(""); setResultKind(""); setWarnings([]);
     const startedAt = Date.now();
     try {
       const response = await invoke<{ outputPath: string; outputSha256?: string; warnings?: string[]; ocrConfidence?: number | null; ocrText?: string; lowConfidenceWords?: Array<{ page: number; text: string; confidence: number }>; outputBytes?: number; originalBytes?: number; savingsPercent?: number }>("scanner_run", { jobId, operation: "process", config: processingConfig(outputPath, finalPageOrder) });
@@ -731,7 +729,7 @@ export function Scanner({ active = true }: { active?: boolean }) {
     const generation = ++resultActionGeneration.current;
     setResultActionError(null);
     const failure = await openScannerResult(path, action);
-    if (resultActionGeneration.current === generation) setResultActionError(failure);
+    if (resultActionGeneration.current === generation) setResultActionError(failure ? { ...failure, mode: workspaceMode } : null);
   };
 
   const openGeneratedPath = (path: string, label: "PDF" | "папку") => runResultAction(path, label === "PDF" ? "pdf" : "folder");
@@ -978,7 +976,7 @@ export function Scanner({ active = true }: { active?: boolean }) {
         </div>}
         {error && <div className="scanner-error"><strong>Не удалось обработать документ</strong><span>{error}</span>{selectedMergePage && <button className="secondary" type="button" onClick={() => void previewMergePage(selectedMergePage)}>Повторить предпросмотр</button>}</div>}
         {warnings.length > 0 && <div className="notice warning"><strong>Проверьте результат</strong>{warnings.map((warning) => <span key={warning}>{warning}</span>)}</div>}
-        {progress && <div className="progress-panel"><div><strong>{progress.stage}</strong><span>{progress.totalPages ? `Страница ${progress.currentPage} из ${progress.totalPages}` : ""}</span></div><progress max="100" value={progress.percent} /><strong>{progress.percent}%</strong>{activeJob && <button className="secondary" type="button" onClick={() => void cancel()}>Отменить</button>}</div>}
+        {progress && <div className="progress-panel"><div><strong>{progress.stage}</strong><span>{progress.totalPages ? `Страница ${progress.currentPage} из ${progress.totalPages}` : ""}</span></div><progress max="100" value={progress.percent} /><strong>{progress.percent}%</strong>{activeJob && activeJobModeRef.current === workspaceMode && <button className="secondary" type="button" onClick={() => void cancel()}>Отменить</button>}</div>}
         {resultPath && resultKind === "single" ? <div className="ready-panel"><div><strong>✓ Объединённый PDF готов</strong><span>{resultPath}</span></div><button className="secondary" type="button" onClick={() => void openGeneratedPath(resultPath, "PDF")}>Открыть PDF</button><button className="secondary" type="button" onClick={() => void revealGeneratedFile(resultPath)}>Открыть папку</button><button className="primary" type="button" disabled={!!activeJob} onClick={() => void processMerge()}>Сохранить ещё одну копию</button></div> : <div className="actionbar"><span>К файлам применяются выбранный пресет, OCR и настройки сжатия.</span><button className="primary" type="button" disabled={mergePaths.length < 2 || !mergePageOrder.length || !!activeJob || mergeInspecting} onClick={() => void processMerge()}>Объединить {mergePageOrder.length} стр. из {mergePaths.length} файлов</button></div>}
       </> : <>
       <div className="scanner-document-tools" role="toolbar" aria-label="Инструменты документа"><span>Инструменты</span>{(["marker", "stroke", "blur", "print_blur"] as const).map((kind) => <button key={kind} className={drawingTool === kind ? "selected-tool" : ""} type="button" aria-label={drawingToolLabels[kind]} title={drawingToolLabels[kind]} aria-pressed={drawingTool === kind} disabled={!documentReady || showOriginal} onClick={() => { if (effectsPanel.current) effectsPanel.current.open = false; setDrawingTool((current) => current === kind ? null : kind); }}><DrawingToolIcon kind={kind} /></button>)}</div>
@@ -1011,10 +1009,10 @@ export function Scanner({ active = true }: { active?: boolean }) {
       {warnings.length > 0 && <div className="notice warning"><strong>Проверьте результат</strong>{warnings.map((warning) => <span key={warning}>{warning}</span>)}</div>}
       {inputPath && <div className="scanner-estimate"><span>Исходный размер: {originalBytes ? `${(originalBytes / 1024 / 1024).toFixed(1)} МБ` : "считается"}</span><span>{resultKind === "single" ? "Размер результата" : "Оценка результата"}: {estimatedOutputBytes ? `${resultKind === "single" ? "" : "≈ "}${(estimatedOutputBytes / 1024 / 1024).toFixed(1)} МБ` : "рассчитывается"}</span>{originalBytes > 0 && estimatedOutputBytes > 0 && <span className={estimatedSavingsPercent >= 0 ? "estimate-good" : "estimate-warning"}>{estimatedSavingsPercent >= 0 ? `Меньше ${resultKind === "single" ? "" : "примерно "}на ${estimatedSavingsPercent.toFixed(0)}%` : `Больше ${resultKind === "single" ? "" : "примерно "}на ${Math.abs(estimatedSavingsPercent).toFixed(0)}%`}</span>}{pageSizeMm && <span>Страница: {pageSizeMm[0].toFixed(1)} × {pageSizeMm[1].toFixed(1)} мм</span>}{ocrConfidence != null && <span>Средняя уверенность OCR: {ocrConfidence.toFixed(1)}%</span>}</div>}
       {ocrText && <details className="ocr-result"><summary>Распознанный текст · сомнительных слов: {lowConfidenceWords.length}</summary><textarea readOnly rows={10} value={ocrText} aria-label="Распознанный текст" />{lowConfidenceWords.length > 0 && <div className="low-confidence-list">{lowConfidenceWords.slice(0, 100).map((word, index) => <span key={`${word.page}-${index}`} title={`Страница ${word.page}`}>{word.text} · {word.confidence.toFixed(0)}%</span>)}</div>}<p className="help-text">Текст показывается только в текущем окне и не записывается в журнал обработки.</p></details>}
-      {progress && <div className="progress-panel"><div><strong>{progress.stage}</strong><span>{progress.totalPages ? `Страница ${progress.currentPage} из ${progress.totalPages}` : ""}</span></div><progress max="100" value={progress.percent} /><strong>{progress.percent}%</strong>{activeJob && <button className="secondary" type="button" onClick={() => void cancel()}>Отменить</button>}</div>}
+      {progress && <div className="progress-panel"><div><strong>{progress.stage}</strong><span>{progress.totalPages ? `Страница ${progress.currentPage} из ${progress.totalPages}` : ""}</span></div><progress max="100" value={progress.percent} /><strong>{progress.percent}%</strong>{activeJob && activeJobModeRef.current === workspaceMode && <button className="secondary" type="button" onClick={() => void cancel()}>Отменить</button>}</div>}
       {resultPath ? resultKind === "batch" || resultKind === "split" ? <div className="ready-panel"><div><strong>✓ {resultKind === "split" ? "Блоки PDF готовы" : "Пакет готов"}</strong><span>{resultPath}</span></div><button className="primary" type="button" onClick={() => void openGeneratedPath(resultPath, "папку")}>Открыть папку</button><button className="secondary" type="button" onClick={() => { if (resultKind === "batch") setBatchPaths([]); setResultPath(""); setResultKind(""); setProgress(null); }}>{resultKind === "split" ? "Изменить блоки" : "Другой пакет"}</button></div> : <div className="ready-panel"><div><strong>✓ PDF готов</strong><span>{resultPath}</span></div><button className="secondary" type="button" onClick={() => void openGeneratedPath(resultPath, "PDF")}>Открыть PDF</button><button className="secondary" type="button" onClick={() => void revealGeneratedFile(resultPath)}>Открыть папку</button><button className="primary" disabled={!documentReady || !!activeJob || !!facsimileSelection.error || !!outputPageSelection.error || !!outputBlockSelection.error} type="button" onClick={() => void processDocument()}>Сохранить ещё одну версию</button><button className="secondary" type="button" onClick={() => { setInputPath(""); setPreviewUrl(""); setPageCount(0); setResultPath(""); setResultKind(""); setWarnings([]); setProgress(null); setFacsimile(null); setSavedFacsimiles([]); setEditingFacsimileId(""); previewCache.current.clear(); }}>Другой файл</button></div> : <div className="actionbar"><span>{facsimileSelection.error || outputPageSelection.error || outputBlockSelection.error || (facsimile ? "Факсимиле перемещается и поворачивается мгновенно, без повторной загрузки документа" : outputPageMode === "blocks" ? "Настройте блоки и сохраните несколько PDF" : "Выберите пресет и сохраните новый PDF")}</span><button className="primary" disabled={!documentReady || !!activeJob || !!facsimileSelection.error || !!outputPageSelection.error || !!outputBlockSelection.error} type="button" onClick={() => void processDocument()}>{outputPageMode === "blocks" ? "Сохранить блоки PDF" : "Сохранить PDF"}</button></div>}
       </>}
-      {resultPath && resultActionError?.path === resultPath && <ScannerResultActionNotice failure={resultActionError} onDismiss={() => { resultActionGeneration.current += 1; setResultActionError(null); }} />}
+      {resultActionError && belongsToScannerResult(resultActionError, workspaceMode, resultPath) && <ScannerResultActionNotice failure={resultActionError} onDismiss={() => { resultActionGeneration.current += 1; setResultActionError(null); }} />}
     </section>
   </div>;
 }

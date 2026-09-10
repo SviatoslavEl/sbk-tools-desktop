@@ -44,6 +44,8 @@ jobs:
       - run: npm run build
       - run: python -m pytest -q
         working-directory: scanner-worker
+      - name: Verify safe extraction of the reusable installed worker
+        run: python -m pytest -q scripts/tests/test_extract_verified_installed_worker.py
       - run: python -m ruff check .
         working-directory: scanner-worker
       - name: Prepare sidecar placeholder for Tauri metadata checks
