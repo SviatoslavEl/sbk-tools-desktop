@@ -200,8 +200,10 @@ public static class InstallerRegressionLocks {
     private static extern SafeFileHandle CreateFileW(string path, uint access, uint share,
         IntPtr security, uint disposition, uint flags, IntPtr template);
     public static SafeFileHandle HoldWithoutDeleteSharing(string path, bool directory) {
-        // READ_ATTRIBUTES, SHARE_READ|SHARE_WRITE, OPEN_EXISTING. Deliberately no SHARE_DELETE.
-        var handle = CreateFileW(path, 0x80, 3, IntPtr.Zero, 3,
+        // GENERIC_READ (not metadata-only READ_ATTRIBUTES), SHARE_READ|SHARE_WRITE,
+        // OPEN_EXISTING. Attribute-only handles do not enforce the needed share
+        // denial; this must model a real open file/directory without SHARE_DELETE.
+        var handle = CreateFileW(path, 0x80000000, 3, IntPtr.Zero, 3,
             directory ? 0x02000000u : 0x80u, IntPtr.Zero);
         if (handle.IsInvalid) throw new Win32Exception(Marshal.GetLastWin32Error());
         return handle;
