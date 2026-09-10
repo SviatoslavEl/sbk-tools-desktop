@@ -8,6 +8,10 @@ build = "build.rs"
 tar = "0.4"
 uuid = { version = "1", features = ["v4"] }
 zstd = { version = "0.13", default-features = false }
+sha2 = "0.10"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_RestartManager"] }
 
 [build-dependencies]
 embed-resource = "3"

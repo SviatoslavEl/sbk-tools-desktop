@@ -1,0 +1,121 @@
+name: Repair Windows installer without rebuilding application
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["codex/v2.8.7-installer-update"]
+    tags: ["installer-v*"]
+    paths:
+      - ".github/workflows/installer-repair.yml"
+      - "scripts/repackage_windows_installer.ps1"
+      - "scripts/extract_installed_smoke_step.py"
+      - "scripts/test_windows_installer_regressions.ps1"
+      - "scripts/create_installer_smoke_payload.py"
+      - "scripts/windows-installed.nsi"
+      - "windows-installer-helper/**"
+
+permissions:
+  contents: read
+
+jobs:
+  repair:
+    runs-on: windows-latest
+    timeout-minutes: 50
+    env:
+      TARGET: x86_64-pc-windows-msvc
+      ARTIFACT_VERSION: 2.8.6-r2
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+      - uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: windows-installer-helper
+      - name: Verify revision and install small test dependencies
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF.StartsWith('refs/tags/') -and $env:GITHUB_REF_NAME -ne 'installer-v2.8.6-r2') {
+            throw 'This installer-only repair is pinned to tag installer-v2.8.6-r2'
+          }
+          python -m pip install zstandard==0.23.0 PyYAML==6.0.2
+          if ($LASTEXITCODE -ne 0) { throw 'Fixture/YAML dependencies failed' }
+          cargo test --locked --manifest-path windows-installer-helper/Cargo.toml
+          if ($LASTEXITCODE -ne 0) { throw 'Extractor regressions failed' }
+          cargo build --locked --release --manifest-path windows-installer-helper/Cargo.toml
+          if ($LASTEXITCODE -ne 0) { throw 'Extractor build failed' }
+      - name: Run lightweight real NSIS sharing-violation regressions first
+        shell: pwsh
+        run: ./scripts/test_windows_installer_regressions.ps1
+      - name: Repackage the immutable released 2.8.6 payload
+        shell: pwsh
+        run: ./scripts/repackage_windows_installer.ps1
+      - name: Extract the exact existing release smoke step
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force scanner-worker/tests/output | Out-Null
+          python scripts/extract_installed_smoke_step.py --output (Join-Path $env:RUNNER_TEMP 'sbk-installed-repair-smoke.ps1')
+          if ($LASTEXITCODE -ne 0) { throw 'Exact installed smoke extraction failed' }
+      - name: Install, launch twice, verify shared locking and uninstall safely
+        timeout-minutes: 35
+        shell: pwsh
+        run: |
+          & (Join-Path $env:RUNNER_TEMP 'sbk-installed-repair-smoke.ps1')
+          if ($LASTEXITCODE -ne 0) { throw 'Repaired installer did not pass the production installed smoke' }
+      - name: Upload repair artifacts only after all real installation checks pass
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: SBK-Windows-Installer-Repair
+          path: |
+            release-artifacts/SBK-Tools-Fast-Setup-2.8.6-r2-x64.exe
+            release-artifacts/SBK-Tools-Fast-Setup-2.8.6-r2-x64.exe.sha256
+            release-artifacts/SBK-Tools-Fast-Setup-2.8.6-r2-x64.provenance.json
+          if-no-files-found: error
+      - name: Preserve test and packaging evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: SBK-Windows-Installer-Repair-Diagnostics-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/sbk-installer-regression-results/
+            ${{ runner.temp }}/SBK-Windows-Installer-Repair-Packaging.log
+            ${{ runner.temp }}/SBK-Tools-Fast-Smoke.log
+            ${{ runner.temp }}/SBK-Tools-Fast-Install-Error.log
+          if-no-files-found: warn
+
+  publish-installer-only:
+    needs: repair
+    if: github.ref == 'refs/tags/installer-v2.8.6-r2'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Download only this successful repair and verify provenance
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" --name SBK-Windows-Installer-Repair --dir release-artifacts
+          cd release-artifacts
+          sha256sum --check SBK-Tools-Fast-Setup-2.8.6-r2-x64.exe.sha256
+          jq -e --arg commit "$GITHUB_SHA" '
+            .buildCommit == $commit and .applicationVersion == "2.8.6" and
+            .installerVersion == "2.8.6-r2" and .installerVersionQuad == "2.8.6.2" and
+            .sourceInstaller.sha256 == "20e6e803b5b7ed42eb9f06a013e1ef849bb963fefce0ccc41267ff40d86e2a0f" and
+            .rebuiltPayload.unchanged == true and .sourcePayload.sha256 == .rebuiltPayload.sha256 and
+            .sourcePayload.sizeBytes == .rebuiltPayload.sizeBytes
+          ' SBK-Tools-Fast-Setup-2.8.6-r2-x64.provenance.json
+      - name: Publish a separate installer revision without replacing application release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release create installer-v2.8.6-r2 --repo "$GITHUB_REPOSITORY" --verify-tag --latest=false \
+            --title 'СБК Инструменты 2.8.6 — исправленный установщик r2' \
+            --notes 'Исправлена только оболочка установщика Windows и механизм безопасного обновления. Версия приложения остаётся 2.8.6; приложение, сканер и встроенные компоненты побайтно сохранены из исходного релиза. Проверены установка, обновление, блокировки файлов и сохранность ProductData. macOS не менялась: https://github.com/SviatoslavEl/sbk-tools-desktop/releases/tag/v2.8.6 . Исходный релиз v2.8.6 не перезаписывается. Происхождение и контрольные суммы — в provenance.json и .sha256.' \
+            release-artifacts/SBK-Tools-Fast-Setup-2.8.6-r2-x64.exe \
+            release-artifacts/SBK-Tools-Fast-Setup-2.8.6-r2-x64.exe.sha256 \
+            release-artifacts/SBK-Tools-Fast-Setup-2.8.6-r2-x64.provenance.json

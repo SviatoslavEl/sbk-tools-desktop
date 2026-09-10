@@ -710,6 +710,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Installed DOCX/LibreOffice processing failed offline' }
           & $worker.FullName process --config scanner-worker/tests/fixtures/process-ocr.json | Out-Host
           if ($LASTEXITCODE -ne 0) { throw 'Installed OCR processing failed offline' }
+          & $worker.FullName process --config scanner-worker/tests/fixtures/process-facsimile.json | Out-Host
+          if ($LASTEXITCODE -ne 0) { throw 'Installed facsimile processing failed offline' }
           Remove-Item Env:SCANDOCUMENT_RESOURCE_ROOT, Env:HTTP_PROXY, Env:HTTPS_PROXY
           Write-Host "Installed offline scanner checks completed at $(Get-Date -Format o)"
 
@@ -838,13 +840,28 @@ jobs:
           $newExtraction = @($tempAfter | Where-Object { $_ -notin $tempBefore })
           if ($newExtraction.Count -gt 0) { throw "Temporary portable extraction was not cleaned: $($newExtraction -join ', ')" }
 
+          function Invoke-InstalledUninstall([string]$Executable, [string]$Destination) {
+            # NSIS normally relaunches its uninstaller asynchronously in TEMP.
+            # Copy this exact synthetic install's uninstaller outside INSTDIR and
+            # use _?= to wait for the real deleting process, without self-locking.
+            $externalUninstaller = Join-Path $env:RUNNER_TEMP ('sbk-fast-uninstall-' + [guid]::NewGuid().ToString() + '.exe')
+            Copy-Item -LiteralPath $Executable -Destination $externalUninstaller
+            try {
+              # _?= must be last and its path must not be quoted.
+              $process = Start-Process -FilePath $externalUninstaller -WorkingDirectory $env:RUNNER_TEMP -ArgumentList @('/S', "_?=$Destination") -PassThru
+              return (Wait-InstallerProcess $process)
+            } finally {
+              Remove-Item -LiteralPath $externalUninstaller -Force -ErrorAction SilentlyContinue
+            }
+          }
+
           $uninstaller = Join-Path $installDir 'uninstall.exe'
           if (-not (Test-Path $uninstaller -PathType Leaf)) { throw 'Uninstaller is missing' }
           $internalProductData = Join-Path $installDir 'ProductData'
           New-Item -ItemType Directory -Force $internalProductData | Out-Null
           Set-Content -Encoding UTF8 (Join-Path $internalProductData 'uninstall-must-preserve.txt') 'preserve adjacent ProductData'
-          $uninstall = Start-Process -FilePath $uninstaller -ArgumentList '/S' -Wait -PassThru
-          if ($uninstall.ExitCode -ne 0) { throw "Uninstaller failed: $($uninstall.ExitCode)" }
+          $uninstallExitCode = Invoke-InstalledUninstall $uninstaller $installDir
+          if ($uninstallExitCode -ne 0) { throw "Uninstaller failed: $uninstallExitCode" }
           if (Test-Path $application) { throw 'Application executable remains after uninstall' }
           if (-not (Test-Path (Join-Path $workspace 'uninstall-must-preserve.txt'))) {
             throw 'Uninstall removed user ProductData'
@@ -862,8 +879,8 @@ jobs:
           if (-not (Test-Path (Join-Path $internalProductData 'uninstall-must-preserve.txt'))) {
             throw 'Reinstall after uninstall lost adjacent ProductData'
           }
-          $finalUninstall = Start-Process -FilePath (Join-Path $installDir 'uninstall.exe') -ArgumentList '/S' -Wait -PassThru
-          if ($finalUninstall.ExitCode -ne 0) { throw "Final uninstaller failed: $($finalUninstall.ExitCode)" }
+          $finalUninstallExitCode = Invoke-InstalledUninstall (Join-Path $installDir 'uninstall.exe') $installDir
+          if ($finalUninstallExitCode -ne 0) { throw "Final uninstaller failed: $finalUninstallExitCode" }
           if (Test-Path $application) { throw 'Application executable remains after final uninstall' }
           Write-Host "Install smoke and ProductData preservation checks completed at $(Get-Date -Format o)"
           Stop-Transcript

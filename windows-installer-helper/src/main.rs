@@ -1,7 +1,21 @@
 use std::fs;
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
-use uuid::Uuid;
+use std::sync::OnceLock;
+
+mod locks;
+mod transaction;
+
+static DIAGNOSTIC_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+fn diagnostic(message: &str) {
+    if let Some(path) = DIAGNOSTIC_PATH.get()
+        && let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path)
+    {
+        let _ = writeln!(file, "{message}");
+    }
+}
 
 const REQUIRED_FILES: &[&str] = &[
     "SBK-Tools-Fast.exe",
@@ -43,6 +57,20 @@ fn unpack(archive_path: &Path, destination: &Path) -> Result<(), String> {
         let path = entry.path().map_err(|error| error.to_string())?;
         if !safe_archive_path(&path) {
             return Err("Пакет установки содержит опасный путь".to_string());
+        }
+        let root = path.components().find_map(|component| match component {
+            Component::Normal(name) => Some(name),
+            _ => None,
+        });
+        if !root.is_some_and(|name| {
+            transaction::PAYLOAD_ROOTS
+                .iter()
+                .any(|allowed| name == *allowed)
+        }) {
+            return Err(format!(
+                "Пакет содержит файл вне разрешённых компонентов программы: {}. База ProductData и пользовательские файлы не заменяются.",
+                path.display()
+            ));
         }
         if !entry
             .unpack_in(destination)
@@ -99,83 +127,12 @@ fn verify_existing_install(destination: &Path) -> Result<(), String> {
 }
 
 fn install(archive: &Path, destination: &Path) -> Result<(), String> {
-    let parent = destination
-        .parent()
-        .ok_or_else(|| "Не удалось определить каталог установки".to_string())?;
-    fs::create_dir_all(parent)
-        .map_err(|error| format!("Не удалось создать каталог установки: {error}"))?;
-    let had_previous = destination.exists();
-    if had_previous {
-        verify_existing_install(destination)?;
-    }
-
-    let suffix = Uuid::new_v4();
-    let staging = parent.join(format!(".sbk-tools-fast-installing-{suffix}"));
-    let backup = parent.join(format!(".sbk-tools-fast-previous-{suffix}"));
-    fs::create_dir(&staging)
-        .map_err(|error| format!("Не удалось подготовить установку: {error}"))?;
-
-    let prepared = unpack(archive, &staging).and_then(|()| verify_payload(&staging));
-    if let Err(error) = prepared {
-        let _ = fs::remove_dir_all(&staging);
-        return Err(error);
-    }
-    if let Err(error) = fs::write(staging.join(INSTALL_MARKER), b"SBK Tools Fast\n") {
-        let _ = fs::remove_dir_all(&staging);
-        return Err(format!("Не удалось записать маркер установки: {error}"));
-    }
-
-    if had_previous && let Err(error) = fs::rename(destination, &backup) {
-        let _ = fs::remove_dir_all(&staging);
-        return Err(format!(
-            "Не удалось обновить программу. Закройте запущенные экземпляры и повторите: {error}"
-        ));
-    }
-
-    let previous_product_data = backup.join(PRODUCT_DATA);
-    let staged_product_data = staging.join(PRODUCT_DATA);
-    let preserved_product_data = had_previous && previous_product_data.exists();
-    if preserved_product_data && staged_product_data.exists() {
-        let _ = fs::rename(&backup, destination);
-        let _ = fs::remove_dir_all(&staging);
-        return Err("Пакет установки не должен содержать ProductData".to_string());
-    }
-    if preserved_product_data
-        && let Err(error) = fs::rename(&previous_product_data, &staged_product_data)
-    {
-        let _ = fs::rename(&backup, destination);
-        let _ = fs::remove_dir_all(&staging);
-        return Err(format!(
-            "Не удалось сохранить ProductData при обновлении: {error}"
-        ));
-    }
-
-    if let Err(error) = fs::rename(&staging, destination) {
-        let product_data_restored = !preserved_product_data
-            || fs::rename(&staged_product_data, &previous_product_data).is_ok();
-        if had_previous {
-            let _ = fs::rename(&backup, destination);
-        }
-        if product_data_restored {
-            let _ = fs::remove_dir_all(&staging);
-        } else {
-            return Err(format!(
-                "Не удалось завершить установку: {error}. ProductData сохранена для ручного восстановления в {}",
-                staged_product_data.display()
-            ));
-        }
-        return Err(format!("Не удалось завершить установку: {error}"));
-    }
-
-    if had_previous {
-        let _ = fs::remove_dir_all(backup);
-    }
-    Ok(())
+    transaction::install(archive, destination)
 }
 
 fn run() -> Result<(), String> {
     let mut arguments = std::env::args_os().skip(1);
-    let archive = PathBuf::from(
+    let archive_or_mode = PathBuf::from(
         arguments
             .next()
             .ok_or_else(|| "Не указан пакет установки".to_string())?,
@@ -189,25 +146,44 @@ fn run() -> Result<(), String> {
     if arguments.next().is_some() {
         return Err("Переданы лишние параметры установки".to_string());
     }
-    install(&archive, &destination)
+    if archive_or_mode == Path::new("--check") {
+        transaction::preflight(&destination)
+    } else {
+        install(&archive_or_mode, &destination)
+    }
 }
 
 fn main() -> ExitCode {
     let diagnostic_path = std::env::args_os().nth(3).map(PathBuf::from);
     if let Some(path) = &diagnostic_path {
-        let _ = fs::write(path, "Распаковщик запущен\n");
+        let _ = DIAGNOSTIC_PATH.set(path.clone());
     }
+    diagnostic(&format!(
+        "Extractor {} / PID {}",
+        env!("CARGO_PKG_VERSION"),
+        std::process::id()
+    ));
+    diagnostic(&format!(
+        "Executable: {:?}; working directory: {:?}",
+        std::env::current_exe(),
+        std::env::current_dir()
+    ));
+    diagnostic(&format!("Destination: {:?}", std::env::args_os().nth(2)));
     match run() {
         Ok(()) => {
-            if let Some(path) = &diagnostic_path {
-                let _ = fs::write(path, "Установка файлов завершена успешно\n");
-            }
+            diagnostic("Операция установщика завершена успешно");
             ExitCode::SUCCESS
         }
         Err(error) => {
             if let Some(path) = &diagnostic_path {
-                let _ = fs::write(path, format!("{error}\n"));
+                let message_path = PathBuf::from(format!("{}.message.txt", path.display()));
+                let bytes: Vec<u8> = std::iter::once(0xfeffu16)
+                    .chain(format!("{error}\r\n").encode_utf16())
+                    .flat_map(u16::to_le_bytes)
+                    .collect();
+                let _ = fs::write(message_path, bytes);
             }
+            diagnostic(&format!("ERROR: {error}"));
             eprintln!("{error}");
             ExitCode::FAILURE
         }
@@ -217,6 +193,7 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use uuid::Uuid;
 
     #[test]
     fn accepts_only_relative_archive_paths() {
@@ -261,5 +238,33 @@ mod tests {
         fs::write(root.join(PRODUCT_DATA).join("keep.txt"), b"keep").unwrap();
         assert!(verify_existing_install(&root).is_ok());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn payload_rejects_database_and_unknown_roots_before_installation() {
+        for path in ["ProductData/keep.db", "user-notes.txt", "uninstall.exe"] {
+            let root =
+                std::env::temp_dir().join(format!("sbk-payload-allowlist-{}", Uuid::new_v4()));
+            fs::create_dir(&root).unwrap();
+            let archive = root.join("payload.tar.zst");
+            let encoder =
+                zstd::stream::Encoder::new(fs::File::create(&archive).unwrap(), 1).unwrap();
+            let mut tar = tar::Builder::new(encoder);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(4);
+            header.set_mode(0o644);
+            header.set_cksum();
+            tar.append_data(&mut header, path, &b"deny"[..]).unwrap();
+            tar.into_inner().unwrap().finish().unwrap();
+            let destination = root.join("stage");
+            fs::create_dir(&destination).unwrap();
+            assert!(
+                unpack(&archive, &destination)
+                    .unwrap_err()
+                    .contains("вне разрешённых")
+            );
+            assert!(directory_is_empty(&destination).unwrap());
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 }

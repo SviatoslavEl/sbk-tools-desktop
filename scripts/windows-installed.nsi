@@ -112,23 +112,68 @@ silent_directory_failure:
   Quit
 FunctionEnd
 
+; Repeat only the safe operation; never close a user's process automatically.
+Function ExplainInstallFailure
+  IfSilent silent_operation_failure
+  StrCpy $2 "Не удалось выполнить обновление. Подробности указаны в журнале."
+  ClearErrors
+  FileOpen $1 "$TEMP\SBK-Tools-Fast-Install-Error.log.message.txt" r
+  IfErrors show_operation_failure
+  FileSeek $1 2 SET
+  StrCpy $2 ""
+read_failure_message:
+  ClearErrors
+  FileReadUTF16LE $1 $3
+  IfErrors close_failure_message
+  StrCpy $2 "$2$3"
+  Goto read_failure_message
+close_failure_message:
+  FileClose $1
+show_operation_failure:
+  MessageBox MB_ICONEXCLAMATION|MB_RETRYCANCEL "$2$\r$\n$\r$\nПосле устранения причины нажмите «Повторить».$\r$\nЖурнал: $TEMP\SBK-Tools-Fast-Install-Error.log" IDRETRY retry_operation
+  Abort
+retry_operation:
+  Return
+silent_operation_failure:
+  SetErrorLevel 1
+  Quit
+FunctionEnd
+
 Section "!${PRODUCT_NAME}" MainSection
   SectionIn RO
   Call ValidateInstallDirectory
   InitPluginsDir
   SetOutPath "$PLUGINSDIR"
-  File /oname=payload.tar.zst "payload.tar.zst"
   File /oname=sbk-installed-extractor.exe "sbk-installed-extractor.exe"
 
+preflight_retry:
+  Delete "$TEMP\SBK-Tools-Fast-Install-Error.log.message.txt"
+  ClearErrors
+  ExecWait '"$PLUGINSDIR\sbk-installed-extractor.exe" --check "$INSTDIR" "$TEMP\SBK-Tools-Fast-Install-Error.log"' $0
+  IfErrors preflight_failed
+  StrCmp $0 "0" preflight_ready
+preflight_failed:
+  Call ExplainInstallFailure
+  Goto preflight_retry
+preflight_ready:
+  File /oname=payload.tar.zst "payload.tar.zst"
+install_retry:
+  Delete "$TEMP\SBK-Tools-Fast-Install-Error.log.message.txt"
+  ClearErrors
   ExecWait '"$PLUGINSDIR\sbk-installed-extractor.exe" "$PLUGINSDIR\payload.tar.zst" "$INSTDIR" "$TEMP\SBK-Tools-Fast-Install-Error.log"' $0
+  IfErrors install_failed
   ${If} $0 != "0"
-    IfSilent silent_install_failure
-    MessageBox MB_ICONSTOP|MB_OK "Не удалось установить ${PRODUCT_NAME}.$\r$\n$\r$\nПроверьте, что выбранная папка доступна для записи, на диске достаточно места и программа закрыта. Для установки без прав администратора выберите:$\r$\n$LOCALAPPDATA\Programs\SBK Tools Fast$\r$\n$\r$\nПодробности: $TEMP\SBK-Tools-Fast-Install-Error.log$\r$\nКод ошибки: $0"
-    Abort
-silent_install_failure:
-    SetErrorLevel 1
-    Quit
+    Goto install_failed
   ${EndIf}
+  Goto install_ready
+install_failed:
+  IfSilent silent_install_failure
+  Call ExplainInstallFailure
+  Goto install_retry
+silent_install_failure:
+  SetErrorLevel 1
+  Quit
+install_ready:
 
   SetOutPath "$INSTDIR"
   WriteUninstaller "$INSTDIR\uninstall.exe"

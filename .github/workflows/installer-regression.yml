@@ -1,0 +1,56 @@
+name: Windows installer regressions
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["codex/v2.8.7-installer-update"]
+    paths:
+      - ".github/workflows/installer-regression.yml"
+      - "scripts/test_windows_installer_regressions.ps1"
+      - "scripts/create_installer_smoke_payload.py"
+      - "scripts/windows-installed.nsi"
+      - "windows-installer-helper/**"
+  pull_request:
+    paths:
+      - ".github/workflows/installer-regression.yml"
+      - "scripts/test_windows_installer_regressions.ps1"
+      - "scripts/create_installer_smoke_payload.py"
+      - "scripts/windows-installed.nsi"
+      - "windows-installer-helper/**"
+
+permissions:
+  contents: read
+
+jobs:
+  installer-regressions:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+      - uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: windows-installer-helper
+      - name: Test and compile the real installed extractor
+        shell: pwsh
+        run: |
+          cargo test --locked --manifest-path windows-installer-helper/Cargo.toml
+          if ($LASTEXITCODE -ne 0) { throw 'Extractor tests failed' }
+          cargo build --locked --release --manifest-path windows-installer-helper/Cargo.toml
+          if ($LASTEXITCODE -ne 0) { throw 'Extractor build failed' }
+      - name: Install tiny fixture dependency
+        run: python -m pip install zstandard==0.23.0
+      - name: Exercise actual NSIS install, update, locks and data preservation
+        shell: pwsh
+        run: ./scripts/test_windows_installer_regressions.ps1
+      - name: Upload only regression diagnostics, never fixture installers
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: SBK-Windows-Installer-Regressions-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/sbk-installer-regression-results/
+          if-no-files-found: warn
+          retention-days: 7
