@@ -475,6 +475,7 @@ fieldset.settings-form { min-width: 0; margin: 0; padding: 0; border: 0; }
 .import-report { padding: 10px; color: #5d4a23; background: #fff3d9; border-radius: 8px; white-space: pre-wrap; font: 11px/1.5 ui-monospace, monospace; }
 .validation-summary { display: block; margin-top: 4px; color: #9a5c08; }
 .procurement-drawer { width: min(1040px, calc(100vw - 90px)); grid-template-rows: auto auto minmax(0, 1fr) auto; }
+.schedule-drawer { width: min(1040px, calc(100vw - 90px)); grid-template-rows: auto minmax(0, 1fr) auto; }
 .editor-card { display: grid; gap: 8px; margin: 10px 0; padding: 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-muted); }
 .checklist-row { display: grid; grid-template-columns: 24px minmax(220px, 1fr) minmax(130px, .5fr) 145px 40px; gap: 7px; align-items: center; margin: 8px 0; }
 .checklist-row > input:not([type="checkbox"]), .link-group select { width: 100%; min-height: 38px; padding: 7px 9px; color: var(--text); background: var(--surface); border: 1px solid var(--line-strong); border-radius: 8px; }
@@ -717,7 +718,7 @@ input[type="checkbox"]:disabled, input[type="radio"]:disabled { cursor: not-allo
   .module-toolbar, .record-switcher, .portable-export-row { align-items: stretch; flex-direction: column; }
   .record-switcher label { min-width: 0; }
   .scanner-layout { grid-template-columns: minmax(0, 1fr); }
-  .detail-drawer, .detail-drawer.wide-drawer, .procurement-drawer { width: calc(100vw - 64px); }
+  .detail-drawer, .detail-drawer.wide-drawer, .procurement-drawer, .schedule-drawer { width: calc(100vw - 64px); }
   .registry-toolbar > label, .registry-toolbar .search-box { flex: 1 1 160px; min-width: 0; max-width: 100%; }
   .scope-switcher { flex-wrap: wrap; }
   .scope-switcher button { flex: 1; }
