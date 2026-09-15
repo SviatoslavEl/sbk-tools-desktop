@@ -3973,6 +3973,8 @@ struct ScannerJobGuard {
     jobs: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     job_id: String,
     config_path: PathBuf,
+    preview_outputs: Vec<PathBuf>,
+    keep_outputs: bool,
 }
 
 impl Drop for ScannerJobGuard {
@@ -3981,12 +3983,18 @@ impl Drop for ScannerJobGuard {
             jobs.remove(&self.job_id);
         }
         let _ = fs::remove_file(&self.config_path);
+        if !self.keep_outputs {
+            for path in &self.preview_outputs {
+                let _ = fs::remove_file(path);
+            }
+        }
     }
 }
 
 fn validate_scanner_result(operation: &str, event: &Value) -> Result<(), String> {
     let expected_type = match operation {
         "preview" => "preview",
+        "preparePreview" => "prepared",
         "extract" => "extraction",
         _ => "complete",
     };
@@ -3995,6 +4003,42 @@ fn validate_scanner_result(operation: &str, event: &Value) -> Result<(), String>
     }
     if event.get("protocolVersion").and_then(Value::as_i64) != Some(2) {
         return Err("Worker вернул несовместимую версию протокола".to_string());
+    }
+    if operation == "preparePreview" {
+        let previews = event
+            .get("previews")
+            .and_then(Value::as_array)
+            .filter(|entries| (1..=3).contains(&entries.len()))
+            .ok_or_else(|| {
+                "Worker вернул неверное количество подготовленных страниц".to_string()
+            })?;
+        let fingerprint = event
+            .get("sourceFingerprint")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let page_count = event.get("pageCount").and_then(Value::as_u64).unwrap_or(0);
+        if fingerprint.len() != 64
+            || !fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || !(1..=5_000).contains(&page_count)
+        {
+            return Err("Worker вернул некорректный индекс документа".to_string());
+        }
+        let mut seen = std::collections::HashSet::new();
+        for preview in previews {
+            let index = preview
+                .get("pageIndex")
+                .and_then(Value::as_u64)
+                .unwrap_or(u64::MAX);
+            if index >= page_count
+                || !seen.insert(index)
+                || preview.get("sourceFingerprint").and_then(Value::as_str) != Some(fingerprint)
+                || preview.get("pageCount").and_then(Value::as_u64) != Some(page_count)
+            {
+                return Err("Worker вернул несовместимые страницы документа".to_string());
+            }
+            validate_scanner_result("preview", preview)?;
+        }
+        return Ok(());
     }
     if operation == "extract" {
         let sha256 = event.get("sha256").and_then(Value::as_str).unwrap_or("");
@@ -4038,15 +4082,59 @@ fn validate_scanner_result(operation: &str, event: &Value) -> Result<(), String>
     Ok(())
 }
 
+fn validate_preview_output_paths(event: &Value, owned_paths: &[PathBuf]) -> Result<(), String> {
+    let pages: Vec<&Value> = if event.get("type").and_then(Value::as_str) == Some("prepared") {
+        event
+            .get("previews")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "Worker не вернул подготовленные страницы".to_string())?
+            .iter()
+            .collect()
+    } else {
+        vec![event]
+    };
+    let mut seen = std::collections::HashSet::new();
+    for page in pages {
+        for field in ["outputPath", "originalPath"] {
+            let path = page
+                .get(field)
+                .and_then(Value::as_str)
+                .map(PathBuf::from)
+                .ok_or_else(|| "Worker не указал файл предпросмотра".to_string())?;
+            if !owned_paths.contains(&path) || !seen.insert(path.clone()) {
+                return Err(
+                    "Worker вернул посторонний или повторный файл предпросмотра".to_string()
+                );
+            }
+            let mut magic = [0_u8; 8];
+            File::open(path)
+                .and_then(|mut file| file.read_exact(&mut magic))
+                .map_err(|_| "Worker не создал файл предпросмотра".to_string())?;
+            if magic != [137, 80, 78, 71, 13, 10, 26, 10] {
+                return Err("Worker создал файл предпросмотра неверного формата".to_string());
+            }
+        }
+    }
+    if seen.len() != owned_paths.len() {
+        return Err("Worker подготовил не все запрошенные страницы".to_string());
+    }
+    Ok(())
+}
+
 fn run_scanner_worker(
     app: AppHandle,
     workspace: Arc<Workspace>,
     jobs: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     job_id: String,
+    cancellation: Arc<AtomicBool>,
     operation: String,
     mut config: Value,
 ) -> Result<Value, String> {
+    if cancellation.load(Ordering::Relaxed) {
+        return Err("Обработка отменена. Исходный документ не изменён.".to_string());
+    }
     if operation != "preview"
+        && operation != "preparePreview"
         && operation != "process"
         && operation != "merge"
         && operation != "extract"
@@ -4116,17 +4204,47 @@ fn run_scanner_worker(
     } else {
         None
     };
-    if operation == "preview" {
+    let prepared_indices = if operation == "preparePreview" {
+        let indices = config
+            .get("pageIndices")
+            .and_then(Value::as_array)
+            .filter(|values| (1..=3).contains(&values.len()))
+            .ok_or_else(|| "Для подготовки выберите от 1 до 3 страниц".to_string())?;
+        let mut seen = std::collections::HashSet::new();
+        for index in indices {
+            let value = index
+                .as_u64()
+                .filter(|value| *value < 5_000)
+                .ok_or_else(|| "Некорректный номер подготавливаемой страницы".to_string())?;
+            if !seen.insert(value) {
+                return Err("Подготавливаемые страницы не должны повторяться".to_string());
+            }
+        }
+        Some(indices.len())
+    } else {
+        None
+    };
+    let mut preview_outputs = Vec::new();
+    if operation == "preview" || operation == "preparePreview" {
         let preview_dir = workspace.runtime_root().join("previews");
         fs::create_dir_all(&preview_dir).map_err(|error| error.to_string())?;
         let source_cache = workspace.runtime_root().join("scanner-source-cache");
         fs::create_dir_all(&source_cache).map_err(|error| error.to_string())?;
-        config["outputPath"] = Value::String(
-            preview_dir
-                .join(format!("{job_id}.png"))
-                .to_string_lossy()
-                .into_owned(),
-        );
+        let outputs: Vec<PathBuf> = (0..prepared_indices.unwrap_or(1))
+            .map(|index| preview_dir.join(format!("{job_id}-{index}.png")))
+            .collect();
+        if prepared_indices.is_some() {
+            config["outputPaths"] = serde_json::json!(outputs);
+        } else {
+            config["outputPath"] = Value::String(outputs[0].to_string_lossy().into_owned());
+        }
+        for output in outputs {
+            preview_outputs.push(output.with_file_name(format!(
+                "{}.original.png",
+                output.file_stem().unwrap_or_default().to_string_lossy()
+            )));
+            preview_outputs.push(output);
+        }
         config["previewCacheDir"] = Value::String(source_cache.to_string_lossy().into_owned());
     } else if operation == "process" || operation == "merge" {
         let output = config
@@ -4163,14 +4281,12 @@ fn run_scanner_worker(
             .map_err(|error| error.to_string())?
             .as_bytes(),
     )?;
-    let cancellation = Arc::new(AtomicBool::new(false));
-    jobs.lock()
-        .map_err(|_| "Не удалось зарегистрировать задачу".to_string())?
-        .insert(job_id.clone(), cancellation.clone());
-    let _guard = ScannerJobGuard {
+    let mut guard = ScannerJobGuard {
         jobs: jobs.clone(),
         job_id: job_id.clone(),
         config_path: config_path.clone(),
+        preview_outputs,
+        keep_outputs: false,
     };
     let (mut command, packaged_worker) = scanner_worker_command()?;
     let worker_path = PathBuf::from(command.get_program());
@@ -4192,6 +4308,9 @@ fn run_scanner_worker(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     configure_scanner_process_group(&mut command);
+    if cancellation.load(Ordering::Relaxed) {
+        return Err("Обработка отменена. Исходный документ не изменён.".to_string());
+    }
     let mut child = command
         .spawn()
         .map_err(|error| format!("Не удалось запустить локальный модуль обработки: {error}"))?;
@@ -4216,6 +4335,7 @@ fn run_scanner_worker(
     });
     let expected_type = match operation.as_str() {
         "preview" => "preview",
+        "preparePreview" => "prepared",
         "extract" => "extraction",
         _ => "complete",
     };
@@ -4291,6 +4411,9 @@ fn run_scanner_worker(
                 }
                 return Err(error);
             }
+            if operation == "preview" || operation == "preparePreview" {
+                validate_preview_output_paths(&event, &guard.preview_outputs)?;
+            }
             if (operation == "process" || operation == "merge")
                 && let Some(output) = event.get("outputPath").and_then(Value::as_str)
             {
@@ -4299,10 +4422,54 @@ fn run_scanner_worker(
                     object.insert("outputSha256".to_string(), Value::String(digest));
                 }
             }
+            guard.keep_outputs = true;
             return Ok(event);
         }
         thread::sleep(Duration::from_millis(60));
     }
+}
+
+fn scanner_source_revision_for(path: &Path) -> Result<String, String> {
+    let path = path
+        .canonicalize()
+        .map_err(|_| "Исходный документ недоступен".to_string())?;
+    let metadata =
+        fs::metadata(&path).map_err(|_| "Не удалось проверить исходный документ".to_string())?;
+    if !metadata.is_file() {
+        return Err("Выберите исходный файл документа".to_string());
+    }
+    let mut digest = Sha256::new();
+    digest.update(b"scanner-source-revision-v1\0");
+    digest.update(path.to_string_lossy().as_bytes());
+    digest.update(metadata.len().to_le_bytes());
+    let modified = metadata
+        .modified()
+        .map_err(|_| "Не удалось проверить версию исходного документа".to_string())?;
+    let modified = modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| "Недопустимое время изменения исходного документа".to_string())?;
+    digest.update(modified.as_nanos().to_le_bytes());
+    if let Ok(created) = metadata.created()
+        && let Ok(created) = created.duration_since(std::time::UNIX_EPOCH)
+    {
+        digest.update(created.as_nanos().to_le_bytes());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        digest.update(metadata.dev().to_le_bytes());
+        digest.update(metadata.ino().to_le_bytes());
+        digest.update(metadata.ctime().to_le_bytes());
+        digest.update(metadata.ctime_nsec().to_le_bytes());
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+#[tauri::command]
+async fn scanner_source_revision(path: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || scanner_source_revision_for(Path::new(&path)))
+        .await
+        .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -4315,6 +4482,17 @@ async fn scanner_run(
 ) -> Result<Value, String> {
     let workspace = state.active_workspace()?;
     let jobs = state.scanner_jobs.clone();
+    Uuid::parse_str(&job_id).map_err(|_| "Некорректный идентификатор задачи".to_string())?;
+    let cancellation = Arc::new(AtomicBool::new(false));
+    {
+        let mut registered = jobs
+            .lock()
+            .map_err(|_| "Не удалось зарегистрировать задачу".to_string())?;
+        if registered.contains_key(&job_id) {
+            return Err("Задача сканера с таким идентификатором уже выполняется".to_string());
+        }
+        registered.insert(job_id.clone(), cancellation.clone());
+    }
     let requested_output = if operation == "process" || operation == "merge" {
         config
             .get("outputPath")
@@ -4324,7 +4502,21 @@ async fn scanner_run(
         None
     };
     let result = tauri::async_runtime::spawn_blocking(move || {
-        run_scanner_worker(app, workspace, jobs, job_id, operation, config)
+        let result = run_scanner_worker(
+            app,
+            workspace,
+            jobs.clone(),
+            job_id.clone(),
+            cancellation,
+            operation,
+            config,
+        );
+        // Also remove an early validation failure that occurred before the
+        // file/output guard was created.
+        if let Ok(mut registered) = jobs.lock() {
+            registered.remove(&job_id);
+        }
+        result
     })
     .await
     .map_err(|error| error.to_string())??;
@@ -4507,6 +4699,7 @@ pub fn run() {
             verify_backup,
             restore_backup,
             scanner_run,
+            scanner_source_revision,
             open_scanner_output,
             scanner_cancel,
             delete_runtime_file,
@@ -4531,6 +4724,119 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scanner_source_revision_is_stable_for_reads_and_changes_with_source() {
+        let root = std::env::temp_dir().join(format!("sbk-source-revision-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("test directory");
+        let source = root.join("source.pdf");
+        fs::write(&source, b"first synthetic source").expect("source");
+        let first = scanner_source_revision_for(&source).expect("initial revision");
+        assert_eq!(first.len(), 64);
+        let _ = fs::read(&source).expect("read source");
+        assert_eq!(scanner_source_revision_for(&source).unwrap(), first);
+        fs::write(&source, b"replacement source of another size").expect("replace source");
+        assert_ne!(scanner_source_revision_for(&source).unwrap(), first);
+        assert!(scanner_source_revision_for(&root).is_err());
+        fs::remove_file(&source).expect("test source cleanup");
+        assert!(scanner_source_revision_for(&source).is_err());
+        fs::remove_dir(root).expect("empty directory");
+    }
+
+    #[test]
+    fn cancelled_scanner_job_removes_all_owned_preview_copies() {
+        let root = std::env::temp_dir().join(format!("sbk-preview-guard-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("test directory");
+        let config_path = root.join("job.json");
+        let outputs = vec![
+            root.join("one.png"),
+            root.join("one.original.png"),
+            root.join("two.png"),
+        ];
+        fs::write(&config_path, b"{}").expect("config");
+        for path in &outputs {
+            fs::write(path, b"partial").expect("partial preview");
+        }
+        let jobs = Arc::new(Mutex::new(HashMap::new()));
+        jobs.lock()
+            .unwrap()
+            .insert("job".to_string(), Arc::new(AtomicBool::new(true)));
+        drop(ScannerJobGuard {
+            jobs: jobs.clone(),
+            job_id: "job".to_string(),
+            config_path: config_path.clone(),
+            preview_outputs: outputs.clone(),
+            keep_outputs: false,
+        });
+        assert!(jobs.lock().unwrap().is_empty());
+        assert!(!config_path.exists());
+        assert!(outputs.iter().all(|path| !path.exists()));
+        fs::remove_dir(&root).expect("empty directory");
+    }
+
+    #[test]
+    fn ready_scanner_job_retains_previews_for_ui_and_removes_config() {
+        let root = std::env::temp_dir().join(format!("sbk-preview-ready-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("test directory");
+        let config_path = root.join("job.json");
+        let output = root.join("ready.png");
+        fs::write(&config_path, b"{}").expect("config");
+        fs::write(&output, b"ready").expect("preview");
+        drop(ScannerJobGuard {
+            jobs: Arc::new(Mutex::new(HashMap::new())),
+            job_id: "job".to_string(),
+            config_path: config_path.clone(),
+            preview_outputs: vec![output.clone()],
+            keep_outputs: true,
+        });
+        assert!(!config_path.exists());
+        assert!(output.exists());
+        fs::remove_file(output).expect("test preview cleanup");
+        fs::remove_dir(root).expect("empty directory");
+    }
+
+    #[test]
+    fn prepared_preview_rejects_unbounded_and_mismatched_results() {
+        let fingerprint = "a".repeat(64);
+        let empty = serde_json::json!({ "type": "prepared", "protocolVersion": 2,
+            "pageCount": 4, "sourceFingerprint": fingerprint, "previews": [] });
+        assert!(validate_scanner_result("preparePreview", &empty).is_err());
+        let mut too_many = empty.clone();
+        too_many["previews"] = serde_json::json!([{}, {}, {}, {}]);
+        assert!(validate_scanner_result("preparePreview", &too_many).is_err());
+        let mut stale = empty.clone();
+        stale["previews"] = serde_json::json!([{
+            "pageCount": 4, "pageIndex": 0, "sourceFingerprint": "b".repeat(64)
+        }]);
+        assert!(
+            validate_scanner_result("preparePreview", &stale)
+                .unwrap_err()
+                .contains("несовместимые")
+        );
+    }
+
+    #[test]
+    fn preview_result_paths_must_belong_to_job_and_include_original() {
+        let root = std::env::temp_dir().join(format!("sbk-preview-paths-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("test directory");
+        let processed = root.join("preview.png");
+        let original = root.join("preview.original.png");
+        let paths = vec![processed.clone(), original.clone()];
+        for path in &paths {
+            fs::write(path, [137, 80, 78, 71, 13, 10, 26, 10]).expect("PNG header");
+        }
+        let mut event = serde_json::json!({ "type": "preview", "outputPath": processed,
+            "originalPath": original });
+        assert!(validate_preview_output_paths(&event, &paths).is_ok());
+        event["originalPath"] = event["outputPath"].clone();
+        assert!(validate_preview_output_paths(&event, &paths).is_err());
+        event["originalPath"] = serde_json::json!(root.join("unrelated.png"));
+        assert!(validate_preview_output_paths(&event, &paths).is_err());
+        for path in paths {
+            fs::remove_file(path).expect("test PNG cleanup");
+        }
+        fs::remove_dir(root).expect("empty directory");
+    }
     use crate::workspace::ensure_workspace;
 
     #[test]

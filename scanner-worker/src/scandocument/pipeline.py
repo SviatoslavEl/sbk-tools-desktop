@@ -6,7 +6,8 @@ import threading
 from collections import deque
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import replace
+from contextlib import contextmanager
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -176,14 +177,19 @@ def process_document(
     request: ProcessRequest,
     callback: ProgressCallback | None = None,
     cancellation: CancellationToken | None = None,
+    expected_source_fingerprint: str | None = None,
 ) -> tuple[list[str], float | None, str, list[dict[str, Any]]]:
     import pypdfium2 as pdfium
     from scandocument.pdf_engine import StreamingPdfWriter, render_page
+    from scandocument.preview_cache import source_fingerprint
 
     token = cancellation or CancellationToken()
     warnings: list[str] = []
     output = request.output_path.expanduser().resolve()
     source = request.input_path.expanduser().resolve()
+    initial_fingerprint = source_fingerprint(source)
+    if expected_source_fingerprint is not None and expected_source_fingerprint != initial_fingerprint:
+        raise ScanDocumentError("Исходный документ изменился после предпросмотра. Откройте его повторно перед сохранением.")
     if output == source:
         raise SaveError("Выберите другое имя для результата, чтобы не перезаписать исходный документ.")
     kind = detect_kind(source)
@@ -335,6 +341,8 @@ def process_document(
                     finish_oldest()
             token.check()
             _notify(callback, "Сборка итогового PDF", total, total, 97)
+            if source_fingerprint(source) != initial_fingerprint:
+                raise ScanDocumentError("Исходный документ изменился во время обработки. Результат не сохранён; откройте файл повторно.")
             writer.finish()
             _notify(callback, "Готово", total, total, 100)
             recognized_text = "\n\n".join(recognized_parts)[:200_000]
@@ -354,6 +362,112 @@ def process_document(
             document.close()
 
 
+@dataclass
+class PreviewDocument:
+    source: Path
+    pdf_source: Path
+    document: Any
+    warnings: list[str]
+    fingerprint: str
+
+    def check_source(self) -> None:
+        from scandocument.preview_cache import source_fingerprint
+
+        if source_fingerprint(self.source) != self.fingerprint:
+            raise ScanDocumentError("Исходный документ изменился. Откройте обновлённый файл повторно.")
+
+
+def _cache_preview_conversion(staged_pdf: Path, cached_pdf: Path | None, warnings: list[str]) -> Path:
+    """Caching is optional: an unavailable cache must not break a valid DOCX."""
+    import json
+    from scandocument.preview_cache import MAX_CONVERSION_CACHE_BYTES, prune_converted_documents
+
+    if cached_pdf is None or staged_pdf.stat().st_size > MAX_CONVERSION_CACHE_BYTES:
+        return staged_pdf
+    try:
+        cached_pdf.parent.mkdir(parents=True, exist_ok=True)
+        if shutil.disk_usage(cached_pdf.parent).free < staged_pdf.stat().st_size + 64 * 1024 * 1024:
+            return staged_pdf
+        from scandocument.office_engine import _install_converted_pdf
+
+        _install_converted_pdf(staged_pdf, cached_pdf)
+    except OSError:
+        # Atomic installation leaves the original intact on failure.
+        return staged_pdf
+    try:
+        cached_pdf.with_suffix(".warnings.json").write_text(
+            json.dumps(warnings, ensure_ascii=False), encoding="utf-8",
+        )
+    except OSError:
+        pass
+    prune_converted_documents(cached_pdf.parent, cached_pdf)
+    return cached_pdf
+
+
+@contextmanager
+def open_preview_document(
+    source: Path,
+    cancellation: CancellationToken | None = None,
+    preview_cache_dir: Path | None = None,
+):
+    """Open/validate once per small batch, retaining only the PDF parser."""
+    import pypdfium2 as pdfium
+    from scandocument.preview_cache import source_fingerprint
+
+    token = cancellation or CancellationToken()
+    token.check()
+    fingerprint = source_fingerprint(source)
+    kind = detect_kind(source)
+    with SecureWorkspace() as workspace:
+        pdf_source = source
+        cached_pdf = None
+        if kind == "docx":
+            from scandocument.docx_engine import convert_docx_to_pdf
+            import json
+
+            if preview_cache_dir is not None:
+                # Version the conversion independently of transient page output.
+                from scandocument import __version__
+                key = f"docx-{__version__}-{fingerprint}"
+                cached_pdf = preview_cache_dir / f"{key}.pdf"
+            if cached_pdf is not None and cached_pdf.is_file():
+                try:
+                    stored = json.loads(cached_pdf.with_suffix(".warnings.json").read_text(encoding="utf-8"))
+                    prepared_warnings = [str(value) for value in stored] if isinstance(stored, list) else []
+                except (OSError, ValueError, TypeError):
+                    prepared_warnings = []
+                pdf_source = cached_pdf
+            else:
+                _validate_docx_conversion_space(source, [workspace])
+                staged_pdf = workspace / "preview.pdf"
+                prepared_warnings = convert_docx_to_pdf(source, staged_pdf, lambda: token.cancelled)
+                token.check()
+                pdf_source = _cache_preview_conversion(staged_pdf, cached_pdf, prepared_warnings)
+        else:
+            prepared_warnings = []
+        token.check()
+        try:
+            document = pdfium.PdfDocument(str(pdf_source))
+        except Exception:
+            if kind != "docx" or cached_pdf is None or pdf_source != cached_pdf:
+                raise
+            # A partial/damaged cached conversion is a miss, not a persistent
+            # document failure. Retry once from the validated DOCX source.
+            token.check()
+            _validate_docx_conversion_space(source, [workspace])
+            recovered_pdf = workspace / "preview-recovered.pdf"
+            prepared_warnings = convert_docx_to_pdf(source, recovered_pdf, lambda: token.cancelled)
+            token.check()
+            pdf_source = _cache_preview_conversion(recovered_pdf, cached_pdf, prepared_warnings)
+            document = pdfium.PdfDocument(str(pdf_source))
+        try:
+            prepared = PreviewDocument(source, pdf_source, document, prepared_warnings, fingerprint)
+            prepared.check_source()
+            yield prepared
+        finally:
+            document.close()
+
+
 def make_preview(
     source: Path,
     settings,
@@ -362,88 +476,47 @@ def make_preview(
     max_dimension: int = 1100,
     cancellation: CancellationToken | None = None,
     preview_cache_dir: Path | None = None,
+    prepared_document: PreviewDocument | None = None,
 ) -> tuple[Image.Image, Image.Image, int, list[str], tuple[float, float]]:
-    import pypdfium2 as pdfium
-
     from scandocument.filters import apply_scan_effect
     from scandocument.pdf_engine import render_page
-    from scandocument.preview_cache import raster_key, read_raster, write_raster
+    from scandocument.preview_cache import processed_key, raster_key, read_raster, write_raster
 
     token = cancellation or CancellationToken()
+    if prepared_document is None:
+        with open_preview_document(source, token, preview_cache_dir) as prepared:
+            return make_preview(source, settings, seed, page_index, max_dimension, token,
+                                preview_cache_dir, prepared)
     token.check()
-    kind = detect_kind(source)
-    with SecureWorkspace() as workspace:
-        pdf_source = source
-        if kind == "docx":
-            from scandocument.docx_engine import convert_docx_to_pdf
-
-            conversion_destinations = [workspace]
-            if preview_cache_dir is not None:
-                conversion_destinations.append(preview_cache_dir)
-            _validate_docx_conversion_space(source, conversion_destinations)
-
-            if preview_cache_dir is not None:
-                import hashlib
-                import json
-
-                metadata = source.stat()
-                key = hashlib.sha256(
-                    f"{source.resolve()}\0{metadata.st_size}\0{metadata.st_mtime_ns}".encode("utf-8")
-                ).hexdigest()
-                preview_cache_dir.mkdir(parents=True, exist_ok=True)
-                cached_pdf = preview_cache_dir / f"{key}.pdf"
-                cached_warnings = preview_cache_dir / f"{key}.warnings.json"
-                if not cached_pdf.is_file():
-                    staged_pdf = workspace / f"{key}.pdf"
-                    prepared_warnings = convert_docx_to_pdf(source, staged_pdf, lambda: token.cancelled)
-                    token.check()
-                    try:
-                        from scandocument.office_engine import _install_converted_pdf
-
-                        _install_converted_pdf(staged_pdf, cached_pdf)
-                    except OSError:
-                        if not cached_pdf.is_file():
-                            raise
-                    cached_warnings.write_text(
-                        json.dumps(prepared_warnings, ensure_ascii=False),
-                        encoding="utf-8",
-                    )
-                else:
-                    try:
-                        stored = json.loads(cached_warnings.read_text(encoding="utf-8"))
-                        prepared_warnings = [str(value) for value in stored] if isinstance(stored, list) else []
-                    except (OSError, ValueError, TypeError):
-                        prepared_warnings = []
-                pdf_source = cached_pdf
-            else:
-                pdf_source = workspace / "preview.pdf"
-                prepared_warnings = convert_docx_to_pdf(source, pdf_source, lambda: token.cancelled)
-        else:
-            prepared_warnings = []
+    prepared_document.check_source()
+    document = prepared_document.document
+    index = int(page_index)
+    if index < 0 or index >= len(document):
+        raise ScanDocumentError("Выбранная страница отсутствует в документе.")
+    page = document[index]
+    try:
+        width, height = page.get_size()
+    finally:
+        page.close()
+    # Validate the geometry before division or raster allocation.
+    warnings = prepared_document.warnings + validate_preview_limits(
+        source.stat().st_size, len(document), (float(width), float(height)), 72,
+    )
+    dpi = int(min(144, max(72, 72 * max_dimension / max(width, height))))
+    validate_preview_limits(source.stat().st_size, len(document), (float(width), float(height)), dpi)
+    key = raster_key(prepared_document.pdf_source, index, dpi)
+    original = read_raster(preview_cache_dir, key)
+    if original is None:
+        original, _ = render_page(document, index, dpi)
         token.check()
-        document = pdfium.PdfDocument(str(pdf_source))
-        try:
-            index = int(page_index)
-            if index < 0 or index >= len(document):
-                raise ScanDocumentError("Выбранная страница отсутствует в документе.")
-            page = document[index]
-            width, height = page.get_size()
-            dpi = min(144, max(72, 72 * max_dimension / max(width, height)))
-            page.close()
-            warnings = prepared_warnings + validate_preview_limits(
-                source.stat().st_size,
-                len(document),
-                (float(width), float(height)),
-                int(dpi),
-            )
-            key = raster_key(pdf_source, index, int(dpi))
-            original = read_raster(preview_cache_dir, key)
-            if original is None:
-                original, _ = render_page(document, index, int(dpi))
-                write_raster(preview_cache_dir, key, original)
-            token.check()
-            processed = apply_scan_effect(original.copy(), settings, seed, index)
-            token.check()
-            return original, processed, len(document), warnings, (float(width), float(height))
-        finally:
-            document.close()
+        write_raster(preview_cache_dir, key, original)
+    token.check()
+    filtered_key = processed_key(key, settings.to_dict(), seed)
+    processed = read_raster(preview_cache_dir, filtered_key)
+    if processed is None:
+        processed = apply_scan_effect(original.copy(), settings, seed, index)
+        token.check()
+        write_raster(preview_cache_dir, filtered_key, processed)
+    token.check()
+    prepared_document.check_source()
+    return original, processed, len(document), warnings, (float(width), float(height))

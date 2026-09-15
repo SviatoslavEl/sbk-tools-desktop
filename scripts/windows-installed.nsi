@@ -8,7 +8,9 @@ CRCCheck on
 !include "LogicLib.nsh"
 !include "FileFunc.nsh"
 
-!define PRODUCT_NAME "СБК Инструменты — быстрый запуск"
+!define PRODUCT_NAME "СБК Инструменты"
+; Display names changed in 2.8.8; executable, installation identity and paths stay stable.
+!define LEGACY_PRODUCT_NAME "СБК Инструменты — быстрый запуск"
 !define PRODUCT_ID "ru.sbk.tools.fast"
 !define PRODUCT_PUBLISHER "СБК"
 !define PRODUCT_AUTHOR "Elbakide S.E."
@@ -207,6 +209,10 @@ silent_shortcut_failure:
   SetErrorLevel 1
   Quit
 shortcut_ready:
+  ; Remove only the old product's exact shortcut names after the new shortcut exists.
+  Delete "$DESKTOP\${LEGACY_PRODUCT_NAME}.lnk"
+  Delete "$APPDATA\Microsoft\Windows\Start Menu\Programs\СБК Инструменты\${LEGACY_PRODUCT_NAME}.lnk"
+  Delete "$APPDATA\Microsoft\Windows\Start Menu\Programs\СБК Инструменты\Удалить ${LEGACY_PRODUCT_NAME}.lnk"
 SectionEnd
 
 Section /o "Ярлык на рабочем столе" DesktopShortcutSection
@@ -233,9 +239,12 @@ remove_program_files:
   IfErrors restore_failure 0
 uninstall_complete:
   Delete "$DESKTOP\${PRODUCT_NAME}.lnk"
+  Delete "$DESKTOP\${LEGACY_PRODUCT_NAME}.lnk"
   ReadRegStr $StartMenuFolder HKCU "${PRODUCT_KEY}" "StartMenuFolder"
   Delete "$APPDATA\Microsoft\Windows\Start Menu\Programs\$StartMenuFolder\${PRODUCT_NAME}.lnk"
   Delete "$APPDATA\Microsoft\Windows\Start Menu\Programs\$StartMenuFolder\Удалить ${PRODUCT_NAME}.lnk"
+  Delete "$APPDATA\Microsoft\Windows\Start Menu\Programs\$StartMenuFolder\${LEGACY_PRODUCT_NAME}.lnk"
+  Delete "$APPDATA\Microsoft\Windows\Start Menu\Programs\$StartMenuFolder\Удалить ${LEGACY_PRODUCT_NAME}.lnk"
   RMDir "$APPDATA\Microsoft\Windows\Start Menu\Programs\$StartMenuFolder"
   DeleteRegKey HKCU "${UNINSTALL_KEY}"
   DeleteRegKey HKCU "${PRODUCT_KEY}"

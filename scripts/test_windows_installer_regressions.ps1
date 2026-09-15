@@ -114,6 +114,23 @@ function New-InstalledFixture([string]$Name) {
     return $destination
 }
 
+function Assert-ProductDisplayName([string]$Destination) {
+    $registration = Get-ItemProperty -LiteralPath 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\ru.sbk.tools.fast'
+    Assert-True ($registration.DisplayName -eq 'СБК Инструменты') 'Installed display name is not the plain product name'
+    Assert-True ($registration.InstallLocation -eq $Destination) 'Renaming the product changed its installation location'
+    $shortcutPath = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\СБК Инструменты\СБК Инструменты.lnk'
+    Assert-True (Test-Path -LiteralPath $shortcutPath -PathType Leaf) 'Plain-name Start menu shortcut is missing'
+    $shell = New-Object -ComObject WScript.Shell
+    $shortcut = $null
+    try {
+        $shortcut = $shell.CreateShortcut($shortcutPath)
+        Assert-True ($shortcut.TargetPath -eq (Join-Path $Destination 'SBK-Tools-Fast.exe')) 'Shortcut no longer targets the update-compatible executable'
+    } finally {
+        if ($shortcut) { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($shortcut) }
+        [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell)
+    }
+}
+
 function Get-UserDataSnapshot([string]$Destination) {
     return @(
         (Get-TreeSnapshot (Join-Path $Destination 'ProductData')),
@@ -221,6 +238,31 @@ public static class InstallerRegressionLocks {
     }
 }
 '@
+
+    Test-Case 'plain-product-name-and-legacy-shortcut-migration' {
+        $versionInfo = [Diagnostics.FileVersionInfo]::GetVersionInfo($Installer)
+        Assert-True ($versionInfo.ProductName -eq 'СБК Инструменты') 'Installer metadata still exposes the fast-start suffix'
+        Assert-True ($versionInfo.FileDescription -eq 'Установщик СБК Инструменты') 'Installer description is not the plain product name'
+        $destination = New-InstalledFixture 'display-name'
+        Assert-ProductDisplayName $destination
+        $preserved = Get-UserDataSnapshot $destination
+        $menu = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\СБК Инструменты'
+        $legacyName = 'СБК Инструменты — быстрый запуск'
+        $legacyProgram = Join-Path $menu ($legacyName + '.lnk')
+        $legacyUninstaller = Join-Path $menu ('Удалить ' + $legacyName + '.lnk')
+        $legacyDesktop = Join-Path ([Environment]::GetFolderPath('Desktop')) ($legacyName + '.lnk')
+        Copy-Item -LiteralPath (Join-Path $menu 'СБК Инструменты.lnk') -Destination $legacyProgram
+        Copy-Item -LiteralPath (Join-Path $menu 'Удалить СБК Инструменты.lnk') -Destination $legacyUninstaller
+        Copy-Item -LiteralPath $legacyProgram -Destination $legacyDesktop
+        Set-ItemProperty -LiteralPath 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\ru.sbk.tools.fast' -Name DisplayName -Value $legacyName
+        Mark-OldProgram $destination
+        Invoke-FixtureInstaller 'display-name-update' $Installer $destination
+        Assert-Upgraded $destination $preserved
+        Assert-ProductDisplayName $destination
+        foreach ($legacyShortcut in @($legacyProgram, $legacyUninstaller, $legacyDesktop)) {
+            Assert-True (-not (Test-Path -LiteralPath $legacyShortcut)) "Update left the obsolete shortcut: $legacyShortcut"
+        }
+    }
 
     Test-Case 'clean-install-and-update' {
         $destination = New-InstalledFixture 'normal'

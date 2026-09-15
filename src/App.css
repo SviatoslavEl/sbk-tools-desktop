@@ -349,6 +349,53 @@ details label { display: block; margin-top: 10px; }
 .history-entry-list { display: flex; flex-wrap: wrap; gap: 6px; max-height: 170px; overflow: auto; }
 .history-entry-list [aria-pressed="true"] { background: var(--primary); color: var(--surface); }
 .calculator-guided .calculator-layout:has(.input-column[hidden]) { grid-template-columns: 1fr; }
+/* A laptop's working area is narrower than its window because of the sidebar.
+   Size calculator cards from that area, and contain the expenses table's own
+   horizontal scroll so its intrinsic 800 px width cannot stretch other cards. */
+.calculator-module { container-type: inline-size; container-name: calculator; }
+.calculator-module .calculator-layout { grid-template-columns: minmax(0, 1fr); }
+.calculator-module .input-column { grid-template-columns: minmax(0, 1fr); container-type: inline-size; container-name: calculator-input; }
+.calculator-module .input-column > *, .calculator-module .result-column > * { min-width: 0; max-width: 100%; }
+.calculator-module .result-column { position: static; grid-template-columns: minmax(0, 1fr); align-items: start; }
+.calculator-module .record-switcher { min-width: 0; max-width: 100%; flex-wrap: wrap; }
+.calculator-module .record-switcher label { min-width: 0; width: min(100%, 340px); }
+.calculator-module .record-switcher select { max-width: 100%; }
+.calculator-module .surface-title { flex-wrap: wrap; }
+.calculator-module .surface-title > select { max-width: 100%; }
+.calculator-module .status { max-width: 100%; white-space: normal; overflow-wrap: anywhere; }
+.calculator-module .form-grid, .calculator-module .form-grid.compact { grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; }
+.calculator-module .checkbox-row { align-self: center; }
+.calculator-module .number-field { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: stretch; }
+.calculator-module .number-field > input { min-width: 0; padding-right: 10px; }
+.calculator-module .number-field:has(> span) > input { border-top-right-radius: 0; border-bottom-right-radius: 0; }
+.calculator-module .number-field > span { position: static; display: flex; align-items: center; max-width: 9ch; padding: 5px 7px; border: 1px solid var(--line-strong); border-left: 0; border-radius: 0 8px 8px 0; background: var(--surface-muted); overflow-wrap: anywhere; }
+.calculator-module .number-field .field-error { grid-column: 1 / -1; }
+.calculator-module .repeatable-row, .calculator-module .payment-stage-row { min-width: 0; grid-template-columns: repeat(auto-fit, minmax(min(100%, 160px), 1fr)); align-items: end; gap: 12px; padding: 12px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface-muted); }
+.calculator-module .repeatable-row > input:first-child, .calculator-module .payment-stage-row > input:first-child { grid-column: 1 / -1; }
+.calculator-module .repeatable-row > .icon-button, .calculator-module .payment-stage-row > .icon-button { grid-column: -2 / -1; justify-self: end; }
+.calculator-module .formula-details > div { grid-template-columns: minmax(0, 1fr); overflow-wrap: anywhere; }
+.calculator-module .hero-number { font-size: clamp(22px, 3cqi, 30px); overflow-wrap: anywhere; }
+.calculator-module .metric-grid strong, .calculator-module .recommendation-card strong { overflow-wrap: anywhere; }
+.calculator-module .chart-tabs { flex-wrap: wrap; overflow: visible; }
+.calculator-module .competitor-bar { grid-template-columns: minmax(0, 1fr) auto; }
+.calculator-module .competitor-bar > span { overflow-wrap: anywhere; }
+.calculator-module .competitor-bar > div { grid-column: 1 / -1; grid-row: 2; }
+.calculator-module .competitor-bar > strong { min-width: 0; max-width: 100%; overflow-wrap: anywhere; }
+@container calculator (min-width: 960px) {
+  .calculator-module .result-column { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@container calculator (min-width: 1100px) {
+  .calculator-module .calculator-layout { grid-template-columns: minmax(0, 1.08fr) minmax(0, 1fr); }
+  .calculator-module .result-column { grid-template-columns: minmax(0, 1fr); }
+  .calculator-module.calculator-guided .calculator-layout:has(.input-column[hidden]) { grid-template-columns: minmax(0, 1fr); }
+  .calculator-module.calculator-guided .input-column[hidden] + .result-column { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@container calculator-input (min-width: 620px) {
+  .calculator-module .form-grid, .calculator-module .form-grid.compact { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+@container calculator-input (max-width: 420px) {
+  .calculator-module .form-grid, .calculator-module .form-grid.compact { grid-template-columns: minmax(0, 1fr); }
+}
 .registry-toolbar { display: flex; align-items: end; gap: 10px; flex-wrap: wrap; min-width: 0; padding: 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
 .portable-export-row { display: flex; align-items: center; justify-content: flex-end; gap: 10px; color: var(--text-muted); font-size: 11px; }
 .registry-toolbar > label { flex: 0 1 150px; min-width: 120px; }

@@ -9,7 +9,7 @@ from pathlib import Path
 from PIL import Image
 
 from scandocument.models import Annotation, ColorMode, EffectSettings, FacsimilePlacement, ProcessRequest, Redaction
-from scandocument.pipeline import make_preview, process_document
+from scandocument.pipeline import PreviewDocument, make_preview, open_preview_document, process_document
 from scandocument.presets import PRESETS, preset_copy
 from scandocument.tempfiles import SecureWorkspace
 from scandocument.validation import MAX_PAGES, validate_ocr_languages
@@ -178,15 +178,20 @@ def estimate_preview_output_bytes(
     return estimated
 
 
-def preview(config: dict) -> int:
+def preview_result(config: dict, prepared_document: PreviewDocument | None = None) -> dict:
     validate_protocol(config)
     source = Path(config["inputPath"])
     output = Path(config["outputPath"])
+    if prepared_document is None:
+        cache_dir = Path(config["previewCacheDir"]) if config.get("previewCacheDir") else None
+        with open_preview_document(source, preview_cache_dir=cache_dir) as prepared:
+            return preview_result(config, prepared)
     settings = settings_for(config.get("preset", "Офисный скан"), config.get("settings"))
     placements = placements_from(config)
     original, processed, pages, warnings, page_size = make_preview(
         source, settings, int(config.get("seed", 42)), int(config.get("pageIndex", 0)),
         preview_cache_dir=Path(config["previewCacheDir"]) if config.get("previewCacheDir") else None,
+        prepared_document=prepared_document,
     )
     for placement in placements:
         placement.validate_for_document(pages)
@@ -245,14 +250,53 @@ def preview(config: dict) -> int:
     processed.save(output, "PNG", compress_level=3)
     original_bytes = source.stat().st_size
     savings_percent = max(-999.0, min(100.0, (1 - estimated / max(1, original_bytes)) * 100))
-    emit({"type": "preview", "outputPath": str(output), "originalPath": str(original_output), "pageCount": pages, "warnings": warnings,
+    prepared_document.check_source()
+    return {"type": "preview", "outputPath": str(output), "originalPath": str(original_output), "pageCount": pages, "warnings": warnings,
           "estimatedOutputBytes": estimated, "originalBytes": original_bytes,
-          "estimatedSavingsPercent": savings_percent, "pageSizePoints": page_size, "protocolVersion": 2})
+          "estimatedSavingsPercent": savings_percent, "pageSizePoints": page_size, "protocolVersion": 2,
+          "pageIndex": page_index, "sourceFingerprint": prepared_document.fingerprint}
+
+
+def preview(config: dict) -> int:
+    emit(preview_result(config))
+    return 0
+
+
+def prepare_preview(config: dict) -> int:
+    """Prepare a bounded neighbourhood; interactive navigation can cancel this job."""
+    validate_protocol(config)
+    indices = config.get("pageIndices")
+    if (not isinstance(indices, list) or not 1 <= len(indices) <= 3
+            or any(type(index) is not int or not 0 <= index < MAX_PAGES for index in indices)
+            or len(set(indices)) != len(indices)):
+        raise ValueError("Для подготовки выберите от 1 до 3 разных страниц.")
+    outputs = config.get("outputPaths")
+    if not isinstance(outputs, list) or len(outputs) != len(indices) or len(set(outputs)) != len(outputs):
+        raise ValueError("Не заданы отдельные пути подготовленных страниц.")
+    cache_dir = Path(config["previewCacheDir"]) if config.get("previewCacheDir") else None
+    results: list[dict] = []
+    with open_preview_document(Path(config["inputPath"]), preview_cache_dir=cache_dir) as prepared:
+        if any(index >= len(prepared.document) for index in indices):
+            raise ValueError("Выбранная страница отсутствует в документе.")
+        for position, index in enumerate(indices):
+            result = preview_result({**config, "pageIndex": index, "outputPath": outputs[position]}, prepared)
+            results.append(result)
+            emit({"type": "progress", "stage": "Подготовка соседних страниц", "currentPage": position + 1,
+                  "totalPages": len(indices), "percent": round((position + 1) / len(indices) * 100)})
+        prepared.check_source()
+        emit({"type": "prepared", "protocolVersion": 2, "pageCount": len(prepared.document),
+              "sourceFingerprint": prepared.fingerprint, "previews": results})
     return 0
 
 
 def process(config: dict) -> int:
     validate_protocol(config)
+    expected_fingerprint = config.get("expectedSourceFingerprint")
+    if expected_fingerprint is not None and (
+        not isinstance(expected_fingerprint, str) or len(expected_fingerprint) != 64
+        or any(character not in "0123456789abcdef" for character in expected_fingerprint)
+    ):
+        raise ValueError("Недопустимая версия исходного документа.")
     ocr_enabled = bool(config.get("ocrEnabled", False))
     ocr_languages = validate_ocr_languages(config.get("ocrLanguages", "rus+eng")) if ocr_enabled else "rus+eng"
     request = ProcessRequest(
@@ -269,7 +313,8 @@ def process(config: dict) -> int:
                                   if config.get("compressionTargetRatio") is not None else None),
     )
     warnings, confidence, ocr_text, low_confidence_words = process_document(request, lambda event: emit({"type": "progress", "stage": event.stage,
-        "currentPage": event.current_page, "totalPages": event.total_pages, "percent": event.percent}))
+        "currentPage": event.current_page, "totalPages": event.total_pages, "percent": event.percent}),
+        expected_source_fingerprint=expected_fingerprint)
     output_bytes = request.output_path.stat().st_size
     original_bytes = request.input_path.stat().st_size
     emit({"type": "complete", "outputPath": str(request.output_path), "warnings": warnings,
@@ -371,7 +416,7 @@ def main() -> int:
     cleanup_stale_onefile_dirs()
     SecureWorkspace.cleanup_stale()
     parser = argparse.ArgumentParser(prog="sbk-scanner-worker")
-    parser.add_argument("command", choices=("preview", "process", "merge", "extract", "info"))
+    parser.add_argument("command", choices=("preview", "preparePreview", "process", "merge", "extract", "info"))
     parser.add_argument("--config")
     args = parser.parse_args()
     try:
@@ -387,6 +432,8 @@ def main() -> int:
             return 0
         if args.command == "preview":
             return preview(config)
+        if args.command == "preparePreview":
+            return prepare_preview(config)
         return merge(config) if args.command == "merge" else process(config)
     except Exception as error:
         emit({"type": "error", "message": str(error), "class": type(error).__name__})

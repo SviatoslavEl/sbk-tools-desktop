@@ -34,14 +34,16 @@ def main() -> None:
     )
     if base["identifier"] != "ru.sbk.tools" or base["productName"] != "СБК Инструменты":
         raise SystemExit("Portable application identity changed")
-    if installed["productName"] != "СБК Инструменты — быстрый запуск":
-        raise SystemExit("Installed product name is not stable")
+    if installed["productName"] != "СБК Инструменты":
+        raise SystemExit("Installed product name must not expose an internal build flavor")
+    if any(window.get("title") != "СБК Инструменты" for window in installed["app"]["windows"]):
+        raise SystemExit("Installed window title must use the plain product name")
     if installed["identifier"] != "ru.sbk.tools.fast":
         raise SystemExit("Installed application must have a stable separate identifier")
     if installed["identifier"] == base["identifier"]:
         raise SystemExit("Installed application would replace the portable application identity")
-    if installed.get("mainBinaryName") in {None, "ScanDocument"}:
-        raise SystemExit("Installed application binary has an invalid name")
+    if installed.get("mainBinaryName") != "SBK-Tools-Fast":
+        raise SystemExit("Installed application binary must retain its update-compatible filename")
 
     bundle = installed["bundle"]
     windows = bundle["windows"]
@@ -111,6 +113,11 @@ def main() -> None:
 
     nsis_template = (ROOT / "scripts/windows-installed.nsi").read_text(encoding="utf-8")
     for required in (
+        '!define PRODUCT_NAME "СБК Инструменты"',
+        '!define PRODUCT_ID "ru.sbk.tools.fast"',
+        '!define PRODUCT_KEY "Software\\SBK\\ToolsFast"',
+        'WriteRegStr HKCU "${UNINSTALL_KEY}" "DisplayName" "${PRODUCT_NAME}"',
+        'CreateShortcut "$APPDATA\\Microsoft\\Windows\\Start Menu\\Programs\\СБК Инструменты\\${PRODUCT_NAME}.lnk"',
         "RequestExecutionLevel user",
         "SetCompress off",
         "SBK-Tools-Fast.exe",
@@ -130,6 +137,14 @@ def main() -> None:
     ):
         if required not in nsis_template:
             raise SystemExit(f"Installed NSIS contract is missing: {required}")
+    shortcut_migration = nsis_template.split("shortcut_ready:\n", maxsplit=1)[-1].split("SectionEnd", maxsplit=1)[0]
+    for required in (
+        'Delete "$DESKTOP\\${LEGACY_PRODUCT_NAME}.lnk"',
+        'Delete "$APPDATA\\Microsoft\\Windows\\Start Menu\\Programs\\СБК Инструменты\\${LEGACY_PRODUCT_NAME}.lnk"',
+        'Delete "$APPDATA\\Microsoft\\Windows\\Start Menu\\Programs\\СБК Инструменты\\Удалить ${LEGACY_PRODUCT_NAME}.lnk"',
+    ):
+        if required not in shortcut_migration:
+            raise SystemExit("Installed update must retire its old display-name shortcuts after creating the new one")
     uninstall_section = nsis_template.split('Section "Uninstall"', maxsplit=1)[-1]
     for required in (
         'Rename "$INSTDIR\\ProductData" $0',
@@ -167,9 +182,21 @@ def main() -> None:
         "Repeated installed launch left stale editor ownership",
         "Installed database schema is incomplete",
         "Reinstall after uninstall lost adjacent ProductData",
+        "Installed display name still contains a build flavor",
+        "Programs\\СБК Инструменты\\СБК Инструменты.lnk",
     ):
         if required not in release_workflow:
             raise SystemExit(f"Installed smoke timeout protection is missing: {required}")
+
+    installer_regressions = (ROOT / "scripts/test_windows_installer_regressions.ps1").read_text(encoding="utf-8")
+    for required in (
+        "plain-product-name-and-legacy-shortcut-migration",
+        "Installer metadata still exposes the fast-start suffix",
+        "Update left the obsolete shortcut",
+        "Shortcut no longer targets the update-compatible executable",
+    ):
+        if required not in installer_regressions:
+            raise SystemExit(f"Installed display-name regression is missing: {required}")
 
     print("Windows packaging contract: portable preserved, installed flavor isolated, startup staged")
 
