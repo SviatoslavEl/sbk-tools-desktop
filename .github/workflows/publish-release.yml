@@ -40,7 +40,7 @@ jobs:
           else
             printf 'СБК Инструменты %s для Windows x64 и macOS Apple Silicon.\n' "$version" > release-notes.md
           fi
-          sed -i '/^Состав:/c\Состав: установщик Windows с быстрым запуском и архив приложения macOS. Portable-версия больше не выпускается.' release-notes.md
+          sed -i '/^Состав:/c\Состав: установщик Windows и архив приложения macOS. Portable-версия больше не выпускается.' release-notes.md
           if [[ "$mac" == *-unsigned.app.zip ]]; then
             printf '\nmacOS: подпись ad-hoc, без Apple Developer ID и нотариальной проверки Apple. Gatekeeper может ограничить первый запуск.\n' >> release-notes.md
           else

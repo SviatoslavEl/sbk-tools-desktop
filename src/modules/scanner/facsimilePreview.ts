@@ -210,7 +210,9 @@ export function previewCacheKey(input: PreviewCacheKeyInput): string {
 export class BoundedPreviewCache<T> {
   private readonly values = new Map<string, T>();
 
-  constructor(private readonly limit = 8) {}
+  constructor(private readonly limit = 8, private readonly maxWeight = Infinity, private readonly weight: (value: T) => number = () => 1) {}
+
+  has(key: string): boolean { return this.values.has(key); }
 
   get(key: string): T | undefined {
     const value = this.values.get(key);
@@ -223,7 +225,7 @@ export class BoundedPreviewCache<T> {
   set(key: string, value: T): void {
     this.values.delete(key);
     this.values.set(key, value);
-    while (this.values.size > this.limit) {
+    while (this.values.size > this.limit || this.totalWeight > this.maxWeight) {
       const oldest = this.values.keys().next().value;
       if (oldest === undefined) break;
       this.values.delete(oldest);
@@ -236,5 +238,9 @@ export class BoundedPreviewCache<T> {
 
   get size(): number {
     return this.values.size;
+  }
+
+  get totalWeight(): number {
+    return [...this.values.values()].reduce((sum, value) => sum + Math.max(0, this.weight(value)), 0);
   }
 }

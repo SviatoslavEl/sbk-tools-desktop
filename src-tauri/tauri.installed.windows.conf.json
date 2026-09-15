@@ -1,12 +1,12 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "СБК Инструменты — быстрый запуск",
+  "productName": "СБК Инструменты",
   "mainBinaryName": "SBK-Tools-Fast",
   "identifier": "ru.sbk.tools.fast",
   "app": {
     "windows": [
       {
-        "title": "СБК Инструменты — быстрый запуск",
+        "title": "СБК Инструменты",
         "width": 1360,
         "height": 860,
         "minWidth": 1024,
@@ -18,7 +18,7 @@
     "active": true,
     "targets": ["nsis"],
     "licenseFile": "../LICENSE",
-    "shortDescription": "Быстро запускаемая установленная версия СБК Инструменты",
+    "shortDescription": "Инструменты для документов, договоров и кадров",
     "windows": {
       "allowDowngrades": false,
       "webviewInstallMode": {

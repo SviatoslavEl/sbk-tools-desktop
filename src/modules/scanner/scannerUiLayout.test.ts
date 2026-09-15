@@ -91,6 +91,18 @@ describe("предпросмотр сканера", () => {
     expect(worker).toContain("radius=min(right - left, bottom - top) / 2");
   });
 
+  it("выбирает цвет новых инструментов и отдельных эффектов без изменения формата данных", () => {
+    const component = readFileSync(new URL("./Scanner.tsx", import.meta.url), "utf8");
+    const styles = readFileSync(new URL("./scanner.css", import.meta.url), "utf8");
+    expect(component).toContain('label={drawingTool === "marker" ? "Цвет нового маркера" : "Цвет нового штриха"}');
+    expect(component).toContain('updateAnnotationColor(items, entry.id, color)');
+    expect(component).toContain('color: annotationColor(entry.kind, entry.color), intensity: entry.intensity');
+    expect(component).toContain('backgroundColor: entry.kind === "marker" ? annotationColor(entry.kind, entry.color)');
+    expect(component).toContain('color: entry.kind === "stroke" ? annotationColor(entry.kind, entry.color)');
+    expect(styles).toContain('.annotation-color-choices { display: flex; align-items: center; flex-wrap: wrap;');
+    expect(styles).toContain('.annotation-color-swatch:focus-visible');
+  });
+
   it("показывает объединение файлов и приветственный экран до инициализации", () => {
     const component = readFileSync(new URL("./Scanner.tsx", import.meta.url), "utf8");
     const app = readFileSync(new URL("../../App.tsx", import.meta.url), "utf8");

@@ -75,7 +75,7 @@ jobs:
   build:
     needs: quality-gate
     env:
-      ARTIFACT_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('2.8.7-test.{0}', github.run_number) }}
+      ARTIFACT_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('2.8.8-test.{0}', github.run_number) }}
     strategy:
       fail-fast: false
       matrix:
@@ -214,6 +214,7 @@ jobs:
           SCANDOCUMENT_RESOURCE_ROOT=src-tauri/runtime-resources "$WORKER" merge --config scanner-worker/tests/fixtures/merge.json
           SCANDOCUMENT_RESOURCE_ROOT=src-tauri/runtime-resources "$WORKER" process --config scanner-worker/tests/fixtures/process-ocr.json
           SCANDOCUMENT_RESOURCE_ROOT=src-tauri/runtime-resources "$WORKER" process --config scanner-worker/tests/fixtures/process-facsimile.json
+          python scripts/smoke_preview_preparation.py --worker "$WORKER" --runtime src-tauri/runtime-resources --output-dir scanner-worker/tests/output/preview-preparation-sidecar
       - name: Generate trusted runtime manifest
         shell: bash
         run: |
@@ -262,8 +263,19 @@ jobs:
           python scripts/verify_runtime_manifest.py --root "$RUNTIME" --worker "$WORKER"
           SCANDOCUMENT_RESOURCE_ROOT="$RUNTIME" "$WORKER" preview --config scanner-worker/tests/fixtures/preview-docx.json
           SCANDOCUMENT_RESOURCE_ROOT="$RUNTIME" "$WORKER" process --config scanner-worker/tests/fixtures/process-docx.json
+          python scripts/smoke_preview_preparation.py --worker "$WORKER" --runtime "$RUNTIME" --output-dir scanner-worker/tests/output/preview-preparation-final-app
           python scripts/verify_runtime_manifest.py --root "$RUNTIME" --worker "$WORKER"
           codesign --verify --deep --strict --verbose=2 "$APP"
+      - name: Upload scanner preparation evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: SBK-Tools-Scanner-Preparation-${{ matrix.target }}
+          path: |
+            scanner-worker/tests/output/preview-preparation-*/**/report.json
+            scanner-worker/tests/output/preview-preparation-*/**/*.jsonl
+            scanner-worker/tests/output/preview-preparation-*/**/*.stderr.log
+          if-no-files-found: ignore
       - name: Sign, notarize and archive portable macOS app
         if: runner.os == 'macOS' && startsWith(github.ref, 'refs/tags/v') && steps.apple_credentials.outputs.available == 'true'
         shell: bash
@@ -484,7 +496,7 @@ jobs:
     runs-on: windows-latest
     env:
       TARGET: x86_64-pc-windows-msvc
-      ARTIFACT_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('2.8.7-test.{0}', github.run_number) }}
+      ARTIFACT_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('2.8.8-test.{0}', github.run_number) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
@@ -565,6 +577,7 @@ jobs:
           SCANDOCUMENT_RESOURCE_ROOT=src-tauri/runtime-resources "$worker" process --config scanner-worker/tests/fixtures/process-docx.json
           SCANDOCUMENT_RESOURCE_ROOT=src-tauri/runtime-resources "$worker" process --config scanner-worker/tests/fixtures/process-ocr.json
           SCANDOCUMENT_RESOURCE_ROOT=src-tauri/runtime-resources "$worker" process --config scanner-worker/tests/fixtures/process-facsimile.json
+          python scripts/smoke_preview_preparation.py --worker "$worker" --runtime src-tauri/runtime-resources --output-dir scanner-worker/tests/output/preview-preparation-sidecar
       - name: Generate and verify trusted runtime manifest
         shell: pwsh
         run: |
@@ -675,8 +688,10 @@ jobs:
           if (Get-ChildItem $installParent -Directory -Filter '.sbk-tools-fast-*' -ErrorAction SilentlyContinue) {
             throw 'Installer left a staging or backup directory behind'
           }
-          $shortcut = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\СБК Инструменты\СБК Инструменты — быстрый запуск.lnk'
+          $shortcut = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\СБК Инструменты\СБК Инструменты.lnk'
           if (-not (Test-Path $shortcut -PathType Leaf)) { throw 'Start menu shortcut is missing' }
+          $installedName = (Get-ItemProperty -LiteralPath 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\ru.sbk.tools.fast').DisplayName
+          if ($installedName -ne 'СБК Инструменты') { throw 'Installed display name still contains a build flavor' }
           Write-Host "Installed files and Start menu shortcut verified at $(Get-Date -Format o)"
           $updateProductData = Join-Path $installDir 'ProductData'
           New-Item -ItemType Directory -Force $updateProductData | Out-Null
@@ -712,6 +727,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Installed OCR processing failed offline' }
           & $worker.FullName process --config scanner-worker/tests/fixtures/process-facsimile.json | Out-Host
           if ($LASTEXITCODE -ne 0) { throw 'Installed facsimile processing failed offline' }
+          python scripts/smoke_preview_preparation.py --worker $worker.FullName --runtime $runtime --output-dir scanner-worker/tests/output/preview-preparation-installed
+          if ($LASTEXITCODE -ne 0) { throw 'Installed page preparation or changed-source guard failed offline' }
+          python scripts/verify_runtime_manifest.py --root $runtime --worker $worker.FullName
+          if ($LASTEXITCODE -ne 0) { throw 'Installed runtime changed during scanner preparation smoke' }
           Remove-Item Env:SCANDOCUMENT_RESOURCE_ROOT, Env:HTTP_PROXY, Env:HTTPS_PROXY
           Write-Host "Installed offline scanner checks completed at $(Get-Date -Format o)"
 
@@ -892,6 +911,16 @@ jobs:
           path: |
             ${{ runner.temp }}/SBK-Tools-Fast-Install-Error.log
             ${{ runner.temp }}/SBK-Tools-Fast-Smoke.log
+          if-no-files-found: ignore
+      - name: Upload installed scanner preparation evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: SBK-Tools-Scanner-Preparation-Windows-Installed
+          path: |
+            scanner-worker/tests/output/preview-preparation-*/**/report.json
+            scanner-worker/tests/output/preview-preparation-*/**/*.jsonl
+            scanner-worker/tests/output/preview-preparation-*/**/*.stderr.log
           if-no-files-found: ignore
       - name: Sign and verify installed Windows package when configured
         if: startsWith(github.ref, 'refs/tags/v')

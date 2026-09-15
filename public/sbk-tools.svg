@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" fill="none">
+  <title>СБК Инструменты</title>
+  <desc>Белый документ и инструмент на индиговом фоне с бирюзовым акцентом.</desc>
+  <defs>
+    <linearGradient id="background" x1="80" y1="48" x2="432" y2="472" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#6157EC"/>
+      <stop offset="1" stop-color="#4338CA"/>
+    </linearGradient>
+  </defs>
+  <rect x="32" y="32" width="448" height="448" rx="108" fill="url(#background)"/>
+  <path d="M170 112h112l74 74v194a24 24 0 0 1-24 24H170a24 24 0 0 1-24-24V136a24 24 0 0 1 24-24Z" fill="#312E81" fill-opacity=".2" transform="translate(0 8)"/>
+  <path d="M170 104h112l74 74v194a24 24 0 0 1-24 24H170a24 24 0 0 1-24-24V128a24 24 0 0 1 24-24Z" fill="#FFF"/>
+  <path d="M282 104v50a24 24 0 0 0 24 24h50Z" fill="#C7D2FE"/>
+  <path d="M188 218h124M188 260h92M188 302h52" stroke="#6962D6" stroke-width="16" stroke-linecap="round"/>
+  <circle cx="352" cy="350" r="88" fill="#4338CA"/>
+  <circle cx="352" cy="350" r="78" fill="#0D9488"/>
+  <path d="M375 304a32 32 0 0 0-40 40l-33 33a14 14 0 0 0 20 20l33-33a32 32 0 0 0 40-40l-21 21-20-20Z" fill="#FFF"/>
+</svg>

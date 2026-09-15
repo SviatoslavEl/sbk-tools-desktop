@@ -18,6 +18,8 @@ describe("scanner loading controls", () => {
   it("binds readiness to the actual loaded image and current document/page/rotation/preset", () => {
     const source = readFileSync(new URL("./Scanner.tsx", import.meta.url), "utf8");
     expect(source).toContain("readyPreviewKey === currentPreviewKey && loadedPreviewUrl === displayedPreviewUrl");
+    expect(source).toContain('${preset}\\n${dpi}\\n${quality}\\n${compressionMode}');
+    expect(source).toContain('${selectedPreset}\\n${dpi}\\n${quality}\\n${compressionMode}');
     expect(source).toContain("setPageCount(0); setPreviewUrl(\"\"); setOriginalUrl(\"\"); setLoadedPreviewUrl(\"\"); setReadyPreviewKey(\"\")");
     expect(source).toContain('setLoadedPreviewUrl(event.currentTarget.getAttribute("src") || "")');
     expect(source).toContain('setPreviewing(true); setReadyPreviewKey("")');

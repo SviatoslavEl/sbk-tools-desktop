@@ -114,6 +114,69 @@ function New-InstalledFixture([string]$Name) {
     return $destination
 }
 
+function Assert-ShortcutTarget([string]$ShortcutPath, [string]$Destination) {
+    Assert-True (Test-Path -LiteralPath $ShortcutPath -PathType Leaf) 'Plain-name shortcut is missing'
+    $native = $null
+    $nativeFailure = ''
+    try { $native = [InstallerRegressionShortcuts]::Read($ShortcutPath) }
+    catch { $nativeFailure = $_.ToString() }
+    # Keep the former automation values for diagnosis, never as a fallback oracle.
+    $shell = $null
+    $shortcut = $null
+    $automationDetails = [ordered]@{ targetPath = ''; workingDirectory = ''; arguments = ''; error = '' }
+    try {
+        $shell = New-Object -ComObject WScript.Shell
+        $shortcut = $shell.CreateShortcut($ShortcutPath)
+        $automationDetails.targetPath = [string]$shortcut.TargetPath
+        $automationDetails.workingDirectory = [string]$shortcut.WorkingDirectory
+        $automationDetails.arguments = [string]$shortcut.Arguments
+    } catch {
+        $automationDetails.error = $_.ToString()
+    } finally {
+        if ($shortcut) { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($shortcut) }
+        if ($shell) { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell) }
+    }
+    $expectedTarget = Join-Path $Destination 'SBK-Tools-Fast.exe'
+    $actualTarget = if ($native) { $native.TargetPath } else { '' }
+    $actualWorkingDirectory = if ($native) { $native.WorkingDirectory } else { '' }
+    $shortcutDetails = [ordered]@{
+        reader = 'IPersistFile.Load + IShellLinkW.GetPath(SLGP_RAWPATH)'
+        actualTarget = $actualTarget
+        expectedTarget = $expectedTarget
+        workingDirectory = $actualWorkingDirectory
+        arguments = if ($native) { $native.Arguments } else { '' }
+        destinationFullName = (Get-Item -LiteralPath $Destination).FullName
+        shortcutPath = $ShortcutPath
+        nativeError = $nativeFailure
+        automation = $automationDetails
+    }
+    $shortcutDetailsJson = ConvertTo-Json -InputObject $shortcutDetails -Depth 4
+    Write-Host "Shortcut target diagnostic:`n$shortcutDetailsJson"
+    if ($nativeFailure -or $actualTarget -ne $expectedTarget -or $actualWorkingDirectory -ne $Destination) {
+        # Retain the exact failing shortcut before a later fixture replaces it.
+        $shortcutDiagnosticBase = Join-Path $Results ('{0:d2}-shortcut-target-mismatch' -f $script:InvocationNumber)
+        try {
+            Copy-Item -LiteralPath $ShortcutPath -Destination ($shortcutDiagnosticBase + '.lnk')
+            [IO.File]::WriteAllText(($shortcutDiagnosticBase + '.json'), $shortcutDetailsJson)
+            Write-Host "Failing shortcut retained: $shortcutDiagnosticBase.lnk"
+        } catch {
+            Write-Warning "Could not retain the failing shortcut diagnostic: $_"
+        }
+    }
+    Assert-True ([string]::IsNullOrEmpty($nativeFailure)) "Native Shell Link reader failed: $nativeFailure"
+    Assert-True ($actualTarget -eq $expectedTarget) 'Shortcut no longer targets the update-compatible executable'
+    Assert-True (Test-Path -LiteralPath $actualTarget -PathType Leaf) 'Shortcut target executable does not exist'
+    Assert-True ($actualWorkingDirectory -eq $Destination) 'Shortcut working directory is not the installation directory'
+}
+
+function Assert-ProductDisplayName([string]$Destination) {
+    $registration = Get-ItemProperty -LiteralPath 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\ru.sbk.tools.fast'
+    Assert-True ($registration.DisplayName -eq 'СБК Инструменты') 'Installed display name is not the plain product name'
+    Assert-True ($registration.InstallLocation -eq $Destination) 'Renaming the product changed its installation location'
+    $shortcutPath = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\СБК Инструменты\СБК Инструменты.lnk'
+    Assert-ShortcutTarget $shortcutPath $Destination
+}
+
 function Get-UserDataSnapshot([string]$Destination) {
     return @(
         (Get-TreeSnapshot (Join-Path $Destination 'ProductData')),
@@ -194,6 +257,8 @@ try {
 using System;
 using System.ComponentModel;
 using System.Runtime.InteropServices;
+using System.Runtime.InteropServices.ComTypes;
+using System.Text;
 using Microsoft.Win32.SafeHandles;
 public static class InstallerRegressionLocks {
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
@@ -220,7 +285,100 @@ public static class InstallerRegressionLocks {
         }
     }
 }
+
+public sealed class InstallerShortcutDetails {
+    public string TargetPath { get; set; }
+    public string WorkingDirectory { get; set; }
+    public string Arguments { get; set; }
+}
+
+public static class InstallerRegressionShortcuts {
+    [ComImport, Guid("00021401-0000-0000-C000-000000000046")]
+    private class ShellLinkCom { }
+
+    // Preserve the native vtable order, including unused methods between getters.
+    [ComImport, Guid("000214F9-0000-0000-C000-000000000046"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IShellLinkW {
+        [PreserveSig] int GetPath([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder path, int capacity, IntPtr findData, uint flags);
+        void GetIDList(out IntPtr itemIdList);
+        void SetIDList(IntPtr itemIdList);
+        void GetDescription([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder description, int capacity);
+        void SetDescription([MarshalAs(UnmanagedType.LPWStr)] string description);
+        void GetWorkingDirectory([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder directory, int capacity);
+        void SetWorkingDirectory([MarshalAs(UnmanagedType.LPWStr)] string directory);
+        void GetArguments([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder arguments, int capacity);
+        void SetArguments([MarshalAs(UnmanagedType.LPWStr)] string arguments);
+        void GetHotkey(out short hotkey);
+        void SetHotkey(short hotkey);
+        void GetShowCmd(out int command);
+        void SetShowCmd(int command);
+        void GetIconLocation([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder iconPath, int capacity, out int index);
+        void SetIconLocation([MarshalAs(UnmanagedType.LPWStr)] string iconPath, int index);
+        void SetRelativePath([MarshalAs(UnmanagedType.LPWStr)] string path, uint reserved);
+        void Resolve(IntPtr window, uint flags);
+        void SetPath([MarshalAs(UnmanagedType.LPWStr)] string path);
+    }
+
+    public static InstallerShortcutDetails Read(string shortcutPath) {
+        object instance = new ShellLinkCom();
+        try {
+            // Load only; never Resolve, execute or save/repair the tested shortcut.
+            // https://learn.microsoft.com/windows/win32/api/objidl/nf-objidl-ipersistfile-load
+            ((IPersistFile)instance).Load(shortcutPath, 0);
+            var link = (IShellLinkW)instance;
+            var target = new StringBuilder(32768);
+            var directory = new StringBuilder(32768);
+            var arguments = new StringBuilder(32768);
+            const uint SLGP_RAWPATH = 0x4;
+            // https://learn.microsoft.com/windows/win32/api/shobjidl_core/nf-shobjidl_core-ishelllinkw-getpath
+            int result = link.GetPath(target, target.Capacity, IntPtr.Zero, SLGP_RAWPATH);
+            Marshal.ThrowExceptionForHR(result);
+            if (result != 0) throw new InvalidOperationException("IShellLinkW.GetPath did not return a valid target (HRESULT " + result + ").");
+            link.GetWorkingDirectory(directory, directory.Capacity);
+            link.GetArguments(arguments, arguments.Capacity);
+            return new InstallerShortcutDetails { TargetPath = target.ToString(), WorkingDirectory = directory.ToString(), Arguments = arguments.ToString() };
+        } finally {
+            Marshal.FinalReleaseComObject(instance);
+        }
+    }
+}
 '@
+
+    Test-Case 'plain-product-name-and-legacy-shortcut-migration' {
+        $versionInfo = [Diagnostics.FileVersionInfo]::GetVersionInfo($Installer)
+        Assert-True ($versionInfo.ProductName -eq 'СБК Инструменты') 'Installer metadata still exposes the fast-start suffix'
+        Assert-True ($versionInfo.FileDescription -eq 'Установщик СБК Инструменты') 'Installer description is not the plain product name'
+        $newDesktop = Join-Path ([Environment]::GetFolderPath('Desktop')) 'СБК Инструменты.lnk'
+        Assert-True (-not (Test-Path -LiteralPath $newDesktop)) 'Clean fixture unexpectedly starts with an existing product desktop shortcut'
+        $destination = New-InstalledFixture 'display-name'
+        Assert-ProductDisplayName $destination
+        Assert-True (-not (Test-Path -LiteralPath $newDesktop)) 'Fresh silent installation ignored the desktop shortcut opt-out'
+        $preserved = Get-UserDataSnapshot $destination
+        $menu = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\СБК Инструменты'
+        $legacyName = 'СБК Инструменты — быстрый запуск'
+        $legacyProgram = Join-Path $menu ($legacyName + '.lnk')
+        $legacyUninstaller = Join-Path $menu ('Удалить ' + $legacyName + '.lnk')
+        $legacyDesktop = Join-Path ([Environment]::GetFolderPath('Desktop')) ($legacyName + '.lnk')
+        Copy-Item -LiteralPath (Join-Path $menu 'СБК Инструменты.lnk') -Destination $legacyProgram
+        Copy-Item -LiteralPath (Join-Path $menu 'Удалить СБК Инструменты.lnk') -Destination $legacyUninstaller
+        Copy-Item -LiteralPath $legacyProgram -Destination $legacyDesktop
+        Set-ItemProperty -LiteralPath 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\ru.sbk.tools.fast' -Name DisplayName -Value $legacyName
+        Mark-OldProgram $destination
+        Invoke-FixtureInstaller 'display-name-update' $Installer $destination
+        Assert-Upgraded $destination $preserved
+        Assert-ProductDisplayName $destination
+        Assert-True (Test-Path -LiteralPath $newDesktop -PathType Leaf) 'Silent update lost the existing desktop shortcut during renaming'
+        Assert-ShortcutTarget $newDesktop $destination
+        foreach ($legacyShortcut in @($legacyProgram, $legacyUninstaller, $legacyDesktop)) {
+            Assert-True (-not (Test-Path -LiteralPath $legacyShortcut)) "Update left the obsolete shortcut: $legacyShortcut"
+        }
+        Mark-OldProgram $destination
+        Invoke-FixtureInstaller 'display-name-second-update' $Installer $destination
+        Assert-Upgraded $destination $preserved
+        Assert-ProductDisplayName $destination
+        Assert-True (Test-Path -LiteralPath $newDesktop -PathType Leaf) 'Repeated silent update lost the plain-name desktop shortcut'
+        Assert-ShortcutTarget $newDesktop $destination
+    }
 
     Test-Case 'clean-install-and-update' {
         $destination = New-InstalledFixture 'normal'

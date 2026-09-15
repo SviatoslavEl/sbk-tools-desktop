@@ -177,7 +177,7 @@ export function Calculator() {
     }
   };
 
-  return <NumberValidityContext.Provider value={reportNumberValidity}><div className={`module-stack calculator-${experienceMode}`}>
+  return <NumberValidityContext.Provider value={reportNumberValidity}><div className={`module-stack calculator-module calculator-${experienceMode}`}>
     <div className="calculator-mode-switch" role="group" aria-label="Уровень калькулятора"><button type="button" aria-pressed={experienceMode === "guided"} onClick={() => setExperienceMode("guided")}>Пошаговый расчёт</button><button type="button" aria-pressed={experienceMode === "expert"} onClick={() => setExperienceMode("expert")}>Экспертный режим</button><span>Один расчёт — переключение без потери данных</span></div>
     {!workspaceAccess.editor && <div className="notice"><strong>Локальный расчёт в режиме просмотра</strong><span>Все параметры и экспорт доступны. Сохранение в общую базу и автоматическая запись черновика отключены.</span></div>}
     {experienceMode === "guided" && <section ref={guideRef} className="surface calculator-guide" aria-label="Шаги расчёта"><nav aria-label="Этапы калькулятора">{steps.map((label, index) => <button type="button" key={label} aria-current={step === index ? "step" : undefined} onClick={() => setStep(index)}>{index + 1}. {label}</button>)}</nav><h2>Шаг {step + 1}. {steps[step]}</h2><p>{guidance[step]}</p></section>}
