@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { openPath } from "@tauri-apps/plugin-opener";
 import { Dialog } from "../../components/Dialog";
@@ -21,6 +21,7 @@ import {
   buildCompanyDirectoryMigration,
   companyUsedAsPerformer,
   companyRelationshipLabel,
+  companyInnFormatHint,
   emptyCompany,
   emptyCompanyDirectory,
   linkContractToDirectory,
@@ -29,6 +30,7 @@ import {
   normalizeCompanyName,
   updateContractCompanyReference,
   validateCompany,
+  validateCompanyInn,
   validateCompanyDirectory,
   type CompanyCard,
   type CompanyDirectoryData,
@@ -584,6 +586,9 @@ export function CompanyEditor({
   const [item, setItem] = useState(() => structuredClone(company));
   const [savedSnapshot, setSavedSnapshot] = useState(() => JSON.stringify(item));
   const [error, setError] = useState("");
+  const innHintId = useId();
+  const innValidation = validateCompanyInn(item, companies);
+  const innMessage = innValidation.error || innValidation.warning;
   useEffect(
     () => () => {
       void discardStagedAttachments("contract-experience", directoryDraftKey);
@@ -668,10 +673,15 @@ export function CompanyEditor({
           <label>
             ИНН
             <input
+              aria-label="ИНН"
+              aria-invalid={Boolean(innValidation.error)}
+              aria-describedby={`${innHintId}${innMessage ? ` ${innHintId}-message` : ""}`}
               inputMode="numeric"
               value={item.inn}
               onChange={(event) => update("inn", event.target.value)}
             />
+            <small id={innHintId} className="help-text">{companyInnFormatHint}</small>
+            {innMessage && <small id={`${innHintId}-message`} className={innValidation.error ? "field-error" : "notice warning"} role="status">{innMessage}</small>}
           </label>
           <label>
             КПП

@@ -34,6 +34,7 @@ import { MAX_PREVIEW_ZOOM, MIN_PREVIEW_ZOOM } from "./previewViewport";
 import { usePreviewViewport } from "./usePreviewViewport";
 import { usePreviewPanelHeight } from "./usePreviewPanelHeight";
 import { ScannerPageControls } from "./ScannerPageControls";
+import { ScannerSizeSummary, positiveFileBytes, totalScannerOutputBytes, type ScannerResultSize } from "./ScannerSizeSummary";
 import { belongsToScannerResult, useScannerOperationUi, type ScannerProgress, type ScannerWorkspaceMode } from "./scannerOperationState";
 import {
   facsimileHeight,
@@ -86,7 +87,6 @@ interface PreviewResult {
   warnings: string[];
   estimatedOutputBytes: number;
   originalBytes: number;
-  estimatedSavingsPercent: number;
   pageSizePoints?: [number, number];
 }
 
@@ -214,7 +214,7 @@ export function Scanner({ active = true }: { active?: boolean }) {
   }, [workspaceMode, resultPath, resultKind]);
   const [estimatedOutputBytes, setEstimatedOutputBytes] = useState(0);
   const [originalBytes, setOriginalBytes] = useState(0);
-  const [estimatedSavingsPercent, setEstimatedSavingsPercent] = useState(0);
+  const [savedResultSize, setSavedResultSize] = useState<ScannerResultSize | null>(null);
   const [pageSizeMm, setPageSizeMm] = useState<[number, number] | null>(null);
   const [ocrConfidence, setOcrConfidence] = useState<number | null>(null);
   const [ocrText, setOcrText] = useState("");
@@ -292,7 +292,6 @@ export function Scanner({ active = true }: { active?: boolean }) {
       : Array.from({ length: result.pageCount }, (_, index) => index));
     setEstimatedOutputBytes(result.estimatedOutputBytes);
     setOriginalBytes(result.originalBytes);
-    setEstimatedSavingsPercent(result.estimatedSavingsPercent);
     setPageSizeMm(result.pageSizePoints
       ? result.pageSizePoints.map((value) => value * 25.4 / 72) as [number, number]
       : null);
@@ -357,7 +356,6 @@ export function Scanner({ active = true }: { active?: boolean }) {
         warnings: response.warnings || [],
         estimatedOutputBytes: response.estimatedOutputBytes || 0,
         originalBytes: response.originalBytes || 0,
-        estimatedSavingsPercent: response.estimatedSavingsPercent || 0,
         pageSizePoints: response.pageSizePoints,
       };
       previewCache.current.set(cacheKey, result);
@@ -384,7 +382,7 @@ export function Scanner({ active = true }: { active?: boolean }) {
     setWorkspaceMode("document");
     previewCache.current.clear();
     setPageCount(0); setPreviewUrl(""); setOriginalUrl(""); setLoadedPreviewUrl(""); setReadyPreviewKey(""); setPageSizeMm(null); setDrawingTool(null);
-    setInputPath(path); setDocumentName(path.split(/[\\/]/).pop() || path); setPageIndex(0); setPageOrder([]); setOutputPageMode("all"); setOutputPageRange(""); setOutputBlocks([]); setPageRotations({}); setResultPath("", "document"); setResultKind("", "document"); setProgress(null, "document"); setWarnings([], "document"); setFacsimile(null); setSavedFacsimiles([]); setEditingFacsimileId(""); setRedactions([]); setAnnotations([]); setSelectedOverlay(null); setOriginalBytes(0); setEstimatedOutputBytes(0); setEstimatedSavingsPercent(0); setOcrConfidence(null); setOcrText(""); setLowConfidenceWords([]); viewport.resetView();
+    setInputPath(path); setDocumentName(path.split(/[\\/]/).pop() || path); setPageIndex(0); setPageOrder([]); setOutputPageMode("all"); setOutputPageRange(""); setOutputBlocks([]); setPageRotations({}); setResultPath("", "document"); setResultKind("", "document"); setProgress(null, "document"); setWarnings([], "document"); setFacsimile(null); setSavedFacsimiles([]); setEditingFacsimileId(""); setRedactions([]); setAnnotations([]); setSelectedOverlay(null); setOriginalBytes(0); setEstimatedOutputBytes(0); setSavedResultSize(null); setOcrConfidence(null); setOcrText(""); setLowConfidenceWords([]); viewport.resetView();
     await makePreview(path, preset, 0, {});
   };
   const chooseBatch = async () => {
@@ -686,7 +684,7 @@ export function Scanner({ active = true }: { active?: boolean }) {
     if (outputPageMode === "blocks" && outputDirectory) {
       const separator = outputDirectory.includes("\\") ? "\\" : "/";
       const totalPages = outputBlockSelection.blocks.reduce((sum, block) => sum + block.order.length, 0);
-      const startedAt = Date.now(); let completedPages = 0; let totalOutputBytes = 0; const combinedWarnings = new Set<string>();
+      const startedAt = Date.now(); let completedPages = 0; const outputFileBytes: Array<number | undefined> = []; const combinedWarnings = new Set<string>();
       setError(""); setResultPath(""); setResultKind(""); setWarnings([]);
       try {
         for (const [index, block] of outputBlockSelection.blocks.entries()) {
@@ -696,13 +694,14 @@ export function Scanner({ active = true }: { active?: boolean }) {
           try {
             const response = await invoke<{ outputPath: string; warnings?: string[]; outputBytes?: number }>("scanner_run", { jobId, operation: "process", config: processingConfig(blockOutputPath, block.order) });
             response.warnings?.forEach((warning) => combinedWarnings.add(warning));
-            totalOutputBytes += response.outputBytes || 0;
+            outputFileBytes.push(response.outputBytes);
           } catch (reason) {
             throw new Error(`Блок «${block.name}»: ${String(reason)}`);
           }
           completedPages += block.order.length;
         }
-        setResultPath(outputDirectory); setResultKind("split"); setWarnings([...combinedWarnings]); if (totalOutputBytes) setEstimatedOutputBytes(totalOutputBytes);
+        setResultPath(outputDirectory); setResultKind("split"); setWarnings([...combinedWarnings]);
+        setSavedResultSize({ inputPath, resultPath: outputDirectory, kind: "split", originalBytes, outputBytes: totalScannerOutputBytes(outputFileBytes), fileCount: outputFileBytes.length });
         setProgress({ stage: "Все блоки готовы", currentPage: totalPages, totalPages, percent: 100 });
         if (workspaceAccess.editor) await templates.save(`Разделение ${new Date().toLocaleString("ru-RU")}`, { kind: "processing-journal", inputType: inputPath.toLowerCase().endsWith(".docx") ? "DOCX" : "PDF", pageCount: totalPages, preset, ocr: ocrEnabled, status: "completed", durationMs: Date.now() - startedAt, appliedOperations: [`Файлов: ${outputBlockSelection.blocks.length}`, ...outputBlockSelection.blocks.map((block) => `${block.name}: ${block.order.length} стр.`)] }).catch(() => undefined);
       } catch (reason) {
@@ -718,7 +717,9 @@ export function Scanner({ active = true }: { active?: boolean }) {
     const startedAt = Date.now();
     try {
       const response = await invoke<{ outputPath: string; outputSha256?: string; warnings?: string[]; ocrConfidence?: number | null; ocrText?: string; lowConfidenceWords?: Array<{ page: number; text: string; confidence: number }>; outputBytes?: number; originalBytes?: number; savingsPercent?: number }>("scanner_run", { jobId, operation: "process", config: processingConfig(outputPath, finalPageOrder) });
-      setResultPath(response.outputPath || outputPath); setResultKind("single"); setWarnings(response.warnings || []); setOcrConfidence(response.ocrConfidence ?? null); setOcrText(response.ocrText || ""); setLowConfidenceWords(response.lowConfidenceWords || []); if (response.outputBytes) setEstimatedOutputBytes(response.outputBytes); if (response.originalBytes) setOriginalBytes(response.originalBytes); if (response.savingsPercent != null) setEstimatedSavingsPercent(response.savingsPercent); setProgress({ stage: "Готово", currentPage: finalPageOrder.length, totalPages: finalPageOrder.length, percent: 100 });
+      setResultPath(response.outputPath || outputPath); setResultKind("single"); setWarnings(response.warnings || []); setOcrConfidence(response.ocrConfidence ?? null); setOcrText(response.ocrText || ""); setLowConfidenceWords(response.lowConfidenceWords || []);
+      setSavedResultSize({ inputPath, resultPath: response.outputPath || outputPath, kind: "single", originalBytes: positiveFileBytes(response.originalBytes) ?? originalBytes, outputBytes: positiveFileBytes(response.outputBytes), fileCount: 1 });
+      setProgress({ stage: "Готово", currentPage: finalPageOrder.length, totalPages: finalPageOrder.length, percent: 100 });
       const logicalFacsimileCount = savedFacsimiles.length + (facsimile && !editingFacsimileId ? 1 : 0);
       const appliedOperations = [`Пресет: ${preset}`, `${dpi} dpi`, `Качество ${quality}%`, `Сжатие: ${compressionMode}`, ...(ocrEnabled ? [`OCR ${ocrLanguages}`] : []), ...(pdfaEnabled ? ["PDF/A-2b"] : []), ...(savedWorkerFacsimiles.length || workerFacsimiles.length ? [`Факсимиле: ${logicalFacsimileCount}`] : []), ...(redactions.length ? [`Скрытие областей: ${redactions.length}`] : []), ...(annotations.length ? [`Инструменты: ${annotations.length}`] : []), ...(pageOrder.some((value, index) => value !== index) ? ["Изменён порядок страниц"] : []), ...(finalPageOrder.length !== pageOrder.length ? ["Выбран диапазон итоговых страниц"] : []), ...(Object.values(pageRotations).some(Boolean) ? ["Поворот страниц"] : [])];
       if (workspaceAccess.editor) await templates.save(`Обработка ${new Date().toLocaleString("ru-RU")}`, { kind: "processing-journal", inputType: inputPath.toLowerCase().endsWith(".docx") ? "DOCX" : "PDF", pageCount: finalPageOrder.length, preset, ocr: ocrEnabled, status: "completed", durationMs: Date.now() - startedAt, outputSha256: response.outputSha256, appliedOperations }).catch(() => undefined);
@@ -1011,7 +1012,7 @@ export function Scanner({ active = true }: { active?: boolean }) {
       </div>}
       {error && <div className="scanner-error"><strong>Не удалось обработать документ</strong><span>{error}</span><div><button className="secondary" type="button" onClick={() => void makePreview()}>Повторить</button>{ocrEnabled && <button className="secondary" type="button" onClick={() => setOcrEnabled(false)}>Без OCR</button>}<button className="secondary" type="button" onClick={() => void chooseDocument()}>Другой файл</button></div></div>}
       {warnings.length > 0 && <div className="notice warning"><strong>Проверьте результат</strong>{warnings.map((warning) => <span key={warning}>{warning}</span>)}</div>}
-      {inputPath && <div className="scanner-estimate"><span>Исходный размер: {originalBytes ? `${(originalBytes / 1024 / 1024).toFixed(1)} МБ` : "считается"}</span><span>{resultKind === "single" ? "Размер результата" : "Оценка результата"}: {estimatedOutputBytes ? `${resultKind === "single" ? "" : "≈ "}${(estimatedOutputBytes / 1024 / 1024).toFixed(1)} МБ` : "рассчитывается"}</span>{originalBytes > 0 && estimatedOutputBytes > 0 && <span className={estimatedSavingsPercent >= 0 ? "estimate-good" : "estimate-warning"}>{estimatedSavingsPercent >= 0 ? `Меньше ${resultKind === "single" ? "" : "примерно "}на ${estimatedSavingsPercent.toFixed(0)}%` : `Больше ${resultKind === "single" ? "" : "примерно "}на ${Math.abs(estimatedSavingsPercent).toFixed(0)}%`}</span>}{pageSizeMm && <span>Страница: {pageSizeMm[0].toFixed(1)} × {pageSizeMm[1].toFixed(1)} мм</span>}{ocrConfidence != null && <span>Средняя уверенность OCR: {ocrConfidence.toFixed(1)}%</span>}</div>}
+      {inputPath && <ScannerSizeSummary inputPath={inputPath} resultPath={resultPath} resultKind={resultKind} originalBytes={originalBytes} estimatedOutputBytes={estimatedOutputBytes} savedResult={savedResultSize}>{pageSizeMm && <span>Страница: {pageSizeMm[0].toFixed(1)} × {pageSizeMm[1].toFixed(1)} мм</span>}{ocrConfidence != null && <span>Средняя уверенность OCR: {ocrConfidence.toFixed(1)}%</span>}</ScannerSizeSummary>}
       {ocrText && <details className="ocr-result"><summary>Распознанный текст · сомнительных слов: {lowConfidenceWords.length}</summary><textarea readOnly rows={10} value={ocrText} aria-label="Распознанный текст" />{lowConfidenceWords.length > 0 && <div className="low-confidence-list">{lowConfidenceWords.slice(0, 100).map((word, index) => <span key={`${word.page}-${index}`} title={`Страница ${word.page}`}>{word.text} · {word.confidence.toFixed(0)}%</span>)}</div>}<p className="help-text">Текст показывается только в текущем окне и не записывается в журнал обработки.</p></details>}
       {progress && <div className="progress-panel"><div><strong>{progress.stage}</strong><span>{progress.totalPages ? `Страница ${progress.currentPage} из ${progress.totalPages}` : ""}</span></div><progress max="100" value={progress.percent} /><strong>{progress.percent}%</strong>{activeJob && activeJobModeRef.current === workspaceMode && <button className="secondary" type="button" onClick={() => void cancel()}>Отменить</button>}</div>}
       </div>

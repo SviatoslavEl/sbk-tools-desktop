@@ -78,6 +78,7 @@ describe("интерфейс реестров", () => {
     expect(declarations(".collapse-button")).toMatchObject({ position: "static", flex: "0 0 28px" });
     expect(declarations(".collapse-button")).not.toHaveProperty("right");
     expect(declarations(".registry-module > .table-surface > .table-scroll")).toMatchObject({ flex: "1 1 auto", "min-height": "0" });
+    expect(declarations(".detail-drawer .form-grid > label > small")).toMatchObject({ display: "block", "margin-top": "4px" });
     const app = readFileSync(new URL("../../App.tsx", import.meta.url), "utf8");
     const brand = app.slice(app.indexOf('<div className="brand">'), app.indexOf('<p className="nav-caption">'));
     expect(brand).toContain('className="collapse-button"');

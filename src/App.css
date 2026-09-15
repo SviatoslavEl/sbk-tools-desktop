@@ -335,6 +335,8 @@ details label { display: block; margin-top: 10px; }
 [hidden] { display: none !important; }
 .calculator-mode-switch, .calculator-step-actions { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
 .calculator-mode-switch span { color: var(--text-muted); font-size: 12px; }
+.calculator-mode-switch button, .calculator-guide nav button { min-height: 36px; padding: 8px 12px; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--surface); color: var(--text-secondary); font-size: 12px; font-weight: 600; line-height: 1.4; }
+.calculator-mode-switch button:hover, .calculator-guide nav button:hover { border-color: var(--primary); }
 .calculator-mode-switch button[aria-pressed="true"], .calculator-guide button[aria-current="step"] { background: var(--primary); color: white; }
 .calculator-guide { padding: 16px; }
 .calculator-guide nav { display: flex; flex-wrap: wrap; gap: 6px; }
@@ -808,3 +810,5 @@ input[type="checkbox"]:disabled, input[type="radio"]:disabled { cursor: not-allo
 .owner-panel td { overflow-wrap: anywhere; }
 .administration-notice { position: fixed; left: 16px; bottom: 16px; z-index: 500; width: min(370px, calc(100vw - 32px)); max-height: 50vh; overflow: auto; box-shadow: 0 8px 30px rgba(15, 23, 42, .18); }
 .administration-notice .icon-button { float: right; }
+/* Field help and validation are separate readable lines, not inline fragments. */
+.detail-drawer .form-grid > label > small { display: block; margin-top: 4px; }

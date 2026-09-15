@@ -82,6 +82,20 @@ export const normalizeCompanyName = (value: string | null | undefined) => (value
 
 export const normalizeInn = (value: string) => value.replace(/\D/g, "");
 
+export const companyInnFormatHint = "Необязательно. Укажите 10 или 12 цифр без букв и пробелов внутри номера.";
+export const companyInnFormatError = "ИНН должен содержать 10 или 12 цифр без букв и пробелов внутри номера. Можно оставить поле пустым.";
+
+/** Validate edited input before the existing directory normalization runs. */
+export function validateCompanyInn(company: Pick<CompanyCard, "id" | "inn">, companies: Pick<CompanyCard, "id" | "inn">[]): { error: string; warning: string } {
+  const value = company.inn.trim();
+  if (!value || /^(?:[0-9]{10}|[0-9]{12})$/.test(value)) return { error: "", warning: "" };
+  const previous = companies.find((item) => item.id === company.id);
+  if (previous && previous.inn === company.inn) {
+    return { error: "", warning: "Ранее сохранённый ИНН имеет неверный формат. Другие поля можно сохранить, оставив этот ИНН без изменений. Для нового значения укажите 10 или 12 цифр либо оставьте поле пустым." };
+  }
+  return { error: companyInnFormatError, warning: "" };
+}
+
 export const emptyCompany = (now: string = new Date().toISOString(), id: string = crypto.randomUUID()): CompanyCard => ({
   id,
   name: "",
@@ -323,6 +337,8 @@ export function validateCompany(company: CompanyCard, companies: CompanyCard[]):
   const errors: string[] = [];
   if (!company.name.trim()) errors.push("Укажите полное название компании.");
   if (company.scope !== "internal" && company.scope !== "external") errors.push("Укажите, относится компания к внутренней группе или к внешним.");
+  const innFormat = validateCompanyInn(company, companies);
+  if (innFormat.error) errors.push(innFormat.error);
   const companyInn = normalizeInn(company.inn);
   const duplicate = companies.find((item) => item.id !== company.id
     && normalizeCompanyName(item.name) === normalizeCompanyName(company.name)
