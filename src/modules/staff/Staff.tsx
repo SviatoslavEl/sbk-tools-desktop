@@ -747,7 +747,7 @@ export function StaffRegistry() {
   };
 
   return (
-    <div className="module-stack">
+    <div className="module-stack registry-module">
       <div className="stats-row registry-stats-compact">
         <div className="stat">
           <span>Людей в реестре</span>

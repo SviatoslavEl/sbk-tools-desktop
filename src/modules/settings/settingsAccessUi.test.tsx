@@ -59,6 +59,20 @@ function buttonAttributes(content: string, label: string) {
 describe("settings workspace access rendered UI", () => {
   beforeEach(() => vi.clearAllMocks());
 
+  it("allows retry of only this process's pending release even with unknown network state", () => {
+    const html = renderSettings(workspace({ editorBusy: true, editorOwner: owner, editorCleanupPending: true, editorCleanupMessage: "Отказ удаления; сохранён свой сеанс", editorStateMessage: "Связь временно недоступна" }));
+    expect(html).toContain("Освобождение своего сеанса не завершено");
+    expect(html).toContain("Отказ удаления; сохранён свой сеанс");
+    expect(accessControls(html).attributes).not.toContain('disabled=""');
+    expect(accessControls(html).content).toContain("Повторить освобождение своего сеанса");
+    expect(accessControls(html).content).not.toContain("Войти в режим редактирования");
+  });
+
+  it("still blocks retry if filesystem access is not writable", () => {
+    const html = renderSettings(workspace({ writable: false, editorCleanupPending: true }));
+    expect(accessControls(html).attributes).toContain('disabled=""');
+  });
+
   it("shows another editor and computer while disabling the whole password fieldset", () => {
     const html = renderSettings(workspace({ editorBusy: true, editorOwner: owner }));
     expect(html).toContain(owner.displayName);

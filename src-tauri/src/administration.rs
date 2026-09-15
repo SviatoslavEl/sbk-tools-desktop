@@ -150,7 +150,36 @@ pub(crate) fn latest_request(root: &Path, token: &str) -> Result<Option<AdminEve
         return Ok(None);
     }
     // A revoke always wins over subsequent ordinary requests for the same lease.
-    open(root, false)?.query_row("SELECT id,created_at,actor,action,target,reason FROM events WHERE target=?1 ORDER BY (action='revoke-requested') DESC,id DESC LIMIT 1", [token], read_event).optional().map_err(|e| e.to_string())
+    open(root, false)?.query_row("SELECT id,created_at,actor,action,target,reason FROM events WHERE target=?1 AND action IN ('revoke-requested','release-requested') ORDER BY (action='revoke-requested') DESC,id DESC LIMIT 1", [token], read_event).optional().map_err(|e| e.to_string())
+}
+
+/// Append to the existing service journal; never rewrite prior events or schemas.
+pub(crate) fn record_session_event(
+    root: &Path,
+    actor: &str,
+    target: &str,
+    action: &str,
+    reason: &str,
+) -> Result<(), String> {
+    if Uuid::parse_str(target).is_err()
+        || !matches!(
+            action,
+            "release-acknowledged"
+                | "release-failed"
+                | "recovery-intent"
+                | "recovery-completed"
+                | "recovery-failed"
+        )
+    {
+        return Err("Некорректное событие управления сессией".into());
+    }
+    open(root, true)?
+        .execute(
+            "INSERT INTO events(created_at,actor,action,target,reason) VALUES(?1,?2,?3,?4,?5)",
+            params![Utc::now().to_rfc3339(), actor, action, target, reason],
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 fn read_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<AdminEvent> {
@@ -197,6 +226,14 @@ mod tests {
         let token = Uuid::new_v4().to_string();
         record_request(&root, "owner", &token, "Проверка отзыва", true).unwrap();
         record_request(&root, "viewer", &token, "Обычный запрос", false).unwrap();
+        for action in [
+            "release-failed",
+            "release-acknowledged",
+            "recovery-intent",
+            "recovery-completed",
+        ] {
+            record_session_event(&root, "session", &token, action, "Проверка результата").unwrap();
+        }
         assert_eq!(
             latest_request(&root, &token).unwrap().unwrap().action,
             "revoke-requested"
@@ -206,7 +243,7 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert_eq!(events(&root).unwrap().len(), 3);
+        assert_eq!(events(&root).unwrap().len(), 7);
         std::fs::remove_dir_all(root).unwrap();
     }
 }

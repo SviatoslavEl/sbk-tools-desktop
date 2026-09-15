@@ -2,7 +2,7 @@ import {
   createContext,
   type ReactNode,
   useContext,
-  useEffect,
+  useLayoutEffect,
   useRef,
 } from "react";
 
@@ -14,6 +14,20 @@ const WorkspaceAccessContext = createContext<WorkspaceAccessValue>({
   editor: true,
   message: "",
 });
+
+export interface WorkspaceBoundaryPolicy {
+  allowMutations: boolean;
+  disableFormControls: boolean;
+}
+const WorkspaceBoundaryPolicyContext = createContext<WorkspaceBoundaryPolicy>({
+  allowMutations: false,
+  disableFormControls: false,
+});
+
+/** Portals keep the same explicit policy as their source workspace boundary. */
+export function useWorkspaceBoundaryPolicy(): WorkspaceBoundaryPolicy {
+  return useContext(WorkspaceBoundaryPolicyContext);
+}
 
 export function WorkspaceAccessProvider({
   editor,
@@ -100,7 +114,7 @@ export function ReadOnlyWorkspaceBoundary({
 }) {
   const access = useWorkspaceAccess();
   const root = useRef<HTMLDivElement>(null);
-  useEffect(() => {
+  useLayoutEffect(() => {
     const container = root.current;
     if (!container) return;
     const update = () =>
@@ -146,13 +160,15 @@ export function ReadOnlyWorkspaceBoundary({
     children,
   ]);
   return (
-    <div
-      ref={root}
-      data-workspace-access={
-        access.editor || allowMutations ? "editor" : "viewer"
-      }
-    >
-      {children}
-    </div>
+    <WorkspaceBoundaryPolicyContext.Provider value={{ allowMutations, disableFormControls }}>
+      <div
+        ref={root}
+        data-workspace-access={
+          access.editor || allowMutations ? "editor" : "viewer"
+        }
+      >
+        {children}
+      </div>
+    </WorkspaceBoundaryPolicyContext.Provider>
   );
 }

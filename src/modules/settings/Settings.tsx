@@ -131,9 +131,18 @@ export function Settings({
     } finally { accessOperation.current = false; setAccessBusy(false); }
   };
   const changeWorkspaceMode = (toEditor: boolean) => runAccessOperation(async () => {
+    const requestedOwnRetry = !toEditor && Boolean(workspace.editorCleanupPending);
     const current = await refreshWorkspace();
+    // The status request itself retries pending cleanup. Do not turn its
+    // successful result into a spurious "editor changed" failure.
+    if (requestedOwnRetry && !current.editor && !current.editorCleanupPending) {
+      setWorkspacePassword("");
+      setAccessMessage(`Собственный сеанс больше не удерживается этим экземпляром. ${current.accessMessage}`);
+      return;
+    }
     const currentStatus = editorStatus(current);
-    if (currentStatus.unknown || (toEditor && !currentStatus.canAcquire) || (!toEditor && !current.editor)) {
+    const retryingOwnRelease = !toEditor && Boolean(current.editorCleanupPending);
+    if ((!retryingOwnRelease && currentStatus.unknown) || (toEditor && (!currentStatus.canAcquire || current.editorCleanupPending)) || (!toEditor && !current.editor && !retryingOwnRelease)) {
       throw new Error(currentStatus.unknown ? currentStatus.text : "Режим редактора уже занят или изменился. Дождитесь обновления статуса.");
     }
     const validationError = current.accessControlled ? workspacePasswordError(workspacePassword) : "";
@@ -318,16 +327,17 @@ export function Settings({
               {workspace.editorOwner?.startedAt && <small>с {new Date(workspace.editorOwner.startedAt).toLocaleString("ru-RU")}</small>}
             </strong>
           </div>
-          {!workspace.editor && (editor.occupied || editor.unknown) && <p className="notice warning" role="status">{editor.unknown ? editor.text : `Права заняты: ${editor.text}. Попросите редактора перейти в режим просмотра или закрыть программу.`} Ввод пароля не освобождает чужой сеанс. Статус обновляется автоматически.</p>}
-          <fieldset className="settings-form workspace-password-controls" aria-busy={accessBusy} disabled={accessBusy || editor.unknown || !workspace.writable || (!workspace.editor && !editor.canAcquire)}>
+          {workspace.editorCleanupPending && <div className="notice warning" role="alert"><strong>Освобождение своего сеанса не завершено</strong><span>{workspace.editorCleanupMessage || "Запись запрещена. Восстановите подключение к сетевой папке и повторите освобождение. Идентификатор вашего сеанса сохранён для повторной попытки."}</span></div>}
+          {!workspace.editor && !workspace.editorCleanupPending && (editor.occupied || editor.unknown) && <p className="notice warning" role="status">{editor.unknown ? editor.text : `Права заняты: ${editor.text}. Попросите редактора перейти в режим просмотра или закрыть программу.`} Ввод пароля не освобождает чужой сеанс. Статус обновляется автоматически.</p>}
+          <fieldset className="settings-form workspace-password-controls" aria-busy={accessBusy} disabled={accessBusy || !workspace.writable || (!workspace.editorCleanupPending && (editor.unknown || (!workspace.editor && !editor.canAcquire)))}>
             {workspace?.accessControlled ? <>
               <label>Пароль рабочей папки<input type="password" autoComplete="current-password" aria-invalid={Boolean(currentWorkspacePasswordError)} aria-describedby="workspace-password-hint" value={workspacePassword} onChange={(event) => setWorkspacePassword(event.target.value)} />{currentWorkspacePasswordError && <small className="field-error">{currentWorkspacePasswordError}</small>}</label>
               <p className="help-text" id="workspace-password-hint">{workspacePasswordHint}</p>
               <div className="button-row">
-                <button className="primary" type="button" disabled={!workspacePassword || (!workspace?.editor && Boolean(workspace?.editorOwner))} onClick={() => void changeWorkspaceMode(!workspace?.editor)}>{workspace?.editor ? "Перейти в режим просмотра" : "Войти в режим редактирования"}</button>
+                <button className="primary" type="button" disabled={!workspacePassword || (!workspace.editorCleanupPending && !workspace.editor && Boolean(workspace.editorOwner))} onClick={() => void changeWorkspaceMode(!workspace.editor && !workspace.editorCleanupPending)}>{workspace.editorCleanupPending ? "Повторить освобождение своего сеанса" : workspace.editor ? "Перейти в режим просмотра" : "Войти в режим редактирования"}</button>
               </div>
               {workspace?.editor && <><label>Новый пароль<input type="password" autoComplete="new-password" aria-invalid={Boolean(newWorkspacePasswordError)} value={newWorkspacePassword} onChange={(event) => setNewWorkspacePassword(event.target.value)} />{newWorkspacePasswordError && <small className="field-error">{newWorkspacePasswordError}</small>}</label><button className="secondary" type="button" disabled={!workspacePassword || !newWorkspacePassword || Boolean(newWorkspacePasswordError)} onClick={() => void saveWorkspacePassword()}>Сменить пароль</button></>}
-            </> : workspace?.editor ? <>
+            </> : workspace.editorCleanupPending ? <><p className="help-text">Повторная попытка касается только сеанса этого экземпляра. Чужие права и пароли не меняются.</p><button className="secondary" type="button" onClick={() => void changeWorkspaceMode(false)}>Повторить освобождение своего сеанса</button></> : workspace?.editor ? <>
               <label>Новый пароль рабочей папки<input type="password" autoComplete="new-password" aria-invalid={Boolean(newWorkspacePasswordError)} aria-describedby="new-workspace-password-hint" value={newWorkspacePassword} onChange={(event) => setNewWorkspacePassword(event.target.value)} placeholder="От 6 до 128 символов" />{newWorkspacePasswordError && <small className="field-error">{newWorkspacePasswordError}</small>}</label>
               <p className="help-text" id="new-workspace-password-hint">{workspacePasswordHint}</p>
               <button className="primary" type="button" disabled={!newWorkspacePassword || Boolean(newWorkspacePasswordError)} onClick={() => void saveWorkspacePassword()}>Включить вход по паролю</button>
@@ -358,7 +368,7 @@ export function Settings({
           <p className="help-text">
             Каждый экземпляр открывает защищённую общую папку в режиме просмотра.
             Редактирование включается вручную по общему паролю. Одновременно
-            редактирует только один пользователь; выход из режима сразу освобождает доступ без перезапуска приложения.
+            редактирует только один пользователь. При сетевой ошибке освобождение может потребовать повторной попытки; до подтверждения запись запрещена.
           </p>
           <div className="notice warning">
             <strong>Требование к сетевой папке</strong>

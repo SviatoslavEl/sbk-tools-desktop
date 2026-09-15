@@ -2,6 +2,7 @@
 // @ts-expect-error Node's built-in module is available in the test runner.
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
+import { parse } from "postcss";
 import { contractContactSummary } from "./types";
 
 describe("интерфейс реестров", () => {
@@ -61,11 +62,25 @@ describe("интерфейс реестров", () => {
 
   it("удерживает основное окно в экране и прокручивает содержимое внутри", () => {
     const styles = readFileSync(new URL("../../App.css", import.meta.url), "utf8");
-    expect(styles).toContain("html, body, #root { min-width: 0; width: 100%; height: 100%; margin: 0; overflow: hidden;");
-    expect(styles).toContain(".app-shell { min-width: 0; max-width: 100vw; height: 100vh; overflow: hidden;");
-    expect(styles).toContain(".tool-nav { min-height: 0; overflow-y: auto;");
-    expect(styles).toContain(".tool-content { min-width: 0; min-height: 0; max-width: 100%; overflow: auto;");
-    expect(styles).toContain(".collapse-button { position: absolute; top: 70px; right: 7px;");
+    const css = parse(styles);
+    const declarations = (selector: string) => {
+      const values: Record<string, string> = {};
+      css.walkRules(selector, (rule) => {
+        if (rule.parent?.type === "root") rule.walkDecls((declaration) => { values[declaration.prop] = declaration.value; });
+      });
+      return values;
+    };
+    expect(declarations("html, body, #root")).toMatchObject({ "min-width": "0", height: "100%", overflow: "hidden" });
+    expect(declarations(".app-shell")).toMatchObject({ "max-width": "100vw", height: "100vh", overflow: "hidden" });
+    expect(declarations(".tool-nav")).toMatchObject({ "min-height": "0", "overflow-y": "auto" });
+    expect(declarations(".tool-content")).toMatchObject({ "min-width": "0", "min-height": "0", overflow: "auto" });
+    expect(declarations(".brand")).toMatchObject({ display: "flex", "align-items": "center" });
+    expect(declarations(".collapse-button")).toMatchObject({ position: "static", flex: "0 0 28px" });
+    expect(declarations(".collapse-button")).not.toHaveProperty("right");
+    expect(declarations(".registry-module > .table-surface > .table-scroll")).toMatchObject({ flex: "1 1 auto", "min-height": "0" });
+    const app = readFileSync(new URL("../../App.tsx", import.meta.url), "utf8");
+    const brand = app.slice(app.indexOf('<div className="brand">'), app.indexOf('<p className="nav-caption">'));
+    expect(brand).toContain('className="collapse-button"');
   });
 
   it("показывает доверенных подписантов внутренних компаний", () => {
@@ -79,7 +94,7 @@ describe("интерфейс реестров", () => {
   });
 
   it("закрывает карточки кликом по свободной области слева", () => {
-    const backdrop = readFileSync(new URL("../../components/DrawerBackdrop.tsx", import.meta.url), "utf8");
+    const backdrop = readFileSync(new URL("../../components/ModalOverlay.tsx", import.meta.url), "utf8");
     const contracts = readFileSync(new URL("./Contracts.tsx", import.meta.url), "utf8");
     const staff = readFileSync(new URL("../staff/Staff.tsx", import.meta.url), "utf8");
     expect(backdrop).toContain("event.currentTarget === event.target");

@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { ConfirmDialog } from "../../components/Dialog";
 import type { WorkspaceInfo } from "../../lib/storage";
 import { editorStatus } from "../../lib/editorStatus";
+import { OwnerRecoveryDialog, type RecoveryInput } from "./OwnerRecoveryDialog";
 
 interface OwnerInfo {
   editor?: { token: string; owner: NonNullable<WorkspaceInfo["editorOwner"]> };
@@ -10,7 +11,7 @@ interface OwnerInfo {
   editorStateMessage?: string | null;
   events: Array<{ id: number; createdAt: string; actor: string; action: string; reason: string }>;
 }
-const actionLabels: Record<string, string> = { "owner-setup": "Настройка владельца", "revoke-requested": "Запрошен отзыв редактора", "release-requested": "Просьба освободить редактора" };
+const actionLabels: Record<string, string> = { "owner-setup": "Настройка владельца", "revoke-requested": "Запрошен отзыв редактора", "release-requested": "Просьба освободить редактора", "release-acknowledged": "Освобождение подтверждено", "release-failed": "Освобождение не завершено", "recovery-intent": "Начата проверка восстановления", "recovery-completed": "Завершённый сеанс восстановлен", "recovery-failed": "Восстановление не выполнено" };
 
 export function OwnerPanel({ workspace }: { workspace: WorkspaceInfo | null }) {
   const [expanded, setExpanded] = useState(false);
@@ -34,9 +35,10 @@ function OwnerPanelContent({ workspace }: { workspace: WorkspaceInfo | null }) {
   const [infoError, setInfoError] = useState("");
   const [message, setMessage] = useState("");
   const [pending, setPending] = useState<OwnerInfo["editor"]>();
+  const [recoveryTarget, setRecoveryTarget] = useState<OwnerInfo["editor"]>();
   const [revokePassword, setRevokePassword] = useState("");
   const [authenticatedAt, setAuthenticatedAt] = useState(0);
-  const logout = () => { authenticationGeneration.current += 1; setPassword(""); setRevokePassword(""); setInfo(null); setPending(undefined); setAuthenticatedAt(0); setInfoError(""); };
+  const logout = () => { authenticationGeneration.current += 1; setPassword(""); setRevokePassword(""); setInfo(null); setPending(undefined); setRecoveryTarget(undefined); setAuthenticatedAt(0); setInfoError(""); };
   useEffect(() => () => { authenticationGeneration.current += 1; }, []);
   useEffect(() => {
     if (!authenticatedAt) return;
@@ -113,6 +115,24 @@ function OwnerPanelContent({ workspace }: { workspace: WorkspaceInfo | null }) {
     });
   };
   const validReason = reason.trim().length >= 3 && reason.trim().length <= 500;
+  const recover = async (input: RecoveryInput) => {
+    if (operation.current) throw new Error("Дождитесь завершения текущей операции");
+    const generation = authenticationGeneration.current;
+    operation.current = true; setBusy(true); setMessage("");
+    try {
+      const result = await invoke<{ archiveFileName: string; message: string }>("recover_workspace_editor_session", { ...input });
+      window.dispatchEvent(new Event("sbk-workspace-refresh"));
+      if (generation !== authenticationGeneration.current) return;
+      setRecoveryTarget(undefined);
+      setMessage(`${result.message} Исходная запись сохранена: ${result.archiveFileName}.`);
+      try {
+        const next = await invoke<OwnerInfo>("workspace_owner_info", { password });
+        if (generation === authenticationGeneration.current) { setInfo(next); setInfoError(""); }
+      } catch {
+        if (generation === authenticationGeneration.current) setInfoError("Восстановление выполнено, но новый статус не получен. Обновите сведения перед входом редактора.");
+      }
+    } finally { operation.current = false; setBusy(false); }
+  };
   const status = editorStatus(info ? { editor: false, editorBusy: info.editorBusy, editorStateMessage: infoError || info.editorStateMessage, editorOwner: info.editor?.owner, writable: Boolean(workspace?.writable) } : workspace);
   const knownEditor = info ? info.editor?.owner : workspace?.editorOwner;
   const canRequest = !busy && !status.unknown && status.occupied && Boolean(knownEditor) && validReason && Boolean(workspace?.writable);
@@ -139,9 +159,11 @@ function OwnerPanelContent({ workspace }: { workspace: WorkspaceInfo | null }) {
         <button type="button" className="secondary" disabled={!canRequest} onClick={() => void request()}>Попросить освободить редактора</button>
         {info && <button type="button" className="danger-button" disabled={!canRequest || !info.editor || !revokePassword} onClick={() => setPending(info.editor)}>Отозвать текущего редактора…</button>}
       </div>
+      {info && <details className="owner-panel-help"><summary>Сеанс остался после сбоя или закрытия программы</summary><p>Обычный отзыв — это запрос работающему приложению. Если оно уже закрыто, подтверждение не придёт. После согласованного закрытия всех редакторов владелец может восстановить завершённый сеанс отдельно.</p><p>Не восстанавливайте доступ, если компьютер редактора просто потерял сеть. Сначала подтвердите закрытие приложения на нём. База и пароли не меняются.</p><button type="button" className="secondary" disabled={busy || status.unknown || !info.editor || Boolean(workspace?.editor) || Boolean(workspace?.editorCleanupPending)} onClick={() => setRecoveryTarget(info.editor)}>Восстановить завершённый сеанс…</button>{workspace?.editorCleanupPending && <p className="help-text">Сначала повторите освобождение собственного сеанса в настройках доступа выше.</p>}</details>}
       {info && <details><summary>Журнал администрирования · последние {info.events.length}</summary><div className="table-scroll"><table><thead><tr><th>Когда</th><th>Кто</th><th>Действие</th><th>Причина</th></tr></thead><tbody>{info.events.map((entry) => <tr key={entry.id}><td>{new Date(entry.createdAt).toLocaleString("ru-RU")}</td><td>{entry.actor}</td><td>{actionLabels[entry.action] || entry.action}</td><td>{entry.reason}</td></tr>)}</tbody></table></div></details>}
     </>}
     <details className="owner-panel-help"><summary>Как устроены права и резервирование</summary><p>Защита действует внутри приложения. Прямые права записи в сетевую папку позволяют менять файлы вне программы. Обновите все рабочие места.</p><p>Отзыв касается только выбранного сеанса. Он не передаёт права автоматически: следующий редактор входит с обычным паролем рабочей папки. Удаления базы здесь нет. Служебное хранилище владельца резервируйте вместе с сетевой папкой при закрытых приложениях.</p></details>
     {pending && <ConfirmDialog title="Отозвать режим редактора?" message={`Редактор: ${pending.owner.displayName}. Причина: ${reason}. Текущая операция записи должна завершиться, затем поддерживающая эту функцию версия перейдёт в просмотр. Несохранённые изменения не будут автоматически записаны. Подтверждаете?`} confirmLabel="Отозвать этот сеанс" onClose={() => setPending(undefined)} onConfirm={revoke} />}
+    {recoveryTarget && <OwnerRecoveryDialog target={recoveryTarget} busy={busy} onClose={() => setRecoveryTarget(undefined)} onSubmit={recover} />}
   </div>;
 }

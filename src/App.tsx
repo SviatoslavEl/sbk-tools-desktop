@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import "./App.css";
 import { Dialog } from "./components/Dialog";
 import { AdministrationNotice } from "./components/AdministrationNotice";
+import { ToolIcon } from "./components/ToolIcon";
 import { editorStatus, unavailableWorkspaceInfo } from "./lib/editorStatus";
 import { Archive } from "./modules/archive/Archive";
 import { Calculator } from "./modules/calculator/Calculator";
@@ -53,14 +54,14 @@ type ToolId =
   | "settings"
   | "about";
 
-const tools: Array<{ id: ToolId; icon: string; label: string }> = [
-  { id: "dashboard", icon: "▦", label: "Главная" },
-  { id: "procurement", icon: "◆", label: "Закупки" },
-  { id: "calculator", icon: "₽", label: "Тендерный калькулятор" },
-  { id: "scanner", icon: "▤", label: "Сканирование документов" },
-  { id: "contracts", icon: "✓", label: "Опыт по договорам" },
-  { id: "counterparties", icon: "⌕", label: "Контрагенты" },
-  { id: "staff", icon: "●", label: "Кадры" },
+const tools: Array<{ id: ToolId; label: string }> = [
+  { id: "dashboard", label: "Главная" },
+  { id: "procurement", label: "Закупки" },
+  { id: "calculator", label: "Тендерный калькулятор" },
+  { id: "scanner", label: "Сканирование документов" },
+  { id: "contracts", label: "Опыт по договорам" },
+  { id: "counterparties", label: "Контрагенты" },
+  { id: "staff", label: "Кадры" },
 ];
 
 const installedFastStart =
@@ -514,12 +515,16 @@ function App() {
         </div>
       </div>
     );
+  const access = editorStatus(workspace);
+  const accessLabel = workspace.editor ? "Режим редактора" : access.unknown ? "Доступ не подтверждён" : "Режим просмотра";
+  const workspaceName = workspace.root.split(/[\\/]/).filter(Boolean).slice(-2).join(" / ");
   return (
     <WorkspaceAccessProvider
       editor={workspace.editor}
       message={workspace.accessMessage}
     >
       <div className={`app-shell ${collapsed ? "sidebar-collapsed" : ""}`}>
+        <a className="skip-link" href="#main-content">Перейти к рабочей области</a>
         <aside className="sidebar" aria-label="Инструменты">
           <div className="brand">
             <div className="brand-mark">СБК</div>
@@ -527,17 +532,19 @@ function App() {
               <strong>Инструменты</strong>
               <span>Рабочее пространство</span>
             </div>
-          </div>
           <button
             className="collapse-button"
             type="button"
             aria-label={
               collapsed ? "Развернуть навигацию" : "Свернуть навигацию"
             }
+            title={collapsed ? "Развернуть навигацию" : "Свернуть навигацию"}
+            aria-expanded={!collapsed}
             onClick={() => updateCollapsed(!collapsed)}
           >
-            {collapsed ? "›" : "‹"}
+            <ToolIcon name={collapsed ? "chevron-right" : "chevron-left"} />
           </button>
+          </div>
           <p className="nav-caption">ИНСТРУМЕНТЫ</p>
           <nav className="tool-nav">
             {tools.map((tool) => (
@@ -551,7 +558,7 @@ function App() {
                 type="button"
               >
                 <span className="nav-icon" aria-hidden="true">
-                  {tool.icon}
+                  <ToolIcon name={tool.id} />
                 </span>
                 <span className="nav-label">{tool.label}</span>
               </button>
@@ -567,7 +574,7 @@ function App() {
               type="button"
             >
               <span className="nav-icon" aria-hidden="true">
-                ⌫
+                <ToolIcon name="archive" />
               </span>
               <span className="nav-label">Архив</span>
             </button>
@@ -580,7 +587,7 @@ function App() {
               type="button"
             >
               <span className="nav-icon" aria-hidden="true">
-                ⚙
+                <ToolIcon name="settings" />
               </span>
               <span className="nav-label">Настройки</span>
             </button>
@@ -593,23 +600,28 @@ function App() {
               type="button"
             >
               <span className="nav-icon" aria-hidden="true">
-                i
+                <ToolIcon name="about" />
               </span>
               <span className="nav-label">О программе</span>
             </button>
           </nav>
+          <button className="sidebar-workspace" type="button" title={`Рабочая папка: ${workspace.root}`} aria-label="Открыть настройки рабочей папки" onClick={() => selectTool("settings")}>
+            <span className={`workspace-dot ${workspace.editor ? "is-editor" : "is-viewer"}`} aria-hidden="true" />
+            <span className="nav-label"><strong>{workspaceName}</strong><small>{accessLabel}</small></span>
+            <ToolIcon name="folder" />
+          </button>
         </aside>
         <main className="workspace">
           <header className="topbar">
-            <div>
+            <div className="topbar-heading">
               <h1>{title}</h1>
               <p>{subtitle}</p>
             </div>
-            {!workspace.editor && (
-              <span className="status neutral" title={workspace.accessMessage}>
-                {editorStatus(workspace).unknown ? "Редактор: статус не подтверждён" : editorStatus(workspace).occupied ? `Редактор: ${editorStatus(workspace).text}` : "Только просмотр и экспорт"}
-              </span>
-            )}
+            <div className="topbar-actions">
+            <button className={`workspace-access-chip ${workspace.editor ? "is-editor" : access.unknown ? "is-unknown" : "is-viewer"}`} type="button" onClick={() => selectTool("settings")} title={workspace.accessMessage} aria-label={`${accessLabel}. Открыть настройки доступа`}>
+              <ToolIcon name={workspace.editor ? "check" : "lock"} />
+              <span><strong>{accessLabel}</strong>{!workspace.editor && access.occupied && !access.unknown && <small>Редактор: {access.text}</small>}</span>
+            </button>
             <button
               className="help-button"
               type="button"
@@ -620,10 +632,11 @@ function App() {
                 setShowHelp(true);
               }}
             >
-              ?
+              <ToolIcon name="about" />
             </button>
+            </div>
           </header>
-          <div className="tool-content">
+          <div id="main-content" tabIndex={-1} className={`tool-content ${["contracts", "staff", "counterparties", "procurement"].includes(activeTool) ? "registry-content" : ""}`}>
             <AdministrationNotice key={workspace.root} message={workspace.administrationNotice} />
             {scannerOpened && <div hidden={activeTool !== "scanner"} key={workspace.root}>
               <ReadOnlyWorkspaceBoundary allowMutations>
@@ -631,7 +644,7 @@ function App() {
               </ReadOnlyWorkspaceBoundary>
             </div>}
             <ReadOnlyWorkspaceBoundary>
-              {activeTool === "dashboard" && <div className="module-stack"><Dashboard /><section aria-label="Календарь тендеров"><h2>Календарь тендеров</h2><p className="help-text">Дважды щёлкните по дню, чтобы назначить закупку. С клавиатуры — Enter на выбранном дне.</p><TenderCalendar /></section></div>}
+              {activeTool === "dashboard" && <div className="module-stack"><Dashboard onNavigate={selectTool} /><section className="dashboard-calendar" aria-label="Календарь тендеров"><h2>Календарь тендеров</h2><p className="help-text">Дважды щёлкните по дню, чтобы назначить закупку. С клавиатуры — Enter на выбранном дне.</p><TenderCalendar /></section></div>}
               {activeTool === "procurement" && <ProcurementRegistry />}
               {activeTool === "calculator" && <Calculator />}
               {activeTool === "contracts" && <ContractsRegistry />}

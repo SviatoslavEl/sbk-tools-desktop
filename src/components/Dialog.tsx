@@ -1,13 +1,5 @@
-import { useEffect, useId, useRef, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from "react";
-
-const focusableSelector = [
-  "button:not([disabled])",
-  "[href]",
-  "input:not([disabled])",
-  "select:not([disabled])",
-  "textarea:not([disabled])",
-  '[tabindex]:not([tabindex="-1"])',
-].join(",");
+import { useId, type ReactNode } from "react";
+import { ModalOverlay } from "./ModalOverlay";
 
 export function Dialog({
   title,
@@ -22,56 +14,11 @@ export function Dialog({
   onClose: () => void;
   width?: string;
 }) {
-  const dialogRef = useRef<HTMLElement>(null);
   const titleId = useId();
   const descriptionId = useId();
 
-  useEffect(() => {
-    const previouslyFocused = document.activeElement instanceof HTMLElement
-      ? document.activeElement
-      : null;
-    const frame = window.requestAnimationFrame(() => {
-      const preferred = dialogRef.current?.querySelector<HTMLElement>("[autofocus]");
-      const first = dialogRef.current?.querySelector<HTMLElement>(focusableSelector);
-      (preferred || first || dialogRef.current)?.focus();
-    });
-    return () => {
-      window.cancelAnimationFrame(frame);
-      previouslyFocused?.focus();
-    };
-  }, []);
-
-  const handleKeyDown = (event: ReactKeyboardEvent<HTMLElement>) => {
-    if (event.key === "Escape") {
-      event.preventDefault();
-      event.stopPropagation();
-      onClose();
-      return;
-    }
-    if (event.key !== "Tab") return;
-    const focusable = [...(dialogRef.current?.querySelectorAll<HTMLElement>(focusableSelector) || [])]
-      .filter((element) => !element.hidden && element.getAttribute("aria-hidden") !== "true");
-    if (!focusable.length) {
-      event.preventDefault();
-      dialogRef.current?.focus();
-      return;
-    }
-    const first = focusable[0];
-    const last = focusable[focusable.length - 1];
-    if (event.shiftKey && (document.activeElement === first || !dialogRef.current?.contains(document.activeElement))) {
-      event.preventDefault();
-      last.focus();
-    } else if (!event.shiftKey && (document.activeElement === last || !dialogRef.current?.contains(document.activeElement))) {
-      event.preventDefault();
-      first.focus();
-    }
-  };
-
-  return <div className="dialog-backdrop" role="presentation" onMouseDown={(event) => {
-    if (event.currentTarget === event.target) onClose();
-  }}>
+  return <ModalOverlay className="dialog-backdrop" onClose={onClose}>
     <section
-      ref={dialogRef}
       className="dialog"
       role="dialog"
       aria-modal="true"
@@ -79,7 +26,6 @@ export function Dialog({
       aria-describedby={description ? descriptionId : undefined}
       style={{ maxWidth: width }}
       tabIndex={-1}
-      onKeyDown={handleKeyDown}
     >
       <header className="dialog-header">
         <div><h2 id={titleId}>{title}</h2>{description && <p id={descriptionId}>{description}</p>}</div>
@@ -87,7 +33,7 @@ export function Dialog({
       </header>
       {children}
     </section>
-  </div>;
+  </ModalOverlay>;
 }
 
 export function ConfirmDialog({

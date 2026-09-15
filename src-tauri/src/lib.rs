@@ -252,6 +252,8 @@ struct WorkspaceInfo {
     editor_owner: Option<EditorOwner>,
     editor_busy: bool,
     editor_state_message: Option<String>,
+    editor_cleanup_pending: bool,
+    editor_cleanup_message: Option<String>,
     owner_configured: bool,
     administration_notice: Option<String>,
     schema_version: i64,
@@ -550,6 +552,8 @@ fn workspace_info(state: State<'_, AppState>) -> Result<WorkspaceInfo, String> {
     let workspace = state.active_workspace()?;
     if workspace.is_editor() {
         let _ = workspace.require_editor();
+    } else {
+        let _ = workspace.retry_pending_editor_release();
     }
     let editor = workspace.is_editor();
     let editor_state = workspace.editor_state();
@@ -566,6 +570,8 @@ fn workspace_info(state: State<'_, AppState>) -> Result<WorkspaceInfo, String> {
         editor_owner: editor_state.presence.map(|presence| presence.owner),
         editor_busy: editor_state.busy,
         editor_state_message: editor_state.message,
+        editor_cleanup_pending: workspace.editor_cleanup_pending(),
+        editor_cleanup_message: workspace.editor_cleanup_message(),
         owner_configured: administration::configured(&workspace.root).unwrap_or(true),
         administration_notice: workspace.admin_notice(),
         schema_version: SCHEMA_VERSION,
@@ -650,6 +656,8 @@ fn workspace_owner_info(state: State<'_, AppState>, password: String) -> Result<
     administration::authenticate(&workspace.root, &Zeroizing::new(password))?;
     if workspace.is_editor() {
         let _ = workspace.require_editor();
+    } else {
+        let _ = workspace.retry_pending_editor_release();
     }
     let editor_state = workspace.editor_state();
     Ok(OwnerInfo {
@@ -701,6 +709,34 @@ fn request_editor_release(
         &target.token,
         &reason,
         revoke,
+    )
+}
+
+#[tauri::command]
+fn recover_workspace_editor_session(
+    state: State<'_, AppState>,
+    password: String,
+    target_token: String,
+    reason: String,
+    confirmation: String,
+    confirmed_all_editors_closed: bool,
+) -> Result<workspace::EditorRecoveryResult, String> {
+    let _maintenance = state
+        .maintenance
+        .lock()
+        .map_err(|_| "Хранилище недоступно".to_string())?;
+    let workspace = state.active_workspace()?;
+    if !workspace.writable {
+        return Err("Нет прав записи в общую папку".into());
+    }
+    // Authentication is inside the testable backend boundary, not UI state.
+    workspace::recover_workspace_editor_session(
+        &workspace.root,
+        &Zeroizing::new(password),
+        &target_token,
+        &reason,
+        &confirmation,
+        confirmed_all_editors_closed,
     )
 }
 
@@ -4422,6 +4458,7 @@ pub fn run() {
             setup_workspace_owner,
             workspace_owner_info,
             request_editor_release,
+            recover_workspace_editor_session,
             intelligence_provider_status,
             validate_intelligence_configuration,
             analysis_job_list,
@@ -4484,7 +4521,9 @@ pub fn run() {
             {
                 // Finish in-flight writes before releasing only this process's
                 // claim. Tauri exits the process directly, bypassing Drop.
-                let _ = workspace.release_editor_on_exit();
+                if let Err(error) = workspace.release_editor_on_exit() {
+                    eprintln!("Не удалось завершить освобождение редактора при закрытии: {error}");
+                }
             }
         });
 }
