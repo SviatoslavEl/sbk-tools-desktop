@@ -124,6 +124,28 @@ function Assert-ProductDisplayName([string]$Destination) {
     $shortcut = $null
     try {
         $shortcut = $shell.CreateShortcut($shortcutPath)
+        $expectedTarget = Join-Path $Destination 'SBK-Tools-Fast.exe'
+        $shortcutDetails = [ordered]@{
+            actualTarget = [string]$shortcut.TargetPath
+            expectedTarget = $expectedTarget
+            workingDirectory = [string]$shortcut.WorkingDirectory
+            arguments = [string]$shortcut.Arguments
+            destinationFullName = (Get-Item -LiteralPath $Destination).FullName
+            shortcutPath = $shortcutPath
+        }
+        $shortcutDetailsJson = ConvertTo-Json -InputObject $shortcutDetails -Depth 4
+        Write-Host "Shortcut target diagnostic:`n$shortcutDetailsJson"
+        if ($shortcut.TargetPath -ne $expectedTarget) {
+            # Retain the exact failing shortcut before a later fixture replaces it.
+            $shortcutDiagnosticBase = Join-Path $Results ('{0:d2}-shortcut-target-mismatch' -f $script:InvocationNumber)
+            try {
+                Copy-Item -LiteralPath $shortcutPath -Destination ($shortcutDiagnosticBase + '.lnk')
+                [IO.File]::WriteAllText(($shortcutDiagnosticBase + '.json'), $shortcutDetailsJson)
+                Write-Host "Failing shortcut retained: $shortcutDiagnosticBase.lnk"
+            } catch {
+                Write-Warning "Could not retain the failing shortcut diagnostic: $_"
+            }
+        }
         Assert-True ($shortcut.TargetPath -eq (Join-Path $Destination 'SBK-Tools-Fast.exe')) 'Shortcut no longer targets the update-compatible executable'
     } finally {
         if ($shortcut) { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($shortcut) }
