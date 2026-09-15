@@ -51,6 +51,15 @@ jobs:
           New-Item -ItemType Directory -Force src-tauri/binaries | Out-Null
           New-Item -ItemType Directory -Force src-tauri/runtime-resources/resources | Out-Null
           New-Item -ItemType File -Force src-tauri/binaries/sbk-scanner-worker-x86_64-pc-windows-msvc.exe | Out-Null
+          # Tauri also validates the resource directory from tauri.windows.conf.
+          # An empty metadata-only directory is sufficient: no webview is launched.
+          $windowsConfig = Get-Content -LiteralPath src-tauri/tauri.windows.conf.json -Raw | ConvertFrom-Json
+          $runtimePath = $windowsConfig.bundle.windows.webviewInstallMode.path
+          if ($windowsConfig.bundle.windows.webviewInstallMode.type -ne 'fixedRuntime' -or
+              $runtimePath -notmatch '^\./webview2-runtime/[^/\\]+$') {
+            throw 'Unexpected fixed WebView2 metadata path'
+          }
+          New-Item -ItemType Directory -Force (Join-Path 'src-tauri' $runtimePath) | Out-Null
           New-Item -ItemType Directory -Force test-results | Out-Null
       - name: Test real Windows sharing denial, retry, exclusivity and explicit recovery
         run: |

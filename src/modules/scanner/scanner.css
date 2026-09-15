@@ -7,6 +7,22 @@
   color: var(--text, #18243b);
 }
 .scanner-layout > .surface { min-width: 0; border-color: var(--line, #e2e8f0); border-radius: 14px; box-shadow: 0 3px 12px #18243b05; }
+/* Size the frame to the actual work area. Only its body scrolls: save/result
+   actions remain reachable when page settings, OCR or warnings grow. */
+.scanner-layout > .preview-panel { position: sticky; top: 0; align-self: start; display: flex; flex-direction: column; height: var(--scanner-panel-height, calc(100dvh - 140px)); min-height: 240px; }
+.scanner-layout .preview-panel > .scanner-workspace-header,
+.scanner-layout .preview-panel > .actionbar,
+.scanner-layout .preview-panel > .ready-panel { flex: 0 0 auto; }
+.scanner-layout .preview-panel > .ready-panel { max-height: 40%; overflow-y: auto; }
+.scanner-preview-scroll { display: flex; flex: 1 1 0; flex-direction: column; min-width: 0; min-height: 0; overflow-y: auto; overscroll-behavior: contain; scroll-padding: 10px; }
+.scanner-preview-scroll > * { flex: 0 0 auto; min-width: 0; }
+.scanner-layout .scanner-preview-scroll > .preview-workspace { flex: 1 1 0; height: auto; min-height: 240px; }
+.scanner-layout .scanner-preview-scroll > .drop-empty { flex: 1 1 0; min-height: 260px; padding: 28px 20px; }
+.scanner-layout .scanner-preview-scroll > .merge-main-workspace { flex: 1 1 0; min-height: 280px; }
+.scanner-preview-scroll .merge-organizer { min-height: 0; max-height: none; }
+.scanner-preview-scroll .merge-document-stage { min-height: 0; }
+.scanner-layout > .preview-panel.fullscreen-preview { position: fixed; height: calc(100dvh - 24px); min-height: 0; overflow: hidden; }
+.scanner-layout .preview-panel > .scanner-result-action-error { flex: 0 1 auto; min-height: 0; max-height: 30%; overflow-y: auto; }
 .scanner-layout .surface-title { min-height: 48px; padding: 12px 16px; border-color: var(--line, #e2e8f0); }
 .scanner-layout .surface-title h2 { color: var(--text, #18243b); font-size: 13px; letter-spacing: .01em; }
 .scanner-layout .primary, .scanner-layout .secondary { min-height: 36px; padding: 8px 12px; font-size: 12px; line-height: 1.35; }
@@ -179,6 +195,12 @@
 .output-page-selection label { display: grid; min-width: 0; max-width: 100%; gap: 4px; margin: 0; font-size: 11px; }
 .output-page-selection select, .output-page-selection input { min-width: 0; max-width: 100%; min-height: 34px; margin: 0; padding: 6px 8px; color: #18243b; background: #fff; border: 1px solid #cbd5e1; border-radius: 7px; }
 .output-page-selection > span { flex: 1 1 180px; min-width: 0; align-self: center; line-height: 1.5; overflow-wrap: anywhere; }
+.scanner-pages-panel { min-width: 0; margin: 0; color: #475569; background: #fff; border-bottom: 1px solid #e2e8f0; }
+.scanner-pages-panel > summary { padding: 9px 14px; font-size: 11px; line-height: 18px; }
+.scanner-pages-panel > summary strong { font-weight: 600; }
+.scanner-pages-summary { margin-left: 12px; color: #64748b; overflow-wrap: anywhere; }
+.scanner-pages-panel > summary .field-error { display: block; margin-top: 4px; line-height: 1.5; }
+.scanner-pages-panel-content { max-height: min(320px, 40vh); overflow-y: auto; overscroll-behavior: contain; }
 .split-blocks { display: grid; flex: 1 0 100%; min-width: 0; gap: 7px; padding: 9px; border: 1px solid #e2e8f0; border-radius: 9px; background: #fff; }
 .split-blocks > p { margin: 0; color: #64748b; font-size: 11px; line-height: 1.5; }
 .split-block-row { display: grid; min-width: 0; grid-template-columns: minmax(0, 1fr) minmax(0, 1.25fr) 36px; align-items: end; gap: 7px; }
@@ -258,6 +280,7 @@
 }
 @media (max-width: 1000px) {
   .scanner-layout { grid-template-columns: minmax(0, 1fr); }
+  .scanner-layout > .preview-panel:not(.fullscreen-preview) { position: relative; }
   .merge-main-workspace { grid-template-columns: minmax(220px, 34%) minmax(0, 1fr); }
 }
 @media (max-width: 640px) {
