@@ -1,4 +1,5 @@
-import type { MouseEvent, ReactNode } from "react";
+import type { ReactNode } from "react";
+import { ModalOverlay } from "./ModalOverlay";
 
 export function DrawerBackdrop({
   children,
@@ -7,17 +8,12 @@ export function DrawerBackdrop({
   children: ReactNode;
   onClose: () => void;
 }) {
-  const closeFromFreeArea = (event: MouseEvent<HTMLDivElement>) => {
-    if (event.currentTarget === event.target) onClose();
-  };
-
   return (
-    <div
+    <ModalOverlay
       className="drawer-backdrop"
-      role="presentation"
-      onMouseDown={closeFromFreeArea}
+      onClose={onClose}
     >
       {children}
-    </div>
+    </ModalOverlay>
   );
 }

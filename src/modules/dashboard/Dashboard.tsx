@@ -8,22 +8,24 @@ import { daysUntil } from "../procurement/domain";
 import type { ProcurementData } from "../procurement/types";
 import { documentExpiry } from "../staff/requirements";
 import type { StaffData } from "../staff/types";
+import { ToolIcon } from "../../components/ToolIcon";
 
 const date = (value: string) => value ? new Date(`${value}T00:00:00`).toLocaleDateString("ru-RU") : "—";
 
-export function Dashboard() {
+export function Dashboard({ onNavigate }: { onNavigate?: (tool: "procurement" | "calculator" | "scanner" | "contracts" | "staff") => void }) {
   const procurements = useRecords<ProcurementData>("procurement");
   const contracts = useRecords<ContractData>("contract-experience");
   const staff = useRecords<StaffData>("staff");
   const calculations = useRecords<CalculatorData>("calculator");
   const [workspace, setWorkspace] = useState<WorkspaceInfo | null>(null);
   const [hasDraft, setHasDraft] = useState(false);
+  const [workspaceError, setWorkspaceError] = useState("");
   useEffect(() => {
     let generation = 0;
     const refresh = () => {
       const current = ++generation;
-      void getWorkspaceInfo().then((value) => { if (current === generation) setWorkspace(value); });
-      void readDraft<CalculatorData>("calculator", "new").then((draft) => { if (current === generation) setHasDraft(Boolean(draft)); });
+      void getWorkspaceInfo().then((value) => { if (current === generation) { setWorkspace(value); setWorkspaceError(""); } }).catch(() => { if (current === generation) setWorkspaceError("Не удалось обновить сведения о рабочей папке."); });
+      void readDraft<CalculatorData>("calculator", "new").then((draft) => { if (current === generation) setHasDraft(Boolean(draft)); }).catch(() => { if (current === generation) setWorkspaceError("Не удалось проверить локальный черновик расчёта."); });
     };
     refresh();
     window.addEventListener("sbk-workspace-refresh", refresh);
@@ -46,5 +48,25 @@ export function Dashboard() {
     ["Убыточные расчёты", lossCalculations.length, lossCalculations.map((record) => record.title)],
     ["Несохранённый расчёт", hasDraft ? 1 : 0, hasDraft ? ["Есть локальный черновик калькулятора"] : []],
   ] as Array<[string, number, string[]]>;
-  return <div className="dashboard-grid">{cards.map(([title, count, rows]) => <section className={`surface dashboard-card ${count ? "has-alert" : ""}`} key={title}><div className="surface-title"><h2>{title}</h2><span className={`status ${count ? "warning" : "success"}`}>{count}</span></div><div className="surface-body">{rows.length ? <ul className="dashboard-list">{rows.slice(0, 6).map((row) => <li key={row}>{row}</li>)}</ul> : <div className="empty-inline">Нет событий</div>}</div></section>)}<section className="surface dashboard-card"><div className="surface-title"><h2>Хранилище и резервные копии</h2></div><div className="surface-body"><div className="metric-grid"><div><span>Свободное место</span><strong>{workspace?.freeSpaceBytes ? `${(workspace.freeSpaceBytes / 1024 / 1024 / 1024).toFixed(1)} ГБ` : "—"}</strong></div><div><span>Режим</span><strong>{workspace?.portable ? "Переносимый" : "Выбранная папка"}</strong></div></div><p className="help-text">Создание, проверка и восстановление резервной копии доступны в настройках.</p></div></section></div>;
+  const loading = [procurements, contracts, staff, calculations].some((store) => store.loading);
+  const errors = [workspaceError, procurements.error, contracts.error, staff.error, calculations.error].filter(Boolean);
+  const stats = [
+    { tool: "procurement", label: "Закупки", store: procurements },
+    { tool: "contracts", label: "Договоры", store: contracts },
+    { tool: "staff", label: "Сотрудники", store: staff },
+    { tool: "calculator", label: "Расчёты", store: calculations },
+  ] as const;
+  const shortcuts = [
+    { tool: "scanner", label: "Подготовить документ", text: "Сканирование, эффекты и объединение PDF" },
+    { tool: "contracts", label: "Подобрать опыт", text: "Договоры, исполнение и подтверждения" },
+    { tool: "staff", label: "Подобрать команду", text: "Квалификация и документы сотрудников" },
+  ] as const;
+  return <div className="module-stack dashboard-module">
+    <div className="dashboard-overview"><div><span className="nav-caption">ОБЗОР РАБОТЫ</span><h2>Всё важное — под рукой</h2><p className="help-text">Рабочие данные, ближайшие сроки и быстрый переход к задачам.</p></div><time dateTime={new Date().toLocaleDateString("sv-SE")}>{new Date().toLocaleDateString("ru-RU", { day: "numeric", month: "long", weekday: "long" })}</time></div>
+    {errors.length > 0 && <div className="notice error" role="alert">{[...new Set(errors)].join(" ")} Показаны последние полученные сведения; отсутствие событий не подтверждено.</div>}
+    <section className="dashboard-stats" aria-label="Реестры рабочей папки">{stats.map(({ tool, label, store }) => <button type="button" className="dashboard-stat" key={tool} onClick={() => onNavigate?.(tool)} disabled={!onNavigate} aria-label={`Открыть: ${label}`}><span className="dashboard-stat-icon"><ToolIcon name={tool} /></span><span><small>{label}</small><strong>{store.loading || store.error ? "—" : store.records.length}</strong></span><ToolIcon name="arrow-right" /></button>)}</section>
+    {onNavigate && <section className="dashboard-shortcuts" aria-label="Быстрые действия">{shortcuts.map(({ tool, label, text }) => <button type="button" key={tool} className="dashboard-shortcut" onClick={() => onNavigate(tool)}><span className="dashboard-shortcut-icon"><ToolIcon name={tool} /></span><span><strong>{label}</strong><small>{text}</small></span><ToolIcon name="arrow-right" /></button>)}</section>}
+    <div className="dashboard-section-heading"><h2>Требует внимания</h2><span className="help-text">По данным реестров</span></div>
+    <div className="dashboard-grid" aria-busy={loading}>{cards.map(([title, count, rows]) => <section className={`surface dashboard-card ${count ? "has-alert" : ""}`} key={title}><div className="surface-title"><h2>{title}</h2><span className={`status ${loading || errors.length ? "neutral" : count ? "warning" : "success"}`}>{loading || errors.length ? "—" : count}</span></div><div className="surface-body">{rows.length ? <ul className="dashboard-list">{rows.slice(0, 6).map((row, index) => <li key={`${index}-${row}`}>{row}</li>)}</ul> : <div className="empty-inline">{loading ? "Обновляем данные…" : errors.length ? "Проверьте доступ к данным" : "Нет событий"}</div>}</div></section>)}<section className="surface dashboard-card"><div className="surface-title"><h2>Хранилище и резервные копии</h2></div><div className="surface-body"><div className="metric-grid"><div><span>Свободное место</span><strong>{workspace && Number.isFinite(workspace.freeSpaceBytes) ? `${(workspace.freeSpaceBytes / 1024 / 1024 / 1024).toFixed(1)} ГБ` : "—"}</strong></div><div><span>Режим</span><strong>{workspace ? workspace.portable ? "Переносимый" : "Выбранная папка" : "—"}</strong></div></div><p className="help-text">Создание, проверка и восстановление резервной копии доступны в настройках.</p></div></section></div>
+  </div>;
 }

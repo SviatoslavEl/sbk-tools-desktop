@@ -94,7 +94,7 @@ export function ProcurementRegistry() {
     );
   }).length;
   return (
-    <div className="module-stack">
+    <div className="module-stack registry-module">
       <div className="stats-row">
         <div className="stat">
           <span>Закупок</span>

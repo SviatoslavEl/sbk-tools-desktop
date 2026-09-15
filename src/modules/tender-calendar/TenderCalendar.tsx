@@ -1,5 +1,6 @@
 import { useMemo, useState } from "react";
 import { ConfirmDialog } from "../../components/Dialog";
+import { DrawerBackdrop } from "../../components/DrawerBackdrop";
 import { useRecords } from "../../hooks/useRecords";
 import { useUnsavedChanges } from "../../hooks/useUnsavedChanges";
 import type { StoredRecord } from "../../lib/storage";
@@ -482,7 +483,7 @@ function EmptyCalendar({ onCreate }: { onCreate: () => void }) {
   );
 }
 
-function ScheduleEditor({
+export function ScheduleEditor({
   record,
   initialDate = "",
   procurements,
@@ -596,8 +597,9 @@ function ScheduleEditor({
   ]);
 
   return (<>
+    <DrawerBackdrop onClose={requestClose}>
     <aside
-      className="detail-drawer procurement-drawer"
+      className="detail-drawer schedule-drawer"
       role="dialog"
       aria-modal="true"
       aria-label="План подготовки заявки"
@@ -1107,6 +1109,7 @@ function ScheduleEditor({
         </button>
       </footer>
     </aside>
+    </DrawerBackdrop>
     {discardConfirmation}
   </>
   );

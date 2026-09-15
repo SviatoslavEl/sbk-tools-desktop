@@ -48,7 +48,7 @@ export function CounterpartiesRegistry() {
     }
   };
 
-  return <div className="module-stack counterparties-tool">
+  return <div className="module-stack registry-module counterparties-tool">
     {(directory.error || message) && <div className={`notice ${directory.error || message.startsWith("Error") || message.startsWith("Нельзя") ? "error" : "success"}`}>{directory.error || message}</div>}
     <div className="registry-toolbar">
       <label className="search-box"><span>Быстрый поиск</span><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Компания, ИНН, ФИО, должность, телефон…" /></label>

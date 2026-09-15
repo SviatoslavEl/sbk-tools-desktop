@@ -1,0 +1,85 @@
+name: Windows workspace locking regression
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["codex/v2.8.7-workspace-ui"]
+    paths:
+      - ".github/workflows/workspace-windows-regression.yml"
+      - "src-tauri/src/workspace.rs"
+      - "src-tauri/src/administration.rs"
+      - "src-tauri/src/lib.rs"
+      - "src-tauri/Cargo.toml"
+      - "src-tauri/Cargo.lock"
+      - "src-tauri/build.rs"
+      - "src-tauri/tauri*.json"
+      - "package.json"
+      - "package-lock.json"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: workspace-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  workspace-locking:
+    name: Windows actual file sharing and owner recovery
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+      - uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: src-tauri
+          key: windows-workspace-regression
+      - run: npm ci
+      - run: npm run build
+      - name: Prepare metadata-only sidecar placeholder
+        run: |
+          # No scanner executable is run by these workspace/admin tests.
+          # Do not stage or package OCR, LibreOffice, WebView2 or worker runtimes.
+          New-Item -ItemType Directory -Force src-tauri/binaries | Out-Null
+          New-Item -ItemType Directory -Force src-tauri/runtime-resources/resources | Out-Null
+          New-Item -ItemType File -Force src-tauri/binaries/sbk-scanner-worker-x86_64-pc-windows-msvc.exe | Out-Null
+          # Tauri also validates the resource directory from tauri.windows.conf.
+          # An empty metadata-only directory is sufficient: no webview is launched.
+          $windowsConfig = Get-Content -LiteralPath src-tauri/tauri.windows.conf.json -Raw | ConvertFrom-Json
+          $runtimePath = $windowsConfig.bundle.windows.webviewInstallMode.path
+          if ($windowsConfig.bundle.windows.webviewInstallMode.type -ne 'fixedRuntime' -or
+              $runtimePath -notmatch '^\./webview2-runtime/[^/\\]+$') {
+            throw 'Unexpected fixed WebView2 metadata path'
+          }
+          New-Item -ItemType Directory -Force (Join-Path 'src-tauri' $runtimePath) | Out-Null
+          New-Item -ItemType Directory -Force test-results | Out-Null
+      - name: Test real Windows sharing denial, retry, exclusivity and explicit recovery
+        run: |
+          $log = Join-Path $env:GITHUB_WORKSPACE 'test-results/workspace-windows.log'
+          cargo test --locked --manifest-path src-tauri/Cargo.toml --lib --all-features workspace::tests:: -- --test-threads=1 2>&1 | Tee-Object -FilePath $log
+          if ($LASTEXITCODE -ne 0) { throw 'Windows workspace regression suite failed' }
+          $expected = 'test workspace::tests::windows_open_claim_without_delete_sharing_keeps_lease_for_successful_retry ... ok'
+          if (-not (Select-String -LiteralPath $log -SimpleMatch $expected -Quiet)) {
+            throw 'Required Windows-only sharing-denial regression did not run successfully'
+          }
+      - name: Test owner authentication and journal event filtering
+        run: |
+          $log = Join-Path $env:GITHUB_WORKSPACE 'test-results/administration-windows.log'
+          cargo test --locked --manifest-path src-tauri/Cargo.toml --lib --all-features administration::tests:: -- --test-threads=1 2>&1 | Tee-Object -FilePath $log
+          if ($LASTEXITCODE -ne 0) { throw 'Windows administration regression suite failed' }
+      - name: Preserve regression logs only
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: Windows-Workspace-Regression-Logs
+          path: test-results/*.log
+          if-no-files-found: warn
+          retention-days: 14

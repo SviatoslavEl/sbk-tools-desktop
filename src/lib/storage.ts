@@ -27,6 +27,8 @@ export interface WorkspaceInfo {
   editor: boolean;
   editorBusy: boolean;
   editorStateMessage?: string | null;
+  editorCleanupPending?: boolean;
+  editorCleanupMessage?: string | null;
   accessControlled: boolean;
   accessMessage: string;
   ownerConfigured?: boolean;

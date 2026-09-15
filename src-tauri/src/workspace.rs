@@ -90,6 +90,9 @@ struct EditorLease {
     guard: Option<File>,
     presence_path: Option<PathBuf>,
     owner: Option<EditorOwner>,
+    cleanup_error: Option<String>,
+    release_reason: Option<String>,
+    failure_audited: bool,
 }
 
 impl EditorLease {
@@ -101,21 +104,343 @@ impl EditorLease {
             guard: None,
             presence_path: None,
             owner: None,
+            cleanup_error: None,
+            release_reason: None,
+            failure_audited: false,
+        }
+    }
+
+    fn cleanup_pending(&self) -> bool {
+        !self.active && self.presence_path.is_some()
+    }
+
+    fn release_checked(&mut self) -> Result<(), String> {
+        self.release_with(|path| fs::remove_file(path))
+    }
+
+    fn release_with(
+        &mut self,
+        remove: impl FnOnce(&Path) -> std::io::Result<()>,
+    ) -> Result<(), String> {
+        // Disable writes first, but retain this exact ownership information and
+        // both locked handles until its claim has actually been removed.
+        self.active = false;
+        let Some(path) = self.presence_path.clone() else {
+            self.edit.take();
+            self.guard.take();
+            return Ok(());
+        };
+        let result = (|| {
+            let root = path.parent().ok_or("Не определена рабочая папка")?;
+            if !fs::metadata(root).is_ok_and(|m| m.is_dir()) {
+                return Err(
+                    "Общая папка недоступна; собственный сеанс ещё не освобождён".to_string(),
+                );
+            }
+            let bytes = match read_regular_claim(&path) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    // SMB can disappear after the initial directory check.
+                    // Missing claim is success only when its parent is freshly
+                    // readable and still confirms absence, not a network error.
+                    return confirm_claim_absent_after_error(&path, &error);
+                }
+                Err(error) => {
+                    return Err(format!("Не удалось проверить собственный сеанс: {error}"));
+                }
+            };
+            let presence: EditorPresence = serde_json::from_slice(&bytes)
+                .map_err(|_| "Запись сеанса повреждена; её принадлежность не подтверждена")?;
+            if presence.token != self.token {
+                // No longer ours. Forget local ownership, never touch replacement.
+                self.presence_path = None;
+                self.edit.take();
+                self.guard.take();
+                return Err(
+                    "Запись принадлежит другому сеансу; чужая блокировка не изменена".into(),
+                );
+            }
+            if read_regular_claim(&path).map_err(|e| e.to_string())? != bytes {
+                return Err(
+                    "Запись сеанса изменилась во время освобождения; повторите проверку".into(),
+                );
+            }
+            remove(&path)
+                .map_err(|error| format!("Не удалось удалить запись собственного сеанса: {error}"))
+        })();
+        match result {
+            Ok(()) => {
+                self.presence_path = None;
+                self.cleanup_error = None;
+                self.edit.take();
+                self.guard.take();
+                Ok(())
+            }
+            Err(error) => {
+                let message = format!(
+                    "Редактирование отключено, но освобождение сессии не подтверждено. {error}. Проверьте подключение и повторите освобождение."
+                );
+                self.cleanup_error = Some(message.clone());
+                Err(message)
+            }
         }
     }
 }
 
 impl Drop for EditorLease {
     fn drop(&mut self) {
-        let Some(path) = self.presence_path.take() else {
-            return;
-        };
-        let owned = fs::read(&path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<EditorPresence>(&bytes).ok())
-            .is_some_and(|presence| presence.token == self.token);
-        if owned {
-            let _ = fs::remove_file(path);
+        if self.presence_path.is_some()
+            && let Err(error) = self.release_checked()
+        {
+            log_release_error(&self.token, &error);
+        }
+    }
+}
+
+fn log_release_error(token: &str, error: &str) {
+    eprintln!("Editor session {token}: {error}");
+    #[cfg(not(test))]
+    if let Some(directory) = dirs::data_local_dir().map(|p| p.join("SBKTools").join("logs"))
+        && fs::create_dir_all(&directory).is_ok()
+        && let Ok(mut log) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(directory.join("editor-release-errors.log"))
+    {
+        let _ = writeln!(log, "{} {token}: {error}", Utc::now().to_rfc3339());
+    }
+}
+
+fn read_regular_claim(path: &Path) -> std::io::Result<Vec<u8>> {
+    let metadata = regular_file_metadata(path)?;
+    if metadata.len() > 64 * 1024 {
+        return Err(std::io::Error::other(
+            "Ожидался обычный служебный файл сеанса, не ссылка/каталог",
+        ));
+    }
+    fs::read(path)
+}
+
+fn confirm_claim_absent_after_error(path: &Path, error: &std::io::Error) -> Result<(), String> {
+    if error.kind() != std::io::ErrorKind::NotFound {
+        return Err(format!("Отсутствие записи сеанса не подтверждено: {error}"));
+    }
+    #[cfg(windows)]
+    if !matches!(error.raw_os_error(), Some(2 | 3)) {
+        // ERROR_BAD_NETPATH/ERROR_BAD_NET_NAME can be classified as NotFound.
+        // Only actual FILE_NOT_FOUND/PATH_NOT_FOUND may enter the parent probe.
+        return Err(format!(
+            "Ошибка сети не подтверждает отсутствие записи сеанса: {error}"
+        ));
+    }
+    let root = path.parent().ok_or("Не определена рабочая папка")?;
+    let entries = fs::read_dir(root)
+        .map_err(|e| format!("Не удалось повторно проверить доступность общей папки: {e}"))?;
+    for entry in entries {
+        let entry = entry
+            .map_err(|e| format!("Общая папка недоступна при проверке отсутствия сеанса: {e}"))?;
+        if Some(entry.file_name().as_os_str()) == path.file_name() {
+            return Err("Запись сеанса обнаружена повторно; отсутствие не подтверждено".into());
+        }
+    }
+    match fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            #[cfg(windows)]
+            if !matches!(e.raw_os_error(), Some(2 | 3)) {
+                return Err(format!("Сетевое состояние записи сеанса неизвестно: {e}"));
+            }
+            Ok(())
+        }
+        Ok(_) => Err("Запись сеанса появилась повторно; отсутствие не подтверждено".into()),
+        Err(e) => Err(format!(
+            "Не удалось подтвердить отсутствие записи сеанса: {e}"
+        )),
+    }
+}
+
+fn regular_file_metadata(path: &Path) -> std::io::Result<fs::Metadata> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(std::io::Error::other(
+            "Служебный путь не является обычным файлом",
+        ));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes() & 0x400 != 0 {
+            return Err(std::io::Error::other(
+                "Служебный путь является reparse point",
+            ));
+        }
+    }
+    Ok(metadata)
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct EditorRecoveryResult {
+    pub(crate) archive_file_name: String,
+    pub(crate) message: String,
+}
+
+/// Explicit, authenticated filesystem maintenance, not automatic stale takeover.
+/// No local PID/hostname/timestamp can prove that a remote editor has stopped.
+pub(crate) fn recover_workspace_editor_session(
+    root: &Path,
+    password: &str,
+    target_token: &str,
+    reason: &str,
+    confirmation: &str,
+    confirmed_all_editors_closed: bool,
+) -> Result<EditorRecoveryResult, String> {
+    crate::administration::authenticate(root, password)?;
+    if confirmation != "ВОССТАНОВИТЬ ДОСТУП" || !confirmed_all_editors_closed {
+        return Err("Подтвердите закрытие всех редакторов, включая компьютеры без связи, и введите «ВОССТАНОВИТЬ ДОСТУП». Локальная проверка не доказывает завершение удалённого процесса.".into());
+    }
+    if uuid::Uuid::parse_str(target_token).is_err()
+        || !(3..=500).contains(&reason.trim().chars().count())
+    {
+        return Err("Нужны точный сеанс и причина длиной от 3 до 500 символов".into());
+    }
+    recover_confirmed_claim(root, target_token, reason.trim(), || {})
+}
+
+fn lock_existing_editor_file(path: &Path) -> Result<File, String> {
+    regular_file_metadata(path).map_err(|e| {
+        format!(
+            "Не удалось проверить существующую блокировку {}: {e}",
+            path.display()
+        )
+    })?;
+    // Never create, truncate, unlink or replace either of these lock files.
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|e| {
+            format!(
+                "Не удалось открыть существующую блокировку {}: {e}",
+                path.display()
+            )
+        })?;
+    file.try_lock_exclusive()
+        .map_err(|error| recovery_lock_error(path, &error))?;
+    regular_file_metadata(path).map_err(|e| {
+        format!(
+            "Не удалось повторно проверить блокировку {}: {e}",
+            path.display()
+        )
+    })?;
+    Ok(file)
+}
+
+fn recovery_lock_error(path: &Path, error: &std::io::Error) -> String {
+    // fs2 exposes the native contention error: Windows ERROR_LOCK_VIOLATION
+    // need not map to ErrorKind::WouldBlock on every Rust version.
+    let contended = error.kind() == std::io::ErrorKind::WouldBlock
+        || error
+            .raw_os_error()
+            .is_some_and(|code| Some(code) == fs2::lock_contended_error().raw_os_error());
+    if contended {
+        format!(
+            "Блокировка {} ещё удерживается редактором: {error}. Восстановление отменено; не завершайте чужие процессы автоматически.",
+            path.display()
+        )
+    } else {
+        format!(
+            "Не удалось подтвердить состояние блокировки {}: {error}. Состояние неизвестно; восстановление отменено. Проверьте сетевое хранилище и доступ к папке.",
+            path.display()
+        )
+    }
+}
+
+fn recover_confirmed_claim(
+    root: &Path,
+    target_token: &str,
+    reason: &str,
+    before_final_check: impl FnOnce(),
+) -> Result<EditorRecoveryResult, String> {
+    let path = root.join(EDITOR_PRESENCE_FILE);
+    let original = read_regular_claim(&path)
+        .map_err(|e| format!("Запись сеанса недоступна; восстановление отменено: {e}"))?;
+    let presence: EditorPresence = serde_json::from_slice(&original)
+        .map_err(|_| "Запись сеанса повреждена; автоматическое восстановление запрещено")?;
+    if presence.token != target_token || presence.owner.display_name.trim().is_empty() {
+        return Err("Сеанс изменился или не определён. Обновите сведения и подтвердите точный сеанс заново.".into());
+    }
+    let mut edit = lock_existing_editor_file(&root.join(".workspace.edit.lock"))?;
+    let mut guard = lock_existing_editor_file(&root.join(".workspace.edit.guard"))?;
+    verify_locked_token(&mut edit, target_token)
+        .and_then(|_| verify_locked_token(&mut guard, target_token))
+        .map_err(|_| "Маркеры блокировок не соответствуют выбранному сеансу. Состояние неизвестно; восстановление отменено.".to_string())?;
+    if read_regular_claim(&path).map_err(|e| e.to_string())? != original {
+        return Err(
+            "Запись сеанса изменилась при проверке блокировок; восстановление отменено".into(),
+        );
+    }
+    let archive_file_name = format!("{EDITOR_PRESENCE_FILE}.recovery-{}", uuid::Uuid::new_v4());
+    let archive = root.join(&archive_file_name);
+    let actor = current_editor_owner().display_name;
+    let audit_reason = format!(
+        "{reason}. Владелец подтвердил закрытие всех редакторов. Архив: {archive_file_name}"
+    );
+    crate::administration::record_session_event(
+        root,
+        &actor,
+        target_token,
+        "recovery-intent",
+        &audit_reason,
+    )?;
+    let recovery = (|| {
+        {
+            let mut copy = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&archive)
+                .map_err(|e| format!("Не удалось сохранить исходную запись сеанса: {e}"))?;
+            copy.write_all(&original)
+                .and_then(|_| copy.sync_all())
+                .map_err(|e| format!("Не удалось подтвердить сохранение архива: {e}"))?;
+        }
+        if read_regular_claim(&archive).map_err(|e| e.to_string())? != original {
+            return Err("Архив записи не прошёл проверку; исходный сеанс не изменён".to_string());
+        }
+        before_final_check();
+        // Both existing locks remain held; compare immutable bytes, not just a
+        // displayed owner name or an old session token supplied by the client.
+        if read_regular_claim(&path).map_err(|e| e.to_string())? != original {
+            return Err(
+                "Запись сеанса изменилась перед освобождением; исходный файл не удалён".into(),
+            );
+        }
+        fs::remove_file(&path).map_err(|e| {
+            format!("Не удалось освободить запись. Архив сохранён как {archive_file_name}: {e}")
+        })?;
+        Ok(())
+    })();
+    match recovery {
+        Ok(()) => {
+            crate::administration::record_session_event(root, &actor, target_token, "recovery-completed", &audit_reason)
+                .map_err(|e| format!("Запись освобождена, архив {archive_file_name} сохранён, но результат не записан в журнал: {e}"))?;
+            Ok(EditorRecoveryResult {
+                archive_file_name,
+                message: "Оставшаяся запись сеанса сохранена в архив и освобождена. Права редактора не выданы: войдите обычным паролем рабочей папки.".into(),
+            })
+        }
+        Err(error) => {
+            if let Err(audit_error) = crate::administration::record_session_event(
+                root,
+                &actor,
+                target_token,
+                "recovery-failed",
+                &format!("{audit_reason}. {error}"),
+            ) {
+                return Err(format!(
+                    "{error}. Не удалось записать результат в журнал: {audit_error}"
+                ));
+            }
+            Err(error)
         }
     }
 }
@@ -165,7 +490,22 @@ fn current_editor_owner() -> EditorOwner {
     }
 }
 
-fn write_editor_presence(root: &Path, token: &str, owner: &EditorOwner) -> Result<PathBuf, String> {
+fn publish_editor_presence(
+    root: &Path,
+    token: &str,
+    owner: &EditorOwner,
+) -> Result<(PathBuf, Option<String>), String> {
+    publish_editor_presence_with(root, token, owner, |file, encoded| {
+        file.write_all(encoded).and_then(|_| file.sync_all())
+    })
+}
+
+fn publish_editor_presence_with(
+    root: &Path,
+    token: &str,
+    owner: &EditorOwner,
+    publish: impl FnOnce(&mut File, &[u8]) -> std::io::Result<()>,
+) -> Result<(PathBuf, Option<String>), String> {
     let path = root.join(EDITOR_PRESENCE_FILE);
     let encoded = serde_json::to_vec_pretty(&EditorPresence {
         token: token.to_string(),
@@ -182,19 +522,40 @@ fn write_editor_presence(root: &Path, token: &str, owner: &EditorOwner) -> Resul
         .create_new(true)
         .open(&path)
         .map_err(|error| format!("Не удалось зарезервировать сессию редактора: {error}"))?;
-    file.write_all(&encoded)
-        .and_then(|_| file.sync_all())
-        .map_err(|error| format!("Не удалось опубликовать сведения о редакторе: {error}"))?;
-    Ok(path)
+    let error = publish(&mut file, &encoded)
+        .err()
+        .map(|error| format!("Не удалось опубликовать сведения о редакторе: {error}"));
+    // Returning the path even after write/sync failure preserves responsibility
+    // for this create_new operation. Never silently discard a partial claim.
+    Ok((path, error))
+}
+
+#[cfg(test)]
+fn write_editor_presence(root: &Path, token: &str, owner: &EditorOwner) -> Result<PathBuf, String> {
+    let (path, error) = publish_editor_presence(root, token, owner)?;
+    error.map_or(Ok(path), Err)
 }
 
 fn read_editor_state(root: &Path) -> EditorState {
+    read_editor_state_with(
+        root,
+        |path| fs::read(path),
+        |path| OpenOptions::new().read(true).open(path),
+    )
+}
+
+fn read_editor_state_with(
+    root: &Path,
+    read_claim: impl FnOnce(&Path) -> std::io::Result<Vec<u8>>,
+    mut open_lock: impl FnMut(&Path) -> std::io::Result<File>,
+) -> EditorState {
     if !fs::metadata(root).is_ok_and(|metadata| metadata.is_dir()) {
         return EditorState::unknown(
             "Общая папка недоступна. Состояние редактора не подтверждено; вход заблокирован до восстановления подключения.",
         );
     }
-    match fs::read(root.join(EDITOR_PRESENCE_FILE)) {
+    let presence_path = root.join(EDITOR_PRESENCE_FILE);
+    match read_claim(&presence_path) {
         Ok(bytes) => {
             return match serde_json::from_slice::<EditorPresence>(&bytes) {
                 Ok(presence)
@@ -212,7 +573,11 @@ fn read_editor_state(root: &Path) -> EditorState {
                 ),
             };
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if let Err(message) = confirm_claim_absent_after_error(&presence_path, &error) {
+                return EditorState::unknown(&message);
+            }
+        }
         Err(_) => {
             return EditorState::unknown(
                 "Не удалось проверить сессию редактора в общей папке. Вход заблокирован до восстановления доступа.",
@@ -222,7 +587,8 @@ fn read_editor_state(root: &Path) -> EditorState {
     // During publication/removal, and with older clients, a byte lock may
     // exist without readable identity. Unknown ownership must not mean free.
     for name in [".workspace.edit.lock", ".workspace.edit.guard"] {
-        match OpenOptions::new().read(true).open(root.join(name)) {
+        let path = root.join(name);
+        match open_lock(&path) {
             Ok(lock) => {
                 if FileExt::try_lock_shared(&lock).is_err() {
                     return EditorState::unknown(
@@ -231,7 +597,11 @@ fn read_editor_state(root: &Path) -> EditorState {
                 }
                 let _ = FileExt::unlock(&lock);
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if let Err(message) = confirm_claim_absent_after_error(&path, &error) {
+                    return EditorState::unknown(&message);
+                }
+            }
             Err(_) => {
                 return EditorState::unknown(
                     "Не удалось проверить блокировку общей папки. Вход в режим редактора заблокирован.",
@@ -420,6 +790,14 @@ fn verify_presence_token(root: &Path, token: &str) -> Result<(), String> {
 }
 
 fn acquire_editor_lease(root: &Path, writable: bool) -> EditorLease {
+    acquire_editor_lease_with(root, writable, publish_editor_presence)
+}
+
+fn acquire_editor_lease_with(
+    root: &Path,
+    writable: bool,
+    publish: impl FnOnce(&Path, &str, &EditorOwner) -> Result<(PathBuf, Option<String>), String>,
+) -> EditorLease {
     let token = uuid::Uuid::new_v4().to_string();
     if !writable {
         return EditorLease::inactive();
@@ -434,26 +812,31 @@ fn acquire_editor_lease(root: &Path, writable: bool) -> EditorLease {
         return EditorLease::inactive();
     };
     let owner = current_editor_owner();
-    let Ok(presence_path) = write_editor_presence(root, &token, &owner) else {
+    let Ok((presence_path, publication_error)) = publish(root, &token, &owner) else {
         return EditorLease::inactive();
     };
-    let active = initialize_locked_token(&mut edit, &token)
-        .and_then(|_| initialize_locked_token(&mut guard, &token))
-        .and_then(|_| verify_presence_token(root, &token))
-        .is_ok();
-    let lease = EditorLease {
+    let active = publication_error.is_none()
+        && initialize_locked_token(&mut edit, &token)
+            .and_then(|_| initialize_locked_token(&mut guard, &token))
+            .and_then(|_| verify_presence_token(root, &token))
+            .is_ok();
+    let mut lease = EditorLease {
         active,
         token,
         edit: Some(edit),
         guard: Some(guard),
         presence_path: Some(presence_path),
         owner: Some(owner),
+        cleanup_error: publication_error,
+        release_reason: None,
+        failure_audited: false,
     };
     if !active {
         // Only this newly created claim is removed, while both handles remain
         // held. Drop checks the exact session token before removing it.
-        drop(lease);
-        return EditorLease::inactive();
+        let _ = lease.release_checked();
+        // A failed cleanup keeps the token and handles in a disabled lease.
+        return lease;
     }
     lease
 }
@@ -713,8 +1096,18 @@ impl Workspace {
             drop(lease);
             return self.require_editor();
         }
+        if lease.cleanup_pending() {
+            self.release_lease(&mut lease, "Повторное освобождение перед входом")?;
+        }
         let next = acquire_editor_lease(&self.root, true);
         if !next.active {
+            if next.cleanup_pending() {
+                let message = next.cleanup_error.clone().unwrap_or_else(|| {
+                    "Не завершено освобождение частично опубликованного сеанса".into()
+                });
+                *lease = next;
+                return Err(message);
+            }
             let state = read_editor_state(&self.root);
             let owner = state
                 .presence
@@ -747,7 +1140,88 @@ impl Workspace {
             .editor_lease
             .lock()
             .map_err(|_| "Переключение режима недоступно".to_string())?;
-        *lease = EditorLease::inactive();
+        let result = self.release_lease(&mut lease, "Освобождение собственного режима редактора");
+        if let Err(error) = &result {
+            log_release_error(&lease.token, error);
+        }
+        result
+    }
+
+    fn release_lease(&self, lease: &mut EditorLease, reason: &str) -> Result<(), String> {
+        let had_claim = lease.presence_path.is_some();
+        let was_cleanup_pending = lease.cleanup_pending();
+        lease
+            .release_reason
+            .get_or_insert_with(|| reason.to_string());
+        let result = lease.release_checked();
+        if had_claim {
+            let action = if result.is_ok() {
+                "release-acknowledged"
+            } else {
+                "release-failed"
+            };
+            let detail = format!(
+                "{}. {}",
+                lease.release_reason.as_deref().unwrap_or(reason),
+                result
+                    .as_ref()
+                    .err()
+                    .map(String::as_str)
+                    .unwrap_or("Собственная запись сеанса освобождена")
+            );
+            if (result.is_ok() || !lease.failure_audited)
+                && self
+                    .root
+                    .join(".workspace-administration.sqlite3")
+                    .is_file()
+            {
+                match crate::administration::record_session_event(
+                    &self.root,
+                    &self.actor_name(),
+                    &lease.token,
+                    action,
+                    &detail,
+                ) {
+                    Ok(()) => lease.failure_audited = result.is_err(),
+                    Err(error) => log_release_error(
+                        &lease.token,
+                        &format!("Событие {action} не записано: {error}"),
+                    ),
+                }
+            }
+        }
+        if let Err(error) = &result {
+            if let Ok(mut notice) = self.admin_notice.lock() {
+                *notice = Some(error.clone());
+            }
+        } else if was_cleanup_pending && let Ok(mut notice) = self.admin_notice.lock() {
+            *notice = Some("Собственная сессия успешно освобождена после повторной проверки. Режим просмотра сохранён; для редактирования нужен обычный вход.".into());
+        }
+        result
+    }
+
+    pub(crate) fn editor_cleanup_pending(&self) -> bool {
+        self.editor_lease
+            .lock()
+            .map(|lease| lease.cleanup_pending())
+            .unwrap_or(true)
+    }
+
+    pub(crate) fn editor_cleanup_message(&self) -> Option<String> {
+        self.editor_lease.lock().ok()?.cleanup_error.clone()
+    }
+
+    pub(crate) fn retry_pending_editor_release(&self) -> Result<(), String> {
+        let mut lease = self
+            .editor_lease
+            .lock()
+            .map_err(|_| "Проверка освобождения недоступна")?;
+        if lease.cleanup_pending() {
+            self.release_lease(
+                &mut lease,
+                "Повторная проверка освобождения собственного сеанса",
+            )?;
+        }
         Ok(())
     }
 
@@ -815,7 +1289,7 @@ impl Workspace {
             .lock()
             .map_err(|_| "Проверка блокировки недоступна".to_string())?;
         if !lease.active {
-            return Err("Общая база открыта только для просмотра. Для изменения нужны права записи на папку и свободная блокировка редактора.".to_string());
+            return Err(lease.cleanup_error.clone().unwrap_or_else(|| "Общая база открыта только для просмотра. Для изменения нужны права записи на папку и свободная блокировка редактора.".to_string()));
         }
         let request = match crate::administration::latest_request(&self.root, &lease.token) {
             Ok(request) => request,
@@ -826,7 +1300,10 @@ impl Workspace {
                 if let Ok(mut notice) = self.admin_notice.lock() {
                     *notice = Some(message.clone());
                 }
-                *lease = EditorLease::inactive();
+                let _ = self.release_lease(
+                    &mut lease,
+                    "Отключение записи: управление сессией недоступно",
+                );
                 return Err(message);
             }
         };
@@ -854,8 +1331,11 @@ impl Workspace {
                 // Called under AppState.maintenance: outstanding writes finish
                 // before this cooperative release. Never rewrite/remove another
                 // process's lock or bypass the ordinary workspace password.
-                *lease = EditorLease::inactive();
-                return Err(message);
+                let release = self.release_lease(
+                    &mut lease,
+                    &format!("Отзыв по запросу #{}: {}", request.id, request.reason),
+                );
+                return Err(release.err().unwrap_or(message));
             }
         }
         // Verify the ownership markers through the already locked handles.
@@ -877,7 +1357,10 @@ impl Workspace {
             })
             .and_then(|_| verify_presence_token(&self.root, &token));
         if result.is_err() {
-            *lease = EditorLease::inactive();
+            let _ = self.release_lease(
+                &mut lease,
+                "Отключение записи после потери подтверждения блокировки",
+            );
         }
         result.map_err(|error: String| {
             format!(
@@ -912,6 +1395,529 @@ mod tests {
     use super::*;
     use std::process::Command;
     use uuid::Uuid;
+
+    #[test]
+    fn editor_state_is_unknown_when_parent_disappears_during_claim_or_lock_probe() {
+        for disappear_during_claim in [false, true] {
+            let root = std::env::temp_dir().join(format!("sbk-state-mid-probe-{}", Uuid::new_v4()));
+            fs::create_dir(&root).unwrap();
+            let state = read_editor_state_with(
+                &root,
+                |path| {
+                    if disappear_during_claim {
+                        fs::remove_dir(&root).unwrap();
+                    }
+                    fs::read(path)
+                },
+                |path| {
+                    if !disappear_during_claim {
+                        fs::remove_dir(&root).unwrap();
+                    }
+                    OpenOptions::new().read(true).open(path)
+                },
+            );
+            assert!(state.busy, "a disappeared share must not be shown as free");
+            assert!(state.presence.is_none());
+            assert!(state.message.is_some());
+            assert!(!root.exists());
+        }
+    }
+
+    #[test]
+    fn editor_state_rechecks_a_claim_that_reappeared_after_not_found() {
+        let root = std::env::temp_dir().join(format!("sbk-state-reappeared-{}", Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let token = Uuid::new_v4().to_string();
+        let state = read_editor_state_with(
+            &root,
+            |path| {
+                let missing = fs::read(path).unwrap_err();
+                write_editor_presence(&root, &token, &current_editor_owner()).unwrap();
+                Err(missing)
+            },
+            |path| OpenOptions::new().read(true).open(path),
+        );
+        assert!(state.busy);
+        assert!(state.message.is_some());
+        assert_eq!(read_editor_state(&root).presence.unwrap().token, token);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn missing_claim_requires_a_fresh_readable_parent_not_a_network_error() {
+        let root =
+            std::env::temp_dir().join(format!("sbk-claim-missing-parent-{}", Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let path = root.join(EDITOR_PRESENCE_FILE);
+        let missing = fs::read(&path).unwrap_err();
+        confirm_claim_absent_after_error(&path, &missing).unwrap();
+        fs::write(&path, b"reappeared").unwrap();
+        assert!(confirm_claim_absent_after_error(&path, &missing).is_err());
+        fs::remove_file(&path).unwrap();
+        #[cfg(windows)]
+        for code in [53, 67] {
+            assert!(
+                confirm_claim_absent_after_error(&path, &std::io::Error::from_raw_os_error(code))
+                    .is_err()
+            );
+        }
+        fs::remove_dir(&root).unwrap();
+        assert!(confirm_claim_absent_after_error(&path, &missing).is_err());
+    }
+
+    #[test]
+    fn recovery_lock_errors_distinguish_contention_from_unavailable_storage() {
+        let path = Path::new("synthetic-workspace/.workspace.edit.lock");
+        let contended = recovery_lock_error(path, &fs2::lock_contended_error());
+        assert!(contended.contains("удерживается редактором"));
+        let unavailable = recovery_lock_error(
+            path,
+            &std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        );
+        assert!(unavailable.contains("Состояние неизвестно"));
+        assert!(unavailable.contains("synthetic-workspace/.workspace.edit.lock"));
+        assert!(!unavailable.contains("удерживается редактором"));
+        #[cfg(windows)]
+        {
+            let unsupported = recovery_lock_error(path, &std::io::Error::from_raw_os_error(50));
+            assert!(unsupported.contains("Состояние неизвестно"));
+            assert!(unsupported.contains("os error 50"));
+        }
+    }
+
+    #[test]
+    fn partial_presence_publication_keeps_disabled_cleanup_responsibility() {
+        let root = std::env::temp_dir().join(format!("sbk-publish-failure-{}", Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let mut lease = acquire_editor_lease_with(&root, true, |root, token, owner| {
+            publish_editor_presence_with(root, token, owner, |file, encoded| {
+                file.write_all(&encoded[..8])?;
+                Err(std::io::ErrorKind::WriteZero.into())
+            })
+        });
+        assert!(!lease.active);
+        assert!(lease.cleanup_pending());
+        assert!(lease.edit.is_some() && lease.guard.is_some());
+        assert!(
+            lease.release_checked().is_err(),
+            "unknown partial claim cannot be removed blindly"
+        );
+        let claim = fs::read(root.join(EDITOR_PRESENCE_FILE)).unwrap();
+        assert_eq!(claim.len(), 8);
+        assert!(!acquire_editor_lease(&root, true).active);
+        // Isolated fixture teardown leaves no appdata/user files modified.
+        lease.presence_path = None;
+        drop(lease);
+        assert_eq!(fs::read(root.join(EDITOR_PRESENCE_FILE)).unwrap(), claim);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_own_release_retains_exact_token_and_locks_until_retry() {
+        let root = std::env::temp_dir().join(format!("sbk-release-retry-{}", Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let mut lease = acquire_editor_lease(&root, true);
+        let token = lease.token.clone();
+        let original = fs::read(root.join(EDITOR_PRESENCE_FILE)).unwrap();
+        let error = lease
+            .release_with(|_| Err(std::io::ErrorKind::PermissionDenied.into()))
+            .unwrap_err();
+        assert!(error.contains("освобождение сессии не подтверждено"));
+        assert!(!lease.active);
+        assert!(lease.cleanup_pending());
+        assert_eq!(lease.token, token);
+        assert!(lease.edit.is_some() && lease.guard.is_some());
+        assert_eq!(fs::read(root.join(EDITOR_PRESENCE_FILE)).unwrap(), original);
+        assert!(!acquire_editor_lease(&root, true).active);
+        lease.release_checked().unwrap();
+        assert!(!lease.cleanup_pending());
+        assert!(lease.cleanup_error.is_none());
+        assert!(lease.edit.is_none() && lease.guard.is_none());
+        let next = acquire_editor_lease(&root, true);
+        assert!(next.active);
+        drop(next);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unreadable_own_claim_disables_writes_and_status_retry_audits_success_once() {
+        let root = std::env::temp_dir().join(format!("sbk-release-read-retry-{}", Uuid::new_v4()));
+        let editor = Workspace::for_test(root.clone(), true);
+        crate::administration::setup(&root, "separate-owner-password", "owner").unwrap();
+        let path = root.join(EDITOR_PRESENCE_FILE);
+        let original = fs::read(&path).unwrap();
+        let token = editor.editor_presence().unwrap().token;
+        // A directory in place of the claim models an unreadable/invalid path
+        // without changing permissions on any real user or network directory.
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(editor.release_editor_on_exit().is_err());
+        assert!(editor.editor_cleanup_pending());
+        assert!(editor.require_editor().is_err());
+        assert!(editor.retry_pending_editor_release().is_err());
+        let failures = crate::administration::events(&root).unwrap();
+        assert_eq!(
+            failures
+                .iter()
+                .filter(|event| event.action == "release-failed")
+                .count(),
+            1
+        );
+        assert!(
+            !failures
+                .iter()
+                .any(|event| event.action == "release-acknowledged")
+        );
+        fs::remove_dir(&path).unwrap();
+        fs::write(&path, original).unwrap();
+        editor.retry_pending_editor_release().unwrap();
+        editor.retry_pending_editor_release().unwrap();
+        assert!(!editor.is_editor());
+        assert!(!editor.editor_cleanup_pending());
+        assert!(editor.editor_cleanup_message().is_none());
+        let events = crate::administration::events(&root).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.action == "release-acknowledged" && event.target == token)
+                .count(),
+            1
+        );
+        assert!(
+            crate::administration::latest_request(&root, &token)
+                .unwrap()
+                .is_none()
+        );
+        drop(editor);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn retry_never_removes_a_foreign_replacement_claim() {
+        let root = std::env::temp_dir().join(format!("sbk-release-foreign-{}", Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let mut lease = acquire_editor_lease(&root, true);
+        assert!(
+            lease
+                .release_with(|_| Err(std::io::ErrorKind::PermissionDenied.into()))
+                .is_err()
+        );
+        let path = root.join(EDITOR_PRESENCE_FILE);
+        fs::remove_file(&path).unwrap();
+        write_editor_presence(&root, &Uuid::new_v4().to_string(), &current_editor_owner()).unwrap();
+        let replacement = fs::read(&path).unwrap();
+        assert!(
+            lease
+                .release_checked()
+                .unwrap_err()
+                .contains("чужая блокировка не изменена")
+        );
+        assert!(!lease.cleanup_pending());
+        drop(lease);
+        assert_eq!(fs::read(path).unwrap(), replacement);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_open_claim_without_delete_sharing_keeps_lease_for_successful_retry() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let root =
+            std::env::temp_dir().join(format!("sbk-windows-release-retry-{}", Uuid::new_v4()));
+        let editor = Workspace::for_test(root.clone(), true);
+        let path = root.join(EDITOR_PRESENCE_FILE);
+        let original = fs::read(&path).unwrap();
+        // GENERIC_READ is intentional: metadata-only READ_ATTRIBUTES does not
+        // establish this Windows sharing denial. Do not share DELETE (0x4).
+        let blocker = OpenOptions::new()
+            .read(true)
+            .share_mode(0x1 | 0x2)
+            .open(&path)
+            .unwrap();
+        let error = editor.release_editor_on_exit().unwrap_err();
+        assert!(error.contains("os error 32"), "{error}");
+        assert!(!editor.is_editor());
+        assert!(editor.editor_cleanup_pending());
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert!(!acquire_editor_lease(&root, true).active);
+        drop(blocker);
+        editor.retry_pending_editor_release().unwrap();
+        assert!(!editor.editor_cleanup_pending());
+        assert!(!path.exists());
+        drop(editor);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn orphan_fixture() -> (PathBuf, String, Vec<u8>) {
+        let root = std::env::temp_dir().join(format!("sbk-owner-recovery-{}", Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let mut lease = acquire_editor_lease(&root, true);
+        assert!(lease.active);
+        let token = lease.token.clone();
+        let original = fs::read(root.join(EDITOR_PRESENCE_FILE)).unwrap();
+        // Test-only crash simulation: close both OS handles while preserving
+        // exactly the immutable claim that an abrupt process exit leaves.
+        lease.presence_path = None;
+        drop(lease);
+        crate::administration::setup(&root, "separate-owner-password", "owner").unwrap();
+        (root, token, original)
+    }
+
+    fn recover_fixture(root: &Path, token: &str) -> Result<EditorRecoveryResult, String> {
+        recover_workspace_editor_session(
+            root,
+            "separate-owner-password",
+            token,
+            "Подтверждено закрытие всех редакторов",
+            "ВОССТАНОВИТЬ ДОСТУП",
+            true,
+        )
+    }
+
+    #[test]
+    fn confirmed_owner_recovery_archives_exact_claim_and_preserves_normal_password_and_data() {
+        let (root, token, original) = orphan_fixture();
+        write_access_control(&root, "ordinary-editor-password").unwrap();
+        let access_bytes = fs::read(root.join(ACCESS_CONTROL_FILE)).unwrap();
+        fs::write(
+            root.join("synthetic-user-database.bin"),
+            b"unchanged test data",
+        )
+        .unwrap();
+        let lock_bytes = fs::read(root.join(".workspace.edit.lock")).unwrap();
+        let guard_bytes = fs::read(root.join(".workspace.edit.guard")).unwrap();
+        let viewer = Workspace::for_test(root.clone(), true);
+        assert!(!viewer.is_editor());
+        let result = recover_fixture(&root, &token).unwrap();
+        assert!(
+            result
+                .archive_file_name
+                .starts_with(".workspace-editor.json.recovery-")
+        );
+        assert_eq!(
+            fs::read(root.join(result.archive_file_name)).unwrap(),
+            original
+        );
+        assert!(!root.join(EDITOR_PRESENCE_FILE).exists());
+        assert_eq!(
+            fs::read(root.join(".workspace.edit.lock")).unwrap(),
+            lock_bytes
+        );
+        assert_eq!(
+            fs::read(root.join(".workspace.edit.guard")).unwrap(),
+            guard_bytes
+        );
+        assert_eq!(
+            fs::read(root.join(ACCESS_CONTROL_FILE)).unwrap(),
+            access_bytes
+        );
+        assert_eq!(
+            fs::read(root.join("synthetic-user-database.bin")).unwrap(),
+            b"unchanged test data"
+        );
+        crate::administration::authenticate(&root, "separate-owner-password").unwrap();
+        assert!(!viewer.is_editor(), "recovery grants no editor authority");
+        assert!(
+            viewer
+                .acquire_editor_with_password("separate-owner-password")
+                .is_err()
+        );
+        viewer
+            .acquire_editor_with_password("ordinary-editor-password")
+            .unwrap();
+        assert!(viewer.require_editor().is_ok());
+        let events = crate::administration::events(&root).unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| event.action == "recovery-intent" && event.target == token)
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.action == "recovery-completed" && event.target == token)
+        );
+        drop(viewer);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recovery_requires_fresh_owner_auth_exact_confirmation_target_and_reason() {
+        let (root, token, original) = orphan_fixture();
+        for (password, target, reason, phrase, closed) in [
+            (
+                "incorrect-owner-password",
+                token.as_str(),
+                "Причина",
+                "ВОССТАНОВИТЬ ДОСТУП",
+                true,
+            ),
+            (
+                "separate-owner-password",
+                token.as_str(),
+                "Причина",
+                "ВОССТАНОВИТЬ ДОСТУП",
+                false,
+            ),
+            (
+                "separate-owner-password",
+                token.as_str(),
+                "Причина",
+                "да",
+                true,
+            ),
+            (
+                "separate-owner-password",
+                token.as_str(),
+                "  ",
+                "ВОССТАНОВИТЬ ДОСТУП",
+                true,
+            ),
+            (
+                "separate-owner-password",
+                "unknown",
+                "Причина",
+                "ВОССТАНОВИТЬ ДОСТУП",
+                true,
+            ),
+        ] {
+            assert!(
+                recover_workspace_editor_session(&root, password, target, reason, phrase, closed)
+                    .is_err()
+            );
+            assert_eq!(fs::read(root.join(EDITOR_PRESENCE_FILE)).unwrap(), original);
+        }
+        assert!(recover_fixture(&root, &Uuid::new_v4().to_string()).is_err());
+        assert!(
+            recover_workspace_editor_session(
+                &root,
+                "separate-owner-password",
+                &token,
+                &"a".repeat(501),
+                "ВОССТАНОВИТЬ ДОСТУП",
+                true
+            )
+            .is_err()
+        );
+        assert_eq!(crate::administration::events(&root).unwrap().len(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recovery_refuses_either_active_lock_and_never_creates_missing_lock_files() {
+        let (root, token, original) = orphan_fixture();
+        for name in [".workspace.edit.lock", ".workspace.edit.guard"] {
+            let blocker = lock_editor_file(&root.join(name)).unwrap();
+            assert!(
+                recover_fixture(&root, &token)
+                    .unwrap_err()
+                    .contains("удерживается")
+            );
+            assert_eq!(fs::read(root.join(EDITOR_PRESENCE_FILE)).unwrap(), original);
+            drop(blocker);
+        }
+        fs::remove_file(root.join(".workspace.edit.guard")).unwrap();
+        assert!(recover_fixture(&root, &token).is_err());
+        assert!(!root.join(".workspace.edit.guard").exists());
+        assert_eq!(fs::read(root.join(EDITOR_PRESENCE_FILE)).unwrap(), original);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recovery_refuses_inconsistent_lock_markers_without_changing_them() {
+        let (root, token, original) = orphan_fixture();
+        let guard = root.join(".workspace.edit.guard");
+        let foreign_token = Uuid::new_v4().to_string();
+        fs::write(&guard, &foreign_token).unwrap();
+        assert!(
+            recover_fixture(&root, &token)
+                .unwrap_err()
+                .contains("Маркеры блокировок не соответствуют")
+        );
+        assert_eq!(fs::read_to_string(&guard).unwrap(), foreign_token);
+        assert_eq!(fs::read(root.join(EDITOR_PRESENCE_FILE)).unwrap(), original);
+        assert_eq!(crate::administration::events(&root).unwrap().len(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recovery_refuses_missing_malformed_and_directory_claims() {
+        let (root, token, _) = orphan_fixture();
+        let path = root.join(EDITOR_PRESENCE_FILE);
+        fs::remove_file(&path).unwrap();
+        assert!(recover_fixture(&root, &token).is_err());
+        fs::write(&path, b"{partial").unwrap();
+        assert!(recover_fixture(&root, &token).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"{partial");
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(recover_fixture(&root, &token).is_err());
+        assert!(path.is_dir());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_refuses_symlink_claims_and_lock_paths() {
+        use std::os::unix::fs::symlink;
+        let (root, token, original) = orphan_fixture();
+        let path = root.join(EDITOR_PRESENCE_FILE);
+        let destination = root.join("synthetic-original-claim");
+        fs::rename(&path, &destination).unwrap();
+        symlink(&destination, &path).unwrap();
+        assert!(recover_fixture(&root, &token).is_err());
+        assert_eq!(fs::read(&destination).unwrap(), original);
+        fs::remove_file(&path).unwrap();
+        fs::rename(&destination, &path).unwrap();
+        fs::remove_file(root.join(".workspace.edit.guard")).unwrap();
+        symlink(
+            root.join(".workspace.edit.lock"),
+            root.join(".workspace.edit.guard"),
+        )
+        .unwrap();
+        assert!(recover_fixture(&root, &token).is_err());
+        assert_eq!(fs::read(&path).unwrap(), original);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recovery_detects_claim_change_after_archive_without_removing_replacement() {
+        let (root, token, original) = orphan_fixture();
+        let path = root.join(EDITOR_PRESENCE_FILE);
+        let other = Uuid::new_v4().to_string();
+        let error = recover_confirmed_claim(
+            &root,
+            &token,
+            "Контроль гонки записи",
+            || {
+                fs::remove_file(&path).unwrap();
+                write_editor_presence(&root, &other, &current_editor_owner()).unwrap();
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("изменилась перед освобождением"));
+        assert_eq!(read_editor_state(&root).presence.unwrap().token, other);
+        let archives: Vec<_> = fs::read_dir(&root)
+            .unwrap()
+            .map(Result::unwrap)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".workspace-editor.json.recovery-")
+            })
+            .collect();
+        assert_eq!(archives.len(), 1);
+        assert_eq!(fs::read(archives[0].path()).unwrap(), original);
+        let events = crate::administration::events(&root).unwrap();
+        assert!(events.iter().any(|event| event.action == "recovery-failed"));
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.action == "recovery-completed")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn exactly_one_process_owns_the_editor_lock() {

@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useMemo, useState } from "react";
+import { Fragment, useEffect, useId, useMemo, useState } from "react";
 import { openPath } from "@tauri-apps/plugin-opener";
 import { ConfirmDialog, Dialog } from "../../components/Dialog";
 import { DrawerBackdrop } from "../../components/DrawerBackdrop";
@@ -61,6 +61,7 @@ import {
   type StaffImportMapping,
 } from "./import";
 import { matchStaff, type StaffSelectionCriteria } from "./selection";
+import { staffEmailHint, validateStaffEmail } from "./emailValidation";
 import {
   applyStaffImportOverrides,
   buildStaffImportOverride,
@@ -747,7 +748,7 @@ export function StaffRegistry() {
   };
 
   return (
-    <div className="module-stack">
+    <div className="module-stack registry-module">
       <div className="stats-row registry-stats-compact">
         <div className="stat">
           <span>Людей в реестре</span>
@@ -1855,7 +1856,7 @@ type StaffTab =
   | "files"
   | "notes";
 
-function StaffEditor({
+export function StaffEditor({
   record,
   initialValue,
   importMode = false,
@@ -1877,6 +1878,9 @@ function StaffEditor({
   const [tab, setTab] = useState<StaffTab>("general");
   const [error, setError] = useState("");
   const [history, setHistory] = useState<HistoryEntry[]>([]);
+  const emailHintId = useId();
+  const emailValidation = validateStaffEmail(item.email, record?.payload.email);
+  const emailMessage = emailValidation.error || emailValidation.warning;
   useEffect(() => {
     if (record) void recordHistory("staff", record.id).then(setHistory);
   }, [record]);
@@ -1892,6 +1896,11 @@ function StaffEditor({
     if (!editorAccess.editor) { setError("Режим редактора завершён. Введённые поля сохранены в открытом окне, но запись в общую базу запрещена."); return; }
     if (!item.fullName.trim()) {
       setError("Заполните ФИО.");
+      setTab("general");
+      return;
+    }
+    if (emailValidation.error) {
+      setError(emailValidation.error);
       setTab("general");
       return;
     }
@@ -1950,7 +1959,16 @@ function StaffEditor({
         ["files", "Все файлы"],
         ["notes", "Примечания"],
       ];
-  const requirements = staffRequirements(item);
+  // Preview the same primary-assignment fields that Save will copy, without
+  // rewriting the draft or its legacy fields while the user is still editing.
+  const readinessAssignment = primaryAssignment(item);
+  const requirements = staffRequirements({
+    ...item,
+    role: readinessAssignment.position,
+    basis: readinessAssignment.engagementType,
+    basisOther: readinessAssignment.engagementOther,
+    startDate: readinessAssignment.startDate,
+  });
   const { requestClose, confirmation: discardConfirmation } = useUnsavedChanges(JSON.stringify(item) !== savedSnapshot, async () => {
     await discardStagedAttachments("staff", recordId).catch(() => undefined);
     onClose();
@@ -2123,9 +2141,14 @@ function StaffEditor({
                 Email
                 <input
                   type="email"
+                  aria-label="Email"
+                  aria-invalid={Boolean(emailValidation.error)}
+                  aria-describedby={`${emailHintId}${emailMessage ? ` ${emailHintId}-message` : ""}`}
                   value={item.email}
                   onChange={(event) => update("email", event.target.value)}
                 />
+                <small id={emailHintId} className="help-text">{staffEmailHint}</small>
+                {emailMessage && <small id={`${emailHintId}-message`} className={emailValidation.error ? "field-error" : "notice warning"} role="status">{emailMessage}</small>}
               </label>
             </div>
           </>

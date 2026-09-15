@@ -998,7 +998,7 @@ export function ContractsRegistry() {
   };
 
   return (
-    <div className="module-stack">
+    <div className="module-stack registry-module">
       {readOnly && (
         <div className="notice warning">
           <strong>Режим просмотра</strong>

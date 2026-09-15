@@ -22,7 +22,7 @@ describe("scanner loading controls", () => {
     expect(source).toContain('setLoadedPreviewUrl(event.currentTarget.getAttribute("src") || "")');
     expect(source).toContain('setPreviewing(true); setReadyPreviewKey("")');
     expect(source).toContain('if (!documentReady || activeJob)');
-    expect(source).toContain('inputPath && pageCount > 0 && <fieldset disabled={!documentReady}');
+    expect(source).toContain('inputPath && pageCount > 0 && <ScannerPageControls disabled={!documentReady}');
     expect(source).toContain('documentReady && !showOriginal && annotations.filter');
   });
 });
