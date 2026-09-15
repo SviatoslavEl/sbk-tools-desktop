@@ -192,10 +192,10 @@ install_ready:
   WriteRegDWORD HKCU "${UNINSTALL_KEY}" "NoModify" 1
   WriteRegDWORD HKCU "${UNINSTALL_KEY}" "NoRepair" 1
 
-  Delete "$DESKTOP\${PRODUCT_NAME}.lnk"
   SetShellVarContext current
   WriteRegStr HKCU "${PRODUCT_KEY}" "StartMenuFolder" "СБК Инструменты"
   CreateDirectory "$APPDATA\Microsoft\Windows\Start Menu\Programs\СБК Инструменты"
+  SetOutPath "$INSTDIR"
   CreateShortcut "$APPDATA\Microsoft\Windows\Start Menu\Programs\СБК Инструменты\${PRODUCT_NAME}.lnk" "$INSTDIR\${PRODUCT_EXE}"
   CreateShortcut "$APPDATA\Microsoft\Windows\Start Menu\Programs\СБК Инструменты\Удалить ${PRODUCT_NAME}.lnk" "$INSTDIR\uninstall.exe"
   IfFileExists "$APPDATA\Microsoft\Windows\Start Menu\Programs\СБК Инструменты\${PRODUCT_NAME}.lnk" shortcut_ready 0
@@ -209,13 +209,23 @@ silent_shortcut_failure:
   SetErrorLevel 1
   Quit
 shortcut_ready:
-  ; Remove only the old product's exact shortcut names after the new shortcut exists.
+  ; Preserve an existing desktop shortcut even when silent update skips the optional section.
+  IfFileExists "$DESKTOP\${LEGACY_PRODUCT_NAME}.lnk" update_desktop_shortcut 0
+  IfFileExists "$DESKTOP\${PRODUCT_NAME}.lnk" update_desktop_shortcut legacy_desktop_ready
+update_desktop_shortcut:
+  ClearErrors
+  CreateShortcut "$DESKTOP\${PRODUCT_NAME}.lnk" "$INSTDIR\${PRODUCT_EXE}"
+  IfErrors legacy_desktop_ready
+  IfFileExists "$DESKTOP\${PRODUCT_NAME}.lnk" 0 legacy_desktop_ready
   Delete "$DESKTOP\${LEGACY_PRODUCT_NAME}.lnk"
+legacy_desktop_ready:
+  ; Remove only the old product's exact menu shortcut names after the new shortcut exists.
   Delete "$APPDATA\Microsoft\Windows\Start Menu\Programs\СБК Инструменты\${LEGACY_PRODUCT_NAME}.lnk"
   Delete "$APPDATA\Microsoft\Windows\Start Menu\Programs\СБК Инструменты\Удалить ${LEGACY_PRODUCT_NAME}.lnk"
 SectionEnd
 
 Section /o "Ярлык на рабочем столе" DesktopShortcutSection
+  SetOutPath "$INSTDIR"
   CreateShortcut "$DESKTOP\${PRODUCT_NAME}.lnk" "$INSTDIR\${PRODUCT_EXE}"
 SectionEnd
 
