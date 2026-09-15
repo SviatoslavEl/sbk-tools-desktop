@@ -139,12 +139,22 @@ def main() -> None:
             raise SystemExit(f"Installed NSIS contract is missing: {required}")
     shortcut_migration = nsis_template.split("shortcut_ready:\n", maxsplit=1)[-1].split("SectionEnd", maxsplit=1)[0]
     for required in (
+        'IfFileExists "$DESKTOP\\${LEGACY_PRODUCT_NAME}.lnk" update_desktop_shortcut 0',
+        'IfFileExists "$DESKTOP\\${PRODUCT_NAME}.lnk" update_desktop_shortcut legacy_desktop_ready',
+        'CreateShortcut "$DESKTOP\\${PRODUCT_NAME}.lnk" "$INSTDIR\\${PRODUCT_EXE}"',
+        'IfErrors legacy_desktop_ready',
         'Delete "$DESKTOP\\${LEGACY_PRODUCT_NAME}.lnk"',
         'Delete "$APPDATA\\Microsoft\\Windows\\Start Menu\\Programs\\СБК Инструменты\\${LEGACY_PRODUCT_NAME}.lnk"',
         'Delete "$APPDATA\\Microsoft\\Windows\\Start Menu\\Programs\\СБК Инструменты\\Удалить ${LEGACY_PRODUCT_NAME}.lnk"',
     ):
         if required not in shortcut_migration:
             raise SystemExit("Installed update must retire its old display-name shortcuts after creating the new one")
+    install_sections = nsis_template.split('Section "Uninstall"', maxsplit=1)[0]
+    if 'Delete "$DESKTOP\\${PRODUCT_NAME}.lnk"' in install_sections:
+        raise SystemExit("Installed update must not remove an existing plain-name desktop shortcut")
+    shortcut_setup = install_sections.split('SetShellVarContext current', maxsplit=1)[-1]
+    if shortcut_setup.index('SetOutPath "$INSTDIR"') > shortcut_setup.index('CreateShortcut '):
+        raise SystemExit("Installed shortcuts must use the installation directory as their working directory")
     uninstall_section = nsis_template.split('Section "Uninstall"', maxsplit=1)[-1]
     for required in (
         'Rename "$INSTDIR\\ProductData" $0',
@@ -194,6 +204,14 @@ def main() -> None:
         "Installer metadata still exposes the fast-start suffix",
         "Update left the obsolete shortcut",
         "Shortcut no longer targets the update-compatible executable",
+        "((IPersistFile)instance).Load(shortcutPath, 0)",
+        "link.GetPath(target, target.Capacity, IntPtr.Zero, SLGP_RAWPATH)",
+        "Assert-True ($actualTarget -eq $expectedTarget)",
+        "Assert-True (Test-Path -LiteralPath $actualTarget -PathType Leaf)",
+        "Assert-True ($actualWorkingDirectory -eq $Destination)",
+        "Fresh silent installation ignored the desktop shortcut opt-out",
+        "display-name-second-update",
+        "Assert-ShortcutTarget $newDesktop $destination",
     ):
         if required not in installer_regressions:
             raise SystemExit(f"Installed display-name regression is missing: {required}")
