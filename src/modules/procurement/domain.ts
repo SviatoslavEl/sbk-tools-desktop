@@ -1,6 +1,7 @@
 import type { CashFlowEvent, ContractRisk, GoNoGoCriterion, ProcurementData, ProcurementDocumentVersion, ProcurementRequirement, ResourceAllocation } from "./types";
 import type { ContractData } from "../contracts/types";
 import type { StaffData } from "../staff/types";
+import { calendarDaysUntil, submissionPending } from "./deadlines";
 
 export type RebidPreset = "comfort" | "working-minimum" | "any-price";
 export interface RebidStep { number: number; price: number; reduction: number; profit: number; margin: number; headroom: number; loss: boolean; }
@@ -131,15 +132,13 @@ export function procurementWarnings(item: ProcurementData, now = new Date()) {
       warnings.push(`Ставка НДС сценария «${scenario.name || "Без названия"}» должна быть от 0 до 100%.`);
     }
   }
-  const due = item.submissionDeadline ? new Date(`${item.submissionDeadline}T23:59:59`) : null;
-  if (due && due < now && !["Подана", "Победа", "Проигрыш", "Отменена"].includes(item.status)) warnings.push("Срок подачи истёк, но закупка не отмечена как поданная или завершённая.");
+  const due = calendarDaysUntil(item.submissionDeadline, now);
+  if (due != null && due < 0 && submissionPending(item)) warnings.push("Срок подачи истёк, но закупка не отмечена как поданная или завершённая.");
   return warnings;
 }
 
 export function daysUntil(value: string, now = new Date()) {
-  if (!value) return null;
-  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
-  return Math.ceil((new Date(`${value}T23:59:59`).getTime() - today) / 86_400_000);
+  return calendarDaysUntil(value, now);
 }
 
 const significantWords = (text: string) => new Set((text.toLowerCase().match(/[\p{L}\p{N}]+/gu) || []).filter((word) => word.length >= 4));

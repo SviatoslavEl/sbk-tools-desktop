@@ -30,8 +30,8 @@ function declarations(selector: string, container?: string) {
 describe("calculator layout on small desktop windows", () => {
   it("keeps all expert sections and actions present in the responsive container", () => {
     const html = renderToStaticMarkup(<Calculator />);
-    expect(html).toContain('class="module-stack calculator-module calculator-expert"');
-    for (const text of ["Основные параметры", "Дополнительные расходы", "Условия сделки, агент и соисполнители", "Конкуренты и пороги", "Результат", "Сохранить расчёт", "Дублировать", "Цена и прибыль"]) {
+    expect(html).toContain('class="module-stack calculator-module calculator-session calculator-expert"');
+    for (const text of ["Основные параметры", "Дополнительные расходы", "Условия сделки, агент и соисполнители", "Конкуренты и пороги", "Результат", "Сохранить в базу", "Новый", "Импорт", "Экспорт", "Цена и прибыль"]) {
       expect(html).toContain(text);
     }
     expect(html).not.toMatch(/class="(?:input-column|result-column)" hidden/);

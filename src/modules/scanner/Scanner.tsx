@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { ConfirmDialog, Dialog } from "../../components/Dialog";
+import { Dialog } from "../../components/Dialog";
 import { droppedDocumentPaths } from "./fileDrop";
 import { facsimileWidthFromMm, imageDimensions, suggestedFacsimileWidthMm } from "./facsimileSize";
 import { useEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent, type PointerEvent } from "react";
@@ -36,6 +36,7 @@ import { ScannerPageControls } from "./ScannerPageControls";
 import { ScannerPreparationStatus } from "./ScannerPreparationStatus";
 import { AnnotationColorPicker } from "./AnnotationColorPicker";
 import { PreviewDebounce } from "./previewDebounce";
+import { ScannerEditHistory, scannerSettingsKey, SCANNER_DRAFT_KEY, encodeScannerDraft, decodeScannerDraft, validScannerDraftSettings, plannedBatchNames, scannerRetryLabel, type ScannerLocalDraft, type ScannerRetryOperation } from "./scannerEditHistory";
 import { annotationColor, DEFAULT_ANNOTATION_COLORS, isColoredAnnotationKind, updateAnnotationColor } from "./annotationColors";
 import { ScannerSizeSummary, positiveFileBytes, totalScannerOutputBytes, type ScannerResultSize } from "./ScannerSizeSummary";
 import { belongsToScannerResult, useScannerOperationUi, type ScannerProgress, type ScannerWorkspaceMode } from "./scannerOperationState";
@@ -83,6 +84,15 @@ type DragState =
   | { target: "draw"; tool: DrawingTool; id: string; start: { x: number; y: number } };
 
 type OutputSaveMode = OutputPageMode | "blocks";
+interface ScannerEditSnapshot {
+  preset: string; pageOrder: number[]; pageRotations: Record<number, number>;
+  outputPageMode: OutputSaveMode; outputPageRange: string; outputBlocks: OutputBlockDefinition[];
+  facsimile: FacsimileState | null; savedFacsimiles: FacsimileState[]; editingFacsimileId: string;
+  activeFacsimilePage: number | null;
+  redactions: RedactionState[]; annotations: AnnotationState[];
+  dpi: number; quality: number; compressionMode: CompressionMode; ocrEnabled: boolean; ocrLanguages: string; pdfaEnabled: boolean;
+}
+interface BatchOutcome { inputPath: string; outputPath: string; status: "planned" | "working" | "done" | "error"; error?: string }
 
 const drawingToolLabels: Record<AnnotationState["kind"], string> = {
   marker: "Маркер",
@@ -175,6 +185,15 @@ export function Scanner({ active = true }: { active?: boolean }) {
   const [fullscreen, setFullscreen] = useState(false);
   const previewPanel = usePreviewPanelHeight(active, fullscreen);
   const [batchPaths, setBatchPaths] = useState<string[]>([]);
+  const [batchPlan, setBatchPlan] = useState<BatchOutcome[]>([]);
+  const [splitOutcomes, setSplitOutcomes] = useState<BatchOutcome[]>([]);
+  const [batchDirectory, setBatchDirectory] = useState("");
+  const [batchPlanning, setBatchPlanning] = useState(false);
+  const batchCancelled = useRef(false);
+  const [retryOperation, setRetryOperation] = useState<ScannerRetryOperation>("preview");
+  const [finalPreview, setFinalPreview] = useState<{ url: string; key: string; page: number } | null>(null);
+  const [finalPreviewing, setFinalPreviewing] = useState(false);
+  const finalPreviewJob = useRef("");
   const [mergePaths, setMergePaths] = useState<string[]>([]);
   const [mergePageOrder, setMergePageOrder] = useState<MergePageItem[]>([]);
   const [mergeInspecting, setMergeInspecting] = useState(false);
@@ -222,8 +241,46 @@ export function Scanner({ active = true }: { active?: boolean }) {
   const currentPreviewKey = `${inputPath}\n${pageIndex}\n${pageRotations[pageIndex] || 0}\n${preset}\n${dpi}\n${quality}\n${compressionMode}`;
   const displayedPreviewUrl = showOriginal && originalUrl ? originalUrl : previewUrl;
   const documentReady = !!inputPath && pageCount > 0 && !!previewUrl && !previewing
-    && readyPreviewKey === currentPreviewKey && loadedPreviewUrl === displayedPreviewUrl;
+    && readyPreviewKey === currentPreviewKey && loadedPreviewUrl === displayedPreviewUrl && !activeJob && !finalPreviewing;
   const dragState = useRef<DragState | null>(null);
+  const activeFacsimilePage = facsimile?.applyTo === "current" && !facsimile.lockedSelection ? pageIndex : null;
+  const editSnapshot = useMemo<ScannerEditSnapshot>(() => ({ preset, pageOrder, pageRotations, outputPageMode, outputPageRange, outputBlocks, facsimile, savedFacsimiles, editingFacsimileId, activeFacsimilePage, redactions, annotations, dpi, quality, compressionMode, ocrEnabled, ocrLanguages, pdfaEnabled }), [preset, pageOrder, pageRotations, outputPageMode, outputPageRange, outputBlocks, facsimile, savedFacsimiles, editingFacsimileId, activeFacsimilePage, redactions, annotations, dpi, quality, compressionMode, ocrEnabled, ocrLanguages, pdfaEnabled]);
+  const editHistory = useRef(new ScannerEditHistory<ScannerEditSnapshot>());
+  const historyDocument = useRef("");
+  const [, refreshHistory] = useState(0);
+  const dirty = !!inputPath && historyDocument.current === inputPath && editHistory.current.dirty(editSnapshot);
+  const [draftEnabled, setDraftEnabled] = useState(false);
+  const [draftNotice, setDraftNotice] = useState("");
+  const [recoverableDraft, setRecoverableDraft] = useState<ScannerLocalDraft<ScannerEditSnapshot> | null>(() => {
+    try { return typeof sessionStorage === "undefined" ? null : decodeScannerDraft(sessionStorage.getItem(SCANNER_DRAFT_KEY)); } catch { return null; }
+  });
+  useEffect(() => {
+    if (!inputPath || !pageCount) return;
+    if (historyDocument.current !== inputPath) {
+      historyDocument.current = inputPath; editHistory.current.reset(editSnapshot); refreshHistory((value) => value + 1); return;
+    }
+    const timer = window.setTimeout(() => { if (!dragState.current) { editHistory.current.record(editSnapshot); refreshHistory((value) => value + 1); } }, 350);
+    return () => window.clearTimeout(timer);
+  }, [editSnapshot, inputPath, pageCount]);
+  useEffect(() => {
+    if (!dirty) return;
+    const protect = (event: BeforeUnloadEvent) => { event.preventDefault(); event.returnValue = ""; };
+    window.addEventListener("beforeunload", protect);
+    return () => window.removeEventListener("beforeunload", protect);
+  }, [dirty]);
+  useEffect(() => {
+    if (!draftEnabled || !inputPath || !pageCount) return;
+    let cancelled = false;
+    const timer = window.setTimeout(() => { void (async () => {
+      if (!await previewSession.current!.verifySource()) throw new Error("Исходный документ изменился, черновик не обновлён.");
+      return invoke<string>("scanner_source_revision", { path: inputPath });
+    })().then((revision) => {
+      if (cancelled) return;
+      sessionStorage.setItem(SCANNER_DRAFT_KEY, encodeScannerDraft({ version: 1, inputPath, revision, savedAt: Date.now(), settings: editSnapshot }));
+      setDraftNotice("Черновик настроек сохранён в этом окне на 24 часа. Файлы и изображения не копируются.");
+    }).catch((reason) => { if (!cancelled) setDraftNotice(`Черновик не сохранён: ${String(reason)}`); }); }, 600);
+    return () => { cancelled = true; window.clearTimeout(timer); };
+  }, [draftEnabled, inputPath, pageCount, editSnapshot]);
   const viewport = usePreviewViewport({ active: active && workspaceMode === "document", documentKey: inputPath, aspect: previewAspect, drawing: !!drawingTool, isEditingPage: () => !!dragState.current });
   const { pageElement, stageElement, zoom: previewZoom } = viewport;
   const latestPreviewJob = useRef("");
@@ -313,20 +370,20 @@ export function Scanner({ active = true }: { active?: boolean }) {
     setWarnings(result.warnings, "document");
   };
 
-  const makePreview = async (path = inputPath, selectedPreset = preset, selectedPage = pageIndex, rotations = pageRotations) => {
+  const makePreview = async (path = inputPath, selectedPreset = preset, selectedPage = pageIndex, rotations = pageRotations, restored?: ScannerEditSnapshot) => {
     previewDebounce.current!.cancel();
-    if (!path) return;
+    if (!path) return null;
     const settings = {
       inputPath: path,
       preset: selectedPreset,
       pageIndex: selectedPage,
-      dpi,
-      quality,
+      dpi: restored?.dpi ?? dpi,
+      quality: restored?.quality ?? quality,
       pageRotations: rotations,
-      compressionMode,
-      compressionTargetRatio,
+      compressionMode: restored?.compressionMode ?? compressionMode,
+      compressionTargetRatio: restored ? compressionProfile(restored.compressionMode).targetRatio : compressionTargetRatio,
     };
-    const readyKey = `${path}\n${selectedPage}\n${rotations[selectedPage] || 0}\n${selectedPreset}\n${dpi}\n${quality}\n${compressionMode}`;
+    const readyKey = restored ? `${path}\n${selectedPage}\n${rotations[selectedPage] || 0}\n${selectedPreset}\n${restored.dpi}\n${restored.quality}\n${restored.compressionMode}` : `${path}\n${selectedPage}\n${rotations[selectedPage] || 0}\n${selectedPreset}\n${dpi}\n${quality}\n${compressionMode}`;
     if (!previewSession.current!.isCached(settings)) { setPreviewing(true); setReadyPreviewKey(""); }
     setError("", "document");
     dragState.current = null;
@@ -334,11 +391,60 @@ export function Scanner({ active = true }: { active?: boolean }) {
     latestPreviewJob.current = jobId;
     try {
       const result = await previewSession.current!.request(settings, jobId);
-      if (!result || latestPreviewJob.current !== jobId) return;
+      if (!result || latestPreviewJob.current !== jobId) return null;
       applyPreview(result);
       setReadyPreviewKey(readyKey);
-    } catch (reason) { if (latestPreviewJob.current === jobId) setError(String(reason), "document"); }
+      return result;
+    } catch (reason) { if (latestPreviewJob.current === jobId) { setRetryOperation("preview"); setError(String(reason), "document"); } return null; }
     finally { if (latestPreviewJob.current === jobId) setPreviewing(false); }
+  };
+
+  const restoreEdits = (snapshot: ScannerEditSnapshot, path = inputPath) => {
+    setPreset(snapshot.preset); setPageOrder(snapshot.pageOrder); setPageRotations(snapshot.pageRotations);
+    setOutputPageMode(snapshot.outputPageMode); setOutputPageRange(snapshot.outputPageRange); setOutputBlocks(snapshot.outputBlocks);
+    setFacsimile(snapshot.facsimile); setSavedFacsimiles(snapshot.savedFacsimiles); setEditingFacsimileId(snapshot.editingFacsimileId);
+    setRedactions(snapshot.redactions); setAnnotations(snapshot.annotations); setDpi(snapshot.dpi); setQuality(snapshot.quality);
+    setCompressionMode(snapshot.compressionMode); setOcrEnabled(snapshot.ocrEnabled); setOcrLanguages(snapshot.ocrLanguages); setPdfaEnabled(snapshot.pdfaEnabled);
+    setSelectedOverlay(null); setDrawingTool(null); setFinalPreview(null);
+    const candidate = snapshot.activeFacsimilePage ?? pageIndex;
+    const selected = snapshot.pageOrder.includes(candidate) ? candidate : snapshot.pageOrder[0] ?? 0;
+    setPageIndex(selected); void makePreview(path, snapshot.preset, selected, snapshot.pageRotations, snapshot);
+  };
+  const undoEdits = (redo = false) => {
+    if (activeJobRef.current || previewing) return;
+    const snapshot = editHistory.current.navigate(editSnapshot, redo);
+    if (snapshot) restoreEdits(snapshot);
+    refreshHistory((value) => value + 1);
+  };
+  const discardDraft = () => { try { sessionStorage.removeItem(SCANNER_DRAFT_KEY); } catch { /* no persistent storage available */ } setRecoverableDraft(null); setDraftEnabled(false); setDraftNotice(""); };
+  const recoverDraft = async () => {
+    if (!recoverableDraft || activeJobRef.current) return;
+    try {
+      const draft = recoverableDraft;
+      if (!validScannerDraftSettings(draft.settings)) throw new Error("Черновик повреждён или несовместим. Документ не заменён; удалите черновик и откройте файл заново.");
+      if (await invoke<string>("scanner_source_revision", { path: draft.inputPath }) !== draft.revision) throw new Error("Исходный документ изменён. Настройки не применены — откройте документ заново.");
+      const images = new Map<string, string>(); let imageBytes = 0;
+      const loadFacsimile = async (item: FacsimileState) => {
+        let imageUrl = images.get(item.imagePath);
+        if (!imageUrl) {
+          imageUrl = await invoke<string>("read_binary_file", { path: item.imagePath, maxBytes: 12 * 1024 * 1024 });
+          imageBytes += imageUrl.length * 2;
+          if (imageBytes > 48 * 1024 * 1024) throw new Error("Факсимиле черновика превышают предел памяти 48 МБ. Откройте документ и добавьте нужные изображения заново.");
+          images.set(item.imagePath, imageUrl);
+        }
+        return { ...item, imageUrl };
+      };
+      const restoredFacsimiles: FacsimileState[] = [];
+      for (const item of draft.settings.savedFacsimiles) restoredFacsimiles.push(await loadFacsimile(item));
+      const snapshot = { ...draft.settings, facsimile: draft.settings.facsimile ? await loadFacsimile(draft.settings.facsimile) : null, savedFacsimiles: restoredFacsimiles };
+      const loaded = await openDocumentPath(draft.inputPath, true);
+      if (!loaded) { setDraftNotice("Не удалось загрузить документ. Черновик сохранён; исправьте ошибку и повторите восстановление."); return; }
+      historyDocument.current = draft.inputPath;
+      // Baseline remains the freshly opened original; restoration is undoable.
+      editHistory.current.reset({ ...editSnapshot, pageOrder: Array.from({ length: loaded.pageCount }, (_, index) => index), pageRotations: {}, outputPageMode: "all", outputPageRange: "", outputBlocks: [], facsimile: null, savedFacsimiles: [], editingFacsimileId: "", activeFacsimilePage: null, redactions: [], annotations: [] });
+      editHistory.current.record(snapshot); restoreEdits(snapshot, draft.inputPath);
+      setRecoverableDraft(null); setDraftEnabled(true); setDraftNotice("Черновик восстановлен. Проверьте итоговый просмотр перед сохранением.");
+    } catch (reason) { setDraftNotice(String(reason)); }
   };
 
   useEffect(() => {
@@ -365,28 +471,39 @@ export function Scanner({ active = true }: { active?: boolean }) {
     if (!path) return;
     await openDocumentPath(path);
   };
-  const openDocumentPath = async (path: string) => {
+  const openDocumentPath = async (path: string, preserveRecoveryDraft = false) => {
     if (activeJobRef.current || mergeInspecting) { setError("Дождитесь завершения текущей обработки, затем замените файл."); return; }
+    if (dirty && !window.confirm("В документе есть несохранённые изменения. Открыть другой файл и сбросить их? Исходный файл не изменится.")) return false;
+    historyDocument.current = ""; setFinalPreview(null);
+    if (!preserveRecoveryDraft) discardDraft(); else setDraftEnabled(false);
+    if (finalPreviewJob.current) void invoke("scanner_cancel", { jobId: finalPreviewJob.current }).catch(() => undefined);
+    finalPreviewJob.current = ""; setFinalPreviewing(false);
     previewDebounce.current!.cancel();
     setWorkspaceMode("document");
     previewSession.current!.clear();
     setPreparation({ state: "idle", prepared: 0, total: 0 });
     setPageCount(0); setPreviewUrl(""); setOriginalUrl(""); setLoadedPreviewUrl(""); setReadyPreviewKey(""); setPageSizeMm(null); setDrawingTool(null);
     setInputPath(path); setDocumentName(path.split(/[\\/]/).pop() || path); setPageIndex(0); setPageOrder([]); setOutputPageMode("all"); setOutputPageRange(""); setOutputBlocks([]); setPageRotations({}); setResultPath("", "document"); setResultKind("", "document"); setProgress(null, "document"); setWarnings([], "document"); setFacsimile(null); setSavedFacsimiles([]); setEditingFacsimileId(""); setRedactions([]); setAnnotations([]); setSelectedOverlay(null); setOriginalBytes(0); setEstimatedOutputBytes(0); setSavedResultSize(null); setOcrConfidence(null); setOcrText(""); setLowConfidenceWords([]); viewport.resetView();
-    await makePreview(path, preset, 0, {});
+    return await makePreview(path, preset, 0, {});
   };
   const clearDocument = () => {
     if (activeJobRef.current || mergeInspecting) return;
+    if (dirty && !window.confirm("Сбросить несохранённые изменения документа? Исходный файл не изменится.")) return;
+    historyDocument.current = ""; setFinalPreview(null); discardDraft();
+    if (finalPreviewJob.current) void invoke("scanner_cancel", { jobId: finalPreviewJob.current }).catch(() => undefined);
+    finalPreviewJob.current = ""; setFinalPreviewing(false);
     previewDebounce.current!.cancel();
     latestPreviewJob.current = "";
     previewSession.current!.clear();
     setInputPath(""); setDocumentName(""); setPreviewUrl(""); setOriginalUrl(""); setLoadedPreviewUrl(""); setReadyPreviewKey(""); setPreviewing(false); setPageCount(0); setPageOrder([]);
     setResultPath(""); setResultKind(""); setWarnings([]); setProgress(null); setFacsimile(null); setSavedFacsimiles([]); setEditingFacsimileId("");
+    setAnnotations([]); setRedactions([]); setSplitOutcomes([]);
+    editHistory.current.reset({ ...editSnapshot, pageOrder: [], facsimile: null, savedFacsimiles: [], editingFacsimileId: "", activeFacsimilePage: null, annotations: [], redactions: [] });
     setPreparation({ state: "idle", prepared: 0, total: 0 });
   };
   const chooseBatch = async () => {
     const paths = await chooseOpenPaths("Выберите PDF и DOCX для пакета", ["pdf", "docx"]);
-    if (paths.length) { setWorkspaceMode("document"); setBatchPaths(paths); setError("", "document"); setResultPath("", "document"); setResultKind("", "document"); setProgress(null, "document"); }
+    if (paths.length) { setWorkspaceMode("document"); setBatchPaths(paths); setBatchPlan([]); setError("", "document"); setResultPath("", "document"); setResultKind("", "document"); setProgress(null, "document"); }
   };
   const previewMergePage = async (page: MergePageItem) => {
     if (latestMergePreviewJob.current) void invoke("scanner_cancel", { jobId: latestMergePreviewJob.current }).catch(() => undefined);
@@ -482,21 +599,40 @@ export function Scanner({ active = true }: { active?: boolean }) {
     return next;
   });
 
+  const prepareBatch = async () => {
+    if (!batchPaths.length || activeJobRef.current || batchPlanning) return;
+    setBatchPlanning(true);
+    try {
+      const directory = await chooseDirectory("Выберите папку для обработанных PDF"); if (!directory) return;
+      const paths = await invoke<string[]>("scanner_plan_outputs", { directory, names: plannedBatchNames(batchPaths) });
+      setBatchDirectory(directory); setBatchPlan(batchPaths.map((inputPath, index) => ({ inputPath, outputPath: paths[index], status: "planned" })));
+      setError("", "document");
+    } catch (reason) { setRetryOperation("batch"); setError(String(reason), "document"); }
+    finally { setBatchPlanning(false); }
+  };
   const processBatch = async () => {
-    if (!batchPaths.length) return;
-    const directory = await chooseDirectory("Выберите папку для обработанных PDF"); if (!directory) return;
-    setWorkspaceMode("document");
-    const separator = directory.includes("\\") ? "\\" : "/"; const startedAt = Date.now(); setError("", "document"); setWarnings([], "document"); setResultPath("", "document"); setResultKind("", "document");
-    for (const [index, path] of batchPaths.entries()) {
-      const jobId = crypto.randomUUID(); setActiveJob(jobId); activeJobRef.current = jobId; activeJobModeRef.current = "document";
-      setProgress({ stage: `Файл ${index + 1} из ${batchPaths.length}`, currentPage: 0, totalPages: 0, percent: Math.round(index / batchPaths.length * 100) }, "document");
-      const name = (path.split(/[\\/]/).pop() || `документ-${index + 1}`).replace(/\.(pdf|docx)$/i, "");
-      const outputPath = `${directory}${separator}${name} — обработано.pdf`;
-      try { await invoke("scanner_run", { jobId, operation: "process", config: { protocolVersion: 2, inputPath: path, outputPath, preset, ocrEnabled, ocrLanguages, pdfaEnabled, seed: 42, settings: { dpi, jpeg_quality: quality }, compressionTargetRatio, pageOrder: [], redactions: [], annotations: [] } }); }
-      catch (reason) { setError(`Файл ${index + 1}: ${String(reason)}`, "document"); setProgress(null, "document"); await templates.save(`Пакет: ошибка ${new Date().toLocaleString("ru-RU")}`, { kind: "processing-journal", inputType: path.toLowerCase().endsWith(".docx") ? "DOCX" : "PDF", preset, ocr: ocrEnabled, status: "failed", durationMs: Date.now() - startedAt }).catch(() => undefined); setActiveJob(""); activeJobRef.current = ""; return; }
-    }
-    setActiveJob(""); activeJobRef.current = ""; setProgress({ stage: "Пакет готов", currentPage: batchPaths.length, totalPages: batchPaths.length, percent: 100 }, "document");
-    setResultPath(directory, "document"); setResultKind("batch", "document"); if (workspaceAccess.editor) await templates.save(`Пакет ${new Date().toLocaleString("ru-RU")}`, { kind: "processing-journal", inputType: "BATCH", pageCount: batchPaths.length, preset, ocr: ocrEnabled, status: "completed", durationMs: Date.now() - startedAt }).catch(() => undefined);
+    if (!batchPlan.length || activeJobRef.current) return;
+    setWorkspaceMode("document"); batchCancelled.current = false; setRetryOperation("batch");
+    const startedAt = Date.now(); setError("", "document"); setWarnings([], "document"); setResultPath("", "document"); setResultKind("", "document");
+    const outcomes = batchPlan.map((entry) => ({ ...entry }));
+    try {
+      for (const [index, entry] of outcomes.entries()) {
+        if (entry.status === "done" || batchCancelled.current) continue;
+        const jobId = crypto.randomUUID(); setActiveJob(jobId); activeJobRef.current = jobId; activeJobModeRef.current = "document";
+        entry.status = "working"; entry.error = undefined; setBatchPlan(outcomes.map((item) => ({ ...item })));
+        setProgress({ stage: `Файл ${index + 1} из ${outcomes.length}`, currentPage: 0, totalPages: 0, percent: Math.round(index / outcomes.length * 100) }, "document");
+        try {
+          await invoke("scanner_run", { jobId, operation: "process", config: { protocolVersion: 2, inputPath: entry.inputPath, outputPath: entry.outputPath, outputPolicy: "no-clobber", preset, ocrEnabled, ocrLanguages, pdfaEnabled, seed: 42, settings: { dpi, jpeg_quality: quality }, compressionTargetRatio, pageOrder: [], redactions: [], annotations: [] } });
+          entry.status = "done";
+        } catch (reason) { entry.status = "error"; entry.error = String(reason); }
+        setBatchPlan(outcomes.map((item) => ({ ...item })));
+      }
+      const complete = outcomes.filter((entry) => entry.status === "done").length;
+      setProgress({ stage: complete === outcomes.length ? "Пакет готов" : `Готово ${complete} из ${outcomes.length}. Проверьте список файлов.`, currentPage: complete, totalPages: outcomes.length, percent: Math.round(complete / outcomes.length * 100) }, "document");
+      if (complete) { setResultPath(batchDirectory, "document"); setResultKind("batch", "document"); }
+      if (complete !== outcomes.length) setError("Некоторые файлы не сохранены. Готовые результаты не изменены; повтор обрабатывает только неготовые строки.", "document");
+      if (workspaceAccess.editor) await templates.save(`Пакет ${new Date().toLocaleString("ru-RU")}`, { kind: "processing-journal", inputType: "BATCH", pageCount: complete, preset, ocr: ocrEnabled, status: complete === outcomes.length ? "completed" : "partial", durationMs: Date.now() - startedAt }).catch(() => undefined);
+    } finally { setActiveJob(""); activeJobRef.current = ""; }
   };
 
   const processMerge = async () => {
@@ -658,9 +794,39 @@ export function Scanner({ active = true }: { active?: boolean }) {
     }));
   };
 
+  const makeFinalPreview = async () => {
+    if (!documentReady || activeJobRef.current || finalPreviewing) return;
+    const sourceSession = previewSession.current!;
+    if (facsimile && !facsimileSelection.selection) { setError(facsimileSelection.error); return; }
+    const key = scannerSettingsKey(editSnapshot);
+    const jobId = crypto.randomUUID(); finalPreviewJob.current = jobId;
+    setFinalPreviewing(true); setRetryOperation("final-preview"); setError(""); sourceSession.pause();
+    try {
+      if (!await sourceSession.verifySource()) return;
+      const order = outputPageMode === "blocks" ? outputBlockSelection.blocks.find((block) => block.order.includes(pageIndex))?.order : outputPageSelection.order;
+      if (!order?.includes(pageIndex)) throw new Error("Эта страница не включена в результат. Выберите страницу итогового PDF.");
+      const placements = savedFacsimiles.filter((entry) => entry.id !== editingFacsimileId).flatMap((entry) => buildFacsimilePlacements(entry, entry.lockedSelection || { application: "current", pages: [pageIndex] }, pageCount));
+      if (facsimile && facsimileSelection.selection) placements.push(...buildFacsimilePlacements(facsimile, facsimileSelection.selection, pageCount));
+      const response = await invoke<{ outputPath: string; originalPath?: string }>("scanner_run", { jobId, operation: "preview", config: {
+        protocolVersion: 2, finalPreview: true, expectedSourceFingerprint: sourceSession.sourceFingerprint, inputPath, preset, pageIndex, seed: 42,
+        settings: { dpi, jpeg_quality: quality }, compressionTargetRatio, pageOrder: order, pageRotations, facsimiles: placements,
+        redactions: redactions.map((entry) => ({ ...entry, pages: [entry.page] })), annotations: annotations.map((entry) => ({ ...entry, pages: [entry.page], color: annotationColor(entry.kind, entry.color) })),
+      } });
+      try {
+        const url = await invoke<string>("read_binary_file", { path: response.outputPath, maxBytes: 24 * 1024 * 1024 });
+        if (finalPreviewJob.current === jobId && await sourceSession.verifySource()) setFinalPreview({ url, key, page: pageIndex });
+      } finally {
+        void invoke("delete_runtime_file", { path: response.outputPath }).catch(() => undefined);
+        if (response.originalPath) void invoke("delete_runtime_file", { path: response.originalPath }).catch(() => undefined);
+      }
+    } catch (reason) { if (finalPreviewJob.current === jobId) setError(String(reason)); }
+    finally { if (finalPreviewJob.current === jobId) setFinalPreviewing(false); }
+  };
+
   const processDocument = async () => {
     if (!documentReady || activeJob) { setError("Дождитесь загрузки актуального предпросмотра документа."); return; }
     if (!inputPath) return;
+    setRetryOperation("save");
     const sourceSession = previewSession.current!;
     const sourceGeneration = sourceSession.sourceGeneration;
     const expectedSourceFingerprint = sourceSession.sourceFingerprint;
@@ -691,25 +857,33 @@ export function Scanner({ active = true }: { active?: boolean }) {
     const processingConfig = (selectedOutputPath: string, selectedPageOrder: number[]) => ({ protocolVersion: 2, expectedSourceFingerprint, inputPath, outputPath: selectedOutputPath, preset, ocrEnabled, ocrLanguages, pdfaEnabled, seed: 42, settings: { dpi, jpeg_quality: quality }, compressionTargetRatio, facsimiles: [...savedWorkerFacsimiles, ...workerFacsimiles], pageOrder: selectedPageOrder, pageRotations, redactions: redactions.map((entry) => ({ pages: [entry.page], x: entry.x, y: entry.y, width: entry.width, height: entry.height, color: entry.color })), annotations: annotations.map((entry) => ({ kind: entry.kind, pages: [entry.page], x: entry.x, y: entry.y, width: entry.width, height: entry.height, color: annotationColor(entry.kind, entry.color), intensity: entry.intensity, shape: entry.shape })) });
 
     if (outputPageMode === "blocks" && outputDirectory) {
-      const separator = outputDirectory.includes("\\") ? "\\" : "/";
       const totalPages = outputBlockSelection.blocks.reduce((sum, block) => sum + block.order.length, 0);
       const startedAt = Date.now(); let completedPages = 0; const outputFileBytes: Array<number | undefined> = []; const combinedWarnings = new Set<string>();
       setError(""); setResultPath(""); setResultKind(""); setWarnings([]);
       try {
+        const plannedPaths = await invoke<string[]>("scanner_plan_outputs", { directory: outputDirectory, names: outputBlockSelection.blocks.map((block) => `${base} — ${block.fileName}.pdf`) });
+        if (!saveStillCurrent()) return;
+        if (!window.confirm(`Создать ${plannedPaths.length} новых PDF без замены существующих?\n${plannedPaths.slice(0, 20).map((path) => path.split(/[\\/]/).pop()).join("\n")}${plannedPaths.length > 20 ? "\n…" : ""}`)) return;
+        const outcomes: BatchOutcome[] = plannedPaths.map((path) => ({ inputPath, outputPath: path, status: "planned" }));
+        setSplitOutcomes(outcomes);
         for (const [index, block] of outputBlockSelection.blocks.entries()) {
-          const blockOutputPath = `${outputDirectory}${separator}${base} — ${block.fileName}.pdf`;
+          const blockOutputPath = plannedPaths[index];
           const jobId = crypto.randomUUID(); setActiveJob(jobId); activeJobRef.current = jobId; activeJobModeRef.current = "document";
           setProgress({ stage: `Блок ${index + 1} из ${outputBlockSelection.blocks.length}: ${block.name}`, currentPage: completedPages, totalPages, percent: Math.round(completedPages / totalPages * 100) });
           try {
-            const response = await invoke<{ outputPath: string; warnings?: string[]; outputBytes?: number }>("scanner_run", { jobId, operation: "process", config: processingConfig(blockOutputPath, block.order) });
+            outcomes[index].status = "working"; setSplitOutcomes(outcomes.map((entry) => ({ ...entry })));
+            const response = await invoke<{ outputPath: string; warnings?: string[]; outputBytes?: number }>("scanner_run", { jobId, operation: "process", config: { ...processingConfig(blockOutputPath, block.order), outputPolicy: "no-clobber" } });
             response.warnings?.forEach((warning) => combinedWarnings.add(warning));
             outputFileBytes.push(response.outputBytes);
+            outcomes[index].status = "done"; setSplitOutcomes(outcomes.map((entry) => ({ ...entry })));
           } catch (reason) {
+            outcomes[index].status = "error"; outcomes[index].error = String(reason); setSplitOutcomes(outcomes.map((entry) => ({ ...entry })));
             throw new Error(`Блок «${block.name}»: ${String(reason)}`);
           }
           completedPages += block.order.length;
         }
         setResultPath(outputDirectory); setResultKind("split"); setWarnings([...combinedWarnings]);
+        editHistory.current.markSaved(editSnapshot); refreshHistory((value) => value + 1);
         setSavedResultSize({ inputPath, resultPath: outputDirectory, kind: "split", originalBytes, outputBytes: totalScannerOutputBytes(outputFileBytes), fileCount: outputFileBytes.length });
         setProgress({ stage: "Все блоки готовы", currentPage: totalPages, totalPages, percent: 100 });
         if (workspaceAccess.editor) await templates.save(`Разделение ${new Date().toLocaleString("ru-RU")}`, { kind: "processing-journal", inputType: inputPath.toLowerCase().endsWith(".docx") ? "DOCX" : "PDF", pageCount: totalPages, preset, ocr: ocrEnabled, status: "completed", durationMs: Date.now() - startedAt, appliedOperations: [`Файлов: ${outputBlockSelection.blocks.length}`, ...outputBlockSelection.blocks.map((block) => `${block.name}: ${block.order.length} стр.`)] }).catch(() => undefined);
@@ -727,6 +901,7 @@ export function Scanner({ active = true }: { active?: boolean }) {
     try {
       const response = await invoke<{ outputPath: string; outputSha256?: string; warnings?: string[]; ocrConfidence?: number | null; ocrText?: string; lowConfidenceWords?: Array<{ page: number; text: string; confidence: number }>; outputBytes?: number; originalBytes?: number; savingsPercent?: number }>("scanner_run", { jobId, operation: "process", config: processingConfig(outputPath, finalPageOrder) });
       setResultPath(response.outputPath || outputPath); setResultKind("single"); setWarnings(response.warnings || []); setOcrConfidence(response.ocrConfidence ?? null); setOcrText(response.ocrText || ""); setLowConfidenceWords(response.lowConfidenceWords || []);
+      editHistory.current.markSaved(editSnapshot); refreshHistory((value) => value + 1);
       setSavedResultSize({ inputPath, resultPath: response.outputPath || outputPath, kind: "single", originalBytes: positiveFileBytes(response.originalBytes) ?? originalBytes, outputBytes: positiveFileBytes(response.outputBytes), fileCount: 1 });
       setProgress({ stage: "Готово", currentPage: finalPageOrder.length, totalPages: finalPageOrder.length, percent: 100 });
       const logicalFacsimileCount = savedFacsimiles.length + (facsimile && !editingFacsimileId ? 1 : 0);
@@ -736,7 +911,7 @@ export function Scanner({ active = true }: { active?: boolean }) {
     finally { setActiveJob(""); activeJobRef.current = ""; }
   };
 
-  const cancel = async () => { if (activeJob) await invoke("scanner_cancel", { jobId: activeJob }); };
+  const cancel = async () => { batchCancelled.current = true; if (activeJob) await invoke("scanner_cancel", { jobId: activeJob }); };
 
   const runResultAction = async (path: string, action: ScannerResultAction) => {
     const generation = ++resultActionGeneration.current;
@@ -857,7 +1032,7 @@ export function Scanner({ active = true }: { active?: boolean }) {
     } else updateCurrentFacsimileGeometry(candidate);
   };
 
-  const stopInteractive = () => { if (dragState.current?.target === "draw") setDrawingTool(null); dragState.current = null; };
+  const stopInteractive = () => { if (dragState.current?.target === "draw") setDrawingTool(null); dragState.current = null; editHistory.current.record(editSnapshot); refreshHistory((value) => value + 1); };
 
   const updateAnnotationIntensity = (id: string, percent: number) => setAnnotations((items) => items.map((item) => item.id === id ? { ...item, intensity: Math.max(.05, Math.min(1, percent / 100 || .05)) } : item));
   const nudge = (event: KeyboardEvent<HTMLDivElement>) => {
@@ -926,17 +1101,24 @@ export function Scanner({ active = true }: { active?: boolean }) {
     try {
       const documents = droppedDocumentPaths(paths);
       if (workspaceMode === "merge") void addMergePaths(documents);
-      else if (documents.length === 1 && !inputPath) void openDocumentPath(documents[0]);
+      else if (documents.length === 1) void openDocumentPath(documents[0]);
       else setPendingDroppedPaths(documents);
     } catch (reason) { setError(String(reason)); }
   };
-  return <div className="scanner-layout">
+  return <div className="scanner-layout" onKeyDown={(event) => {
+    if (!(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== "z" || (event.target instanceof HTMLElement && event.target.closest("input,textarea,[contenteditable=true]"))) return;
+    event.preventDefault(); undoEdits(event.shiftKey);
+  }}>
+    {finalPreview && <Dialog title={`Итоговый просмотр · страница ${finalPreview.page + 1}`} width="min(1100px, 94vw)" onClose={() => setFinalPreview(null)}><div className="dialog-body scanner-final-preview"><p>{finalPreview.key === scannerSettingsKey(editSnapshot) ? "Изображение рассчитано обработчиком итогового PDF с текущими эффектами, факсимиле и JPEG-сжатием. Для экрана уменьшено до 1400 пикселей. OCR-слой и метаданные здесь не проверяются." : "Настройки изменились. Закройте просмотр и рассчитайте его заново."}{outputPageMode === "blocks" ? " При нескольких блоках показан первый блок, содержащий эту страницу; бюджет сжатия других блоков может отличаться." : ""}</p><img src={finalPreview.url} alt={`Итоговый вид страницы ${finalPreview.page + 1}`} /></div><footer className="dialog-actions"><button className="primary" type="button" onClick={() => setFinalPreview(null)}>Вернуться к редактированию</button></footer></Dialog>}
     {fileDragActive && <div className="scanner-file-drop-overlay" role="status"><strong>Отпустите PDF или DOCX здесь</strong><span>{workspaceMode === "merge" ? "Документы добавятся к объединению" : "Один документ откроется в сканере; для нескольких можно выбрать объединение или пакетную обработку"}</span></div>}
-    {pendingDroppedPaths.length === 1 && <ConfirmDialog title="Открыть другой документ?" message="Текущие несохранённые настройки страниц и факсимиле будут сброшены. Исходные файлы сохранятся." confirmLabel="Открыть документ" onClose={() => setPendingDroppedPaths([])} onConfirm={() => { const path = pendingDroppedPaths[0]; setPendingDroppedPaths([]); void openDocumentPath(path); }} />}
-    {pendingDroppedPaths.length > 1 && <Dialog title="Добавить перетащенные документы" onClose={() => setPendingDroppedPaths([])} width="560px"><div className="dialog-body"><p>Файлов: {pendingDroppedPaths.length}. Объединить страницы в один PDF или обработать каждый документ отдельно?</p></div><footer className="dialog-actions"><button className="secondary" type="button" onClick={() => { setBatchPaths(pendingDroppedPaths); setPendingDroppedPaths([]); setError(""); }}>Обработать отдельно</button><button className="primary" type="button" onClick={() => { const paths = pendingDroppedPaths; setPendingDroppedPaths([]); void addMergePaths(paths); }}>Объединить</button></footer></Dialog>}
-    <section className="surface scanner-controls"><div className="surface-title"><h2>Настройки</h2></div><div className="surface-body scanner-control-stack">
+    {pendingDroppedPaths.length > 1 && <Dialog title="Добавить перетащенные документы" onClose={() => setPendingDroppedPaths([])} width="560px"><div className="dialog-body"><p>Файлов: {pendingDroppedPaths.length}. Объединить страницы в один PDF или обработать каждый документ отдельно?</p></div><footer className="dialog-actions"><button className="secondary" type="button" onClick={() => { setBatchPaths(pendingDroppedPaths); setBatchPlan([]); setPendingDroppedPaths([]); setError(""); }}>Обработать отдельно</button><button className="primary" type="button" onClick={() => { const paths = pendingDroppedPaths; setPendingDroppedPaths([]); void addMergePaths(paths); }}>Объединить</button></footer></Dialog>}
+    <section className="surface scanner-controls" inert={!!activeJob || finalPreviewing}><div className="surface-title"><h2>Настройки</h2></div><div className="surface-body scanner-control-stack">
       <button className="primary full-width" type="button" disabled={!!activeJob || mergeInspecting} onClick={() => void chooseDocument()}>{inputPath ? "Заменить файл" : "Выбрать PDF или DOCX"}</button>
-      <button className="secondary full-width" type="button" onClick={() => void chooseBatch()}>Пакетная обработка</button>{batchPaths.length > 0 && <div className="notice success"><span>Выбрано файлов: {batchPaths.length}</span><button className="primary small" type="button" onClick={() => void processBatch()}>Обработать пакет в папку</button></div>}{documentName && <p className="selected-file">▧ {documentName}</p>}
+      <button className="secondary full-width" type="button" disabled={!!activeJob || batchPlanning} onClick={() => void chooseBatch()}>Пакетная обработка</button>{batchPaths.length > 0 && <div className="notice success"><span>Выбрано файлов: {batchPaths.length}</span><button className="primary small" type="button" disabled={!!activeJob || batchPlanning} onClick={() => void prepareBatch()}>{batchPlanning ? "Проверяем имена…" : "Выбрать папку и проверить имена"}</button></div>}{documentName && <p className="selected-file">▧ {documentName}</p>}
+      {batchPlan.length > 0 && <details open className="scanner-output-plan"><summary>Результаты пакета · готово {batchPlan.filter((entry) => entry.status === "done").length} из {batchPlan.length}</summary><p>Существующие файлы не заменяются. Совпадающие имена получают номер. Окончательная проверка выполняется при сохранении.</p><ol>{batchPlan.map((entry, index) => <li key={`${entry.inputPath}-${index}`}><span>{entry.inputPath.split(/[\\/]/).pop()} → <strong>{entry.outputPath.split(/[\\/]/).pop()}</strong></span><small>{({ planned: "Ожидает", working: "Обрабатывается…", done: "Готово", error: "Не сохранён" })[entry.status]}{entry.error ? `: ${entry.error}` : ""}</small></li>)}</ol><button className="primary small" type="button" disabled={!!activeJob || batchPlan.every((entry) => entry.status === "done")} onClick={() => void processBatch()}>Сохранить неготовые файлы</button></details>}
+      {recoverableDraft && <div className="notice warning"><span>Есть локальный черновик настроек: {recoverableDraft.inputPath.split(/[\\/]/).pop()}</span><button type="button" className="secondary small" onClick={() => void recoverDraft()}>Восстановить черновик</button><button type="button" className="link-button" onClick={discardDraft}>Удалить черновик</button></div>}
+      {inputPath && <label className="checkbox-row"><input type="checkbox" checked={draftEnabled} onChange={(event) => { if (event.target.checked) setDraftEnabled(true); else discardDraft(); }} /> Черновик настроек в этом окне</label>}
+      {draftNotice && <p className="help-text" role="status">{draftNotice} При закрытии окна черновик удаляется. При перезагрузке окна его можно восстановить.</p>}
       <div><h3>Пресет</h3><div className="preset-grid">{presets.map(([name, description]) => <button key={name} className={preset === name ? "selected" : ""} type="button" onClick={() => { setPreset(name); void makePreview(inputPath, name, pageIndex); }}><strong>{name}</strong><small>{description}</small></button>)}</div></div>
       <div className="control-divider" />
       <fieldset disabled={!documentReady} style={{ border: 0, margin: 0, padding: 0, minWidth: 0 }}>
@@ -995,6 +1177,8 @@ export function Scanner({ active = true }: { active?: boolean }) {
       </> : <><div className="scanner-preview-scroll">
       <div className="scanner-document-tools" role="toolbar" aria-label="Инструменты документа"><span>Инструменты</span>{(["marker", "stroke", "blur", "print_blur"] as const).map((kind) => <button key={kind} className={drawingTool === kind ? "selected-tool" : ""} type="button" aria-label={drawingToolLabels[kind]} title={drawingToolLabels[kind]} aria-pressed={drawingTool === kind} disabled={!documentReady || showOriginal} onClick={() => { if (effectsPanel.current) effectsPanel.current.open = false; setDrawingTool((current) => current === kind ? null : kind); }}><DrawingToolIcon kind={kind} /></button>)}{isColoredAnnotationKind(drawingTool) && <AnnotationColorPicker kind={drawingTool} value={drawingColors[drawingTool]} label={drawingTool === "marker" ? "Цвет нового маркера" : "Цвет нового штриха"} disabled={!documentReady || showOriginal} onChange={(color) => setDrawingColors((current) => ({ ...current, [drawingTool]: annotationColor(drawingTool, color) }))} />}</div>
       {inputPath && <fieldset disabled={!documentReady} style={{ border: 0, margin: 0, padding: 0, minWidth: 0 }}><details ref={effectsPanel} className="applied-effects-panel"><summary aria-disabled={!documentReady || !annotations.length} onClick={(event) => { if (!documentReady || !annotations.length) event.preventDefault(); else setDrawingTool(null); }}>Добавленные эффекты · {annotations.length}</summary><div>{annotations.map((entry) => <section className="geometry-control-card" key={entry.id}><div className="geometry-card-header"><button className="link-button" type="button" onClick={() => { setPageIndex(entry.page); setSelectedOverlay({ kind: "annotation", id: entry.id }); void makePreview(inputPath, preset, entry.page); }}><strong>Стр. {entry.page + 1} · {drawingToolLabels[entry.kind]}</strong></button><button className="icon-button danger" type="button" aria-label={`Удалить эффект ${drawingToolLabels[entry.kind]} со страницы ${entry.page + 1}`} onClick={() => { setAnnotations((items) => items.filter((item) => item.id !== entry.id)); setSelectedOverlay(null); }}>×</button></div><label className="geometry-intensity"><span>{drawingIntensityLabels[entry.kind]}</span><span><input aria-label={`${drawingIntensityLabels[entry.kind]} «${drawingToolLabels[entry.kind]}», страница ${entry.page + 1}`} type="range" min="5" max="100" value={Math.round(entry.intensity * 100)} onChange={(event) => updateAnnotationIntensity(entry.id, event.target.valueAsNumber)} /><output>{Math.round(entry.intensity * 100)}%</output></span></label>{isColoredAnnotationKind(entry.kind) && <AnnotationColorPicker kind={entry.kind} value={entry.color} label={`Цвет «${drawingToolLabels[entry.kind]}», страница ${entry.page + 1}`} onChange={(color) => setAnnotations((items) => updateAnnotationColor(items, entry.id, color))} />}</section>)}</div></details></fieldset>}
+      {inputPath && <div className="scanner-edit-actions" role="toolbar" aria-label="История изменений документа"><button className="secondary small" type="button" disabled={!!activeJob || previewing || !(editHistory.current.canUndo || editHistory.current.hasPending(editSnapshot))} onClick={() => undoEdits()}>↶ Отменить</button><button className="secondary small" type="button" disabled={!!activeJob || previewing || !editHistory.current.canRedo} onClick={() => undoEdits(true)}>↷ Повторить</button><span role="status">{dirty ? "Есть несохранённые изменения" : resultKind === "single" || resultKind === "split" ? "Настройки сохранены в PDF" : "Исходный файл не изменяется"}</span><button className="secondary small" type="button" disabled={!documentReady || !!activeJob || finalPreviewing} onClick={() => void makeFinalPreview()}>{finalPreviewing ? "Рассчитываем итоговый вид…" : "Проверить итоговый вид"}</button></div>}
+      {inputPath && <p className="help-text scanner-preview-disclaimer">Интерактивный вид — для размещения инструментов. Размытие и качество сжатия проверяйте кнопкой «Проверить итоговый вид».</p>}
       <ScannerPreparationStatus pageCount={pageCount} preparation={preparation} />
       {inputPath && pageCount > 0 && <ScannerPageControls disabled={!documentReady} error={outputPageSelection.error || outputBlockSelection.error} summary={outputPageMode === "blocks" ? `${pageOrder.length} стр. · ${outputBlockSelection.blocks.length} файлов по блокам` : outputPageMode === "range" ? `${outputPageSelection.order.length} из ${pageOrder.length} стр. · выбранный диапазон` : `${pageOrder.length} стр. · один PDF`}>
         <div className="page-editor"><span>Итоговый порядок ({pageOrder.length}):</span><div>{pageWindow.omittedBefore > 0 && <span className="page-gap">…{pageWindow.omittedBefore}…</span>}{pageWindow.pages.map((sourceIndex) => <button key={sourceIndex} className={sourceIndex === pageIndex ? "active" : ""} type="button" onClick={() => { setPageIndex(sourceIndex); void makePreview(inputPath, preset, sourceIndex); }}>{sourceIndex + 1}{pageRotations[sourceIndex] ? ` · ${pageRotations[sourceIndex]}°` : ""}</button>)}{pageWindow.omittedAfter > 0 && <span className="page-gap">…{pageWindow.omittedAfter}…</span>}</div><label className="page-jump">К странице<input type="number" min="1" max={pageCount} value={pageIndex + 1} onChange={(event) => { const selected = Math.max(0, Math.min(pageCount - 1, Number(event.target.value) - 1)); setPageIndex(selected); void makePreview(inputPath, preset, selected); }} /></label><button className="secondary small" type="button" onClick={() => moveCurrentPage(-1)}>← Раньше</button><button className="secondary small" type="button" onClick={() => moveCurrentPage(1)}>Позже →</button><button className="secondary small" type="button" onClick={() => rotateCurrentPage(-90)}>↶ 90°</button><button className="secondary small" type="button" onClick={() => rotateCurrentPage(90)}>↷ 90°</button><button className="secondary small danger" type="button" onClick={deleteCurrentPage}>Удалить страницу</button><button className="link-button" type="button" onClick={() => { const rotations = {}; setPageOrder(Array.from({ length: pageCount }, (_, index) => index)); setPageRotations(rotations); void makePreview(inputPath, preset, pageIndex, rotations); }}>Сбросить</button></div>
@@ -1021,13 +1205,14 @@ export function Scanner({ active = true }: { active?: boolean }) {
           </div>
         </div>
       </div>}
-      {error && <div className="scanner-error"><strong>Не удалось обработать документ</strong><span>{error}</span><div><button className="secondary" type="button" onClick={() => void makePreview()}>Повторить</button>{ocrEnabled && <button className="secondary" type="button" onClick={() => setOcrEnabled(false)}>Без OCR</button>}<button className="secondary" type="button" disabled={!!activeJob || mergeInspecting} onClick={() => void chooseDocument()}>Другой файл</button></div></div>}
+      {error && <div className="scanner-error"><strong>Не удалось обработать документ</strong><span>{error}</span><div><button className="secondary" type="button" disabled={!!activeJob || finalPreviewing || batchPlanning} onClick={() => { if (retryOperation === "save") void processDocument(); else if (retryOperation === "batch") { if (batchPlan.length) void processBatch(); else void prepareBatch(); } else if (retryOperation === "final-preview") void makeFinalPreview(); else void makePreview(); }}>{scannerRetryLabel(retryOperation)}</button>{ocrEnabled && <button className="secondary" type="button" onClick={() => setOcrEnabled(false)}>Без OCR</button>}<button className="secondary" type="button" disabled={!!activeJob || mergeInspecting} onClick={() => void chooseDocument()}>Другой файл</button></div></div>}
+      {splitOutcomes.length > 0 && <details className="scanner-output-plan"><summary>Результаты блоков · готово {splitOutcomes.filter((entry) => entry.status === "done").length} из {splitOutcomes.length}</summary><ol>{splitOutcomes.map((entry) => <li key={entry.outputPath}><strong>{entry.outputPath}</strong><small>{({ planned: "Не запущен", working: "Обрабатывается…", done: "Готово", error: "Не сохранён" })[entry.status]}{entry.error ? `: ${entry.error}` : ""}</small></li>)}</ol></details>}
       {warnings.length > 0 && <div className="notice warning"><strong>Проверьте результат</strong>{warnings.map((warning) => <span key={warning}>{warning}</span>)}</div>}
       {inputPath && <ScannerSizeSummary inputPath={inputPath} resultPath={resultPath} resultKind={resultKind} originalBytes={originalBytes} estimatedOutputBytes={estimatedOutputBytes} savedResult={savedResultSize}>{pageSizeMm && <span>Страница: {pageSizeMm[0].toFixed(1)} × {pageSizeMm[1].toFixed(1)} мм</span>}{ocrConfidence != null && <span>Средняя уверенность OCR: {ocrConfidence.toFixed(1)}%</span>}</ScannerSizeSummary>}
       {ocrText && <details className="ocr-result"><summary>Распознанный текст · сомнительных слов: {lowConfidenceWords.length}</summary><textarea readOnly rows={10} value={ocrText} aria-label="Распознанный текст" />{lowConfidenceWords.length > 0 && <div className="low-confidence-list">{lowConfidenceWords.slice(0, 100).map((word, index) => <span key={`${word.page}-${index}`} title={`Страница ${word.page}`}>{word.text} · {word.confidence.toFixed(0)}%</span>)}</div>}<p className="help-text">Текст показывается только в текущем окне и не записывается в журнал обработки.</p></details>}
       {progress && <div className="progress-panel"><div><strong>{progress.stage}</strong><span>{progress.totalPages ? `Страница ${progress.currentPage} из ${progress.totalPages}` : ""}</span></div><progress max="100" value={progress.percent} /><strong>{progress.percent}%</strong>{activeJob && activeJobModeRef.current === workspaceMode && <button className="secondary" type="button" onClick={() => void cancel()}>Отменить</button>}</div>}
       </div>
-      {resultPath ? resultKind === "batch" || resultKind === "split" ? <div className="ready-panel"><div><strong>✓ {resultKind === "split" ? "Блоки PDF готовы" : "Пакет готов"}</strong><span>{resultPath}</span></div><button className="primary" type="button" onClick={() => void openGeneratedPath(resultPath, "папку")}>Открыть папку</button><button className="secondary" type="button" onClick={() => { if (resultKind === "batch") setBatchPaths([]); setResultPath(""); setResultKind(""); setProgress(null); }}>{resultKind === "split" ? "Изменить блоки" : "Другой пакет"}</button></div> : <div className="ready-panel"><div><strong>✓ PDF готов</strong><span>{resultPath}</span></div><button className="secondary" type="button" onClick={() => void openGeneratedPath(resultPath, "PDF")}>Открыть PDF</button><button className="secondary" type="button" onClick={() => void revealGeneratedFile(resultPath)}>Открыть папку</button><button className="primary" disabled={!documentReady || !!activeJob || !!facsimileSelection.error || !!outputPageSelection.error || !!outputBlockSelection.error} type="button" onClick={() => void processDocument()}>Сохранить ещё одну версию</button><button className="secondary" type="button" disabled={!!activeJob || mergeInspecting} onClick={clearDocument}>Другой файл</button></div> : <div className="actionbar"><span>{facsimileSelection.error || outputPageSelection.error || outputBlockSelection.error || (facsimile ? "Факсимиле перемещается и поворачивается мгновенно, без повторной загрузки документа" : outputPageMode === "blocks" ? "Настройте блоки и сохраните несколько PDF" : "Выберите пресет и сохраните новый PDF")}</span><button className="primary" disabled={!documentReady || !!activeJob || !!facsimileSelection.error || !!outputPageSelection.error || !!outputBlockSelection.error} type="button" onClick={() => void processDocument()}>{outputPageMode === "blocks" ? "Сохранить блоки PDF" : "Сохранить PDF"}</button></div>}
+      {resultPath ? resultKind === "batch" || resultKind === "split" ? <div className="ready-panel"><div><strong>✓ {resultKind === "split" ? "Блоки PDF готовы" : batchPlan.every((entry) => entry.status === "done") ? "Пакет готов" : "Сохранена часть пакета"}</strong><span>{resultPath}</span></div><button className="primary" type="button" onClick={() => void openGeneratedPath(resultPath, "папку")}>Открыть папку</button><button className="secondary" type="button" onClick={() => { if (resultKind === "batch") setBatchPaths([]); setResultPath(""); setResultKind(""); setProgress(null); }}>{resultKind === "split" ? "Изменить блоки" : "Другой пакет"}</button></div> : <div className="ready-panel"><div><strong>✓ PDF готов</strong><span>{resultPath}</span></div><button className="secondary" type="button" onClick={() => void openGeneratedPath(resultPath, "PDF")}>Открыть PDF</button><button className="secondary" type="button" onClick={() => void revealGeneratedFile(resultPath)}>Открыть папку</button><button className="primary" disabled={!documentReady || !!activeJob || !!facsimileSelection.error || !!outputPageSelection.error || !!outputBlockSelection.error} type="button" onClick={() => void processDocument()}>Сохранить ещё одну версию</button><button className="secondary" type="button" disabled={!!activeJob || mergeInspecting} onClick={clearDocument}>Другой файл</button></div> : <div className="actionbar"><span>{facsimileSelection.error || outputPageSelection.error || outputBlockSelection.error || (facsimile ? "Факсимиле перемещается и поворачивается мгновенно, без повторной загрузки документа" : outputPageMode === "blocks" ? "Настройте блоки и сохраните несколько PDF" : "Выберите пресет и сохраните новый PDF")}</span><button className="primary" disabled={!documentReady || !!activeJob || !!facsimileSelection.error || !!outputPageSelection.error || !!outputBlockSelection.error} type="button" onClick={() => void processDocument()}>{outputPageMode === "blocks" ? "Сохранить блоки PDF" : "Сохранить PDF"}</button></div>}
       </>}
       {resultActionError && belongsToScannerResult(resultActionError, workspaceMode, resultPath) && <ScannerResultActionNotice failure={resultActionError} onDismiss={() => { resultActionGeneration.current += 1; setResultActionError(null); }} />}
     </section>

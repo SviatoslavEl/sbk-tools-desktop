@@ -457,8 +457,8 @@ export function TenderCalendar() {
           message={archiving.payload.procurementTitle}
           confirmLabel="В архив"
           onClose={() => setArchiving(null)}
-          onConfirm={() => {
-            void schedules.archive(archiving.id);
+          onConfirm={async () => {
+            await schedules.archive(archiving.id);
             setArchiving(null);
           }}
         />

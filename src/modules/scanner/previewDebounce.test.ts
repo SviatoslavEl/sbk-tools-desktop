@@ -9,7 +9,7 @@ describe("scanner preview slider debounce", () => {
   it("cancels the slider timer before explicit requests and document replacement", () => {
     const source = readFileSync(new URL("./Scanner.tsx", import.meta.url), "utf8");
     const request = source.slice(source.indexOf("const makePreview = async"), source.indexOf("const makePreview = async") + 320);
-    expect(request).toContain("previewDebounce.current!.cancel();\n    if (!path) return;");
+    expect(request).toContain("previewDebounce.current!.cancel();\n    if (!path) return null;");
     const replacement = source.slice(source.indexOf("const openDocumentPath = async"), source.indexOf("const clearDocument ="));
     expect(replacement).toContain("previewDebounce.current!.cancel();");
     expect(replacement.indexOf("previewDebounce.current!.cancel();")).toBeLessThan(replacement.indexOf("previewSession.current!.clear();"));

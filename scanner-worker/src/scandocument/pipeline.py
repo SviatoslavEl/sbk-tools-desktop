@@ -185,12 +185,16 @@ def process_document(
 
     token = cancellation or CancellationToken()
     warnings: list[str] = []
-    output = request.output_path.expanduser().resolve()
+    requested_output = request.output_path.expanduser()
+    # Do not resolve the final component for no-clobber saves: an existing
+    # broken symlink is also an occupied name, not permission to create its target.
+    output = (requested_output.parent.resolve() / requested_output.name
+              if not request.overwrite_output else requested_output.resolve())
     source = request.input_path.expanduser().resolve()
     initial_fingerprint = source_fingerprint(source)
     if expected_source_fingerprint is not None and expected_source_fingerprint != initial_fingerprint:
         raise ScanDocumentError("Исходный документ изменился после предпросмотра. Откройте его повторно перед сохранением.")
-    if output == source:
+    if output.resolve() == source:
         raise SaveError("Выберите другое имя для результата, чтобы не перезаписать исходный документ.")
     kind = detect_kind(source)
     SecureWorkspace.cleanup_stale()
@@ -263,7 +267,7 @@ def process_document(
         for item in request.annotations:
             for page_index in item.pages:
                 annotations_by_page.setdefault(page_index, []).append(item)
-        writer = StreamingPdfWriter(output, output.stem, request.seed, request.pdfa_enabled)
+        writer = StreamingPdfWriter(output, output.stem, request.seed, request.pdfa_enabled, overwrite=request.overwrite_output)
         try:
             pending: deque[tuple[int, int, tuple[float, float], Future]] = deque()
             confidence_sum = 0.0

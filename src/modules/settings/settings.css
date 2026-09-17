@@ -1,0 +1,11 @@
+.settings-module [hidden] { display: none !important; }
+.settings-sections { display: flex; flex-wrap: wrap; gap: 6px; border-bottom: 1px solid var(--line); padding-bottom: 10px; }
+.settings-sections button { padding: 9px 14px; border-radius: 8px; background: var(--surface); border: 1px solid var(--line); color: var(--text); }
+.settings-sections button[aria-pressed="true"] { background: var(--primary); color: white; }
+.settings-technical { font-size: 13px; line-height: 1.6; margin-top: 14px; }
+.settings-technical summary { cursor: pointer; font-weight: 600; }
+.settings-technical > span { display: block; margin-top: 10px; }
+.settings-module .settings-actions > fieldset { display: grid; gap: 16px; }
+.settings-grid .settings-interface-fields { padding: 18px; }
+.settings-module .backup-surface { grid-column: auto; }
+.settings-module .settings-form select, .settings-module .settings-form input:not([type="checkbox"]) { min-height: 36px; }

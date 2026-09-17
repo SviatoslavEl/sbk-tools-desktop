@@ -4472,6 +4472,51 @@ async fn scanner_source_revision(path: String) -> Result<String, String> {
         .map_err(|error| error.to_string())?
 }
 
+// Planning is advisory only. The worker's no-clobber publication is the final
+// authority if a competing process creates the name after this read-only check.
+fn plan_scanner_outputs(directory: &Path, names: &[String]) -> Result<Vec<String>, String> {
+    if !directory.is_dir() || names.is_empty() || names.len() > 5000 {
+        return Err("Выберите доступную папку и от 1 до 5000 файлов".to_string());
+    }
+    let mut occupied = std::collections::HashSet::new();
+    for entry in fs::read_dir(directory).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        occupied.insert(entry.file_name().to_string_lossy().to_lowercase());
+    }
+    let mut outputs = Vec::with_capacity(names.len());
+    for name in names {
+        if name.is_empty()
+            || name.len() > 240
+            || name.contains(['/', '\\', '\0', ':'])
+            || !name.to_lowercase().ends_with(".pdf")
+        {
+            return Err("Недопустимое имя итогового PDF".to_string());
+        }
+        let base = &name[..name.len() - 4];
+        let mut candidate = name.clone();
+        let mut suffix = 2_u32;
+        while occupied.contains(&candidate.to_lowercase()) {
+            candidate = format!("{base} ({suffix}).pdf");
+            suffix += 1;
+        }
+        occupied.insert(candidate.to_lowercase());
+        outputs.push(directory.join(candidate).to_string_lossy().into_owned());
+    }
+    Ok(outputs)
+}
+
+#[tauri::command]
+async fn scanner_plan_outputs(
+    directory: String,
+    names: Vec<String>,
+) -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        plan_scanner_outputs(Path::new(&directory), &names)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
 #[tauri::command]
 async fn scanner_run(
     app: AppHandle,
@@ -4700,6 +4745,7 @@ pub fn run() {
             restore_backup,
             scanner_run,
             scanner_source_revision,
+            scanner_plan_outputs,
             open_scanner_output,
             scanner_cancel,
             delete_runtime_file,
@@ -4741,6 +4787,30 @@ mod tests {
         fs::remove_file(&source).expect("test source cleanup");
         assert!(scanner_source_revision_for(&source).is_err());
         fs::remove_dir(root).expect("empty directory");
+    }
+
+    #[test]
+    fn scanner_output_plan_preserves_existing_case_insensitive_names_and_duplicates() {
+        let root = std::env::temp_dir().join(format!("sbk-output-plan-{}", Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let occupied = root.join("Договор.pdf");
+        fs::write(&occupied, b"existing result").unwrap();
+        let names = vec![
+            "договор.pdf".to_string(),
+            "договор.pdf".to_string(),
+            "other.pdf".to_string(),
+        ];
+        let plan = plan_scanner_outputs(&root, &names).unwrap();
+        assert_eq!(Path::new(&plan[0]).file_name().unwrap(), "договор (2).pdf");
+        assert_eq!(Path::new(&plan[1]).file_name().unwrap(), "договор (3).pdf");
+        assert_eq!(Path::new(&plan[2]).file_name().unwrap(), "other.pdf");
+        assert_eq!(fs::read(&occupied).unwrap(), b"existing result");
+        assert!(!Path::new(&plan[0]).exists());
+        for invalid in ["../outside.pdf", "a\\b.pdf", "a:b.pdf", "x.txt", ""] {
+            assert!(plan_scanner_outputs(&root, &[invalid.to_string()]).is_err());
+        }
+        fs::remove_file(occupied).unwrap();
+        fs::remove_dir(root).unwrap();
     }
 
     #[test]

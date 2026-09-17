@@ -318,3 +318,12 @@
 .scanner-preparation-status { display: flex; flex-wrap: wrap; gap: 4px 12px; min-height: 24px; padding: 2px 12px; color: var(--muted, #64748b); font-size: 11px; align-items: center; }
 .scanner-preparation-status > span { display: inline-flex; align-items: center; gap: 6px; }
 .scanner-preparation-status .loading-spinner { width: 11px; height: 11px; border-width: 2px; }
+.scanner-edit-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 8px 12px; }
+.scanner-edit-actions > span { flex: 1 1 160px; font-size: 12px; color: var(--muted); }
+.scanner-preview-disclaimer { margin: 0; padding: 0 12px 8px; }
+.scanner-output-plan { min-width: 0; padding: 10px; border: 1px solid var(--border); border-radius: 10px; font-size: 12px; }
+.scanner-output-plan ol { max-height: 260px; overflow: auto; margin: 8px 0; padding-left: 20px; }
+.scanner-output-plan li { margin-bottom: 8px; overflow-wrap: anywhere; }
+.scanner-output-plan small { display: block; }
+.scanner-final-preview { max-height: 75vh; overflow: auto; }
+.scanner-final-preview img { display: block; width: auto; max-width: 100%; margin: auto; }

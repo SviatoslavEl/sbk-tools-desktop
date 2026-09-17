@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { createPortal } from "react-dom";
 import { ConfirmDialog } from "../../components/Dialog";
 import { VersionHistory } from "../../components/VersionHistory";
@@ -20,6 +20,8 @@ export function CounterpartiesRegistry() {
   const [editing, setEditing] = useState<CompanyCard | null>(null);
   const [pending, setPending] = useState<PendingAction>(null);
   const [message, setMessage] = useState("");
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  useEffect(() => { setSelected(new Set()); }, [scope, showArchived, search]);
   const filtered = useMemo(() => {
     const needle = search.trim().toLocaleLowerCase("ru-RU");
     return directory.companies.filter((company) => {
@@ -34,34 +36,36 @@ export function CounterpartiesRegistry() {
       return !needle || searchable.includes(needle);
     }).sort((a, b) => a.name.localeCompare(b.name, "ru"));
   }, [directory.companies, search, scope, showArchived]);
+  const selectedCompanies = filtered.filter((company) => selected.has(company.id));
+  const canMutate = access.editor && !directory.loading && !contracts.loading && !directory.error && !contracts.error;
 
   const runPending = async () => {
     if (!pending) return;
-    try {
+    if (!canMutate) throw new Error("Нет доступа редактора или справочник ещё не прочитан. Действие не выполнено.");
       if (pending.kind === "delete") await directory.deleteArchivedCompanies(pending.ids, contracts.records);
       else await directory.setCompaniesArchived(pending.ids, pending.kind === "archive");
       setMessage(pending.kind === "archive" ? "Карточки перенесены в архив." : pending.kind === "restore" ? "Карточки восстановлены." : "Несвязанные архивные карточки удалены.");
-    } catch (reason) {
-      setMessage(String(reason));
-    } finally {
       setPending(null);
-    }
+      setSelected(new Set());
   };
 
   return <div className="module-stack registry-module counterparties-tool">
-    {(directory.error || message) && <div className={`notice ${directory.error || message.startsWith("Error") || message.startsWith("Нельзя") ? "error" : "success"}`}>{directory.error || message}</div>}
+    {(directory.error || contracts.error) && <div className="notice error" role="alert"><strong>Не удалось прочитать справочник.</strong><span>{directory.error || contracts.error}</span><button className="secondary" type="button" disabled={directory.loading || contracts.loading} onClick={() => { void contracts.reload(); void directory.reload(); }}>Повторить чтение</button></div>}
+    {message && <div className="notice success" role="status">{message}</div>}
     <div className="registry-toolbar">
       <label className="search-box"><span>Быстрый поиск</span><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Компания, ИНН, ФИО, должность, телефон…" /></label>
       <fieldset className="scope-switcher"><legend>Раздел контрагентов</legend><button type="button" className={scope === "external" ? "active" : ""} aria-pressed={scope === "external"} onClick={() => setScope("external")}>Внешние</button><button type="button" className={scope === "internal" ? "active" : ""} aria-pressed={scope === "internal"} onClick={() => setScope("internal")}>Внутренние</button><button type="button" className={scope === "all" ? "active" : ""} aria-pressed={scope === "all"} onClick={() => setScope("all")}>Все</button></fieldset>
       <label className="checkbox-row"><input type="checkbox" checked={showArchived} onChange={(event) => setShowArchived(event.target.checked)} /> Архив</label>
       <div className="toolbar-actions">
-        {!showArchived && <button className="primary" type="button" disabled={!access.editor} onClick={() => setEditing(emptyCompany())}>Добавить компанию</button>}
-        {filtered.length > 0 && !showArchived && <button className="secondary" type="button" disabled={!access.editor} onClick={() => setPending({ kind: "archive", ids: filtered.map((company) => company.id) })}>В архив все найденные</button>}
-        {filtered.length > 0 && showArchived && <><button className="secondary" type="button" disabled={!access.editor} onClick={() => setPending({ kind: "restore", ids: filtered.map((company) => company.id) })}>Восстановить все</button><button className="danger-button" type="button" disabled={!access.editor} onClick={() => setPending({ kind: "delete", ids: filtered.map((company) => company.id) })}>Удалить все найденные</button></>}
+        {!showArchived && <button className="primary" type="button" disabled={!canMutate} onClick={() => setEditing(emptyCompany())}>Добавить компанию</button>}
+        {selectedCompanies.length > 0 && !showArchived && <button className="secondary" type="button" disabled={!canMutate} onClick={() => setPending({ kind: "archive", ids: selectedCompanies.map((company) => company.id) })}>В архив выбранные ({selectedCompanies.length})</button>}
+        {selectedCompanies.length > 0 && showArchived && <><button className="secondary" type="button" disabled={!canMutate} onClick={() => setPending({ kind: "restore", ids: selectedCompanies.map((company) => company.id) })}>Восстановить выбранные ({selectedCompanies.length})</button><button className="danger-button" type="button" disabled={!canMutate} onClick={() => setPending({ kind: "delete", ids: selectedCompanies.map((company) => company.id) })}>Удалить выбранные ({selectedCompanies.length})</button></>}
       </div>
     </div>
     <section className="surface table-surface">
-      <div className="table-scroll"><table><thead><tr><th>Компания</th><th>Реквизиты</th><th>Лица, принимающие решения</th><th>Право подписи</th><th>Контакты</th><th>Связи</th><th /></tr></thead><tbody>{filtered.map((company) => <tr key={company.id}>
+      <div className="registry-display-options" role="status">Найдено: {filtered.length} · выбрано: {selectedCompanies.length}{selectedCompanies.length > 0 && <button className="link-button" type="button" onClick={() => setSelected(new Set())}>Снять выбор</button>}</div>
+      <div className="table-scroll"><table className="registry-counterparties-table registry-compact-table"><thead><tr><th className="selection-cell"><input type="checkbox" aria-label="Выбрать всех найденных контрагентов" checked={filtered.length > 0 && selectedCompanies.length === filtered.length} ref={(input) => { if (input) input.indeterminate = selectedCompanies.length > 0 && selectedCompanies.length < filtered.length; }} onChange={(event) => setSelected(event.target.checked ? new Set(filtered.map((company) => company.id)) : new Set())} /></th><th>Компания</th><th>Реквизиты</th><th>Лица, принимающие решения</th><th>Право подписи</th><th>Контакты</th><th>Связи</th><th /></tr></thead><tbody>{filtered.map((company) => <tr key={company.id}>
+        <td className="selection-cell"><input type="checkbox" aria-label={`Выбрать контрагента ${company.name}`} checked={selected.has(company.id)} onChange={(event) => setSelected((current) => { const next = new Set(current); if (event.target.checked) next.add(company.id); else next.delete(company.id); return next; })} /></td>
         <td><button className="link-button" type="button" onClick={() => setEditing(company)}><strong>{company.shortName || company.name}</strong>{company.shortName && <small>{company.name}</small>}</button><span className={`status ${company.scope === "internal" ? "success" : "neutral"}`}>{company.scope === "internal" ? "Внутренняя" : "Внешняя"}</span></td>
         <td>{company.inn ? <>ИНН {company.inn}{company.kpp ? <><br />КПП {company.kpp}</> : null}</> : "—"}</td>
         <td>{company.decisionMakers.length ? company.decisionMakers.map((person) => <div className="decision-maker-summary" key={person.id}><strong>{person.fullName || "Без имени"}{person.isPrimary ? " ★" : ""}</strong><small>{person.position || person.department || "Должность не указана"}</small></div>) : "—"}</td>
@@ -70,9 +74,10 @@ export function CounterpartiesRegistry() {
         <td>{companyRelationshipLabel(company, directory.companies).map((label) => <small className="company-relation" key={label}>{label}</small>)}</td>
         <td><button className="secondary small" type="button" onClick={() => setEditing(company)}>{access.editor ? "Редактировать" : "Открыть"}</button><VersionHistory module="contract-experience" id={`company:${company.id}`} title={company.name} payload={company} onRestore={async (snapshot) => { await directory.save({ ...(snapshot as CompanyCard), id: company.id }, company, contracts.records); }} /></td>
       </tr>)}</tbody></table></div>
-      {!directory.loading && filtered.length === 0 && <div className="empty-state"><h2>Ничего не найдено</h2><p>Измените строку поиска или выбранный раздел.</p></div>}
+      {(directory.loading || contracts.loading) && <div className="empty-state" role="status">Загружаем контрагентов…</div>}
+      {!directory.loading && !contracts.loading && !directory.error && !contracts.error && filtered.length === 0 && <div className="empty-state"><h2>{directory.companies.length ? "Нет совпадений" : "Справочник пока пуст"}</h2><p>{directory.companies.length ? "Измените поиск или выбранный раздел." : "Добавьте компанию или импортируйте договоры — связанные компании появятся здесь."}</p>{(search || scope !== "all") && directory.companies.length > 0 && <button className="secondary" type="button" onClick={() => { setSearch(""); setScope("all"); }}>Сбросить фильтры</button>}</div>}
     </section>
-    {editing && createPortal(<CompanyEditor company={editing} companies={directory.companies} readOnly={!access.editor} onClose={() => setEditing(null)} onSave={async (company) => { if (!access.editor) return; const previous = directory.companies.find((item) => item.id === company.id); await directory.save(company, previous, contracts.records); setEditing(null); }} />, document.body)}
-    {pending && <ConfirmDialog title={pending.kind === "delete" ? "Удалить найденные карточки навсегда?" : pending.kind === "archive" ? "Перенести найденные карточки в архив?" : "Восстановить найденные карточки?"} message={pending.kind === "delete" ? "Карточки, связанные с договорами, останутся в архиве. Остальные будут удалены без возможности восстановления." : `Будет обработано карточек: ${pending.ids.length}.`} confirmLabel={pending.kind === "delete" ? "Удалить" : "Подтвердить"} onClose={() => setPending(null)} onConfirm={() => void runPending()} />}
+    {editing && createPortal(<CompanyEditor company={editing} companies={directory.companies} readOnly={!canMutate} onClose={() => setEditing(null)} onSave={async (company) => { if (!canMutate) throw new Error("Доступ редактора завершён или справочник недоступен."); const previous = directory.companies.find((item) => item.id === company.id); await directory.save(company, previous, contracts.records); setEditing(null); }} />, document.body)}
+    {pending && <ConfirmDialog title={pending.kind === "delete" ? "Удалить выбранные карточки навсегда?" : pending.kind === "archive" ? "Перенести выбранные карточки в архив?" : "Восстановить выбранные карточки?"} message={`Выбрано: ${pending.ids.length}. ${directory.companies.filter((company) => pending.ids.includes(company.id)).map((company) => company.name).join("; ")}. ${pending.kind === "delete" ? "Удаление необратимо. При наличии связей с договорами вся операция будет отменена." : pending.kind === "archive" ? "Карточки можно восстановить. Существующие связи в договорах сохранятся." : "Карточки вернутся в рабочий справочник."}`} confirmLabel={pending.kind === "delete" ? "Удалить" : "Подтвердить"} onClose={() => setPending(null)} onConfirm={runPending} />}
   </div>;
 }

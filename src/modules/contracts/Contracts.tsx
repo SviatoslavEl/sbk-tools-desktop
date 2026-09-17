@@ -1,6 +1,7 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { openPath } from "@tauri-apps/plugin-opener";
 import { ConfirmDialog, Dialog } from "../../components/Dialog";
+import { CollapsibleEditorBlock } from "../../components/CollapsibleEditorBlock";
 import { DrawerBackdrop } from "../../components/DrawerBackdrop";
 import { SortableHeader } from "../../components/SortableHeader";
 import { useRecords } from "../../hooks/useRecords";
@@ -54,6 +55,9 @@ import { contractBalance, contractChecks } from "./validation";
 import { matchContract, type ContractSelectionCriteria } from "./selection";
 import { CompanyNameField, useCompanyDirectory } from "./CompanyDirectory";
 import type { CompanyCard } from "./companies";
+import { ContractReadCard } from "./RegistryReadCard";
+import { RegistryTableView } from "./RegistryTableView";
+import "./registry.css";
 
 const money = (value: number) =>
   new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 0 }).format(value) +
@@ -368,16 +372,26 @@ export function mergeContractImportUpdate(
   return next;
 }
 
-export function ContractsRegistry() {
+export function ContractsRegistry({ openRecordId, onRecordOpened }: { openRecordId?: string; onRecordOpened?: () => void } = {}) {
   const store = useRecords<ContractData>("contract-experience");
   const companyDirectory = useCompanyDirectory(store.records);
   const [search, setSearch] = useState("");
   const [stageFilter, setStageFilter] = useState("");
   const [paymentFilter, setPaymentFilter] = useState("");
   const [legalEntityFilter, setLegalEntityFilter] = useState("");
-  const [editing, setEditing] = useState<
+  const [editing, setEditingRecord] = useState<
     StoredRecord<ContractData> | "new" | null
   >(null);
+  const [viewingCard, setViewingCard] = useState(false);
+  const setEditing = (record: StoredRecord<ContractData> | "new" | null) => {
+    if (record !== null) setViewingCard(!companyDirectory.editor);
+    setEditingRecord(record);
+  };
+  useEffect(() => {
+    if (!openRecordId || store.loading || store.error || companyDirectory.loading || editing) return;
+    const record = store.records.find((entry) => entry.id === openRecordId);
+    if (record) { setViewingCard(!companyDirectory.editor); setEditingRecord(record); onRecordOpened?.(); }
+  }, [openRecordId, store.loading, store.error, store.records, companyDirectory.loading, companyDirectory.editor, editing, onRecordOpened]);
   const [archiving, setArchiving] = useState<StoredRecord<ContractData> | null>(
     null,
   );
@@ -1022,24 +1036,6 @@ export function ContractsRegistry() {
           <strong>{stats.payment}</strong>
         </div>
       </div>
-      {!readOnly && (
-        <div className="portable-export-row">
-          <span>
-            Полный переносимый пакет включает базу, историю и вложения раздела.
-          </span>
-          <button
-            className="secondary small"
-            type="button"
-            onClick={() =>
-              void createBackup("contract-experience").then((result) =>
-                window.alert(`Полный пакет создан: ${result.fileName}`),
-              )
-            }
-          >
-            Создать полный пакет
-          </button>
-        </div>
-      )}
       <div className="registry-toolbar">
         <label className="search-box">
           <span>Поиск</span>
@@ -1089,9 +1085,14 @@ export function ContractsRegistry() {
           <div className="toolbar-action-group"><span>Обмен</span>
             {!readOnly && <button className="secondary" type="button" onClick={() => void openImport("add")}>Добавить из файла</button>}
             {!readOnly && <button className="secondary" type="button" onClick={() => void openImport("update")}>Обновить из файла</button>}
-            <button className="secondary" type="button" disabled={selectedRegistryContracts.size === 0} title="В экспорт попадут только отмеченные договоры" onClick={() => void exportArchive([...selectedRegistryContracts])}>Экспорт ZIP ({selectedRegistryContracts.size})</button>
-            <button className="secondary" type="button" disabled={selectedRegistryContracts.size === 0} title="В экспорт попадут только отмеченные договоры" onClick={() => void exportSelection([...selectedRegistryContracts])}>CSV ({selectedRegistryContracts.size})</button>
-            <button className="secondary" type="button" disabled={selectedRegistryContracts.size === 0} title="В экспорт попадут только отмеченные договоры" onClick={() => void exportXlsx([...selectedRegistryContracts])}>XLSX ({selectedRegistryContracts.size})</button>
+            <details className="registry-export-menu"><summary>Экспорт ({selectedRegistryContracts.size})</summary><div>
+              <p>В экспорт попадут только отмеченные договоры: {selectedRegistryContracts.size}. Ограничения раскрытия — справочные, проверьте их перед передачей файлов.</p>
+              {selectedRegistryContracts.size > 0 && <details className="registry-export-contents"><summary>Состав выгрузки: записи и вложения</summary><ul>{selectedExportRecords([...selectedRegistryContracts]).map(({ id, payload }) => <li key={id}><strong>{payload.number} · {payload.customer}{!payload.disclosureAllowed ? " · запрещено раскрытие" : ""}</strong><span>{payload.documents?.filter((document) => document.relativePath).map((document) => document.fileName || document.name || document.type).join("; ") || "Файлы не приложены"}</span></li>)}</ul></details>}
+              <button className="secondary" type="button" disabled={selectedRegistryContracts.size === 0} title="В экспорт попадут только отмеченные договоры" onClick={() => void exportArchive([...selectedRegistryContracts]).catch((reason) => window.alert(`Экспорт не выполнен: ${String(reason)}`))}>Документы и сведения (ZIP)</button>
+              <button className="secondary" type="button" disabled={selectedRegistryContracts.size === 0} onClick={() => void exportSelection([...selectedRegistryContracts]).catch((reason) => window.alert(`Экспорт не выполнен: ${String(reason)}`))}>Таблица CSV</button>
+              <button className="secondary" type="button" disabled={selectedRegistryContracts.size === 0} onClick={() => void exportXlsx([...selectedRegistryContracts]).catch((reason) => window.alert(`Экспорт не выполнен: ${String(reason)}`))}>Таблица XLSX</button>
+              {!readOnly && <details><summary>Перенос всего раздела</summary><p>Все договоры, включая архив, историю и вложения. Выбор строк не ограничивает полный перенос.</p><button className="secondary small" type="button" onClick={() => void createBackup("contract-experience").then((result) => window.alert(`Пакет переноса создан: ${result.fileName}`)).catch((reason) => window.alert(`Не удалось создать пакет: ${String(reason)}`))}>Создать пакет переноса раздела</button></details>}
+            </div></details>
           </div>
           <button
             className="secondary"
@@ -1119,11 +1120,16 @@ export function ContractsRegistry() {
         <div className="notice error">
           <strong>Не удалось открыть реестр.</strong>
           <span>{store.error}</span>
+          {store.records.length > 0 && <span>Показаны данные последнего успешного чтения.</span>}
+          <button className="secondary" type="button" disabled={store.loading} onClick={() => void store.reload()}>Повторить чтение</button>
         </div>
       )}
       <div className="surface table-surface">
+        <RegistryTableView name="contracts" count={filtered.length} columns={[
+          { key: "number", label: "Номер и дата", compact: true }, { key: "performer", label: "Юрлицо", compact: false }, { key: "customer", label: "Заказчик", compact: true }, { key: "subject", label: "Предмет", compact: false }, { key: "amount", label: "Сумма", compact: true }, { key: "period", label: "Период", compact: false }, { key: "stage", label: "Стадия", compact: true }, { key: "payment", label: "Оплата", compact: true }, { key: "acts", label: "Акты", compact: true }, { key: "importantDate", label: "Важная дата", compact: false }, { key: "responsible", label: "Ответственный", compact: false },
+        ]} />
         <div className="table-scroll">
-          <table>
+          <table className="registry-contracts-table registry-compact-table">
             <thead>
               <tr>
                 <th className="selection-cell"><input type="checkbox" aria-label="Выбрать все найденные договоры" checked={filtered.length > 0 && filtered.every((record) => selectedRegistryContracts.has(record.id))} onChange={(event) => setSelectedRegistryContracts((current) => { const next = new Set(current); filtered.forEach((record) => event.target.checked ? next.add(record.id) : next.delete(record.id)); return next; })} /></th>
@@ -1143,19 +1149,12 @@ export function ContractsRegistry() {
                   <tr
                     key={record.id}
                     onDoubleClick={() => {
-                      if (!readOnly) setEditing(record);
+                      setEditing(record);
                     }}
                   >
                     <td className="selection-cell"><input type="checkbox" aria-label={`Выбрать договор ${item.number}`} checked={selectedRegistryContracts.has(record.id)} onChange={(event) => setSelectedRegistryContracts((current) => { const next = new Set(current); if (event.target.checked) next.add(record.id); else next.delete(record.id); return next; })} /></td>
                     <td className="sticky-cell">
-                      {readOnly ? (
-                        <>
-                          <strong>{item.number}</strong>
-                          <small className="company-relation">
-                            {date(item.date)}
-                          </small>
-                        </>
-                      ) : (
+                      {(
                         <button
                           className="link-button"
                           type="button"
@@ -1240,7 +1239,8 @@ export function ContractsRegistry() {
             </tbody>
           </table>
         </div>
-        {!store.loading && filtered.length === 0 && (
+        {store.loading && <div className="empty-state" role="status">Загружаем договоры…</div>}
+        {!store.loading && !store.error && filtered.length === 0 && (
           <div className="empty-state">
             <span className="empty-icon">✓</span>
             <h2>
@@ -1255,6 +1255,7 @@ export function ContractsRegistry() {
                 ? "Измените поиск или фильтры."
                 : "Стадия, оплата и акты будут видны одновременно."}
             </p>
+            {store.records.length > 0 && <button className="secondary" type="button" onClick={() => { setSearch(""); setStageFilter(""); setPaymentFilter(""); setLegalEntityFilter(""); }}>Сбросить фильтры</button>}
             {!store.records.length && !readOnly && (
               <button
                 className="primary"
@@ -1267,7 +1268,7 @@ export function ContractsRegistry() {
           </div>
         )}
       </div>
-      {editing && (
+      {editing && viewingCard && editing !== "new" ? <ContractReadCard record={{ ...editing, payload: normalizeContractData(editing.payload) }} onClose={() => setEditing(null)} /> : editing && (
         <ContractEditor
           companies={companyDirectory.companies}
           record={editing === "new" ? undefined : editing}
@@ -1285,8 +1286,8 @@ export function ContractsRegistry() {
           message={`${archiving.payload.number} останется в базе и сможет быть восстановлен.`}
           confirmLabel="В архив"
           onClose={() => setArchiving(null)}
-          onConfirm={() => {
-            void store.archive(archiving.id);
+          onConfirm={async () => {
+            await store.archive(archiving.id);
             setArchiving(null);
           }}
         />
@@ -1297,8 +1298,9 @@ export function ContractsRegistry() {
           message={`Будет перенесено договоров: ${bulkArchiveIds.length}. Записи, история и документы останутся в базе и смогут быть восстановлены.`}
           confirmLabel="В архив"
           onClose={() => setBulkArchiveIds([])}
-          onConfirm={() => {
-            void store.archiveMany(bulkArchiveIds).then(() => setSelectedRegistryContracts(new Set()));
+          onConfirm={async () => {
+            await store.archiveMany(bulkArchiveIds);
+            setSelectedRegistryContracts(new Set());
             setBulkArchiveIds([]);
           }}
         />
@@ -1922,7 +1924,7 @@ export function ContractsRegistry() {
   );
 }
 
-function ContractEditor({
+export function ContractEditor({
   record,
   initialValue,
   companies,
@@ -1946,10 +1948,14 @@ function ContractEditor({
   );
   const [savedSnapshot, setSavedSnapshot] = useState(() => JSON.stringify(item));
   const [error, setError] = useState("");
+  const [saving, setSaving] = useState(false);
+  const saveInFlight = useRef(false);
+  const [workspacePath, setWorkspacePath] = useState("");
   const [history, setHistory] = useState<HistoryEntry[]>([]);
   useEffect(() => {
     if (record)
-      void recordHistory("contract-experience", record.id).then(setHistory);
+      void recordHistory("contract-experience", record.id).then(setHistory).catch((reason) => setError(`Не удалось загрузить историю: ${String(reason)}`));
+    void getWorkspaceInfo().then((workspace) => setWorkspacePath(workspace.root)).catch(() => undefined);
   }, [record]);
   useEffect(
     () => () => {
@@ -1961,13 +1967,16 @@ function ContractEditor({
     key: K,
     value: ContractData[K],
   ) => setItem((current) => ({ ...current, [key]: value }));
-  const { requestClose, confirmation: discardConfirmation } = useUnsavedChanges(JSON.stringify(item) !== savedSnapshot, async () => {
+  const { requestClose: confirmClose, confirmation: discardConfirmation } = useUnsavedChanges(!saving && JSON.stringify(item) !== savedSnapshot, async () => {
+    if (saveInFlight.current) return;
     await discardStagedAttachments("contract-experience", recordId).catch(
       () => undefined,
     );
     onClose();
   });
+  const requestClose = () => { if (!saveInFlight.current) confirmClose(); };
   const submit = async () => {
+    if (saveInFlight.current) return;
     if (!editorAccess.editor) { setError("Режим редактора завершён. Введённые поля сохранены в открытом окне, но запись в общую базу запрещена."); return; }
     if (
       !item.performingLegalEntity.trim() ||
@@ -1987,8 +1996,14 @@ function ContractEditor({
       setError(blocking.map((check) => check.message).join(" "));
       return;
     }
-    await onSave(item, recordId);
-    setSavedSnapshot(JSON.stringify(item));
+    saveInFlight.current = true;
+    setSaving(true); setError("");
+    try {
+      await onSave(item, recordId);
+      setSavedSnapshot(JSON.stringify(item));
+    } catch (reason) {
+      setError(`Договор не сохранён. Введённые данные остались в форме. Проверьте доступность рабочей папки и повторите сохранение. ${String(reason)}`);
+    } finally { saveInFlight.current = false; setSaving(false); }
   };
   const checks = contractChecks(item);
   const balance = contractBalance(item);
@@ -2024,7 +2039,11 @@ function ContractEditor({
         </button>
       </header>
       <div className="drawer-body">
-        {error && <div className="notice error">{error}</div>}
+        {error && <div className="notice error" role="alert">{error}</div>}
+        {!editorAccess.editor && <p className="notice warning" role="status">Редактирование недоступно. Введённые данные сохранены в открытой форме; не закрывайте её, если хотите продолжить после возврата доступа.</p>}
+        <p className="registry-save-status" role="status">{saving ? "Сохраняем договор… Не закрывайте программу." : JSON.stringify(item) !== savedSnapshot ? "Есть несохранённые изменения" : "Карточка без несохранённых изменений"}{workspacePath && <><br />Рабочая папка: {workspacePath}</>}</p>
+        <nav className="registry-section-nav" aria-label="Разделы договора">{[["main", "Основное"], ["execution", "Исполнение"], ["payment", "Оплата"], ["documents", "Документы"], ["contacts", "Контакты"]].map(([id, label]) => <button className="secondary small" key={id} type="button" onClick={(event) => event.currentTarget.closest(".drawer-body")?.querySelector(`#contract-section-${id}`)?.scrollIntoView({ block: "start", behavior: "smooth" })}>{label}</button>)}</nav>
+        <fieldset className="registry-editor-fields" disabled={saving || !editorAccess.editor}>
         {checks.length > 0 && (
           <div className="notice warning">
             <strong>Проверка согласованности</strong>
@@ -2033,7 +2052,7 @@ function ContractEditor({
             ))}
           </div>
         )}
-        <h3>Основное</h3>
+        <h3 id="contract-section-main">Основное</h3>
         <div className="form-grid">
           <CompanyNameField
             wide
@@ -2162,7 +2181,7 @@ function ContractEditor({
             />
           </label>
         </div>
-        <h3>Исполнение</h3>
+        <h3 id="contract-section-execution">Исполнение</h3>
         <div className="form-grid">
           <label>
             Начало
@@ -2204,7 +2223,7 @@ function ContractEditor({
             />
           </label>
         </div>
-        <h3>Оплата и акты</h3>
+        <h3 id="contract-section-payment">Оплата и акты</h3>
         <div className="form-grid">
           <label>
             Статус оплаты
@@ -2278,6 +2297,7 @@ function ContractEditor({
             />
           </label>
         </div>
+        <div id="contract-section-documents" />
         {!initialValue && (
           <ContractDocumentsEditor
             recordId={recordId}
@@ -2285,7 +2305,7 @@ function ContractEditor({
             onChange={(documents) => update("documents", documents)}
           />
         )}
-        <h3>Контакты и раскрытие</h3>
+        <h3 id="contract-section-contacts">Контакты и раскрытие</h3>
         <div className="form-grid">
           <label>Контактное лицо<input value={item.contactName || ""} onChange={(event) => update("contactName", event.target.value)} placeholder="Фамилия, имя, отчество" /></label>
           <label>Должность<input value={item.contactPosition || ""} onChange={(event) => update("contactPosition", event.target.value)} /></label>
@@ -2379,6 +2399,7 @@ function ContractEditor({
             ))}
           </div>
         )}
+        </fieldset>
       </div>
       <footer>
         <button
@@ -2388,8 +2409,8 @@ function ContractEditor({
         >
           Отмена
         </button>
-        <button className="primary" type="button" disabled={!editorAccess.editor} onClick={() => void submit()}>
-          Сохранить договор
+        <button className="primary" type="button" disabled={!editorAccess.editor || saving} onClick={() => void submit()}>
+          {saving ? "Сохраняем…" : "Сохранить договор"}
         </button>
       </footer>
     </aside>
@@ -2399,7 +2420,7 @@ function ContractEditor({
   );
 }
 
-function ContractDocumentsEditor({
+export function ContractDocumentsEditor({
   recordId,
   documents,
   onChange,
@@ -2466,7 +2487,12 @@ function ContractDocumentsEditor({
         <div className="empty-inline">Документы пока не прикреплены.</div>
       )}
       {documents.map((document) => (
-        <section className="document-card" key={document.id}>
+        <CollapsibleEditorBlock
+          key={document.id}
+          title={document.name?.trim() || document.fileName || `${document.type} · без названия`}
+          summary={`${document.type} · ${document.fileName || "Файл не прикреплён"}`}
+          defaultExpanded={![document.name, document.comment, document.fileName, document.relativePath].some((value) => value?.trim())}
+        >
           <div className="document-card-header">
             <select
               aria-label="Тип документа договора"
@@ -2550,7 +2576,7 @@ function ContractDocumentsEditor({
               </button>
             </div>
           </div>
-        </section>
+        </CollapsibleEditorBlock>
       ))}
     </>
   );

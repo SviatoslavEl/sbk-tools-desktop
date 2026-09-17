@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { ConfirmDialog } from "../../components/Dialog";
 import { DrawerBackdrop } from "../../components/DrawerBackdrop";
 import { useRecords } from "../../hooks/useRecords";
@@ -12,7 +12,7 @@ import type { StaffData } from "../staff/types";
 import {
   buildRebidSteps,
   complianceSummary,
-  daysUntil,
+  markSignificantChange,
   procurementWarnings,
   suggestedExperience,
   suggestedTeam,
@@ -43,6 +43,10 @@ import {
   type SnapshotLink,
 } from "./types";
 import { Stage2Workspace } from "./Stage2Workspace";
+import { procurementDeadline } from "./deadlines";
+import { procurementWorkflow, stage2Section, workflowStage, type ProcurementSection } from "./workflow";
+import "./procurement.css";
+import { snapshotDifferences, snapshotFieldLabels, snapshotValue } from "./snapshotComparison";
 
 function snapshot(
   sourceModule: SnapshotLink["sourceModule"],
@@ -58,7 +62,7 @@ function snapshot(
   };
 }
 
-export function ProcurementRegistry() {
+export function ProcurementRegistry({ openRecordId, onRecordOpened }: { openRecordId?: string; onRecordOpened?: () => void } = {}) {
   const workspaceAccess = useWorkspaceAccess();
   const readOnly = !workspaceAccess.editor;
   const store = useRecords<ProcurementData>("procurement");
@@ -69,6 +73,14 @@ export function ProcurementRegistry() {
   >(null);
   const [archiving, setArchiving] =
     useState<StoredRecord<ProcurementData> | null>(null);
+  const [actionError, setActionError] = useState("");
+  useEffect(() => {
+    if (!openRecordId || store.loading || store.error) return;
+    const record = store.records.find((entry) => entry.id === openRecordId);
+    if (record) setEditing(record);
+    else setActionError("Закупка недоступна: возможно, её уже перенесли в архив. Обновите список.");
+    onRecordOpened?.();
+  }, [openRecordId, onRecordOpened, store.loading, store.error, store.records]);
   const filtered = store.records.filter(
     (record) =>
       [
@@ -83,15 +95,8 @@ export function ProcurementRegistry() {
       (!status || record.payload.status === status),
   );
   const urgent = store.records.filter((record) => {
-    const days = daysUntil(record.payload.submissionDeadline);
-    return (
-      days != null &&
-      days >= 0 &&
-      days <= 7 &&
-      !["Подана", "Победа", "Проигрыш", "Отменена"].includes(
-        record.payload.status,
-      )
-    );
+    const { days, pending } = procurementDeadline(record.payload);
+    return pending && days != null && days <= 7;
   }).length;
   return (
     <div className="module-stack registry-module">
@@ -101,7 +106,7 @@ export function ProcurementRegistry() {
           <strong>{store.records.length}</strong>
         </div>
         <div className="stat">
-          <span>Срок ≤ 7 дней</span>
+          <span>Просрочено / срок ≤ 7 дней</span>
           <strong>{urgent}</strong>
         </div>
         <div className="stat">
@@ -121,6 +126,7 @@ export function ProcurementRegistry() {
           <span>{workspaceAccess.message}</span>
         </div>
       )}
+      {(store.error || actionError) && <div className="notice error" role="alert">{store.error || actionError}</div>}
       <div className="registry-toolbar">
         <label className="search-box">
           <span>Поиск</span>
@@ -173,17 +179,11 @@ export function ProcurementRegistry() {
             <tbody>
               {filtered.map((record) => {
                 const item = record.payload;
-                const deadline = daysUntil(item.submissionDeadline);
+                const deadline = procurementDeadline(item);
                 const compliance = complianceSummary(item.requirements);
                 return (
                   <tr key={record.id}>
                     <td className="sticky-cell">
-                      {readOnly ? (
-                        <>
-                          <strong>{item.name}</strong>
-                          <small>{record.updatedAt.slice(0, 10)}</small>
-                        </>
-                      ) : (
                         <button
                           className="link-button"
                           type="button"
@@ -192,7 +192,6 @@ export function ProcurementRegistry() {
                           <strong>{item.name}</strong>
                           <small>{record.updatedAt.slice(0, 10)}</small>
                         </button>
-                      )}
                     </td>
                     <td>{item.customer}</td>
                     <td className="wide-cell">{item.subject}</td>
@@ -200,12 +199,10 @@ export function ProcurementRegistry() {
                     <td>{item.platform || "—"}</td>
                     <td>
                       <span
-                        className={`status ${deadline != null && deadline < 0 ? "danger" : deadline != null && deadline <= 7 ? "warning" : "neutral"}`}
+                        className={`status ${deadline.tone}`}
                       >
                         {item.submissionDeadline || "—"}
-                        {deadline != null
-                          ? ` · ${deadline < 0 ? "просрочено" : `${deadline} дн.`}`
-                          : ""}
+                        {deadline.label ? ` · ${deadline.label}` : ""}
                       </span>
                     </td>
                     <td>{item.status}</td>
@@ -230,7 +227,8 @@ export function ProcurementRegistry() {
             </tbody>
           </table>
         </div>
-        {!store.loading && filtered.length === 0 && (
+        {store.loading && <div className="empty-inline" role="status">Загружаем закупки…</div>}
+        {!store.loading && !store.error && filtered.length === 0 && (
           <div className="empty-state">
             <span className="empty-icon">◆</span>
             <h2>
@@ -254,9 +252,11 @@ export function ProcurementRegistry() {
           </div>
         )}
       </div>
-      {!readOnly && editing && (
+      {editing && (
         <ProcurementEditor
+          key={editing === "new" ? "new" : editing.id}
           record={editing === "new" ? undefined : editing}
+          readOnly={readOnly}
           onClose={() => setEditing(null)}
           onSave={async (item, id) => {
             const saved = await store.save(item.name, item, id);
@@ -270,9 +270,10 @@ export function ProcurementRegistry() {
           message={archiving.payload.name}
           confirmLabel="В архив"
           onClose={() => setArchiving(null)}
-          onConfirm={() => {
-            void store.archive(archiving.id);
+          onConfirm={async () => {
+            await store.archive(archiving.id);
             setArchiving(null);
+            setActionError("");
           }}
         />
       )}
@@ -280,24 +281,16 @@ export function ProcurementRegistry() {
   );
 }
 
-type Tab =
-  | "main"
-  | "compliance"
-  | "links"
-  | "partners"
-  | "checklist"
-  | "rebid"
-  | "stage2"
-  | "documents";
-
-function ProcurementEditor({
+export function ProcurementEditor({
   record,
   onSave,
   onClose,
+  readOnly = false,
 }: {
   record?: StoredRecord<ProcurementData>;
   onSave: (item: ProcurementData, id?: string) => Promise<void>;
   onClose: () => void;
+  readOnly?: boolean;
 }) {
   const calculations = useRecords<CalculatorData>("calculator");
   const contracts = useRecords<ContractData>("contract-experience");
@@ -311,8 +304,16 @@ function ProcurementEditor({
       : emptyProcurement(),
   );
   const [savedSnapshot, setSavedSnapshot] = useState(() => JSON.stringify(item));
-  const [tab, setTab] = useState<Tab>("main");
+  const dirty = JSON.stringify(item) !== savedSnapshot;
+  const [tab, setTab] = useState<ProcurementSection>("main");
+  const activeStage = workflowStage(tab);
+  const expertSection = stage2Section(tab);
   const [error, setError] = useState("");
+  const [saving, setSaving] = useState(false);
+  const saveInFlight = useRef(false);
+  const readOnlyRef = useRef(readOnly);
+  readOnlyRef.current = readOnly;
+  const [savedMessage, setSavedMessage] = useState("");
   const [cost, setCost] = useState(
     () => Number(item.calculations[0]?.snapshot.cost) || 0,
   );
@@ -320,7 +321,9 @@ function ProcurementEditor({
   const [reduction, setReduction] = useState(1);
   const [rebidPreset, setRebidPreset] = useState<RebidPreset>("comfort");
   const warnings = procurementWarnings(item);
-  const { requestClose, confirmation: discardConfirmation } = useUnsavedChanges(JSON.stringify(item) !== savedSnapshot, onClose);
+  const protectedClose = () => { if (!saveInFlight.current) onClose(); };
+  const { requestClose: checkClose, confirmation: discardConfirmation } = useUnsavedChanges(dirty, protectedClose);
+  const requestClose = () => { if (!saveInFlight.current) checkClose(); };
   const compliance = complianceSummary(item.requirements);
   const steps = useMemo(() => {
     try {
@@ -333,10 +336,13 @@ function ProcurementEditor({
     key: K,
     value: ProcurementData[K],
   ) => {
+    if (readOnlyRef.current || saveInFlight.current) return;
     setError("");
-    setItem((current) => ({ ...current, [key]: value }));
+    setSavedMessage("");
+    setItem((current) => markSignificantChange({ ...current, [key]: value }));
   };
   const save = async () => {
+    if (readOnlyRef.current || saveInFlight.current) return;
     const blocking = procurementWarnings(item).filter(
       (warning) =>
         warning.startsWith("Не заполнены") ||
@@ -349,9 +355,17 @@ function ProcurementEditor({
       setError("Исправьте отмеченные замечания перед сохранением.");
       return;
     }
-    await onSave(item, record?.id);
-    setSavedSnapshot(JSON.stringify(item));
-    setError("");
+    saveInFlight.current = true;
+    setSaving(true);
+    setSavedMessage("");
+    try {
+      await onSave(item, record?.id);
+      setSavedSnapshot(JSON.stringify(item));
+      setError("");
+      setSavedMessage("Закупка сохранена в рабочей папке.");
+    } catch (reason) {
+      setError(`Закупка не сохранена. Введённые данные остаются в карточке. ${reason instanceof Error ? reason.message : String(reason)}`);
+    } finally { saveInFlight.current = false; setSaving(false); }
   };
   const addLink = (
     key: "calculations" | "experience" | "team",
@@ -459,16 +473,6 @@ function ProcurementEditor({
         ),
       );
   };
-  const tabs: Array<[Tab, string]> = [
-    ["main", "Основное"],
-    ["compliance", "Матрица"],
-    ["links", "Опыт и команда"],
-    ["partners", "Партнёры"],
-    ["checklist", "Чек-лист"],
-    ["rebid", "Переторжка"],
-    ["stage2", "Полный контур"],
-    ["documents", "Документы"],
-  ];
   return (<>
     <DrawerBackdrop onClose={requestClose}>
     <aside
@@ -479,26 +483,30 @@ function ProcurementEditor({
       <header>
         <div>
           <h2>{record ? item.name : "Новая закупка"}</h2>
-          <p>Локальная карточка подготовки заявки</p>
+          <p>{readOnly ? "Просмотр закупки" : "Подготовка заявки"} · ревизия {item.revision}{dirty ? " · есть несохранённые изменения" : ""}{record ? ` · последнее сохранение ${new Date(record.updatedAt).toLocaleString("ru-RU")}` : " · ещё не сохранена"}</p>
         </div>
         <button className="icon-button" type="button" aria-label="Закрыть карточку закупки" title="Закрыть" onClick={requestClose}>
           ×
         </button>
       </header>
-      <nav className="drawer-tabs">
-        {tabs.map(([value, label]) => (
+      <nav className="drawer-tabs procurement-workflow" aria-label="Этапы подготовки закупки">
+        {procurementWorkflow.map((stage, index) => (
           <button
-            key={value}
-            className={tab === value ? "active" : ""}
+            key={stage.id}
+            className={activeStage.id === stage.id ? "active" : ""}
+            aria-current={activeStage.id === stage.id ? "step" : undefined}
             type="button"
-            onClick={() => setTab(value)}
+            onClick={() => setTab(stage.sections[0][0])}
           >
-            {label}
+            <span>{index + 1}</span> {stage.label}
           </button>
         ))}
       </nav>
       <div className="drawer-body">
-        {error && <div className="notice error">{error}</div>}
+        {activeStage.sections.length > 1 && <label className="procurement-section-select">Раздел этапа «{activeStage.label}»<select value={tab} onChange={(event) => setTab(event.target.value as ProcurementSection)}>{activeStage.sections.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>}
+        {readOnly && <p className="notice">Режим просмотра: карточка и выгрузка доступны, изменения запрещены.</p>}
+        {error && <div className="notice error" role="alert">{error}</div>}
+        {savedMessage && <div className="notice success" role="status">{savedMessage}</div>}
         {warnings.length > 0 && (
           <div className="notice warning">
             {warnings.map((warning) => (
@@ -506,6 +514,7 @@ function ProcurementEditor({
             ))}
           </div>
         )}
+        <fieldset className="procurement-fields" disabled={saving || (readOnly && tab !== "exports" && tab !== "s2:documents")}>
         {tab === "main" && (
           <>
             <h3>Карточка</h3>
@@ -768,8 +777,9 @@ function ProcurementEditor({
             ))}
           </>
         )}
-        {tab === "links" && (
+        {(tab === "links" || tab === "calculations") && (
           <LinkSelection
+            groups={tab === "calculations" ? ["calculations"] : ["experience", "team"]}
             item={item}
             calculations={calculations.records}
             contracts={contracts.records}
@@ -1139,11 +1149,11 @@ function ProcurementEditor({
             ))}
           </>
         )}
-        {tab === "documents" && (
+        {tab === "exports" && (
           <>
-            <h3>Версионированные документы</h3>
+            <h3>Документы заявки</h3>
             <p className="muted">
-              Создаются локально из сохранённых данных карточки. Шаблон
+              Создаются локально из текущих данных карточки и выбранных снимков. Шаблон
               SBK-PROCUREMENT/1.
             </p>
             <div className="document-actions">
@@ -1231,6 +1241,7 @@ function ProcurementEditor({
             <label>
               Лицензии и допуски, по одному в строке
               <textarea
+                readOnly={readOnly}
                 rows={6}
                 value={item.licenses.join("\n")}
                 onChange={(event) =>
@@ -1244,6 +1255,7 @@ function ProcurementEditor({
             <label>
               Документы заявки, по одному в строке
               <textarea
+                readOnly={readOnly}
                 rows={8}
                 value={item.documents.join("\n")}
                 onChange={(event) =>
@@ -1256,13 +1268,16 @@ function ProcurementEditor({
             </label>
           </>
         )}
-        {tab === "stage2" && (
+        <div hidden={!expertSection}>
           <Stage2Workspace
+            section={expertSection || "overview"}
+            readOnly={readOnly}
             item={item}
             procurementId={record?.id}
-            onChange={setItem}
+            onChange={(next) => { if (!readOnlyRef.current && !saveInFlight.current) { setItem(next); setSavedMessage(""); } }}
           />
-        )}
+        </div>
+        </fieldset>
       </div>
       <footer>
         <span className="drawer-completeness">
@@ -1270,12 +1285,12 @@ function ProcurementEditor({
           {item.checklist.filter((row) => row.done).length} из{" "}
           {item.checklist.length}
         </span>
-        <button className="secondary" type="button" onClick={requestClose}>
+        <button className="secondary" type="button" disabled={saving} onClick={requestClose}>
           Закрыть
         </button>
-        <button className="primary" type="button" onClick={() => void save()}>
-          Сохранить закупку
-        </button>
+        {!readOnly && <button className="primary" type="button" disabled={saving} onClick={() => void save()}>
+          {saving ? "Сохраняем…" : "Сохранить закупку"}
+        </button>}
       </footer>
     </aside>
     </DrawerBackdrop>
@@ -1285,6 +1300,7 @@ function ProcurementEditor({
 }
 
 function LinkSelection({
+  groups,
   item,
   calculations,
   contracts,
@@ -1292,6 +1308,7 @@ function LinkSelection({
   addLink,
   remove,
 }: {
+  groups: Array<"calculations" | "experience" | "team">;
   item: ProcurementData;
   calculations: StoredRecord<CalculatorData>[];
   contracts: StoredRecord<ContractData>[];
@@ -1336,13 +1353,18 @@ function LinkSelection({
           пользователь.
         </p>
         <div className="snapshot-list">
-          {item[key].map((link) => (
+          {item[key].map((link) => {
+            const current = records.find((record) => record.id === link.sourceId);
+            const differences = snapshotDifferences(link.snapshot, current?.payload);
+            return (
             <div key={link.id}>
               <span>
                 <strong>{link.title}</strong>
                 <small>
                   Снимок {new Date(link.capturedAt).toLocaleString("ru-RU")}
                 </small>
+                <small>{differences == null ? "Исходная запись недоступна; сохранённый снимок остаётся в заявке." : differences.length ? `Реестр изменился: ${differences.length} полей. Снимок заявки не изменён.` : "Данные снимка совпадают с текущим реестром."}</small>
+                {differences && differences.length > 0 && <details className="procurement-snapshot-comparison"><summary>Сравнить со сведениями реестра</summary><p className="help-text">Реестр сохранён {current ? new Date(current.updatedAt).toLocaleString("ru-RU") : "—"}. Сравнение ничего не заменяет. Для новой версии снимка явно удалите его из карточки и добавьте заново, затем сохраните закупку.</p>{differences.map((difference) => <section key={difference.key}><strong>{snapshotFieldLabels[difference.key] || difference.key}</strong><p className="help-text">В снимке заявки</p><pre>{snapshotValue(difference.snapshot)}</pre><p className="help-text">Сейчас в реестре</p><pre>{snapshotValue(difference.current)}</pre></section>)}</details>}
               </span>
               <button
                 className="link-button danger"
@@ -1352,7 +1374,7 @@ function LinkSelection({
                 Удалить
               </button>
             </div>
-          ))}
+          ); })}
         </div>
         <select
           aria-label={`Добавить ${title}`}
@@ -1386,20 +1408,20 @@ function LinkSelection({
   };
   return (
     <>
-      {group(
+      {groups.includes("calculations") && group(
         "Расчёты",
         "calculations",
         "calculator",
         calculations as StoredRecord<unknown>[],
       )}
-      {group(
+      {groups.includes("experience") && group(
         "Опыт",
         "experience",
         "contract-experience",
         contracts as StoredRecord<unknown>[],
         experienceSuggestions,
       )}
-      {group(
+      {groups.includes("team") && group(
         "Команда",
         "team",
         "staff",

@@ -1,18 +1,21 @@
 import { useMemo, useState } from "react";
-import { applicationCompleteness, calculateGoNoGo, cashFlowSummary, confirmGoNoGo, detectContractRisks, markSignificantChange, resourceConflicts, scenarioFinancials } from "./domain";
+import { applicationCompleteness, calculateGoNoGo, cashFlowSummary, confirmGoNoGo as confirmGoNoGoUnchecked, detectContractRisks, markSignificantChange, resourceConflicts, scenarioFinancials } from "./domain";
 import { decisionStatuses, emptyCashFlowEvent, emptyQuestion, emptyResourceAllocation, emptyScenario, goNoGoStatuses, type ProcurementData } from "./types";
 import { Stage2Documents } from "./Stage2Documents";
 import { Stage2Requirements } from "./Stage2Requirements";
+import type { Stage2Section } from "./workflow";
 
-type Section = "overview" | "documents" | "requirements" | "decision" | "questions" | "risks" | "finance" | "resources" | "application" | "result";
-const sections: Array<[Section, string]> = [["overview", "Обзор"], ["documents", "Документы"], ["requirements", "Требования"], ["decision", "Go/No-Go"], ["questions", "Вопросы"], ["risks", "Риски договора"], ["finance", "Сценарии и поток"], ["resources", "План и загрузка"], ["application", "Готовность заявки"], ["result", "Результат"]];
 const money = (value: number) => new Intl.NumberFormat("ru-RU", { style: "currency", currency: "RUB", maximumFractionDigits: 0 }).format(value || 0);
 
-export function Stage2Workspace({ item, procurementId, onChange }: { item: ProcurementData; procurementId?: string; onChange: (item: ProcurementData) => void }) {
-  const [section, setSection] = useState<Section>("overview");
+export function Stage2Workspace({ item, procurementId, onChange, section, readOnly = false }: { item: ProcurementData; procurementId?: string; onChange: (item: ProcurementData) => void; section: Stage2Section; readOnly?: boolean }) {
   const [author, setAuthor] = useState(item.goNoGoDecision.author);
   const [decisionComment, setDecisionComment] = useState(item.goNoGoDecision.comment);
   const [contractText, setContractText] = useState("");
+  const [decisionError, setDecisionError] = useState("");
+  const confirmGoNoGo = (...args: Parameters<typeof confirmGoNoGoUnchecked>) => {
+    try { const next = confirmGoNoGoUnchecked(...args); setDecisionError(""); return next; }
+    catch (reason) { setDecisionError(reason instanceof Error ? reason.message : String(reason)); return item; }
+  };
   const decision = calculateGoNoGo(item.goNoGoCriteria);
   const cash = cashFlowSummary(item.cashFlow);
   const conflicts = resourceConflicts(item.resourcePlan);
@@ -32,8 +35,8 @@ export function Stage2Workspace({ item, procurementId, onChange }: { item: Procu
   const gaps = item.requirements.filter((entry) => ["Не подтверждено", "Частично подтверждено", "Требует уточнения"].includes(entry.status));
 
   return <div className="module-stack stage2-workspace">
-    <div className="drawer-tabs stage2-tabs">{sections.map(([value, label]) => <button type="button" key={value} className={section === value ? "active" : ""} onClick={() => setSection(value)}>{label}</button>)}</div>
-    {section === "documents" && <Stage2Documents item={item} procurementId={procurementId} onChange={onChange} />}
+    {section === "documents" && <Stage2Documents item={item} procurementId={procurementId} onChange={onChange} readOnly={readOnly} />}
+    {decisionError && section === "decision" && <p className="notice error" role="alert">{decisionError}</p>}
     {section === "requirements" && <Stage2Requirements item={item} onChange={onChange} />}
 
     {section === "overview" && <><div className="stats-row"><div className="stat"><span>Ревизия данных</span><strong>{item.revision}</strong></div><div className="stat"><span>Готовность заявки</span><strong>{completeness.ready ? "Готова" : `${completeness.missing.length + completeness.invalidFiles.length + completeness.staleEvidence.length} проблем`}</strong></div><div className="stat"><span>Решение</span><strong>{item.goNoGoDecision.confirmed}</strong></div><div className="stat"><span>Кассовый разрыв</span><strong>{money(cash.maximumCashGap)}</strong></div></div>{item.goNoGoDecision.requiresReview && <div className="notice error"><strong>Решение требует пересмотра.</strong><span>После подтверждения существенно изменились данные закупки.</span></div>}<div className="form-grid"><label>Ответственный<input value={item.responsible} onChange={(event) => replace("responsible", event.target.value)} /></label><label>Начало работ<input type="date" value={item.executionStartDate} onChange={(event) => replace("executionStartDate", event.target.value)} /></label><label>Завершение работ<input type="date" value={item.executionEndDate} onChange={(event) => replace("executionEndDate", event.target.value)} /></label></div><h3>Незакрытые действия</h3><ul className="plain-list">{gaps.map((entry) => <li key={entry.id}>{entry.mandatory ? "Блокирует: " : ""}{entry.text || "Требование без формулировки"}</li>)}{completeness.missing.map((entry) => <li key={entry}>Нет обязательного элемента заявки: {entry}</li>)}{conflicts.map((entry) => <li key={`${entry.firstId}-${entry.secondId}`}>{entry.reason}</li>)}</ul></>}

@@ -1,0 +1,23 @@
+.dashboard-task-queue { overflow: hidden; }
+.dashboard-task-queue .surface-title { flex-wrap: wrap; gap: 6px 16px; }
+.dashboard-task-group { padding: 12px 18px; border-top: 1px solid var(--border, #dce4eb); }
+.dashboard-task-group h3 { display: flex; align-items: center; gap: 8px; margin: 0 0 8px; font-size: 14px; }
+.dashboard-task-group.overdue h3 { color: #a32d33; }
+.dashboard-task-group ul { list-style: none; padding: 0; margin: 0; }
+.dashboard-task-group li + li { border-top: 1px solid var(--border, #dce4eb); }
+.dashboard-task-group summary { padding: 8px 0; cursor: pointer; }
+.dashboard-task { display: flex; width: 100%; padding: 10px 4px; gap: 16px; align-items: center; border: 0; border-radius: 6px; background: transparent; color: inherit; text-align: left; }
+.dashboard-task:hover:not(:disabled) { background: var(--surface-soft, #f3f6fb); }
+.dashboard-task > span:first-child { flex: 1; min-width: 0; }
+.dashboard-task strong, .dashboard-task span span, .dashboard-task small { display: block; overflow-wrap: anywhere; }
+.dashboard-task small { color: var(--muted, #5c6b7b); margin-top: 3px; }
+.dashboard-task-date { flex-shrink: 0; text-align: right; }
+.dashboard-task > svg { flex: 0 0 16px; }
+.dashboard-clear-summary { margin: 0; }
+.dashboard-storage > summary { padding: 12px 16px; font-weight: 600; cursor: pointer; }
+.dashboard-card .link-button { text-align: left; overflow-wrap: anywhere; }
+@media (max-width: 650px) {
+  .dashboard-task { flex-wrap: wrap; gap: 6px; }
+  .dashboard-task > span:first-child { flex-basis: calc(100% - 24px); }
+  .dashboard-task-date { text-align: left; font-size: 12px; }
+}

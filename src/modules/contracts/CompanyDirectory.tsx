@@ -2,6 +2,7 @@ import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react"
 import { createPortal } from "react-dom";
 import { openPath } from "@tauri-apps/plugin-opener";
 import { Dialog } from "../../components/Dialog";
+import { CollapsibleEditorBlock } from "../../components/CollapsibleEditorBlock";
 import { DrawerBackdrop } from "../../components/DrawerBackdrop";
 import { useUnsavedChanges } from "../../hooks/useUnsavedChanges";
 import {
@@ -9,6 +10,7 @@ import {
   copyAttachment,
   discardStagedAttachments,
   importContractsWithCompanyDirectoryAtomic,
+  listRecords,
   readDraft,
   saveContractWithCompanyDirectoryAtomic,
   updateContractsAndCompanyDirectoryAtomic,
@@ -36,6 +38,7 @@ import {
   type CompanyDirectoryData,
 } from "./companies";
 import type { ContractData } from "./types";
+import { CompanyReadCard } from "./RegistryReadCard";
 
 const directoryDraftKey = "company-directory-v1";
 export const companyDirectoryRefreshEvent = "sbk-workspace-refresh";
@@ -243,7 +246,10 @@ export function useCompanyDirectory(contracts: StoredRecord<ContractData>[]) {
 
   const deleteArchivedCompanies = useCallback(async (ids: string[], records: StoredRecord<ContractData>[]) => {
     const selected = new Set(ids);
-    const referenced = directory.companies.filter((company) => selected.has(company.id) && records.some((record) =>
+    // A company referenced by an archived contract must remain recoverable too.
+    // If this read fails, abort deletion rather than treating it as an empty base.
+    const allRecords = [...records, ...await listRecords<ContractData>("contract-experience", true)];
+    const referenced = directory.companies.filter((company) => selected.has(company.id) && allRecords.some((record) =>
       record.payload.performingLegalEntityId === company.id || record.payload.customerCompanyId === company.id
     ));
     if (referenced.length) throw new Error(`Нельзя удалить связанные с договорами компании: ${referenced.map((company) => company.shortName || company.name).join(", ")}. Их можно оставить в архиве.`);
@@ -294,7 +300,7 @@ export function CompanyNameField({
   const available = companies
     .filter(
       (company) =>
-        company.scope === (role === "ours" ? "internal" : "external") ||
+        (!company.archived && company.scope === (role === "ours" ? "internal" : "external")) ||
         company.id === companyId,
     )
     .sort((a, b) => a.name.localeCompare(b.name, "ru"));
@@ -336,7 +342,7 @@ export function CompanyNameField({
           </option>
           {available.map((company) => (
             <option key={company.id} value={company.id}>
-              {company.shortName || company.name}
+              {company.shortName || company.name}{company.archived ? " (в архиве — текущая связь)" : ""}
             </option>
           ))}
           <option value="__manual">+ Ввести новую компанию</option>
@@ -584,8 +590,13 @@ export function CompanyEditor({
   readOnly?: boolean;
 }) {
   const [item, setItem] = useState(() => structuredClone(company));
+  const [viewingCard] = useState(readOnly);
+  const [existingAffiliationIds] = useState(() => new Set(company.affiliations.map((relation) => relation.id)));
+  const [revealInvalidBlocks, setRevealInvalidBlocks] = useState(0);
   const [savedSnapshot, setSavedSnapshot] = useState(() => JSON.stringify(item));
   const [error, setError] = useState("");
+  const [saving, setSaving] = useState(false);
+  const saveInFlight = useRef(false);
   const innHintId = useId();
   const innValidation = validateCompanyInn(item, companies);
   const innMessage = innValidation.error || innValidation.warning;
@@ -595,21 +606,25 @@ export function CompanyEditor({
     },
     [],
   );
-  const { requestClose, confirmation: discardConfirmation } = useUnsavedChanges(JSON.stringify(item) !== savedSnapshot, onClose);
+  const { requestClose: confirmClose, confirmation: discardConfirmation } = useUnsavedChanges(!saving && JSON.stringify(item) !== savedSnapshot, () => { if (!saveInFlight.current) onClose(); });
+  const requestClose = () => { if (!saveInFlight.current) confirmClose(); };
   const update = <K extends keyof CompanyCard>(key: K, value: CompanyCard[K]) =>
     setItem((current) => ({ ...current, [key]: value }));
   const submit = async () => {
+    if (saveInFlight.current || readOnly) return;
     const errors = validateCompany(item, companies);
     if (errors.length) {
       setError(errors.join(" "));
+      setRevealInvalidBlocks((value) => value + 1);
       return;
     }
     try {
+      saveInFlight.current = true; setSaving(true); setError("");
       await onSave(item);
       setSavedSnapshot(JSON.stringify(item));
     } catch (reason) {
-      setError(`Не удалось сохранить карточку: ${String(reason)}`);
-    }
+      setError(`Карточка не сохранена. Введённые данные остались в форме. Проверьте рабочую папку и повторите сохранение. ${String(reason)}`);
+    } finally { saveInFlight.current = false; setSaving(false); }
   };
   const updateAuthorizedSigner = (id: string, patch: Partial<CompanyCard["authorizedSigners"][number]>) =>
     update("authorizedSigners", item.authorizedSigners.map((person) => person.id === id ? { ...person, ...patch } : person));
@@ -634,6 +649,7 @@ export function CompanyEditor({
       setError(`Не удалось открыть доверенность: ${String(reason)}`);
     }
   };
+  if (viewingCard) return <CompanyReadCard company={item} companies={companies} onClose={onClose} />;
   return (<>
     <DrawerBackdrop onClose={requestClose}>
     <aside
@@ -651,8 +667,10 @@ export function CompanyEditor({
           ×
         </button>
       </header>
-      <fieldset className="drawer-body company-editor-fieldset" disabled={readOnly}>
-        {error && <div className="notice error">{error}</div>}
+      <fieldset className="drawer-body company-editor-fieldset" disabled={readOnly || saving}>
+        {error && <div className="notice error" role="alert">{error}</div>}
+        {readOnly && <p className="notice warning" role="status">Редактирование недоступно. Введённые данные остались в открытой форме.</p>}
+        <p className="registry-save-status" role="status">{saving ? "Сохраняем компанию…" : JSON.stringify(item) !== savedSnapshot ? "Есть несохранённые изменения" : "Карточка без несохранённых изменений"}</p>
         <h3>Карточка</h3>
         <div className="form-grid">
           <label className="wide">
@@ -725,7 +743,13 @@ export function CompanyEditor({
             </button>
           </div>
           {item.authorizedSigners.length === 0 && <div className="empty-inline">Подписанты по доверенности не указаны.</div>}
-          {item.authorizedSigners.map((person) => <div className="decision-maker-card" key={person.id}>
+          {item.authorizedSigners.map((person) => <CollapsibleEditorBlock
+            key={person.id}
+            title={person.fullName?.trim() || person.position?.trim() || "Новый подписант"}
+            summary={[person.position, person.powerOfAttorneyNumber ? `Доверенность № ${person.powerOfAttorneyNumber}` : "Номер доверенности не указан", person.document.fileName || "Доверенность не прикреплена"].filter(Boolean).join(" · ")}
+            defaultExpanded={![person.fullName, person.position, person.powerOfAttorneyNumber, person.issuedAt, person.expiresAt, person.notes, person.document.fileName, person.document.relativePath].some((value) => value?.trim())}
+            revealKey={revealInvalidBlocks}
+          >
             <div className="form-grid compact">
               <label className="wide">ФИО *<input value={person.fullName} onChange={(event) => updateAuthorizedSigner(person.id, { fullName: event.target.value })} /></label>
               <label>Должность<input value={person.position} onChange={(event) => updateAuthorizedSigner(person.id, { position: event.target.value })} /></label>
@@ -742,7 +766,7 @@ export function CompanyEditor({
                 <button className="secondary small danger" type="button" onClick={() => update("authorizedSigners", item.authorizedSigners.filter((entry) => entry.id !== person.id))}>Удалить подписанта</button>
               </div>
             </div>
-          </div>)}
+          </CollapsibleEditorBlock>)}
         </>}
         <label>
           Раздел справочника *
@@ -788,7 +812,13 @@ export function CompanyEditor({
           <div className="empty-inline">Лица, принимающие решения, не указаны.</div>
         )}
         {item.decisionMakers.map((person) => (
-          <div className="decision-maker-card" key={person.id}>
+          <CollapsibleEditorBlock
+            key={person.id}
+            title={person.fullName?.trim() || person.position?.trim() || "Новый контакт"}
+            summary={[person.isPrimary ? "Основной контакт" : "", person.position, person.phone, person.email].filter(Boolean).join(" · ") || "Контактные сведения не заполнены"}
+            defaultExpanded={![person.fullName, person.position, person.department, person.phone, person.email, person.notes].some((value) => value?.trim())}
+            revealKey={revealInvalidBlocks}
+          >
             <div className="form-grid compact">
               <label className="wide">
                 ФИО
@@ -821,7 +851,7 @@ export function CompanyEditor({
               </label>
               <button className="secondary small danger" type="button" onClick={() => update("decisionMakers", item.decisionMakers.filter((entry) => entry.id !== person.id))}>Удалить ЛПР</button>
             </div>
-          </div>
+          </CollapsibleEditorBlock>
         ))}
         <div className="inline-heading">
           <div>
@@ -832,7 +862,7 @@ export function CompanyEditor({
             className="secondary small"
             type="button"
             disabled={
-              companies.filter((target) => target.id !== item.id).length === 0
+              companies.filter((target) => target.id !== item.id && !target.archived).length === 0
             }
             onClick={() =>
               update("affiliations", [
@@ -840,7 +870,7 @@ export function CompanyEditor({
                 {
                   id: crypto.randomUUID(),
                   targetCompanyId:
-                    companies.find((target) => target.id !== item.id)?.id || "",
+                    companies.find((target) => target.id !== item.id && !target.archived)?.id || "",
                   type: "Головная компания",
                   note: "",
                 },
@@ -854,7 +884,14 @@ export function CompanyEditor({
           <div className="empty-inline">Связи не указаны.</div>
         )}
         {item.affiliations.map((relation) => (
-          <div className="company-affiliation-row" key={relation.id}>
+          <CollapsibleEditorBlock
+            key={relation.id}
+            title={companies.find((target) => target.id === relation.targetCompanyId)?.name || "Связь с компанией"}
+            summary={[relation.type, relation.note].filter(Boolean).join(" · ")}
+            defaultExpanded={!existingAffiliationIds.has(relation.id) || !relation.targetCompanyId}
+            revealKey={revealInvalidBlocks}
+          >
+          <div className="company-affiliation-row">
             <select
               aria-label="Тип связи"
               value={relation.type}
@@ -891,10 +928,10 @@ export function CompanyEditor({
               }
             >
               {companies
-                .filter((target) => target.id !== item.id)
+                .filter((target) => target.id !== item.id && (!target.archived || target.id === relation.targetCompanyId))
                 .map((target) => (
                   <option key={target.id} value={target.id}>
-                    {target.shortName || target.name}
+                    {target.shortName || target.name}{target.archived ? " (в архиве — текущая связь)" : ""}
                   </option>
                 ))}
             </select>
@@ -927,6 +964,7 @@ export function CompanyEditor({
               ×
             </button>
           </div>
+          </CollapsibleEditorBlock>
         ))}
         <label>
           Примечания
@@ -941,8 +979,8 @@ export function CompanyEditor({
         <button className="secondary" type="button" onClick={requestClose}>
           Отмена
         </button>
-        <button className="primary" type="button" disabled={readOnly} onClick={() => void submit()}>
-          Сохранить компанию
+        <button className="primary" type="button" disabled={readOnly || saving} onClick={() => void submit()}>
+          {saving ? "Сохраняем…" : "Сохранить компанию"}
         </button>
       </footer>
     </aside>

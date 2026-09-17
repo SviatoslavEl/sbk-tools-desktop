@@ -109,7 +109,7 @@ describe("component-managed disabled state", () => {
   it("does not restore a stale viewer disabled flag after React enables a valid calculator", () => {
     const renderSaveButton = (editor: boolean) => {
       const html = renderToStaticMarkup(<WorkspaceAccessProvider editor={editor} message={editor ? "Редактор" : "Только просмотр"}><Calculator /></WorkspaceAccessProvider>);
-      const match = html.match(/<button\b([^>]*)>Сохранить расчёт<\/button>/);
+      const match = html.match(/<button\b([^>]*)>Сохранить в базу<\/button>/);
       if (!match) throw new Error("Calculator must render its save button");
       return match[1];
     };

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import "./App.css";
 import { Dialog } from "./components/Dialog";
 import { AdministrationNotice } from "./components/AdministrationNotice";
@@ -331,9 +331,17 @@ function App() {
     () => localStorage.getItem("sbk-tools:sidebar-collapsed") === "true",
   );
   const [scannerOpened, setScannerOpened] = useState(activeTool === "scanner");
+  const [calculatorOpened, setCalculatorOpened] = useState(activeTool === "calculator");
   const [showHelp, setShowHelp] = useState(false);
-  const selectTool = (tool: ToolId) => {
+  const [openRecord, setOpenRecord] = useState<{ tool: ToolId; id: string } | null>(null);
+  const contentRef = useRef<HTMLDivElement>(null);
+  useEffect(() => { setOpenRecord(null); }, [workspace?.root]);
+  useEffect(() => { contentRef.current?.scrollTo(0, 0); }, [activeTool]);
+  const recordOpened = () => setOpenRecord(null);
+  const selectTool = (tool: ToolId, recordId?: string) => {
     if (tool === "scanner") setScannerOpened(true);
+    if (tool === "calculator") setCalculatorOpened(true);
+    setOpenRecord(recordId ? { tool, id: recordId } : null);
     setActiveTool(tool);
     localStorage.setItem("sbk-tools:last-tool", tool);
   };
@@ -636,7 +644,7 @@ function App() {
             </button>
             </div>
           </header>
-          <div id="main-content" tabIndex={-1} className={`tool-content ${["contracts", "staff", "counterparties", "procurement"].includes(activeTool) ? "registry-content" : ""}`}>
+          <div ref={contentRef} id="main-content" tabIndex={-1} className={`tool-content ${["contracts", "staff", "counterparties", "procurement"].includes(activeTool) ? "registry-content" : ""}`}>
             <AdministrationNotice key={workspace.root} message={workspace.administrationNotice} />
             {scannerOpened && <div hidden={activeTool !== "scanner"} key={workspace.root}>
               <ReadOnlyWorkspaceBoundary allowMutations>
@@ -645,11 +653,11 @@ function App() {
             </div>}
             <ReadOnlyWorkspaceBoundary>
               {activeTool === "dashboard" && <div className="module-stack"><Dashboard onNavigate={selectTool} /><section className="dashboard-calendar" aria-label="Календарь тендеров"><h2>Календарь тендеров</h2><p className="help-text">Дважды щёлкните по дню, чтобы назначить закупку. С клавиатуры — Enter на выбранном дне.</p><TenderCalendar /></section></div>}
-              {activeTool === "procurement" && <ProcurementRegistry />}
-              {activeTool === "calculator" && <Calculator />}
-              {activeTool === "contracts" && <ContractsRegistry />}
+              {activeTool === "procurement" && <ProcurementRegistry openRecordId={openRecord?.tool === "procurement" ? openRecord.id : undefined} onRecordOpened={recordOpened} />}
+              {calculatorOpened && <div hidden={activeTool !== "calculator"} key={`calculator-${workspace.root}`}><Calculator active={activeTool === "calculator"} openRecordId={openRecord?.tool === "calculator" ? openRecord.id : undefined} onRecordOpened={recordOpened} /></div>}
+              {activeTool === "contracts" && <ContractsRegistry openRecordId={openRecord?.tool === "contracts" ? openRecord.id : undefined} onRecordOpened={recordOpened} />}
               {activeTool === "counterparties" && <CounterpartiesRegistry />}
-              {activeTool === "staff" && <StaffRegistry />}
+              {activeTool === "staff" && <StaffRegistry openRecordId={openRecord?.tool === "staff" ? openRecord.id : undefined} onRecordOpened={recordOpened} />}
               {activeTool === "archive" && <Archive />}
               {activeTool === "settings" && (
                 <Settings collapsed={collapsed} onCollapsed={updateCollapsed} workspace={workspace} onWorkspaceChange={setWorkspace} />

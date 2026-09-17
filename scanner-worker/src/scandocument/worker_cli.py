@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import io
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -187,6 +188,8 @@ def preview_result(config: dict, prepared_document: PreviewDocument | None = Non
         with open_preview_document(source, preview_cache_dir=cache_dir) as prepared:
             return preview_result(config, prepared)
     settings = settings_for(config.get("preset", "Офисный скан"), config.get("settings"))
+    if config.get("expectedSourceFingerprint") and config["expectedSourceFingerprint"] != prepared_document.fingerprint:
+        raise ValueError("Исходный документ изменился после предпросмотра. Откройте его повторно.")
     placements = placements_from(config)
     original, processed, pages, warnings, page_size = make_preview(
         source, settings, int(config.get("seed", 42)), int(config.get("pageIndex", 0)),
@@ -235,6 +238,36 @@ def preview_result(config: dict, prepared_document: PreviewDocument | None = Non
         for annotation in annotations:
             annotation.validate_for_document(pages)
         processed = apply_annotations(processed, annotations, page_index)
+    if config.get("finalPreview") is True:
+        # Interactive CSS is only a editing aid. This explicit final preview
+        # executes the very same full-resolution page pipeline and JPEG budget
+        # as PDF export, including facsimiles, blur, rotation and compression.
+        from scandocument.pipeline import _process_page, CancellationToken
+        from scandocument.pdf_engine import render_page
+        from scandocument.validation import validate_preview_limits
+
+        document = prepared_document.document
+        order = [int(value) for value in config.get("pageOrder", [])] or list(range(pages))
+        if len(order) > MAX_PAGES or any(index < 0 or index >= pages for index in order) or page_index not in order:
+            raise ValueError("Выберите страницу, включённую в итоговый PDF.")
+        dimensions = []
+        for index in order:
+            page = document[index]
+            size = tuple(map(float, page.get_size()))
+            page.close()
+            dimensions.append(size)
+        validate_preview_limits(source.stat().st_size, pages, dimensions[order.index(page_index)], settings.dpi)
+        pixels = [max(1, round(width / 72 * settings.dpi) * round(height / 72 * settings.dpi)) for width, height in dimensions]
+        target = config.get("compressionTargetRatio")
+        total_budget = max(len(order) * 8_192, round(source.stat().st_size * max(.10, min(1., float(target))))) if target is not None else None
+        page_budget = round(total_budget * pixels[order.index(page_index)] / max(1, sum(pixels))) if total_budget is not None else None
+        image, size = render_page(document, page_index, settings.dpi)
+        request = ProcessRequest(source, output, settings, int(config.get("seed", 42)),
+                                 facsimiles=placements, annotations=annotations, redactions=redactions)
+        with SecureWorkspace() as final_workspace:
+            jpeg, _, _ = _process_page(image, request, page_index, size, rotation, final_workspace, CancellationToken(), page_budget)
+        with Image.open(io.BytesIO(jpeg)) as decoded:
+            processed = decoded.convert("RGB")
     output.parent.mkdir(parents=True, exist_ok=True)
     original_output = output.with_name(f"{output.stem}.original.png")
     target_ratio = config.get("compressionTargetRatio")
@@ -291,6 +324,8 @@ def prepare_preview(config: dict) -> int:
 
 def process(config: dict) -> int:
     validate_protocol(config)
+    if config.get("outputPolicy", "replace") not in {"replace", "no-clobber"}:
+        raise ValueError("Недопустимое правило сохранения результата.")
     expected_fingerprint = config.get("expectedSourceFingerprint")
     if expected_fingerprint is not None and (
         not isinstance(expected_fingerprint, str) or len(expected_fingerprint) != 64
@@ -309,6 +344,7 @@ def process(config: dict) -> int:
         redactions=redactions_from(config),
         annotations=annotations_from(config),
         pdfa_enabled=bool(config.get("pdfaEnabled", False)),
+        overwrite_output=config.get("outputPolicy", "replace") != "no-clobber",
         compression_target_ratio=(float(config["compressionTargetRatio"])
                                   if config.get("compressionTargetRatio") is not None else None),
     )

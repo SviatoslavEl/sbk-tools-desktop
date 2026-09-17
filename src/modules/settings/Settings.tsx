@@ -37,6 +37,7 @@ import { useWorkspaceAccess } from "../../lib/workspaceAccess";
 import { workspacePasswordError, workspacePasswordHint } from "./passwordPolicy";
 import { OwnerPanel } from "./OwnerPanel";
 import { editorStatus, unavailableWorkspaceInfo } from "../../lib/editorStatus";
+import "./settings.css";
 
 interface AppSettings {
   expiryDays: 30 | 60 | 90;
@@ -58,6 +59,12 @@ export function Settings({
   const workspaceAccess = useWorkspaceAccess();
   const store = useRecords<AppSettings>("settings");
   const [accessBusy, setAccessBusy] = useState(false);
+  const [section, setSection] = useState("workspace");
+  const [backupLoading, setBackupLoading] = useState(true);
+  const [backupError, setBackupError] = useState("");
+  const [verification, setVerification] = useState<{ path: string; at: string } | null>(null);
+  const [maintenanceBusy, setMaintenanceBusy] = useState(false);
+  const maintenanceOperation = useRef(false);
   const accessOperation = useRef(false);
   const editor = editorStatus(workspace);
   const [message, setMessage] = useState("");
@@ -86,17 +93,28 @@ export function Settings({
   const historyLimit =
     store.records.find((record) => record.title === "application")?.payload
       .historyLimit || 100;
-  const reloadBackups = () =>
-    void listBackups()
-      .then(setBackups)
-      .catch(() => setMessage("Не удалось обновить список резервных копий. Показаны последние полученные сведения."));
+  const reloadBackups = async () => {
+    setBackupLoading(true);
+    try { setBackups(await listBackups()); setBackupError(""); }
+    catch { setBackupError("Не удалось обновить список резервных копий. Показаны последние полученные сведения."); }
+    finally { setBackupLoading(false); }
+  };
+  const latestBackup = [...backups].sort((a, b) => Date.parse(b.modifiedAt) - Date.parse(a.modifiedAt))[0];
+  const runMaintenance = async (action: () => Promise<void>) => {
+    if (maintenanceOperation.current) return;
+    maintenanceOperation.current = true; setMaintenanceBusy(true);
+    try { await action(); }
+    catch (reason) { setMessage(`Ошибка: ${String(reason)}`); }
+    finally { maintenanceOperation.current = false; setMaintenanceBusy(false); }
+  };
   useEffect(() => {
     const timers = readAccessTimers(workspace.root);
     setAccessTimers(timers);
     setRetention(timers.retentionCount);
     setRetentionDays(timers.retentionDays);
-    void getIntelligenceProviderStatus().then(setIntelligence);
-    reloadBackups();
+    void getIntelligenceProviderStatus().then(setIntelligence).catch(() => setIntelligence(null));
+    setVerification(null);
+    void reloadBackups();
   }, [workspace.root]);
   useEffect(() => {
     if (!workspace?.root) return;
@@ -223,16 +241,18 @@ export function Settings({
     }
   };
   const verify = async (path: string) => {
-    setMessage("Проверяем manifest, контрольные суммы и базы…");
+    setMessage("Проверяем целостность файлов и баз в резервной копии…");
+    setVerification(null);
     try {
       const result = path.endsWith(".enc")
         ? await verifyEncryptedBackup(path, backupPassword)
         : await verifyBackup(path);
       setMessage(
-        `Проверка PASS: ${result.files} файлов, ${(result.unpackedBytes / 1024 / 1024).toFixed(1)} МБ, SHA-256 ${result.sha256}.`,
+        `Копия проверена: ${result.files} файлов, ${(result.unpackedBytes / 1024 / 1024).toFixed(1)} МБ. Повреждений не обнаружено.`,
       );
+      setVerification({ path, at: new Date().toLocaleString("ru-RU") });
     } catch (reason) {
-      setMessage(`Проверка FAIL: ${String(reason)}`);
+      setMessage(`Ошибка проверки: ${String(reason)}`);
     }
   };
   const selectRestore = async () => {
@@ -244,17 +264,18 @@ export function Settings({
   };
   const restore = async () => {
     const path = restorePath;
-    setRestorePath("");
     setMessage("Восстанавливаем данные…");
     try {
       if (path.endsWith(".enc"))
         await restoreEncryptedBackup(path, backupPassword);
       else await restoreBackup(path);
       setBackupPassword("");
+      setRestorePath("");
       setMessage("Данные восстановлены. Перезагружаем приложение…");
       window.setTimeout(() => window.location.reload(), 350);
     } catch (reason) {
       setMessage(`Восстановление не выполнено: ${String(reason)}`);
+      throw reason;
     }
   };
   const selectWorkspace = async () => {
@@ -288,8 +309,12 @@ export function Settings({
   };
 
   return (
-    <div className="settings-grid">
-      <section className="surface">
+    <div className="module-stack settings-module">
+      <nav className="settings-sections" aria-label="Разделы настроек">{[["workspace", "Рабочая папка"], ["backups", "Резервные копии"], ["interface", "Интерфейс"], ["advanced", "Обслуживание"]].map(([id, label]) => <button type="button" key={id} aria-pressed={section === id} onClick={() => setSection(id)}>{label}</button>)}</nav>
+      {message && <div className={`notice ${/Ошибка|не выполнено|не завершено|Не удалось/.test(message) ? "error" : "neutral"}`} role="status">{message}</div>}
+      {store.error && <div className="notice error" role="alert"><span>Настройки не прочитаны: {store.error}. Их изменение остановлено, чтобы не заменить сохранённые значения.</span><button type="button" onClick={() => void store.reload()}>Повторить загрузку настроек</button></div>}
+      <div className="settings-grid">
+      <section className="surface" hidden={section !== "workspace"}>
         <div className="surface-title">
           <h2>Общая рабочая папка</h2>
           <span
@@ -370,19 +395,19 @@ export function Settings({
             Редактирование включается вручную по общему паролю. Одновременно
             редактирует только один пользователь. При сетевой ошибке освобождение может потребовать повторной попытки; до подтверждения запись запрещена.
           </p>
-          <div className="notice warning">
-            <strong>Требование к сетевой папке</strong>
+          <details className="settings-technical">
+            <summary>Технические требования к сетевой папке</summary>
             <span>
               SMB/NFS-хранилище должно поддерживать межмашинные блокировки
               файлов и атомарное переименование. Если администратор отключил эти
               механизмы, прямую общую базу использовать нельзя.
             </span>
-          </div>
+          </details>
         </div>
       </section>
-      <section className="surface">
+      <section className="surface" hidden={section !== "workspace"}>
         <div className="surface-title">
-          <h2>Обновление и архивирование</h2>
+          <h2>Обновление данных</h2>
         </div>
         <div className="surface-body settings-form">
           <label>
@@ -403,25 +428,6 @@ export function Settings({
               <option value="300">каждые 5 минут</option>
             </select>
           </label>
-          <label>
-            Автоматически архивировать базу
-            <select
-              disabled={!workspaceAccess.editor}
-              value={accessTimers.backupHours}
-              onChange={(event) =>
-                updateAccessTimers({
-                  ...accessTimers,
-                  backupHours: Number(event.target.value),
-                })
-              }
-            >
-              <option value="0">выключено</option>
-              <option value="6">каждые 6 часов</option>
-              <option value="12">каждые 12 часов</option>
-              <option value="24">ежедневно</option>
-              <option value="168">еженедельно</option>
-            </select>
-          </label>
           <div className="button-row">
             <button
               className="secondary"
@@ -433,24 +439,22 @@ export function Settings({
             </button>
           </div>
           <p className="help-text">
-            Автоархивирование работает во всём приложении и выполняется только
-            экземпляром-редактором. Копия сначала создаётся во временном файле,
-            проверяется и затем атомарно переименовывается.
+            Обновление получает изменения коллег из общей папки. Оно не создаёт резервную копию и не меняет режим доступа.
           </p>
         </div>
       </section>
-      <section className="surface" data-workspace-mutation>
+      <section className="surface" data-workspace-mutation hidden={section !== "interface"}>
         <div className="surface-title">
           <h2>Интерфейс и история</h2>
         </div>
-        <div className="surface-body settings-form">
+        <fieldset className="surface-body settings-form settings-interface-fields" disabled={maintenanceBusy || store.loading || Boolean(store.error)}>
           <label className="checkbox-row">
             <input
               type="checkbox"
               checked={collapsed}
               onChange={(event) => {
                 onCollapsed(event.target.checked);
-                void saveSettings({ collapsedSidebar: event.target.checked });
+                void runMaintenance(() => saveSettings({ collapsedSidebar: event.target.checked }));
               }}
             />{" "}
             Сворачивать навигацию до значков
@@ -460,11 +464,11 @@ export function Settings({
             <select
               value={expiryDays}
               onChange={(event) =>
-                void saveSettings({
+                void runMaintenance(() => saveSettings({
                   expiryDays: Number(
                     event.target.value,
                   ) as AppSettings["expiryDays"],
-                })
+                }))
               }
             >
               <option value="30">за 30 дней</option>
@@ -476,15 +480,18 @@ export function Settings({
             Версий на одну запись
             <select
               value={historyLimit}
-              onChange={async (event) => {
+              onChange={(event) => {
                 const limit = Number(
                   event.target.value,
                 ) as AppSettings["historyLimit"];
+                if (!window.confirm(`Хранить не более ${limit} версий на запись? Более старые версии будут удалены. Текущие записи останутся без изменений.`)) return;
+                void runMaintenance(async () => {
                 await saveSettings({ historyLimit: limit });
                 const removed = await pruneHistory(limit);
                 setMessage(
                   `Ограничение истории применено: удалено старых версий — ${removed}.`,
                 );
+                });
               }}
             >
               <option value="25">25</option>
@@ -493,9 +500,9 @@ export function Settings({
               <option value="200">200</option>
             </select>
           </label>
-        </div>
+        </fieldset>
       </section>
-      <section className="surface">
+      <section className="surface" hidden={section !== "advanced"}>
         <div className="surface-title">
           <h2>Локальный AI-сервер</h2>
           <span className="status neutral">Выключен</span>
@@ -516,18 +523,20 @@ export function Settings({
           </p>
         </div>
       </section>
-      <section className="surface">
+      <section className="surface" hidden={section !== "backups"}>
         <div className="surface-title">
-          <h2>Защита резервной копии</h2>
+          <h2>Создание и защита копий</h2>
         </div>
         <div className="surface-body settings-form">
+          <label>Автоматические резервные копии<select disabled={!workspaceAccess.editor} value={accessTimers.backupHours} onChange={(event) => updateAccessTimers({ ...accessTimers, backupHours: Number(event.target.value) })}><option value="0">выключено</option><option value="6">каждые 6 часов</option><option value="12">каждые 12 часов</option><option value="24">ежедневно</option><option value="168">еженедельно</option></select></label>
+          <p className="help-text">Создаются, пока программа открыта в режиме редактора. Это полная копия данных, а не архив отдельных записей. Автоматические копии не шифруются; настройка ниже относится к новой ручной копии.</p>
           <label className="checkbox-row">
             <input
               type="checkbox"
               checked={encryptBackup}
               onChange={(event) => setEncryptBackup(event.target.checked)}
             />{" "}
-            Шифровать новую копию (Argon2id + XChaCha20-Poly1305)
+            Защитить новую ручную копию паролем
           </label>
           <label>
             Пароль копии
@@ -542,11 +551,12 @@ export function Settings({
           </label>
           <p className="help-text">
             Пароль нигде не сохраняется. Он нужен только для зашифрованной
-            копии; запуск приложения пароля не требует.
+            копии. Это не пароль доступа к рабочей папке. Без пароля восстановить зашифрованную копию нельзя.
           </p>
+          <details className="settings-technical"><summary>Как защищена копия</summary><p>Для шифрования используются Argon2id и XChaCha20-Poly1305. Пароль не сохраняется в приложении.</p></details>
         </div>
       </section>
-      <section className="surface backup-surface">
+      <section className="surface backup-surface" hidden={section !== "backups"}>
         <div className="surface-title">
           <h2>Резервное копирование</h2>
           <span>{backups.length} копий</span>
@@ -556,12 +566,15 @@ export function Settings({
             Копия содержит отдельные базы всех инструментов и сохранённые
             вложения.
           </p>
+          <div className="notice neutral" role="status"><strong>{backupLoading ? "Проверяем список копий…" : backupError ? "Состояние резервных копий не подтверждено" : latestBackup ? `Последняя копия: ${new Date(latestBackup.modifiedAt).toLocaleString("ru-RU")}` : "Резервных копий пока нет"}</strong><span>{verification ? `Проверена в этом сеансе: ${verification.path.split(/[\\/]/).pop()} · ${verification.at}` : "Целостность существующих копий в этом сеансе не проверялась."}</span></div>
+          {backupError && <div className="notice error" role="alert"><span>{backupError}</span><button type="button" onClick={() => void reloadBackups()}>Повторить загрузку</button></div>}
+          <fieldset disabled={maintenanceBusy} aria-busy={maintenanceBusy} className="settings-actions">
           <div className="button-row">
             <button
               className="primary"
               disabled={!workspaceAccess.editor}
               type="button"
-              onClick={() => void backup()}
+              onClick={() => void runMaintenance(backup)}
             >
               Создать резервную копию
             </button>
@@ -569,7 +582,7 @@ export function Settings({
               className="secondary"
               disabled={!workspaceAccess.editor}
               type="button"
-              onClick={() => void selectRestore()}
+              onClick={() => void runMaintenance(selectRestore)}
             >
               Проверить / восстановить файл
             </button>
@@ -603,15 +616,15 @@ export function Settings({
               className="secondary small"
               disabled={!workspaceAccess.editor}
               type="button"
-              onClick={async () => {
+              onClick={() => { if (!window.confirm("Удалить незакреплённые резервные копии сверх выбранного количества и возраста? Закреплённые копии останутся.")) return; void runMaintenance(async () => {
                 const removed = await rotateBackups(retention, retentionDays);
                 setMessage(
                   `Ротация завершена: удалено ${removed}. Закреплённые копии сохранены.`,
                 );
-                reloadBackups();
-              }}
+                await reloadBackups();
+              }); }}
             >
-              Применить ротацию
+              Очистить старые копии
             </button>
           </div>
           <div className="backup-list">
@@ -631,7 +644,7 @@ export function Settings({
                   <button
                     className="link-button"
                     type="button"
-                    onClick={() => void verify(item.path)}
+                    onClick={() => void runMaintenance(() => verify(item.path))}
                   >
                     Проверить
                   </button>
@@ -639,10 +652,10 @@ export function Settings({
                     className="link-button"
                     disabled={!workspaceAccess.editor}
                     type="button"
-                    onClick={async () => {
+                    onClick={() => void runMaintenance(async () => {
                       await setBackupPinned(item.fileName, !item.pinned);
-                      reloadBackups();
-                    }}
+                      await reloadBackups();
+                    })}
                   >
                     {item.pinned ? "Открепить" : "Закрепить"}
                   </button>
@@ -650,7 +663,7 @@ export function Settings({
                     className="link-button danger"
                     disabled={!workspaceAccess.editor || item.pinned}
                     type="button"
-                    onClick={async () => {
+                    onClick={() => void runMaintenance(async () => {
                       if (
                         !window.confirm(
                           `Удалить резервную копию ${item.fileName}?`,
@@ -658,8 +671,8 @@ export function Settings({
                       )
                         return;
                       await deleteBackup(item.fileName);
-                      reloadBackups();
-                    }}
+                      await reloadBackups();
+                    })}
                   >
                     Удалить
                   </button>
@@ -667,16 +680,10 @@ export function Settings({
               </div>
             ))}
           </div>
-          {message && (
-            <div
-              className={`notice ${message.startsWith("Ошибка") || message.startsWith("Восстановление не") || message.startsWith("Проверка FAIL") ? "error" : "success"}`}
-            >
-              {message}
-            </div>
-          )}
+          </fieldset>
         </div>
       </section>
-      <section className="surface">
+      <section className="surface" hidden={section !== "advanced"}>
         <div className="surface-title">
           <h2>Изоляция данных</h2>
         </div>
@@ -693,7 +700,7 @@ export function Settings({
           </ul>
         </div>
       </section>
-      <section className="surface">
+      <section className="surface" hidden={section !== "advanced"}>
         <div className="surface-title">
           <h2>Контроль вложений</h2>
         </div>
@@ -706,13 +713,14 @@ export function Settings({
             <button
               className="secondary"
               type="button"
-              onClick={() => void checkAttachments(false)}
+              disabled={maintenanceBusy}
+              onClick={() => void runMaintenance(() => checkAttachments(false))}
             >
               Проверить
             </button>
             <button
               className="secondary danger"
-              disabled={!workspaceAccess.editor}
+              disabled={!workspaceAccess.editor || maintenanceBusy}
               type="button"
               onClick={() => {
                 if (
@@ -720,7 +728,7 @@ export function Settings({
                     "Удалить все неподключённые вложения? Текущие записи и история не изменятся.",
                   )
                 )
-                  void checkAttachments(true);
+                  void runMaintenance(() => checkAttachments(true));
               }}
             >
               Очистить неподключённые
@@ -728,6 +736,7 @@ export function Settings({
           </div>
         </div>
       </section>
+      </div>
       <OwnerPanel key={workspace.root} workspace={workspace} />
       {workspaceAccess.editor && restorePath && (
         <ConfirmDialog
@@ -735,7 +744,7 @@ export function Settings({
           message="Перед изменением данных архив будет полностью проверен. Текущее состояние сохранится в страховочную копию."
           confirmLabel="Проверить и восстановить"
           onClose={() => setRestorePath("")}
-          onConfirm={() => void restore()}
+          onConfirm={restore}
         />
       )}
     </div>

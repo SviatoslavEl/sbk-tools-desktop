@@ -203,6 +203,8 @@ class ProcessRequest:
     annotations: list[Annotation] = field(default_factory=list)
     pdfa_enabled: bool = False
     compression_target_ratio: float | None = None
+    # Folder/batch saves must never replace an existing result, including races.
+    overwrite_output: bool = True
 
 
 @dataclass(slots=True)

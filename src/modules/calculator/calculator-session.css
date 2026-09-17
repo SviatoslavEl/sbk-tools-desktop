@@ -1,0 +1,7 @@
+.calculator-session { border: 0; padding: 0; margin: 0; min-inline-size: 0; }
+.calculator-session [hidden] { display: none !important; }
+.calculator-record-status { display: block; font-size: 12px; line-height: 1.5; }
+.calculator-live-summary { align-self: start; padding: 20px; display: grid; gap: 10px; }
+.calculator-live-summary > strong { font-size: clamp(24px, 3vw, 36px); }
+.calculator-live-summary > small { color: var(--muted); line-height: 1.5; }
+.calculator-guided .calculator-layout:has(.result-column:not([hidden])) { grid-template-columns: minmax(0, 1fr); }

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { recordHistory, restoreHistoryVersion, type HistoryEntry, type ModuleId } from "../lib/storage";
 import { useWorkspaceAccess } from "../lib/workspaceAccess";
@@ -17,6 +17,7 @@ export function VersionHistory({ module, id, title, payload, onRestore }: {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [revision, setRevision] = useState(0);
+  const restoreOperation = useRef(false);
   useEffect(() => {
     if (!open) return;
     let cancelled = false;
@@ -30,16 +31,20 @@ export function VersionHistory({ module, id, title, payload, onRestore }: {
   const entry = entries.find((item) => item.id === selected);
   const changes = entry?.snapshot ? historyChanges(entry.snapshot, payload) : [];
   const restore = async () => {
-    if (!access.editor || !entry?.snapshot || busy) return;
-    setPending(false); setBusy(true); setError("");
+    if (restoreOperation.current) return;
+    if (!access.editor || !entry?.snapshot || busy) throw new Error("Восстановление недоступно. Дождитесь загрузки истории и проверьте режим редактора.");
+    restoreOperation.current = true;
+    setBusy(true); setError("");
     try {
       if (onRestore) await onRestore(entry.snapshot);
       else await restoreHistoryVersion(module, id, entry.id);
       window.dispatchEvent(new Event("sbk-workspace-refresh"));
+      setPending(false);
       setRevision((value) => value + 1);
-    } catch (reason) { setError(String(reason)); setBusy(false); }
+    } catch (reason) { setError(String(reason)); throw reason; }
+    finally { restoreOperation.current = false; setBusy(false); }
   };
-  return <><button className="secondary small" type="button" aria-label={`История изменений: ${title}`} onDoubleClick={(event) => event.stopPropagation()} onClick={(event) => { event.stopPropagation(); setOpen(true); }}>История</button>{open && createPortal(<Dialog title={`История изменений: ${title}`} onClose={() => { if (!busy) setOpen(false); }}>
+  return <><button className="secondary small" type="button" aria-label={`История изменений: ${title}`} onDoubleClick={(event) => event.stopPropagation()} onClick={(event) => { event.stopPropagation(); setOpen(true); }}>История</button>{open && createPortal(<Dialog title={`История изменений: ${title}`} closeDisabled={busy} onClose={() => { if (!busy) setOpen(false); }}>
     <div className="version-history">
       <p>Снимок хранит состояние <strong>до указанного изменения</strong>. Сравнение показывает отличие от текущей сохранённой карточки. Возврат не удаляет последующие снимки.</p>
       {error && <div role="alert" className="notice error">{error}</div>}
@@ -49,6 +54,6 @@ export function VersionHistory({ module, id, title, payload, onRestore }: {
       {entry?.snapshot ? <><h3>Отличия от текущей карточки: {changes.length}</h3>{changes.length ? <div className="table-scroll"><table><thead><tr><th>Поле</th><th>Выбранное состояние</th><th>Сейчас</th></tr></thead><tbody>{changes.map((change) => <tr key={change.field}><th>{change.field}</th><td>{change.before}</td><td>{change.after}</td></tr>)}</tbody></table></div> : <p>Данные совпадают.</p>}<button className="primary" type="button" disabled={!access.editor || busy || !changes.length} onClick={() => setPending(true)}>Восстановить это состояние</button></> : null}
       {!access.editor && <p>Просмотр истории доступен. Возврат версии — только текущему редактору базы.</p>}
     </div>
-    {pending && <ConfirmDialog title="Вернуть сохранённое состояние?" message="Будут восстановлены данные выбранной карточки. Текущее состояние останется в истории. Для компании связанные реквизиты договоров также обновятся; несохранённые изменения в других открытых редакторах сюда не входят." confirmLabel="Восстановить" onClose={() => setPending(false)} onConfirm={() => void restore()} />}
+    {pending && <ConfirmDialog title="Вернуть сохранённое состояние?" message="Будут восстановлены данные выбранной карточки. Текущее состояние останется в истории. Для компании связанные реквизиты договоров также обновятся; несохранённые изменения в других открытых редакторах сюда не входят." confirmLabel="Восстановить" onClose={() => { if (!restoreOperation.current) setPending(false); }} onConfirm={restore} />}
   </Dialog>, document.body)}</>;
 }

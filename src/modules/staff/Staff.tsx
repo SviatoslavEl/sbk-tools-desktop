@@ -1,7 +1,8 @@
-import { Fragment, useEffect, useId, useMemo, useState } from "react";
+import { Fragment, useEffect, useId, useMemo, useRef, useState } from "react";
 import { openPath } from "@tauri-apps/plugin-opener";
 import { ConfirmDialog, Dialog } from "../../components/Dialog";
 import { DrawerBackdrop } from "../../components/DrawerBackdrop";
+import { CollapsibleEditorBlock } from "../../components/CollapsibleEditorBlock";
 import { SortableHeader } from "../../components/SortableHeader";
 import { useRecords } from "../../hooks/useRecords";
 import { useUnsavedChanges } from "../../hooks/useUnsavedChanges";
@@ -51,6 +52,7 @@ import {
 import {
   documentExpiry,
   staffRequirements,
+  staffAttachmentSummary,
   urgentDocument,
   type ExpiryCategory,
 } from "./requirements";
@@ -62,6 +64,9 @@ import {
 } from "./import";
 import { matchStaff, type StaffSelectionCriteria } from "./selection";
 import { staffEmailHint, validateStaffEmail } from "./emailValidation";
+import { StaffReadCard } from "./StaffReadCard";
+import { RegistryTableView } from "../contracts/RegistryTableView";
+import "../contracts/registry.css";
 import {
   applyStaffImportOverrides,
   buildStaffImportOverride,
@@ -157,7 +162,7 @@ const requiredStaffImportFields: ImportRequiredField<StaffData>[] = [
   },
 ];
 
-export function StaffRegistry() {
+export function StaffRegistry({ openRecordId, onRecordOpened }: { openRecordId?: string; onRecordOpened?: () => void } = {}) {
   const workspaceAccess = useWorkspaceAccess();
   const readOnly = !workspaceAccess.editor;
   const store = useRecords<StaffData>("staff");
@@ -173,9 +178,19 @@ export function StaffRegistry() {
   const [expiryFilter, setExpiryFilter] = useState<
     "" | ExpiryCategory | "no-document"
   >("");
-  const [editing, setEditing] = useState<
+  const [editing, setEditingRecord] = useState<
     StoredRecord<StaffData> | "new" | null
   >(null);
+  const [viewingCard, setViewingCard] = useState(false);
+  const setEditing = (record: StoredRecord<StaffData> | "new" | null) => {
+    if (record !== null) setViewingCard(readOnly);
+    setEditingRecord(record);
+  };
+  useEffect(() => {
+    if (!openRecordId || store.loading || store.error || editing) return;
+    const record = store.records.find((entry) => entry.id === openRecordId);
+    if (record) { setViewingCard(readOnly); setEditingRecord(record); onRecordOpened?.(); }
+  }, [openRecordId, store.loading, store.error, store.records, editing, readOnly, onRecordOpened]);
   const [archiving, setArchiving] = useState<StoredRecord<StaffData> | null>(
     null,
   );
@@ -769,24 +784,6 @@ export function StaffRegistry() {
           <span>{workspaceAccess.message}</span>
         </div>
       )}
-      {!readOnly && (
-        <div className="portable-export-row">
-          <span>
-            Полный переносимый пакет включает базу, историю и вложения кадров.
-          </span>
-          <button
-            className="secondary small"
-            type="button"
-            onClick={() =>
-              void createBackup("staff").then((result) =>
-                window.alert(`Полный пакет создан: ${result.fileName}`),
-              )
-            }
-          >
-            Создать полный пакет
-          </button>
-        </div>
-      )}
       <div className="registry-toolbar">
         <label className="search-box">
           <span>Поиск</span>
@@ -820,6 +817,7 @@ export function StaffRegistry() {
             ))}
           </select>
         </label>
+        <details className="registry-extra-filters"><summary>Ещё фильтры ({[basisFilter, statusFilter, expiryFilter].filter(Boolean).length})</summary><div className="form-grid">
         <label>
           <span>Основание</span>
           <select
@@ -859,13 +857,19 @@ export function StaffRegistry() {
             <option value="no-document">Нет документов</option>
           </select>
         </label>
+        </div></details>
         <div className="toolbar-actions">
           <div className="toolbar-action-group"><span>Обмен</span>
             {!readOnly && <button className="secondary" type="button" onClick={() => void openImport("add")}>Добавить из файла</button>}
             {!readOnly && <button className="secondary" type="button" onClick={() => void openImport("update")}>Обновить из файла</button>}
-            <button className="secondary" type="button" disabled={!selectedRegistryRecords.length} onClick={() => void exportArchive()}>Экспорт ZIP ({selectedRegistryRecords.length})</button>
-            <button className="secondary" type="button" disabled={!selectedRegistryRecords.length} onClick={() => void exportSelection()}>CSV ({selectedRegistryRecords.length})</button>
-            <button className="secondary" type="button" disabled={!selectedRegistryRecords.length} onClick={() => void exportXlsx()}>XLSX ({selectedRegistryRecords.length})</button>
+            <details className="registry-export-menu"><summary>Экспорт ({selectedRegistryRecords.length})</summary><div>
+              <p>Только отмеченные кадровые карточки: {selectedRegistryRecords.length}. Проверьте разрешения на раскрытие перед передачей.</p>
+              {selectedRegistryRecords.length > 0 && <details className="registry-export-contents"><summary>Состав выгрузки: записи и вложения</summary><ul>{selectedRegistryRecords.map(({ id, payload }) => <li key={id}><strong>{payload.fullName}{!payload.disclosureAllowed ? " · раскрытие не разрешено" : ""}</strong><span>{payload.documents.filter((document) => document.relativePath).map((document) => document.fileName || document.name || document.type).join("; ") || "Файлы не приложены"}</span></li>)}</ul></details>}
+              <button className="secondary" type="button" disabled={!selectedRegistryRecords.length} onClick={() => void exportArchive().catch((reason) => window.alert(`Экспорт не выполнен: ${String(reason)}`))}>Документы и сведения (ZIP)</button>
+              <button className="secondary" type="button" disabled={!selectedRegistryRecords.length} onClick={() => void exportSelection().catch((reason) => window.alert(`Экспорт не выполнен: ${String(reason)}`))}>Таблица CSV</button>
+              <button className="secondary" type="button" disabled={!selectedRegistryRecords.length} onClick={() => void exportXlsx().catch((reason) => window.alert(`Экспорт не выполнен: ${String(reason)}`))}>Таблица XLSX</button>
+              {!readOnly && <details><summary>Перенос всего раздела</summary><p>Все кадровые карточки, включая архив, историю и вложения. Выбор строк не ограничивает полный перенос.</p><button className="secondary small" type="button" onClick={() => void createBackup("staff").then((result) => window.alert(`Пакет переноса создан: ${result.fileName}`)).catch((reason) => window.alert(`Не удалось создать пакет: ${String(reason)}`))}>Создать пакет переноса раздела</button></details>}
+            </div></details>
           </div>
           <button
             className="secondary"
@@ -895,18 +899,23 @@ export function StaffRegistry() {
         <div className="notice error">
           <strong>Не удалось открыть кадровый реестр.</strong>
           <span>{store.error}</span>
+          {store.records.length > 0 && <span>Показаны данные последнего успешного чтения.</span>}
+          <button className="secondary" type="button" disabled={store.loading} onClick={() => void store.reload()}>Повторить чтение</button>
         </div>
       )}
       <div className="surface table-surface">
+        <RegistryTableView name="staff" count={filtered.length} columns={[
+          { key: "name", label: "ФИО", compact: true }, { key: "legalEntity", label: "Юрлицо", compact: false }, { key: "department", label: "Отдел", compact: false }, { key: "position", label: "Должность", compact: true }, { key: "basis", label: "Основание", compact: true }, { key: "status", label: "Статус", compact: false }, { key: "qualification", label: "Квалификация", compact: false }, { key: "document", label: "Документы", compact: true }, { key: "readiness", label: "Полнота карточки", compact: true },
+        ]} />
         <div className="table-scroll">
-          <table>
+          <table className="registry-staff-table registry-compact-table">
             <thead>
               <tr>
                 <th className="selection-cell"><input type="checkbox" aria-label="Выбрать все найденные кадровые карточки" checked={filtered.length > 0 && filtered.every((record) => selectedRegistryStaff.has(record.id))} ref={(input) => { if (input) input.indeterminate = filtered.some((record) => selectedRegistryStaff.has(record.id)) && !filtered.every((record) => selectedRegistryStaff.has(record.id)); }} onChange={(event) => { const checked = event.target.checked; setSelectedRegistryStaff((current) => { const next = new Set(current); filtered.forEach((record) => checked ? next.add(record.id) : next.delete(record.id)); return next; }); }} /></th>
                 {([[
                   "name", "ФИО"], ["legalEntity", "Юрлицо"], ["department", "Отдел"],
                   ["position", "Должность / роль"], ["basis", "Основание"], ["status", "Статус"],
-                  ["qualification", "Квалификация"], ["document", "Самый срочный документ"], ["readiness", "Готовность к закупке"],
+                  ["qualification", "Квалификация"], ["document", "Самый срочный документ"], ["readiness", "Полнота карточки"],
                 ] as Array<[StaffSortKey, string]>).map(([column, label]) => <SortableHeader key={column} label={label} column={column} active={sort.key === column} direction={sort.direction} onSort={(key) => setSort((current) => toggleSort(current, key))} />)}
                 <th />
               </tr>
@@ -923,6 +932,7 @@ export function StaffRegistry() {
                     : "";
                 const urgent = urgentDocument(item.documents, expiryDays);
                 const requirements = staffRequirements(item, expiryDays);
+                const attachmentSummary = staffAttachmentSummary(requirements.files);
                 return (
                   <Fragment key={record.id}>
                     {sort.key === "department" && department !== previousDepartment && (
@@ -932,21 +942,12 @@ export function StaffRegistry() {
                     )}
                     <tr
                       onDoubleClick={() => {
-                        if (!readOnly) setEditing(record);
+                        setEditing(record);
                       }}
                     >
                       <td className="selection-cell" onDoubleClick={(event) => event.stopPropagation()}><input type="checkbox" aria-label={`Выбрать сотрудника ${item.fullName}`} checked={selectedRegistryStaff.has(record.id)} onChange={(event) => { const checked = event.target.checked; setSelectedRegistryStaff((current) => { const next = new Set(current); if (checked) next.add(record.id); else next.delete(record.id); return next; }); }} /></td>
                       <td className="sticky-cell">
-                        {readOnly ? (
-                          <>
-                            <strong>{item.fullName}</strong>
-                            <small>
-                              {item.birthDate
-                                ? `р. ${date(item.birthDate)}`
-                                : ""}
-                            </small>
-                          </>
-                        ) : (
+                        {(
                           <button
                             className="link-button"
                             type="button"
@@ -1000,12 +1001,13 @@ export function StaffRegistry() {
                           title={
                             requirements.missing.length
                               ? `Не хватает: ${requirements.missing.join(", ")}`
-                              : "Комплект готов"
+                              : "Сведения заполнены. Соответствие конкретной закупке не проверено."
                           }
                         >
                           {requirements.met} из {requirements.total} ·{" "}
-                          {requirements.ready ? "готов" : "не готов"}
+                          {requirements.ready ? "заполнено" : "неполно"}
                         </span>
+                        <small title={attachmentSummary.title}>{attachmentSummary.label}</small>
                       </td>
                       <td>
                         {!readOnly && (
@@ -1037,7 +1039,8 @@ export function StaffRegistry() {
             </tbody>
           </table>
         </div>
-        {!store.loading && filtered.length === 0 && (
+        {store.loading && <div className="empty-state" role="status">Загружаем кадровый реестр…</div>}
+        {!store.loading && !store.error && filtered.length === 0 && (
           <div className="empty-state">
             <span className="empty-icon">●</span>
             <h2>
@@ -1050,6 +1053,7 @@ export function StaffRegistry() {
                 ? "Измените поиск или фильтры."
                 : "Здесь будут юрлица, отделы, основания сотрудничества и документы."}
             </p>
+            {store.records.length > 0 && <button className="secondary" type="button" onClick={() => { setSearch(""); setBasisFilter(""); setStatusFilter(""); setLegalEntityFilter(""); setDepartmentFilter(""); setExpiryFilter(""); }}>Сбросить фильтры</button>}
             {!store.records.length && !readOnly && (
               <button
                 className="primary"
@@ -1062,7 +1066,7 @@ export function StaffRegistry() {
           </div>
         )}
       </div>
-      {editing && (
+      {editing && viewingCard && editing !== "new" ? <StaffReadCard record={{ ...editing, payload: normalizeStaffData(editing.payload) }} onClose={() => setEditing(null)} /> : editing && (
         <StaffEditor
           record={editing === "new" ? undefined : editing}
           onClose={() => setEditing(null)}
@@ -1078,8 +1082,8 @@ export function StaffRegistry() {
           message={`${archiving.payload.fullName} и сведения о документах останутся в базе.`}
           confirmLabel="В архив"
           onClose={() => setArchiving(null)}
-          onConfirm={() => {
-            void store.archive(archiving.id);
+          onConfirm={async () => {
+            await store.archive(archiving.id);
             setArchiving(null);
           }}
         />
@@ -1118,6 +1122,10 @@ export function StaffRegistry() {
                   placeholder="аудит, информационная безопасность, ISO 27001…"
                 />
               </label>
+            </div>
+            <details className="registry-extra-filters"><summary>Дополнительные условия ({Object.entries(selectionCriteria).filter(([key, value]) => !["procurementTitle", "keywords"].includes(key) && Boolean(value)).length}) · найдено: {staffMatches.length}</summary>
+            <p className="help-text">Применяются все заданные ограничения одновременно. Совпадение не заменяет проверку документов и требований закупки.</p>
+            <div className="form-grid selection-filters">
               <label>
                 Юрлицо
                 <select
@@ -1351,6 +1359,8 @@ export function StaffRegistry() {
                 </select>
               </label>
             </div>
+            </details>
+            <details className="registry-extra-filters"><summary>Документы для ZIP ({selectionDocumentCategories.size} категорий)</summary>
             <section className="selection-document-options" aria-label="Документы для архива подбора">
               <div className="inline-heading">
                 <div><strong>Документы для ZIP</strong><small>В архив попадут только отмеченные категории.</small></div>
@@ -1373,6 +1383,7 @@ export function StaffRegistry() {
                 </label>)}
               </div>
             </section>
+            </details>
             <div className="import-summary">
               <strong>
                 Найдено: {staffMatches.length} · выбрано: {selectedStaff.size}
@@ -1878,11 +1889,16 @@ export function StaffEditor({
   const [tab, setTab] = useState<StaffTab>("general");
   const [error, setError] = useState("");
   const [history, setHistory] = useState<HistoryEntry[]>([]);
+  const [saving, setSaving] = useState(false);
+  const saveInFlight = useRef(false);
+  const [workspacePath, setWorkspacePath] = useState("");
+  const [assignmentValidationAttempt, setAssignmentValidationAttempt] = useState(0);
   const emailHintId = useId();
   const emailValidation = validateStaffEmail(item.email, record?.payload.email);
   const emailMessage = emailValidation.error || emailValidation.warning;
   useEffect(() => {
-    if (record) void recordHistory("staff", record.id).then(setHistory);
+    if (record) void recordHistory("staff", record.id).then(setHistory).catch((reason) => setError(`Не удалось загрузить историю: ${String(reason)}`));
+    void getWorkspaceInfo().then((workspace) => setWorkspacePath(workspace.root)).catch(() => undefined);
   }, [record]);
   useEffect(
     () => () => {
@@ -1893,6 +1909,7 @@ export function StaffEditor({
   const update = <K extends keyof StaffData>(key: K, value: StaffData[K]) =>
     setItem((current) => ({ ...current, [key]: value }));
   const save = async () => {
+    if (saveInFlight.current) return;
     if (!editorAccess.editor) { setError("Режим редактора завершён. Введённые поля сохранены в открытом окне, но запись в общую базу запрещена."); return; }
     if (!item.fullName.trim()) {
       setError("Заполните ФИО.");
@@ -1918,11 +1935,15 @@ export function StaffEditor({
       setError(
         "Для каждого места работы заполните юрлицо, отдел, должность и пояснение основания «Иное».",
       );
+      setAssignmentValidationAttempt((current) => current + 1);
       setTab("work");
       return;
     }
     const primary =
       assignments.find((entry) => entry.isPrimary) || assignments[0];
+    saveInFlight.current = true;
+    setSaving(true); setError("");
+    try {
     await onSave(
       {
         ...item,
@@ -1941,6 +1962,9 @@ export function StaffEditor({
       recordId,
     );
     setSavedSnapshot(JSON.stringify(item));
+    } catch (reason) {
+      setError(`Карточка не сохранена. Введённые данные остались в форме. Проверьте доступность рабочей папки и повторите сохранение. ${String(reason)}`);
+    } finally { saveInFlight.current = false; setSaving(false); }
   };
   const tabs: Array<[StaffTab, string]> = importMode
     ? [
@@ -1969,10 +1993,12 @@ export function StaffEditor({
     basisOther: readinessAssignment.engagementOther,
     startDate: readinessAssignment.startDate,
   });
-  const { requestClose, confirmation: discardConfirmation } = useUnsavedChanges(JSON.stringify(item) !== savedSnapshot, async () => {
+  const { requestClose: confirmClose, confirmation: discardConfirmation } = useUnsavedChanges(!saving && JSON.stringify(item) !== savedSnapshot, async () => {
+    if (saveInFlight.current) return;
     await discardStagedAttachments("staff", recordId).catch(() => undefined);
     onClose();
   });
+  const requestClose = () => { if (!saveInFlight.current) confirmClose(); };
   return (<>
     <DrawerBackdrop onClose={requestClose}>
     <aside
@@ -2017,7 +2043,10 @@ export function StaffEditor({
         ))}
       </nav>
       <div className="drawer-body">
-        {error && <div className="notice error">{error}</div>}
+        {error && <div className="notice error" role="alert">{error}</div>}
+        {!editorAccess.editor && <p className="notice warning" role="status">Редактирование недоступно. Введённые данные сохранены в открытой форме; не закрывайте её, если хотите продолжить после возврата доступа.</p>}
+        <p className="registry-save-status" role="status">{saving ? "Сохраняем карточку… Не закрывайте программу." : JSON.stringify(item) !== savedSnapshot ? "Есть несохранённые изменения" : "Карточка без несохранённых изменений"}{workspacePath && <><br />Рабочая папка: {workspacePath}</>}</p>
+        <fieldset className="registry-editor-fields" disabled={saving || !editorAccess.editor}>
         {tab === "general" && (
           <>
             <h3>Общие сведения</h3>
@@ -2156,6 +2185,7 @@ export function StaffEditor({
         {tab === "work" && (
           <OrganizationalAssignmentsEditor
             assignments={item.organizationalAssignments}
+            validationAttempt={assignmentValidationAttempt}
             onChange={(assignments) =>
               update("organizationalAssignments", assignments)
             }
@@ -2344,6 +2374,7 @@ export function StaffEditor({
             )}
           </>
         )}
+        </fieldset>
       </div>
       <footer>
         <span
@@ -2351,13 +2382,14 @@ export function StaffEditor({
           title={
             requirements.missing.length
               ? `Не хватает: ${requirements.missing.join(", ")}`
-              : "Комплект готов"
+              : "Сведения заполнены. Соответствие конкретной закупке не проверено."
           }
         >
-          Готовность: {requirements.met} из {requirements.total}
+          Полнота карточки: {requirements.met} из {requirements.total}
           {requirements.missing.length
             ? ` · нет: ${requirements.missing.join(", ")}`
-            : " · готово"}
+            : " · заполнено"}
+          {` · ${staffAttachmentSummary(requirements.files).label}`}
         </span>
         <button
           className="secondary"
@@ -2366,8 +2398,8 @@ export function StaffEditor({
         >
           Отмена
         </button>
-        <button className="primary" type="button" disabled={!editorAccess.editor} onClick={() => void save()}>
-          Сохранить карточку
+        <button className="primary" type="button" disabled={!editorAccess.editor || saving} onClick={() => void save()}>
+          {saving ? "Сохраняем…" : "Сохранить карточку"}
         </button>
       </footer>
     </aside>
@@ -2380,9 +2412,11 @@ export function StaffEditor({
 function OrganizationalAssignmentsEditor({
   assignments,
   onChange,
+  validationAttempt = 0,
 }: {
   assignments: OrganizationalAssignment[];
   onChange: (items: OrganizationalAssignment[]) => void;
+  validationAttempt?: number;
 }) {
   const update = (id: string, patch: Partial<OrganizationalAssignment>) =>
     onChange(
@@ -2421,7 +2455,13 @@ function OrganizationalAssignmentsEditor({
         </button>
       </div>
       {assignments.map((assignment) => (
-        <section className="document-card" key={assignment.id}>
+        <CollapsibleEditorBlock
+          key={assignment.id}
+          title={assignment.position.trim() || assignment.legalEntity.trim() || "Новое назначение"}
+          summary={[assignment.legalEntity, assignment.department, assignment.isPrimary ? "Основное" : "Дополнительное"].filter(Boolean).join(" · ")}
+          defaultExpanded={!assignment.legalEntity.trim() || !assignment.department.trim() || !assignment.position.trim()}
+          revealKey={!assignment.legalEntity.trim() || !assignment.department.trim() || !assignment.position.trim() || (assignment.engagementType === "Иное" && !assignment.engagementOther.trim()) ? validationAttempt : 0}
+        >
           <div className="document-card-header">
             <label className="checkbox-row">
               <input
@@ -2560,7 +2600,7 @@ function OrganizationalAssignmentsEditor({
               />
             </label>
           </div>
-        </section>
+        </CollapsibleEditorBlock>
       ))}
     </>
   );
@@ -2643,7 +2683,12 @@ function DocumentsEditor({
         <div className="empty-inline">Документов пока нет.</div>
       )}
       {visible.map((doc) => (
-        <section className="document-card" key={doc.id}>
+        <CollapsibleEditorBlock
+          key={doc.id}
+          title={doc.name.trim() || doc.type.trim() || doc.fileName || "Новый документ"}
+          summary={[categoryLabels[doc.category], doc.seriesNumber && `№ ${doc.seriesNumber}`, doc.fileName ? "Файл прикреплён" : "Без файла"].filter(Boolean).join(" · ")}
+          defaultExpanded={!doc.name.trim() && !doc.type.trim() && !doc.fileName}
+        >
           <div className="document-card-header">
             <select
               aria-label="Категория документа"
@@ -2782,7 +2827,7 @@ function DocumentsEditor({
               </button>
             </div>
           </div>
-        </section>
+        </CollapsibleEditorBlock>
       ))}
     </>
   );

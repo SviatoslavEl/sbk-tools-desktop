@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 
 import pypdfium2 as pdfium
 from PIL import Image
+from scandocument.errors import SaveError
 
 if TYPE_CHECKING:
     from pypdf import PdfWriter
@@ -76,10 +77,11 @@ class StreamingPdfWriter:
     _OUTPUT_INTENT_ID = 8
     _INFO_ID = 9
 
-    def __init__(self, destination: Path, title: str, seed: int, pdfa: bool = False) -> None:
+    def __init__(self, destination: Path, title: str, seed: int, pdfa: bool = False, *, overwrite: bool = True) -> None:
         from scandocument.tempfiles import SecureWorkspace
 
         self.destination = destination
+        self._overwrite = overwrite
         self.destination.parent.mkdir(parents=True, exist_ok=True)
         self.temporary, self._journal = SecureWorkspace.register_output_part(destination)
         try:
@@ -292,7 +294,25 @@ class StreamingPdfWriter:
             self._stream.flush()
             os.fsync(self._stream.fileno())
             self._stream.close()
-            self.temporary.replace(self.destination)
+            if self._overwrite:
+                self.temporary.replace(self.destination)
+            else:
+                # A check followed by replace is unsafe: another process can
+                # publish in between. Hard-link creation publishes the complete
+                # same-volume file atomically and fails if the name now exists.
+                # Unsupported filesystems fail closed; never fall back to replace.
+                try:
+                    if os.name == "nt":
+                        # Windows rename, unlike replace, refuses an existing
+                        # target and works on SMB shares without hard links.
+                        os.rename(self.temporary, self.destination)
+                    else:
+                        os.link(self.temporary, self.destination)
+                except FileExistsError as exc:
+                    raise SaveError(f"Файл уже существует, он не изменён: {self.destination.name}. Выберите другое имя или папку.") from exc
+                except OSError as exc:
+                    raise SaveError("Не удалось безопасно сохранить файл без замены. Проверьте доступ или выберите локальную папку; существующие файлы не изменены.") from exc
+                self.temporary.unlink(missing_ok=True)
             self._finished = True
             self._journal.unlink(missing_ok=True)
         finally:

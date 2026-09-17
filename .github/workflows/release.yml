@@ -75,7 +75,7 @@ jobs:
   build:
     needs: quality-gate
     env:
-      ARTIFACT_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('2.8.8-test.{0}', github.run_number) }}
+      ARTIFACT_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('2.8.9-test.{0}', github.run_number) }}
     strategy:
       fail-fast: false
       matrix:
@@ -496,7 +496,7 @@ jobs:
     runs-on: windows-latest
     env:
       TARGET: x86_64-pc-windows-msvc
-      ARTIFACT_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('2.8.8-test.{0}', github.run_number) }}
+      ARTIFACT_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('2.8.9-test.{0}', github.run_number) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6

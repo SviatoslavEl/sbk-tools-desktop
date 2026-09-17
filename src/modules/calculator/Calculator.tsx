@@ -1,8 +1,10 @@
 import { createContext, useCallback, useContext, useEffect, useId, useMemo, useRef, useState, type Dispatch, type SetStateAction } from "react";
 import { useRecords } from "../../hooks/useRecords";
+import { ConfirmDialog } from "../../components/Dialog";
 import { exportText, importText } from "../../lib/files";
 import { clearDraft, readDraft, saveDraft } from "../../lib/storage";
 import { useWorkspaceAccess } from "../../lib/workspaceAccess";
+import "./calculator-session.css";
 import { calculate, competitorComparablePrice, priceScenarios, recommendPrice } from "./engine";
 import {
   initialCalculatorData,
@@ -67,14 +69,14 @@ function NumberField({ value, onChange, min, max, suffix }: {
   </div>;
 }
 
-export function Calculator() {
+export function Calculator({ openRecordId, onRecordOpened, active = true }: { openRecordId?: string; onRecordOpened?: () => void; active?: boolean } = {}) {
   const workspaceAccess = useWorkspaceAccess();
   const [experienceMode, setExperienceMode] = useState<"guided" | "expert">("guided");
   const [step, setStep] = useState(0);
   const guideRef = useRef<HTMLElement>(null);
   useEffect(() => {
-    if (experienceMode === "guided") guideRef.current?.scrollIntoView({ block: "start" });
-  }, [step, experienceMode]);
+    if (active && experienceMode === "guided") guideRef.current?.scrollIntoView({ block: "start" });
+  }, [step, experienceMode, active]);
   const steps = ["Основа и цель", "Дополнительные расходы", "Условия сделки", "Конкуренты и риски", "Итоговая цена"];
   const guidance = [
     "Укажите себестоимость, включён ли в неё НДС, и желаемую маржу. Маржа — доля прибыли в цене без НДС; наценка — процент сверх затрат. Если цена уже известна, выберите расчёт прибыли по цене.",
@@ -90,6 +92,25 @@ export function Calculator() {
   const [recordId, setRecordId] = useState<string | undefined>();
   const [savedStatus, setSavedStatus] = useState("Загружаем черновик…");
   const [formError, setFormError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const operation = useRef(false);
+  const initialRecordRequest = useRef(openRecordId);
+  const initialReadGeneration = useRef(0);
+  const latestRecordRequest = useRef(openRecordId);
+  const lastRecordAttempt = useRef<{ id: string; retry: number } | null>(null);
+  latestRecordRequest.current = openRecordId;
+  const [initialLoadError, setInitialLoadError] = useState("");
+  const [initialRetry, setInitialRetry] = useState(0);
+  const draftTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const draftQueue = useRef<Promise<void>>(Promise.resolve());
+  const [archiving, setArchiving] = useState(false);
+  const [savedPayload, setSavedPayload] = useState("");
+  const hasRecordChanges = !recordId || JSON.stringify(data) !== savedPayload;
+  const queueDraft = useCallback((payload: CalculatorData, id: string) => {
+    const next = draftQueue.current.catch(() => undefined).then(() => saveDraft("calculator", payload, id));
+    draftQueue.current = next;
+    return next;
+  }, []);
   const [invalidNumberFields, setInvalidNumberFields] = useState<Set<string>>(new Set());
   const [activeChart, setActiveChart] = useState<"structure" | "scenario" | "competitors">("structure");
   const result = useMemo(() => calculate(data), [data]);
@@ -110,30 +131,84 @@ export function Calculator() {
 
   useEffect(() => {
     let active = true;
+    if (initialRecordRequest.current) return;
+    const readGeneration = ++initialReadGeneration.current;
+    setInitialLoadError("");
     void readDraft<unknown>("calculator", "new")
-      .then((draft) => { if (active) { if (draft) setData(restoredCalculatorData(draft)); setSavedStatus(draft ? "Черновик восстановлен" : "Новый черновик"); } })
-      .catch(() => { if (active) setSavedStatus("Черновик не удалось восстановить"); })
-      .finally(() => { if (active) setDraftReady(true); });
+      .then((draft) => { if (active && readGeneration === initialReadGeneration.current) { if (draft) setData(restoredCalculatorData(draft)); setSavedStatus(draft ? "Черновик восстановлен" : "Новый черновик"); setDraftReady(true); } })
+      .catch(() => { if (active && readGeneration === initialReadGeneration.current) setInitialLoadError("Черновик не удалось прочитать. Запись поверх него остановлена. Проверьте рабочую папку и повторите загрузку."); });
     return () => { active = false; };
-  }, []);
+  }, [initialRetry]);
 
   useEffect(() => {
-    if (!draftReady || !workspaceAccess.editor) return;
+    if (!draftReady || !workspaceAccess.editor || busy) return;
+    let active = true;
+    if (recordId && !hasRecordChanges) { setSavedStatus("Все изменения сохранены в общей базе"); return; }
     if (!calculationValid) {
       setSavedStatus("Исправьте поля — черновик не сохранён");
       return;
     }
     setSavedStatus("Сохраняем черновик…");
-    const timer = window.setTimeout(() => {
-      void saveDraft("calculator", data, recordId || "new")
-        .then(() => setSavedStatus("Изменения сохранены"))
-        .catch(() => setSavedStatus("Черновик не сохранён"));
+    const timer = setTimeout(() => {
+      draftTimer.current = undefined;
+      void queueDraft(data, recordId || "new")
+        .then(() => { if (active) setSavedStatus("Черновик сохранён · запись в базе не изменена"); })
+        .catch(() => { if (active) setSavedStatus("Не удалось сохранить черновик — оставьте расчёт открытым и повторите сохранение"); });
     }, 450);
-    return () => window.clearTimeout(timer);
-  }, [data, draftReady, recordId, workspaceAccess.editor, calculationValid]);
+    draftTimer.current = timer;
+    return () => { active = false; clearTimeout(timer); if (draftTimer.current === timer) draftTimer.current = undefined; };
+  }, [data, draftReady, recordId, workspaceAccess.editor, calculationValid, busy, queueDraft, hasRecordChanges]);
 
   const update = <K extends keyof CalculatorData>(key: K, value: CalculatorData[K]) =>
     setData((current) => ({ ...current, [key]: value }));
+
+  const runOperation = async (action: () => Promise<void>) => {
+    if (operation.current) return false;
+    operation.current = true;
+    if (draftTimer.current) clearTimeout(draftTimer.current);
+    setBusy(true); setFormError("");
+    try { await action(); return true; }
+    catch (reason) { setFormError(`${reason instanceof Error ? reason.message : String(reason)} Введённые данные остаются в форме.`); return false; }
+    finally { operation.current = false; setBusy(false); }
+  };
+  const preserveCurrent = async (replacesNew = false) => {
+    if (!draftReady) return;
+    if (replacesNew && !recordId && hasRecordChanges) {
+      if (!window.confirm("Новый расчёт ещё не сохранён в базу. Его черновик будет заменён. Продолжить?")) throw new Error("Замена черновика отменена.");
+      return;
+    }
+    if (workspaceAccess.editor && calculationValid) {
+      await queueDraft(data, recordId || "new");
+    } else if (hasRecordChanges && !window.confirm("Текущий расчёт не сохранён. Продолжить без сохранения?")) {
+      throw new Error("Переход отменён.");
+    }
+  };
+  const loadCalculation = async (id: string, preserve = true, fromDashboard = false) => {
+    initialReadGeneration.current += 1;
+    const record = saved.records.find((item) => item.id === id);
+    if (!record) { setFormError("Расчёт не найден: он мог быть перенесён в архив."); return; }
+    return runOperation(async () => {
+      if (preserve) await preserveCurrent();
+      const draft = await readDraft<unknown>("calculator", record.id);
+      if (fromDashboard && latestRecordRequest.current !== id) return;
+      const payload = restoredCalculatorData(record.payload);
+      setData(draft ? restoredCalculatorData(draft) : payload);
+      setRecordId(record.id); setSavedPayload(JSON.stringify(payload));
+      setSavedStatus(draft ? "Восстановлен черновик · нажмите «Сохранить в базу», чтобы обновить запись" : "Открыта сохранённая запись");
+    });
+  };
+  useEffect(() => {
+    if (!openRecordId) { lastRecordAttempt.current = null; return; }
+    if (saved.loading || saved.error || busy || operation.current) return;
+    if (lastRecordAttempt.current?.id === openRecordId && lastRecordAttempt.current.retry === initialRetry) return;
+    lastRecordAttempt.current = { id: openRecordId, retry: initialRetry };
+    const requestedId = openRecordId;
+    void loadCalculation(requestedId, !initialRecordRequest.current, true).then((success) => {
+      if (latestRecordRequest.current !== requestedId) return;
+      if (success) { initialRecordRequest.current = undefined; setInitialLoadError(""); setDraftReady(true); onRecordOpened?.(); }
+      else if (!draftReady) setInitialLoadError("Не удалось открыть запрошенный расчёт. Существующие черновики не изменены. Повторите загрузку.");
+    });
+  }, [openRecordId, saved.loading, saved.error, initialRetry, busy]);
 
   const saveCalculation = async (duplicate = false) => {
     if (!workspaceAccess.editor) { setFormError("Расчёт доступен локально. Для сохранения в общую базу необходим режим редактора."); return; }
@@ -141,18 +216,24 @@ export function Calculator() {
       setFormError(result.issues.find((issue) => issue.blocking)?.message || "Исправьте неверно заполненные числовые поля перед сохранением.");
       return;
     }
-    const title = data.name.trim() || "Расчёт без названия";
-    const record = await saved.save(title, data, duplicate ? undefined : recordId);
-    setRecordId(record.id);
-    void clearDraft("calculator", recordId || "new");
-    setSavedStatus(duplicate ? "Копия сохранена" : "Расчёт сохранён");
+    await runOperation(async () => {
+      await draftQueue.current.catch(() => undefined);
+      const title = data.name.trim() || "Расчёт без названия";
+      const record = await saved.save(title, data, duplicate ? undefined : recordId);
+      setRecordId(record.id); setSavedPayload(JSON.stringify(data));
+      try { await clearDraft("calculator", recordId || "new"); }
+      catch { setFormError("Запись сохранена в базе, но старый черновик не удалось удалить."); }
+      setSavedStatus(duplicate ? "Копия сохранена в общей базе" : "Расчёт сохранён в общей базе");
+    });
   };
 
-  const newCalculation = () => {
+  const resetCalculation = () => {
     setData({ ...clone(initialCalculatorData), name: `Расчёт ${new Date().toLocaleDateString("ru-RU")}` });
     setRecordId(undefined);
+    setSavedPayload("");
     setSavedStatus("Новый черновик");
   };
+  const newCalculation = () => runOperation(async () => { await preserveCurrent(true); resetCalculation(); });
 
   const exportCalculation = async () => {
     if (!calculationValid) {
@@ -160,54 +241,51 @@ export function Calculator() {
       return;
     }
     if (result.status === "danger" && !window.confirm("Расчёт убыточный или ниже минимальной маржи. Экспортировать с предупреждением?")) return;
-    await exportText("Экспорт расчёта", `${data.name || "расчёт"}.sbkcalc.json`, ["json"], JSON.stringify({ version: 2, data, result }, null, 2));
+    await runOperation(async () => { await exportText("Экспорт расчёта", `${data.name || "расчёт"}.sbkcalc.json`, ["json"], JSON.stringify({ version: 2, data, result }, null, 2)); });
   };
 
   const importCalculation = async () => {
+    await runOperation(async () => {
     const imported = await importText("Импорт расчёта", ["json"]);
     if (!imported) return;
-    try {
       const parsed = JSON.parse(imported.content) as { data?: unknown };
-      setData(migrateCalculatorData(parsed.data ?? parsed, true));
+      const nextData = migrateCalculatorData(parsed.data ?? parsed, true);
+      await preserveCurrent(true);
+      setData(nextData);
       setRecordId(undefined);
+      setSavedPayload("");
       setFormError("");
       setSavedStatus("Импортирован новый черновик");
-    } catch (reason) {
-      setFormError(reason instanceof Error ? reason.message : "Файл расчёта повреждён или несовместим.");
-    }
+    });
   };
 
-  return <NumberValidityContext.Provider value={reportNumberValidity}><div className={`module-stack calculator-module calculator-${experienceMode}`}>
+  return <NumberValidityContext.Provider value={reportNumberValidity}><div className="module-stack">{initialLoadError && <div className="notice error" role="alert"><span>{initialLoadError}</span><button type="button" onClick={() => setInitialRetry((value) => value + 1)}>Повторить загрузку черновика</button></div>}{!draftReady && saved.error && <div className="notice error" role="alert"><span>{saved.error}</span><button type="button" onClick={() => void saved.reload()}>Повторить загрузку расчётов</button></div>}<fieldset disabled={busy || !draftReady} aria-busy={busy || !draftReady} className={`module-stack calculator-module calculator-session calculator-${experienceMode}`}>
     <div className="calculator-mode-switch" role="group" aria-label="Уровень калькулятора"><button type="button" aria-pressed={experienceMode === "guided"} onClick={() => setExperienceMode("guided")}>Пошаговый расчёт</button><button type="button" aria-pressed={experienceMode === "expert"} onClick={() => setExperienceMode("expert")}>Экспертный режим</button><span>Один расчёт — переключение без потери данных</span></div>
     {!workspaceAccess.editor && <div className="notice"><strong>Локальный расчёт в режиме просмотра</strong><span>Все параметры и экспорт доступны. Сохранение в общую базу и автоматическая запись черновика отключены.</span></div>}
     {experienceMode === "guided" && <section ref={guideRef} className="surface calculator-guide" aria-label="Шаги расчёта"><nav aria-label="Этапы калькулятора">{steps.map((label, index) => <button type="button" key={label} aria-current={step === index ? "step" : undefined} onClick={() => setStep(index)}>{index + 1}. {label}</button>)}</nav><h2>Шаг {step + 1}. {steps[step]}</h2><p>{guidance[step]}</p></section>}
     <div className="module-toolbar">
       <div className="record-switcher">
         <label>Текущий расчёт
-          <select value={recordId || ""} onChange={(event) => {
-            const record = saved.records.find((item) => item.id === event.target.value);
-            if (record) {
-              setRecordId(record.id);
-              void readDraft<unknown>("calculator", record.id).then((draft) => setData(restoredCalculatorData(draft || record.payload)));
-            }
-          }}>
-            <option value="">Черновик — {data.name}</option>
+          <select disabled={saved.loading} value={recordId || ""} onChange={(event) => { if (event.target.value) void loadCalculation(event.target.value); }}>
+            <option value="" disabled={Boolean(recordId)}>Черновик — {data.name}</option>
             {saved.records.map((record) => <option key={record.id} value={record.id}>{record.title}</option>)}
           </select>
         </label>
-        <span className="autosave-status">{workspaceAccess.editor ? savedStatus : "Локальная копия · без записи в базу"}</span>
+        <span className="autosave-status" role="status">{busy ? "Выполняем…" : workspaceAccess.editor ? savedStatus : "Локальная копия · без записи в базу"}</span>
+        <strong className="calculator-record-status">{recordId ? hasRecordChanges ? "Есть изменения, не сохранённые в базу" : "Совпадает с сохранённой записью" : "Новый расчёт · в общей базе ещё нет"}</strong>
       </div>
       <div className="toolbar-actions">
         <button className="secondary" type="button" onClick={newCalculation}>Новый</button>
         <button className="secondary" type="button" onClick={() => void importCalculation()}>Импорт</button>
         <button className="secondary" disabled={!calculationValid} type="button" onClick={() => void exportCalculation()}>Экспорт</button>
-        {recordId && <button data-workspace-mutation data-workspace-managed-disabled="true" className="secondary danger" disabled={!workspaceAccess.editor} type="button" onClick={() => { if (workspaceAccess.editor && window.confirm("Переместить расчёт в архив?")) void saved.archive(recordId).then(newCalculation); }}>В архив</button>}
-        <button data-workspace-mutation data-workspace-managed-disabled="true" className="primary" disabled={!calculationValid || !workspaceAccess.editor} type="button" onClick={() => void saveCalculation(false)}>Сохранить расчёт</button>
+        {recordId && <><button data-workspace-mutation data-workspace-managed-disabled="true" className="secondary" disabled={!calculationValid || !workspaceAccess.editor} type="button" onClick={() => void saveCalculation(true)}>Сохранить как копию</button><button data-workspace-mutation data-workspace-managed-disabled="true" className="secondary danger" disabled={!workspaceAccess.editor} type="button" onClick={() => setArchiving(true)}>В архив</button></>}
+        <button data-workspace-mutation data-workspace-managed-disabled="true" className="primary" disabled={!calculationValid || !workspaceAccess.editor || (Boolean(recordId) && !hasRecordChanges)} type="button" onClick={() => void saveCalculation(false)}>Сохранить в базу</button>
       </div>
     </div>
 
-    {saved.error && <div className="notice error"><strong>База недоступна.</strong><span>{saved.error}</span></div>}
-    {formError && <div className="notice error"><strong>Расчёт не сохранён.</strong><span>{formError}</span></div>}
+    {saved.loading && <p role="status">Загружаем сохранённые расчёты…</p>}
+    {saved.error && <div className="notice error"><strong>База недоступна.</strong><span>{saved.error}</span><button type="button" onClick={() => void saved.reload()}>Повторить загрузку</button></div>}
+    {formError && <div className="notice error" role="alert"><strong>Проверьте результат действия.</strong><span>{formError}</span></div>}
     <div className="calculator-layout">
       <section className="input-column" hidden={experienceMode === "guided" && step === 4}>
         <div className="surface" hidden={!visibleStep(0)}>
@@ -286,7 +364,8 @@ export function Calculator() {
         </details>
       </section>
 
-      <section className="result-column">
+      {experienceMode === "guided" && step < 4 && <aside className={`surface calculator-live-summary ${resultStatus}`} aria-label="Предварительный результат"><span>Предварительная цена с НДС</span><strong>{calculationValid ? money(result.priceGross) : "Проверьте поля"}</strong><span>Прибыль: {money(result.profit)} · маржа: {percent(result.margin)}</span><small>Итог, состав затрат и предупреждения — на шаге 5.</small></aside>}
+      <section className="result-column" hidden={experienceMode === "guided" && step < 4}>
         <div className={`surface result-panel ${resultStatus}`}>
           <div className="surface-title"><h2>Результат</h2><span className={`status ${resultStatus}`}>{!calculationValid ? "! Исправьте исходные данные" : resultStatus === "success" ? "✓ Расчёт устойчив" : resultStatus === "warning" ? "⚠ Низкая маржа" : "! Убыточно или ниже порога"}</span></div>
           <div className="surface-body">
@@ -313,14 +392,14 @@ export function Calculator() {
             {calculationValid && result.status === "danger" && <div className="notice warning"><strong>Проверьте цену.</strong><span>Расчёт убыточный или находится ниже установленного порога.</span></div>}
             {recommendation && !recommendation.valid && <div className="notice error"><strong>Рекомендация недоступна.</strong><span>{recommendation.issue?.message}</span></div>}
             {recommendation?.valid && <div className="recommendation-card"><span>Рекомендованная цена с НДС</span><strong>{money(recommendation.priceGross)}</strong><small>База: {recommendation.basisLabel}. Ближайшее сравнимое предложение: {money(recommendation.lowestCompetitor)}. {recommendation.limitedByMargin ? `Ниже опускаться рискованно: защита маржи ${percent(data.minMargin)}.` : `Шаг ниже конкурента; расчётная маржа ${percent(recommendation.margin)}.`}</small><button className="secondary" type="button" onClick={() => setData((current) => ({ ...current, mode: "price-to-margin", proposedPrice: recommendation.priceGross, priceAmountType: "with-vat" }))}>Применить рекомендацию</button></div>}
-            <div className="button-row" data-workspace-mutation data-workspace-managed-disabled="true"><button className="primary grow" disabled={!calculationValid || !workspaceAccess.editor} type="button" onClick={() => void saveCalculation(false)}>Сохранить</button><button className="secondary" disabled={!calculationValid || !workspaceAccess.editor} type="button" onClick={() => void saveCalculation(true)}>Дублировать</button></div>
           </div>
         </div>
         <CalculatorCharts data={data} result={result} valid={calculationValid} scenarios={scenarios} active={activeChart} onActive={setActiveChart} />
       </section>
     </div>
     {experienceMode === "guided" && <div className="calculator-step-actions"><button type="button" className="secondary" disabled={step === 0} onClick={() => setStep((value) => value - 1)}>Назад</button><span>{step + 1} из {steps.length}</span>{step < 4 ? <button type="button" className="primary" disabled={invalidNumberFields.size > 0} onClick={() => setStep((value) => value + 1)}>{step === 3 ? "Получить итог" : "Далее"}</button> : <button type="button" className="primary" disabled={!calculationValid} onClick={() => void exportCalculation()}>Экспортировать результат</button>}</div>}
-  </div></NumberValidityContext.Provider>;
+    {archiving && <ConfirmDialog title="Переместить расчёт в архив?" message={`В архив будет перенесена сохранённая запись «${data.name}». ${hasRecordChanges ? "Изменения текущего черновика в неё не войдут. " : ""}Запись можно восстановить в разделе «Архив».`} confirmLabel="В архив" onClose={() => setArchiving(false)} onConfirm={async () => { if (!workspaceAccess.editor || !recordId) throw new Error("Требуется режим редактора"); await saved.archive(recordId); setArchiving(false); resetCalculation(); }} />}
+  </fieldset></div></NumberValidityContext.Provider>;
 }
 
 function VatSelect({ value, onChange }: { value: VatRate; onChange: (value: VatRate) => void }) {

@@ -1,0 +1,32 @@
+.registry-read-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 20px; margin: 0 0 20px; }
+.registry-read-fields > div { min-width: 0; }
+.registry-read-fields dt { color: var(--text-muted, #64748b); font-size: 12px; margin-bottom: 3px; }
+.registry-read-fields dd { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; }
+.registry-read-document { border-top: 1px solid var(--border, #dbe3eb); padding: 14px 0; }
+.registry-read-card .drawer-body { min-height: 0; }
+.registry-read-card .drawer-body > h3 { margin-top: 24px; }
+.registry-save-status { overflow-wrap: anywhere; font-size: 12px; }
+.registry-editor-fields { border: 0; margin: 0; padding: 0; min-width: 0; display: block; }
+.registry-editor-fields > label { display: block; margin-top: 12px; }
+.registry-editor-fields > label.checkbox-row { display: flex; margin-top: 15px; }
+.registry-editor-fields h3[id] { scroll-margin-top: 60px; }
+.registry-section-nav { display: flex; flex-wrap: wrap; gap: 6px; position: sticky; top: 0; background: var(--surface, #fff); z-index: 1; padding: 8px 0; }
+.registry-section-nav button { font-size: 12px; padding: 5px 8px; }
+.registry-display-options { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 8px 12px; }
+.registry-display-options details { margin-left: auto; }
+.registry-display-options summary, .registry-export-menu summary { cursor: pointer; }
+.registry-display-options .column-options { display: flex; flex-wrap: wrap; gap: 8px 16px; padding-top: 8px; }
+.registry-export-menu { flex: 1 1 160px; }
+.registry-export-menu > div { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 10px 0; }
+.registry-export-menu p { flex-basis: 100%; margin: 0; font-size: 12px; }
+.registry-export-contents { flex-basis: 100%; }
+.registry-export-contents ul { max-height: 220px; overflow: auto; margin: 8px 0; padding-left: 22px; }
+.registry-export-contents li { overflow-wrap: anywhere; margin-bottom: 8px; }
+.registry-export-contents li > span { display: block; font-size: 12px; }
+.registry-module .registry-compact-table td { padding-top: 7px; padding-bottom: 7px; }
+.registry-module .registry-compact-table .row-actions { gap: 3px; }
+.registry-extra-filters { min-width: 0; }
+.registry-extra-filters > summary { cursor: pointer; padding: 8px 0; }
+.registry-extra-filters > .form-grid { margin: 8px 0; }
+.counterparties-tool > .table-surface > .table-scroll > .registry-counterparties-table > :is(thead, tbody) > tr > .selection-cell { min-width: 36px; width: 36px; }
+@media (max-width: 600px) { .registry-read-fields { grid-template-columns: minmax(0, 1fr); } }
