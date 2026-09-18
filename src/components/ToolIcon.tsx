@@ -1,8 +1,11 @@
 import type { SVGProps } from "react";
 
-export type ToolIconName = "dashboard" | "procurement" | "calculator" | "scanner" | "contracts" | "counterparties" | "staff" | "archive" | "settings" | "about" | "chevron-left" | "chevron-right" | "folder" | "lock" | "check" | "arrow-right";
+export type ToolIconName = "dashboard" | "procurement" | "calculator" | "scanner" | "contracts" | "counterparties" | "staff" | "archive" | "settings" | "about" | "chevron-left" | "chevron-right" | "folder" | "lock" | "check" | "arrow-right" | "proposals" | "status" | "search";
 
 const paths: Record<ToolIconName, React.ReactNode> = {
+  proposals: <><path d="M14 3H5v18h14V8zM14 3v5h5M8 12h8M8 16h5" /><path d="m15 18 2 2 4-4" /></>,
+  status: <><path d="M3 12h4l3-7 4 14 3-7h4" /><path d="M3 3h18v18H3z" /></>,
+  search: <><circle cx="10" cy="10" r="6" /><path d="m15 15 6 6" /></>,
   dashboard: <><rect x="3" y="3" width="7" height="7" rx="1.5" /><rect x="14" y="3" width="7" height="7" rx="1.5" /><rect x="3" y="14" width="7" height="7" rx="1.5" /><rect x="14" y="14" width="7" height="7" rx="1.5" /></>,
   procurement: <><rect x="4" y="6" width="16" height="15" rx="2" /><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2M8 11h8M8 15h5" /></>,
   calculator: <><rect x="5" y="3" width="14" height="18" rx="2" /><path d="M8 7h8M8 11h1m6 0h1m-8 4h1m6 0h1m-8 3h1m6 0h1" /></>,

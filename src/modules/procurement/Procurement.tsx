@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { ConfirmDialog } from "../../components/Dialog";
 import { DrawerBackdrop } from "../../components/DrawerBackdrop";
 import { useRecords } from "../../hooks/useRecords";
+import { useViewState } from "../../hooks/useViewState";
 import { useUnsavedChanges } from "../../hooks/useUnsavedChanges";
 import { chooseSavePath, exportText } from "../../lib/files";
 import { writeTextFile, writeXlsx, type StoredRecord } from "../../lib/storage";
@@ -47,6 +48,8 @@ import { procurementDeadline } from "./deadlines";
 import { procurementWorkflow, stage2Section, workflowStage, type ProcurementSection } from "./workflow";
 import "./procurement.css";
 import { snapshotDifferences, snapshotFieldLabels, snapshotValue } from "./snapshotComparison";
+import type { ProposalData } from "../proposals/types";
+import { ProcurementProposalSource } from "../proposals/ProcurementProposalSource";
 
 function snapshot(
   sourceModule: SnapshotLink["sourceModule"],
@@ -62,18 +65,19 @@ function snapshot(
   };
 }
 
-export function ProcurementRegistry({ openRecordId, onRecordOpened }: { openRecordId?: string; onRecordOpened?: () => void } = {}) {
+export function ProcurementRegistry({ openRecordId, onRecordOpened, onCreateProposal }: { openRecordId?: string; onRecordOpened?: () => void; onCreateProposal?: (proposal: ProposalData) => void } = {}) {
   const workspaceAccess = useWorkspaceAccess();
   const readOnly = !workspaceAccess.editor;
   const store = useRecords<ProcurementData>("procurement");
-  const [search, setSearch] = useState("");
-  const [status, setStatus] = useState("");
+  const [search, setSearch] = useViewState("procurement:search", "");
+  const [status, setStatus] = useViewState("procurement:status", "");
   const [editing, setEditing] = useState<
     StoredRecord<ProcurementData> | "new" | null
   >(null);
   const [archiving, setArchiving] =
     useState<StoredRecord<ProcurementData> | null>(null);
   const [actionError, setActionError] = useState("");
+  const [proposalSource, setProposalSource] = useState<StoredRecord<ProcurementData> | null>(null);
   useEffect(() => {
     if (!openRecordId || store.loading || store.error) return;
     const record = store.records.find((entry) => entry.id === openRecordId);
@@ -210,6 +214,7 @@ export function ProcurementRegistry({ openRecordId, onRecordOpened }: { openReco
                       {compliance.confirmed} из {compliance.total}
                     </td>
                     <td>
+                      {onCreateProposal && <button className="secondary small" type="button" aria-label={`Создать КП из закупки ${item.name}`} onClick={() => setProposalSource(record)}>КП</button>}
                       {!readOnly && (
                         <button
                           className="icon-button danger"
@@ -252,6 +257,7 @@ export function ProcurementRegistry({ openRecordId, onRecordOpened }: { openReco
           </div>
         )}
       </div>
+      {proposalSource && onCreateProposal && <ProcurementProposalSource data={normalizeProcurement({ ...proposalSource.payload })} recordId={proposalSource.id} onClose={() => setProposalSource(null)} onCreate={(proposal) => { setProposalSource(null); onCreateProposal(proposal); }} />}
       {editing && (
         <ProcurementEditor
           key={editing === "new" ? "new" : editing.id}
@@ -349,6 +355,7 @@ export function ProcurementEditor({
         warning.startsWith("НМЦ") ||
         warning.startsWith("Срок вопросов") ||
         warning.startsWith("Ставка НДС") ||
+        warning.startsWith("Некорректно") ||
         warning.includes("превышает 100"),
     );
     if (blocking.length) {
@@ -359,7 +366,7 @@ export function ProcurementEditor({
     setSaving(true);
     setSavedMessage("");
     try {
-      await onSave(item, record?.id);
+      await onSave(normalizeProcurement({ ...item }), record?.id);
       setSavedSnapshot(JSON.stringify(item));
       setError("");
       setSavedMessage("Закупка сохранена в рабочей папке.");

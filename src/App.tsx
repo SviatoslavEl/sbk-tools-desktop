@@ -3,6 +3,14 @@ import "./App.css";
 import { Dialog } from "./components/Dialog";
 import { AdministrationNotice } from "./components/AdministrationNotice";
 import { ToolIcon } from "./components/ToolIcon";
+import { GlobalSearch } from "./modules/search/GlobalSearch";
+import { StatusCenter } from "./modules/status/StatusCenter";
+import { StatusIndicator } from "./modules/status/StatusIndicator";
+import { Proposals, type ProposalHandoff } from "./modules/proposals/Proposals";
+import type { ProposalData } from "./modules/proposals/types";
+import { clearActivities } from "./lib/activity";
+import { setViewStateWorkspace } from "./hooks/useViewState";
+import { useAutomaticBackup } from "./hooks/useAutomaticBackup";
 import { editorStatus, unavailableWorkspaceInfo } from "./lib/editorStatus";
 import { Archive } from "./modules/archive/Archive";
 import { Calculator } from "./modules/calculator/Calculator";
@@ -16,13 +24,11 @@ import { ProcurementRegistry } from "./modules/procurement/Procurement";
 import { TenderCalendar } from "./modules/tender-calendar/TenderCalendar";
 import { chooseDirectory } from "./lib/files";
 import {
-  createBackup,
   getStartupStatus,
   getWorkspaceInfo,
   quitApplication,
   reportStartupUiVisible,
   retryWorkspaceInitialization,
-  rotateBackups,
   setWorkspaceLocation,
   workspaceAccessInvalidatedEvent,
   type StartupStatus,
@@ -30,11 +36,7 @@ import {
 } from "./lib/storage";
 import {
   accessTimerEvent,
-  AutomaticBackupGate,
-  lastAutomaticBackupAttemptKey,
-  lastAutomaticBackupKey,
   readAccessTimers,
-  workspaceLocalKey,
   type AccessTimers,
 } from "./lib/sharedWorkspace";
 import {
@@ -51,6 +53,8 @@ type ToolId =
   | "counterparties"
   | "staff"
   | "archive"
+  | "proposals"
+  | "status"
   | "settings"
   | "about";
 
@@ -58,6 +62,7 @@ const tools: Array<{ id: ToolId; label: string }> = [
   { id: "dashboard", label: "Главная" },
   { id: "procurement", label: "Закупки" },
   { id: "calculator", label: "Тендерный калькулятор" },
+  { id: "proposals", label: "Коммерческие предложения" },
   { id: "scanner", label: "Сканирование документов" },
   { id: "contracts", label: "Опыт по договорам" },
   { id: "counterparties", label: "Контрагенты" },
@@ -90,6 +95,8 @@ const toolTitles: Record<ToolId, [string, string]> = {
     "Быстрый поиск компаний и лиц, принимающих решения",
   ],
   staff: ["Кадры", "Люди, основания сотрудничества и подтверждающие документы"],
+  proposals: ["Коммерческие предложения", "Состав, стоимость, условия и клиентские документы"],
+  status: ["Центр состояния", "Рабочая папка, редактор, резервные копии и операции"],
   archive: ["Архив", "Восстановление и окончательное удаление записей"],
   settings: ["Настройки", "Рабочая папка, интерфейс и резервные копии"],
   about: ["О программе", "Версия, приватность и лицензии компонентов"],
@@ -112,6 +119,8 @@ const helpText: Record<ToolId, string> = {
     "Основание сотрудничества хранится отдельно от должности и статуса. Дипломы, сертификаты и договоры добавляются повторяемыми записями.",
   archive:
     "Архивные расчёты, договоры и кадровые карточки можно восстановить. Окончательное удаление также удаляет историю и связанные файлы.",
+  proposals: "Создавайте предложение по шагам. Данные сторон и цены сохраняются снимком; изменения справочника не меняют готовое КП. Внутренние заметки не включаются в клиентский документ.",
+  status: "Центр состояния только читает сведения. Он не перехватывает редактора и не снимает блокировки. Состояние сетевой папки проверяется отдельно от наличия резервной копии.",
   settings:
     "Резервная копия включает базы и вложения. Перед восстановлением приложение автоматически создаёт страховочную копию текущих данных.",
   about:
@@ -127,20 +136,12 @@ function App() {
     failed: false,
     needsWorkspace: false,
   });
-  const [startupDelayElapsed, setStartupDelayElapsed] = useState(
-    installedFastStart,
-  );
   const [workspaceError, setWorkspaceError] = useState("");
   const [workspaceReady, setWorkspaceReady] = useState("");
   const [accessTimers, setAccessTimers] =
     useState<AccessTimers>(readAccessTimers);
   useEffect(() => {
     if (installedFastStart) void reportStartupUiVisible();
-  }, []);
-  useEffect(() => {
-    if (installedFastStart) return;
-    const timer = window.setTimeout(() => setStartupDelayElapsed(true), 3500);
-    return () => window.clearTimeout(timer);
   }, []);
   useEffect(() => {
     let stopped = false;
@@ -239,55 +240,7 @@ function App() {
     );
     return () => window.clearInterval(timer);
   }, [accessTimers.refreshSeconds]);
-  useEffect(() => {
-    if (!workspace?.editor || accessTimers.backupHours <= 0) return;
-    const gate = new AutomaticBackupGate();
-    const runIfDue = async () => {
-      let currentWorkspace: WorkspaceInfo;
-      try {
-        currentWorkspace = await getWorkspaceInfo();
-      } catch (reason) {
-        console.warn("Workspace access check before backup failed", reason);
-        return;
-      }
-      setWorkspace(currentWorkspace);
-      if (!currentWorkspace.editor) return;
-      const lastKey = workspaceLocalKey(lastAutomaticBackupKey, workspace.root);
-      const attemptKey = workspaceLocalKey(
-        lastAutomaticBackupAttemptKey,
-        workspace.root,
-      );
-      const last = Number(localStorage.getItem(lastKey) || "0");
-      const lastAttempt = Number(localStorage.getItem(attemptKey) || "0");
-      const startedAt = Date.now();
-      if (
-        !gate.beginIfDue(last, lastAttempt, startedAt, accessTimers.backupHours)
-      )
-        return;
-      localStorage.setItem(attemptKey, String(startedAt));
-      try {
-        await createBackup();
-        await rotateBackups(
-          accessTimers.retentionCount,
-          accessTimers.retentionDays,
-        );
-        localStorage.setItem(lastKey, String(Date.now()));
-      } catch (reason) {
-        console.warn("Automatic workspace backup failed", reason);
-      } finally {
-        gate.finish();
-      }
-    };
-    void runIfDue();
-    const timer = window.setInterval(() => void runIfDue(), 60_000);
-    return () => window.clearInterval(timer);
-  }, [
-    workspace?.editor,
-    workspace?.root,
-    accessTimers.backupHours,
-    accessTimers.retentionCount,
-    accessTimers.retentionDays,
-  ]);
+  useAutomaticBackup(workspace, setWorkspace);
   const chooseFirstWorkspace = async () => {
     const selected = await chooseDirectory(
       "Выберите рабочую папку СБК Инструменты",
@@ -332,15 +285,26 @@ function App() {
   );
   const [scannerOpened, setScannerOpened] = useState(activeTool === "scanner");
   const [calculatorOpened, setCalculatorOpened] = useState(activeTool === "calculator");
+  const [proposalsOpened, setProposalsOpened] = useState(activeTool === "proposals");
+  const [proposalHandoff, setProposalHandoff] = useState<ProposalHandoff | undefined>();
   const [showHelp, setShowHelp] = useState(false);
+  const [showSearch, setShowSearch] = useState(false);
   const [openRecord, setOpenRecord] = useState<{ tool: ToolId; id: string } | null>(null);
   const contentRef = useRef<HTMLDivElement>(null);
-  useEffect(() => { setOpenRecord(null); }, [workspace?.root]);
+  useEffect(() => { setOpenRecord(null); setShowSearch(false); setProposalHandoff(undefined); clearActivities(); setViewStateWorkspace(workspace?.root || ""); }, [workspace?.root]);
+  useEffect(() => {
+    const openSearch = (event: KeyboardEvent) => {
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k" && !document.querySelector('[role="dialog"]')) { event.preventDefault(); setShowSearch(true); }
+    };
+    window.addEventListener("keydown", openSearch);
+    return () => window.removeEventListener("keydown", openSearch);
+  }, []);
   useEffect(() => { contentRef.current?.scrollTo(0, 0); }, [activeTool]);
   const recordOpened = () => setOpenRecord(null);
   const selectTool = (tool: ToolId, recordId?: string) => {
     if (tool === "scanner") setScannerOpened(true);
     if (tool === "calculator") setCalculatorOpened(true);
+    if (tool === "proposals") setProposalsOpened(true);
     setOpenRecord(recordId ? { tool, id: recordId } : null);
     setActiveTool(tool);
     localStorage.setItem("sbk-tools:last-tool", tool);
@@ -350,8 +314,9 @@ function App() {
     localStorage.setItem("sbk-tools:sidebar-collapsed", String(value));
   };
   const [title, subtitle] = toolTitles[activeTool];
+  const createProposal = (data: ProposalData) => { setProposalHandoff({id:crypto.randomUUID(),data}); selectTool("proposals"); };
 
-  if (!installedFastStart && (!workspace || !startupDelayElapsed))
+  if (!installedFastStart && !workspace)
     return (
       <div className="startup-screen">
         <div className="startup-card">
@@ -573,6 +538,7 @@ function App() {
             ))}
           </nav>
           <nav className="settings-nav">
+            <button aria-label="Центр состояния" aria-current={activeTool === "status" ? "page" : undefined} title="Центр состояния" className={activeTool === "status" ? "active" : ""} onClick={() => selectTool("status")} type="button"><span className="nav-icon" aria-hidden="true"><ToolIcon name="status" /></span><span className="nav-label">Центр состояния</span><StatusIndicator /></button>
             <button
               aria-label="Архив"
               aria-current={activeTool === "archive" ? "page" : undefined}
@@ -626,6 +592,7 @@ function App() {
               <p>{subtitle}</p>
             </div>
             <div className="topbar-actions">
+            <button className="secondary global-search-button" type="button" aria-label="Глобальный поиск" title="Поиск по рабочей папке (Ctrl/⌘ K)" onClick={() => setShowSearch(true)}><ToolIcon name="search" /><span>Поиск</span></button>
             <button className={`workspace-access-chip ${workspace.editor ? "is-editor" : access.unknown ? "is-unknown" : "is-viewer"}`} type="button" onClick={() => selectTool("settings")} title={workspace.accessMessage} aria-label={`${accessLabel}. Открыть настройки доступа`}>
               <ToolIcon name={workspace.editor ? "check" : "lock"} />
               <span><strong>{accessLabel}</strong>{!workspace.editor && access.occupied && !access.unknown && <small>Редактор: {access.text}</small>}</span>
@@ -645,20 +612,22 @@ function App() {
             </div>
           </header>
           <div ref={contentRef} id="main-content" tabIndex={-1} className={`tool-content ${["contracts", "staff", "counterparties", "procurement"].includes(activeTool) ? "registry-content" : ""}`}>
-            <AdministrationNotice key={workspace.root} message={workspace.administrationNotice} />
-            {scannerOpened && <div hidden={activeTool !== "scanner"} key={workspace.root}>
+            <AdministrationNotice key={`notice-${workspace.root}`} message={workspace.administrationNotice} />
+            {scannerOpened && <div hidden={activeTool !== "scanner"} key={`scanner-${workspace.root}`}>
               <ReadOnlyWorkspaceBoundary allowMutations>
                 <Scanner active={activeTool === "scanner"} />
               </ReadOnlyWorkspaceBoundary>
             </div>}
             <ReadOnlyWorkspaceBoundary>
               {activeTool === "dashboard" && <div className="module-stack"><Dashboard onNavigate={selectTool} /><section className="dashboard-calendar" aria-label="Календарь тендеров"><h2>Календарь тендеров</h2><p className="help-text">Дважды щёлкните по дню, чтобы назначить закупку. С клавиатуры — Enter на выбранном дне.</p><TenderCalendar /></section></div>}
-              {activeTool === "procurement" && <ProcurementRegistry openRecordId={openRecord?.tool === "procurement" ? openRecord.id : undefined} onRecordOpened={recordOpened} />}
-              {calculatorOpened && <div hidden={activeTool !== "calculator"} key={`calculator-${workspace.root}`}><Calculator active={activeTool === "calculator"} openRecordId={openRecord?.tool === "calculator" ? openRecord.id : undefined} onRecordOpened={recordOpened} /></div>}
+              {activeTool === "procurement" && <ProcurementRegistry onCreateProposal={createProposal} openRecordId={openRecord?.tool === "procurement" ? openRecord.id : undefined} onRecordOpened={recordOpened} />}
+              {calculatorOpened && <div hidden={activeTool !== "calculator"} key={`calculator-${workspace.root}`}><Calculator onCreateProposal={createProposal} active={activeTool === "calculator"} openRecordId={openRecord?.tool === "calculator" ? openRecord.id : undefined} onRecordOpened={recordOpened} /></div>}
+              {proposalsOpened && <div hidden={activeTool !== "proposals"} key={`proposals-${workspace.root}`}><Proposals active={activeTool === "proposals"} handoff={proposalHandoff} onHandoffConsumed={() => setProposalHandoff(undefined)} openRecordId={openRecord?.tool === "proposals" ? openRecord.id : undefined} onRecordOpened={recordOpened} /></div>}
               {activeTool === "contracts" && <ContractsRegistry openRecordId={openRecord?.tool === "contracts" ? openRecord.id : undefined} onRecordOpened={recordOpened} />}
-              {activeTool === "counterparties" && <CounterpartiesRegistry />}
+              {activeTool === "counterparties" && <CounterpartiesRegistry openRecordId={openRecord?.tool === "counterparties" ? openRecord.id : undefined} onRecordOpened={recordOpened} />}
               {activeTool === "staff" && <StaffRegistry openRecordId={openRecord?.tool === "staff" ? openRecord.id : undefined} onRecordOpened={recordOpened} />}
               {activeTool === "archive" && <Archive />}
+              {activeTool === "status" && <StatusCenter key={`status-${workspace.root}`} workspace={workspace} onSettings={() => selectTool("settings")} />}
               {activeTool === "settings" && (
                 <Settings collapsed={collapsed} onCollapsed={updateCollapsed} workspace={workspace} onWorkspaceChange={setWorkspace} />
               )}
@@ -666,6 +635,7 @@ function App() {
             </ReadOnlyWorkspaceBoundary>
           </div>
         </main>
+        {showSearch && <GlobalSearch key={`search-${workspace.root}`} onClose={() => setShowSearch(false)} onNavigate={selectTool} />}
         {showHelp && (
           <Dialog
             title={`Справка: ${title}`}

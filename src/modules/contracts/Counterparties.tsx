@@ -3,6 +3,7 @@ import { createPortal } from "react-dom";
 import { ConfirmDialog } from "../../components/Dialog";
 import { VersionHistory } from "../../components/VersionHistory";
 import { useRecords } from "../../hooks/useRecords";
+import { useViewState } from "../../hooks/useViewState";
 import { useWorkspaceAccess } from "../../lib/workspaceAccess";
 import { CompanyEditor, useCompanyDirectory } from "./CompanyDirectory";
 import { companyRelationshipLabel, emptyCompany, type CompanyCard } from "./companies";
@@ -10,17 +11,24 @@ import type { ContractData } from "./types";
 
 type PendingAction = { kind: "archive" | "restore" | "delete"; ids: string[] } | null;
 
-export function CounterpartiesRegistry() {
+export function CounterpartiesRegistry({ openRecordId, onRecordOpened }: { openRecordId?: string; onRecordOpened?: () => void } = {}) {
   const contracts = useRecords<ContractData>("contract-experience");
   const directory = useCompanyDirectory(contracts.records);
   const access = useWorkspaceAccess();
-  const [search, setSearch] = useState("");
-  const [scope, setScope] = useState<"all" | "internal" | "external">("external");
-  const [showArchived, setShowArchived] = useState(false);
+  const [search, setSearch] = useViewState("counterparties:search", "");
+  const [scope, setScope] = useViewState<"all" | "internal" | "external">("counterparties:scope", "external");
+  const [showArchived, setShowArchived] = useViewState("counterparties:archive", false);
   const [editing, setEditing] = useState<CompanyCard | null>(null);
   const [pending, setPending] = useState<PendingAction>(null);
   const [message, setMessage] = useState("");
   const [selected, setSelected] = useState<Set<string>>(new Set());
+  useEffect(() => {
+    if (!openRecordId || directory.loading || contracts.loading) return;
+    const company = directory.companies.find((entry) => entry.id === openRecordId);
+    if (company) { setScope(company.scope); setShowArchived(company.archived); setEditing(company); }
+    else setMessage("Компания больше не найдена. Обновите поиск и повторите переход.");
+    onRecordOpened?.();
+  }, [openRecordId, directory.loading, contracts.loading, directory.companies, onRecordOpened]);
   useEffect(() => { setSelected(new Set()); }, [scope, showArchived, search]);
   const filtered = useMemo(() => {
     const needle = search.trim().toLocaleLowerCase("ru-RU");

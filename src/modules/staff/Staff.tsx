@@ -1,4 +1,5 @@
 import { Fragment, useEffect, useId, useMemo, useRef, useState } from "react";
+import { useViewState } from "../../hooks/useViewState";
 import { openPath } from "@tauri-apps/plugin-opener";
 import { ConfirmDialog, Dialog } from "../../components/Dialog";
 import { DrawerBackdrop } from "../../components/DrawerBackdrop";
@@ -62,7 +63,10 @@ import {
   staffImportFields,
   type StaffImportMapping,
 } from "./import";
-import { matchStaff, type StaffSelectionCriteria } from "./selection";
+import { matchStaff, matchesStaffAssignmentFilters, type StaffSelectionCriteria } from "./selection";
+import { mergeImportedStaffData } from "./importUpdate";
+import { StaffSelectionDocuments } from "./StaffSelectionDocuments";
+import { pruneStaffDocumentSelection, selectedStaffAttachmentPaths } from "./documentSelection";
 import { staffEmailHint, validateStaffEmail } from "./emailValidation";
 import { StaffReadCard } from "./StaffReadCard";
 import { RegistryTableView } from "../contracts/RegistryTableView";
@@ -85,7 +89,6 @@ const categoryLabels: Record<StaffDocument["category"], string> = {
   permit: "Удостоверения и допуски",
   other: "Прочие документы",
 };
-const staffDocumentCategories = Object.keys(categoryLabels) as StaffDocument["category"][];
 
 const expiryLabels: Record<ExpiryCategory, string> = {
   expired: "Истёк",
@@ -107,34 +110,8 @@ export const normalizeStaffData = (payload: StaffData): StaffData => {
   return { ...source, organizationalAssignments: staffAssignments(source) };
 };
 
-export function mergeStaffImportUpdate(previous: StaffData, imported: StaffData, mapping: StaffImportMapping): StaffData {
-  const next = structuredClone(previous);
-  const copy = <K extends keyof StaffData>(field: keyof StaffImportMapping, key: K) => { if (mapping[field] >= 0) next[key] = imported[key]; };
-  copy("fullName", "fullName"); copy("birthDate", "birthDate"); copy("role", "role"); copy("grade", "grade");
-  copy("primarySpecialization", "primarySpecialization"); copy("additionalSpecializations", "additionalSpecializations"); copy("competencies", "competencies"); copy("industries", "industries");
-  if (["skills", "additionalSpecializations", "competencies"].some((field) => mapping[field as keyof StaffImportMapping] >= 0)) next.skills = imported.skills;
-  copy("qualification", "qualification"); copy("location", "location"); copy("travelReadiness", "travelReadiness");
-  copy("phone", "phone"); copy("email", "email");
-  if (mapping.contacts >= 0) { next.phone = imported.phone; next.email = imported.email; }
-  copy("experienceYears", "experienceYears"); copy("experienceText", "experienceNotes"); copy("availableFrom", "availableFrom"); copy("availableTo", "availableTo");
-  copy("hourlyRate", "hourlyRate"); copy("disclosureAllowed", "disclosureAllowed"); copy("notes", "notes");
-  const assignmentFields: Array<keyof StaffImportMapping> = ["legalEntity", "department", "role", "basis", "basisOther", "basisNumber", "startDate", "endDate", "status"];
-  if (assignmentFields.some((field) => mapping[field] >= 0)) {
-    const current = primaryAssignment(next);
-    const incoming = primaryAssignment(imported);
-    const assignment = { ...current };
-    const assignmentCopy = (field: keyof StaffImportMapping, key: keyof typeof assignment) => { if (mapping[field] >= 0) assignment[key] = incoming[key] as never; };
-    assignmentCopy("legalEntity", "legalEntity"); assignmentCopy("department", "department"); assignmentCopy("role", "position"); assignmentCopy("basis", "engagementType"); assignmentCopy("basisOther", "engagementOther"); assignmentCopy("basisNumber", "basisNumber"); assignmentCopy("startDate", "startDate"); assignmentCopy("endDate", "endDate"); assignmentCopy("status", "status");
-    next.organizationalAssignments = [assignment, ...next.organizationalAssignments.filter((item) => item.id !== current.id)];
-    next.basis = assignment.engagementType; next.basisOther = assignment.engagementOther; next.basisNumber = assignment.basisNumber; next.startDate = assignment.startDate; next.endDate = assignment.endDate; next.status = assignment.status;
-  }
-  if (["certificates", "certificateStatuses", "education"].some((field) => mapping[field as keyof StaffImportMapping] >= 0)) {
-    const replaced = new Set<StaffDocument["category"]>();
-    if (mapping.certificates >= 0 || mapping.certificateStatuses >= 0) replaced.add("certificate");
-    if (mapping.education >= 0) replaced.add("education");
-    next.documents = [...next.documents.filter((document) => !replaced.has(document.category)), ...imported.documents.filter((document) => replaced.has(document.category))];
-  }
-  return normalizeStaffData(next);
+export function mergeStaffImportUpdate(previous: StaffData, imported: StaffData, mapping: StaffImportMapping, sourceRow?: readonly string[]): StaffData {
+  return normalizeStaffData(mergeImportedStaffData(previous, imported, mapping, sourceRow));
 }
 const requiredStaffImportFields: ImportRequiredField<StaffData>[] = [
   { key: "fullName", label: "ФИО", missing: (item) => !item.fullName.trim() },
@@ -170,14 +147,14 @@ export function StaffRegistry({ openRecordId, onRecordOpened }: { openRecordId?:
   const expiryDays =
     settings.records.find((record) => record.title === "application")?.payload
       .expiryDays || 60;
-  const [search, setSearch] = useState("");
-  const [basisFilter, setBasisFilter] = useState("");
-  const [statusFilter, setStatusFilter] = useState("");
-  const [legalEntityFilter, setLegalEntityFilter] = useState("");
-  const [departmentFilter, setDepartmentFilter] = useState("");
-  const [expiryFilter, setExpiryFilter] = useState<
+  const [search, setSearch] = useViewState("staff.search", "");
+  const [basisFilter, setBasisFilter] = useViewState("staff.basis", "");
+  const [statusFilter, setStatusFilter] = useViewState("staff.status", "");
+  const [legalEntityFilter, setLegalEntityFilter] = useViewState("staff.legalEntity", "");
+  const [departmentFilter, setDepartmentFilter] = useViewState("staff.department", "");
+  const [expiryFilter, setExpiryFilter] = useViewState<
     "" | ExpiryCategory | "no-document"
-  >("");
+  >("staff.expiry", "");
   const [editing, setEditingRecord] = useState<
     StoredRecord<StaffData> | "new" | null
   >(null);
@@ -220,13 +197,13 @@ export function StaffRegistry({ openRecordId, onRecordOpened }: { openRecordId?:
     status: "Не указано" as StaffData["status"],
   });
   const [selectionOpen, setSelectionOpen] = useState(false);
-  const [sort, setSort] = useState<{ key: StaffSortKey; direction: SortDirection }>({ key: "department", direction: "asc" });
+  const [sort, setSort] = useViewState<{ key: StaffSortKey; direction: SortDirection }>("staff.sort", { key: "department", direction: "asc" });
   const [selectedStaff, setSelectedStaff] = useState<Set<string>>(new Set());
   const [selectedRegistryStaff, setSelectedRegistryStaff] = useState<Set<string>>(new Set());
   const [bulkArchiveIds, setBulkArchiveIds] = useState<string[]>([]);
-  const [selectionDocumentCategories, setSelectionDocumentCategories] = useState<Set<StaffDocument["category"]>>(
-    () => new Set(staffDocumentCategories),
-  );
+  const [selectedDocumentKeys, setSelectedDocumentKeys] = useState<Set<string>>(new Set());
+  const selectionZipPending = useRef(false);
+  const [selectionZipExporting, setSelectionZipExporting] = useState(false);
   const [selectionCriteria, setSelectionCriteria] =
     useState<StaffSelectionCriteria>({
       procurementTitle: "",
@@ -290,20 +267,7 @@ export function StaffRegistry({ openRecordId, onRecordOpened }: { openRecordId?:
               : categories.includes(expiryFilter));
           return (
             matches &&
-            (!legalEntityFilter ||
-              assignments.some(
-                (entry) => entry.legalEntity === legalEntityFilter,
-              )) &&
-            (!departmentFilter ||
-              assignments.some(
-                (entry) => entry.department === departmentFilter,
-              )) &&
-            (!basisFilter ||
-              assignments.some(
-                (entry) => entry.engagementType === basisFilter,
-              )) &&
-            (!statusFilter ||
-              assignments.some((entry) => entry.status === statusFilter)) &&
+            matchesStaffAssignmentFilters(item, { legalEntity: legalEntityFilter, department: departmentFilter, basis: basisFilter, status: statusFilter }) &&
             expiryMatches
           );
         })
@@ -390,6 +354,14 @@ export function StaffRegistry({ openRecordId, onRecordOpened }: { openRecordId?:
       (current) => new Set([...current].filter((id) => visible.has(id))),
     );
   }, [staffMatches]);
+  const selectedStaffRecords = useMemo(() => staffMatches.filter(({ record }) => selectedStaff.has(record.id)).map(({ record }) => record), [staffMatches, selectedStaff]);
+  const selectedStaffFiles = selectedStaffAttachmentPaths(selectedStaffRecords, selectedDocumentKeys);
+  useEffect(() => {
+    setSelectedDocumentKeys((current) => {
+      const next = pruneStaffDocumentSelection(selectedStaffRecords, current);
+      return next.size === current.size ? current : next;
+    });
+  }, [selectedStaffRecords]);
   const documentCount = normalizedRecords.reduce(
     (sum, record) => sum + record.payload.documents.length,
     0,
@@ -497,7 +469,7 @@ export function StaffRegistry({ openRecordId, onRecordOpened }: { openRecordId?:
   };
   const exportArchive = async (
     recordIds = selectedRegistryRecords.map((record) => record.id),
-    documentCategories?: Iterable<StaffDocument["category"]>,
+    attachmentPaths?: string[],
   ) => {
     if (!recordIds.length) return window.alert("Нет сотрудников для экспорта.");
     const selected = new Set(recordIds);
@@ -512,25 +484,29 @@ export function StaffRegistry({ openRecordId, onRecordOpened }: { openRecordId?:
     )
       return;
     const path = await chooseSavePath(
-      "Кадры и все документы",
+      attachmentPaths ? "Подбор кадров и выбранные файлы" : "Кадры и все документы",
       "кадры-с-документами.zip",
       ["zip"],
     );
     if (!path) return;
     try {
-      const selectedCategories = documentCategories ? new Set(documentCategories) : null;
-      const attachmentPaths = selectedCategories
-        ? normalizedRecords
-            .filter((record) => selected.has(record.id))
-            .flatMap((record) => record.payload.documents)
-            .filter((document) => selectedCategories.has(document.category))
-            .map((document) => document.relativePath)
-            .filter((value): value is string => Boolean(value))
-        : undefined;
       const result = await createRegistryArchive("staff", path, recordIds, attachmentPaths);
       window.alert(`Архив создан: ${result.fileName}`);
     } catch (reason) {
       window.alert(`Не удалось создать архив: ${String(reason)}`);
+    }
+  };
+  const exportSelectedDocuments = async () => {
+    if (selectionZipPending.current || !selectedStaffRecords.length || !selectedStaffFiles.length) return;
+    selectionZipPending.current = true;
+    setSelectionZipExporting(true);
+    try {
+      await exportArchive(selectedStaffRecords.map((record) => record.id), selectedStaffFiles);
+    } catch (reason) {
+      window.alert(`Не удалось создать архив: ${String(reason)}`);
+    } finally {
+      selectionZipPending.current = false;
+      setSelectionZipExporting(false);
     }
   };
   const exportStaffSelection = async () => {
@@ -657,11 +633,24 @@ export function StaffRegistry({ openRecordId, onRecordOpened }: { openRecordId?:
     setImportReport(null);
   };
 
+  const importDataRows = importSource?.rows.filter((row) => row.some((cell) => cell.trim())) || [];
+  const staffUpdate = (item: StaffData, index: number) => {
+    let candidates = normalizedRecords.filter((record) => record.payload.fullName.trim().toLocaleLowerCase("ru-RU") === item.fullName.trim().toLocaleLowerCase("ru-RU"));
+    if (item.birthDate) candidates = candidates.filter((record) => record.payload.birthDate === item.birthDate);
+    if (candidates.length !== 1) throw new Error(`${candidates.length ? "Найдено несколько кадровых карточек" : "Сотрудник не найден"}. Уточните ФИО и дату рождения.`);
+    const previous = candidates[0];
+    const payload = mergeStaffImportUpdate(previous.payload, item, importSource?.mapping || detectStaffMapping([]), importDataRows[index]);
+    return { id: previous.id, title: payload.fullName, payload };
+  };
   const staffImportProblems = importRows
     ? importProblemRows(importRows, (item, index) => {
         const issues = (importMode === "add" ? missingImportFields(item, requiredStaffImportFields) : item.fullName.trim() ? [] : [{ label: "ФИО" }]).map(
           (field) => `Не заполнено: ${field.label}`,
         );
+        if (importMode === "update" && item.fullName.trim()) {
+          try { staffUpdate(item, index); }
+          catch (reason) { issues.push(reason instanceof Error ? reason.message : String(reason)); }
+        }
         issues.push(
           ...importSourceIssues
             .filter((issue) => issue.startsWith(`Строка ${index + 2}:`))
@@ -742,12 +731,8 @@ export function StaffRegistry({ openRecordId, onRecordOpened }: { openRecordId?:
     try {
       if (importMode === "update") {
         const updates = importRows.map((item, index) => {
-          let candidates = normalizedRecords.filter((record) => record.payload.fullName.trim().toLocaleLowerCase("ru-RU") === item.fullName.trim().toLocaleLowerCase("ru-RU"));
-          if (item.birthDate) candidates = candidates.filter((record) => record.payload.birthDate === item.birthDate);
-          if (candidates.length !== 1) throw new Error(`Строка ${index + 2}: ${candidates.length ? "найдено несколько кадровых карточек" : "сотрудник не найден"}. Для обновления нужны ФИО и дата рождения.`);
-          const previous = candidates[0];
-          const payload = mergeStaffImportUpdate(previous.payload, item, importSource?.mapping || detectStaffMapping([]));
-          return { id: previous.id, title: payload.fullName, payload };
+          try { return staffUpdate(item, index); }
+          catch (reason) { throw new Error(`Строка ${index + 2}: ${reason instanceof Error ? reason.message : String(reason)}`); }
         });
         await updateRecordsAtomic("staff", updates);
       } else {
@@ -1360,30 +1345,6 @@ export function StaffRegistry({ openRecordId, onRecordOpened }: { openRecordId?:
               </label>
             </div>
             </details>
-            <details className="registry-extra-filters"><summary>Документы для ZIP ({selectionDocumentCategories.size} категорий)</summary>
-            <section className="selection-document-options" aria-label="Документы для архива подбора">
-              <div className="inline-heading">
-                <div><strong>Документы для ZIP</strong><small>В архив попадут только отмеченные категории.</small></div>
-                <div className="button-row">
-                  <button className="link-button" type="button" onClick={() => setSelectionDocumentCategories(new Set(staffDocumentCategories))}>Выбрать все</button>
-                  <button className="link-button" type="button" onClick={() => setSelectionDocumentCategories(new Set())}>Без документов</button>
-                </div>
-              </div>
-              <div className="document-category-grid">
-                {staffDocumentCategories.map((category) => <label className="checkbox-row" key={category}>
-                  <input
-                    type="checkbox"
-                    checked={selectionDocumentCategories.has(category)}
-                    onChange={(event) => setSelectionDocumentCategories((current) => {
-                      const next = new Set(current);
-                      if (event.target.checked) next.add(category); else next.delete(category);
-                      return next;
-                    })}
-                  />{" "}{categoryLabels[category]}
-                </label>)}
-              </div>
-            </section>
-            </details>
             <div className="import-summary">
               <strong>
                 Найдено: {staffMatches.length} · выбрано: {selectedStaff.size}
@@ -1465,6 +1426,7 @@ export function StaffRegistry({ openRecordId, onRecordOpened }: { openRecordId?:
                 снимите часть ограничений.
               </div>
             )}
+            <StaffSelectionDocuments records={selectedStaffRecords} selected={selectedDocumentKeys} onChange={setSelectedDocumentKeys} />
           </div>
           <footer className="dialog-actions">
             <button
@@ -1476,11 +1438,11 @@ export function StaffRegistry({ openRecordId, onRecordOpened }: { openRecordId?:
             </button>
             <button
               className="secondary"
-              disabled={!selectedStaff.size}
+              disabled={selectionZipExporting || !selectedStaffRecords.length || !selectedStaffFiles.length}
               type="button"
-              onClick={() => void exportArchive([...selectedStaff], selectionDocumentCategories)}
+              onClick={() => void exportSelectedDocuments()}
             >
-              ZIP · выбранные документы
+              {selectionZipExporting ? "Создаём архив…" : `ZIP · выбранные файлы (${selectedStaffFiles.length})`}
             </button>
             <button
               className="primary"
@@ -1495,8 +1457,8 @@ export function StaffRegistry({ openRecordId, onRecordOpened }: { openRecordId?:
       )}
       {!readOnly && importRows && importSource && importEditingIndex === null && (
         <Dialog
-          title="Проверка импорта кадров"
-          description="Показываем только сотрудников, чьи обязательные данные требуют дополнения. Готовые строки скрыты; пакет сохраняется одной транзакцией."
+          title={importMode === "update" ? "Проверка обновления кадров" : "Проверка импорта кадров"}
+          description={importMode === "update" ? "Сопоставляем существующих сотрудников и документы. Неоднозначные строки не записываются; пакет сохраняется одной транзакцией." : "Показываем только сотрудников, чьи обязательные данные требуют дополнения. Готовые строки скрыты; пакет сохраняется одной транзакцией."}
           onClose={() => {
             setImportRows(null);
             setImportSource(null);
@@ -1507,6 +1469,7 @@ export function StaffRegistry({ openRecordId, onRecordOpened }: { openRecordId?:
           width="880px"
         >
           <div className="dialog-body">
+            {importMode === "update" && <div className="notice warning"><strong>Обновление без удаления документов</strong><span>Пустые ячейки оставляют прежние значения. Одноимённые документы сохраняют ID, файлы, номера, издателей и комментарии; новые добавляются. Срок сертификата меняется только по явно указанному распознанному значению. Чтобы очистить поле или удалить документ, сделайте это явно в карточке.</span></div>}
             <div className="form-grid">
               <label>
                 Быстрый шаблон юрлица — необязательно

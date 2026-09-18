@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub(crate) const SCHEMA_VERSION: i64 = 3;
-pub(crate) const MODULES: [&str; 7] = [
+pub(crate) const MODULES: [&str; 8] = [
     "settings",
     "calculator",
     "scanner",
@@ -13,6 +13,7 @@ pub(crate) const MODULES: [&str; 7] = [
     "staff",
     "procurement",
     "tender-calendar",
+    "commercial-proposals",
 ];
 
 pub(crate) fn validated_module(module: &str) -> Result<&str, String> {

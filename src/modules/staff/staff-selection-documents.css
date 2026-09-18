@@ -1,0 +1,8 @@
+.staff-selection-documents { margin-top: 18px; min-width: 0; }
+.staff-document-selection-group { border: 1px solid var(--line); border-radius: 10px; padding: 12px; margin-top: 10px; min-width: 0; }
+.staff-document-selection-row { display: flex; align-items: flex-start; gap: 10px; padding: 9px 0; border-top: 1px solid var(--line); cursor: pointer; }
+.staff-document-selection-row input { flex: 0 0 auto; width: 16px; height: 16px; margin-top: 3px; }
+.staff-document-selection-row > span { display: flex; flex-direction: column; gap: 3px; min-width: 0; overflow-wrap: anywhere; }
+.staff-document-selection-row.unavailable { opacity: .7; cursor: default; }
+.staff-document-selection-row small { color: var(--muted); }
+.staff-selection-documents .inline-heading { flex-wrap: wrap; gap: 8px; }

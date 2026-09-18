@@ -65,12 +65,19 @@ export function cashFlowSummary(events: CashFlowEvent[]) {
   let balance = 0;
   let minimumBalance = 0;
   let minimumDate = "";
-  const timeline = [...events].sort((left, right) => left.date.localeCompare(right.date) || left.id.localeCompare(right.id)).map((event) => {
-    balance += event.amount;
-    if (balance < minimumBalance) { minimumBalance = balance; minimumDate = event.date; }
-    return { ...event, balance };
-  });
-  return { timeline, closingBalance: balance, maximumCashGap: Math.abs(Math.min(0, minimumBalance)), maximumCashGapDate: minimumDate };
+  const byDate = new Map<string, CashFlowEvent[]>();
+  for (const event of events) {
+    if (!event.date || !Number.isFinite(event.amount)) continue;
+    byDate.set(event.date, [...(byDate.get(event.date) || []), event]);
+  }
+  const timeline: Array<CashFlowEvent & { balance: number }> = [];
+  for (const [date, entries] of [...byDate.entries()].sort(([a], [b]) => a.localeCompare(b))) {
+    balance += entries.reduce((sum, event) => sum + event.amount, 0);
+    if (balance < minimumBalance) { minimumBalance = balance; minimumDate = date; }
+    // No order within a day is supplied by the user: show the end-of-day balance.
+    timeline.push(...entries.map((event) => ({ ...event, balance })));
+  }
+  return { timeline, closingBalance: balance, maximumCashGap: Math.abs(Math.min(0, minimumBalance)), maximumCashGapDate: minimumDate, undatedEvents: events.filter((event) => !event.date || !Number.isFinite(event.amount)).length };
 }
 
 export function scenarioFinancials(scenario: ProcurementData["participationScenarios"][number]) {
@@ -84,12 +91,19 @@ export function scenarioFinancials(scenario: ProcurementData["participationScena
 }
 
 export function resourceConflicts(entries: ResourceAllocation[]) {
-  const conflicts: Array<{ staffSnapshotId: string; firstId: string; secondId: string; reason: string }> = [];
-  for (let leftIndex = 0; leftIndex < entries.length; leftIndex += 1) for (let rightIndex = leftIndex + 1; rightIndex < entries.length; rightIndex += 1) {
-    const left = entries[leftIndex]; const right = entries[rightIndex];
-    if (!left.staffSnapshotId || left.staffSnapshotId !== right.staffSnapshotId) continue;
-    const overlaps = !left.endDate || !right.startDate || !right.endDate || !left.startDate || (left.startDate <= right.endDate && right.startDate <= left.endDate);
-    if (overlaps && left.loadPercent + right.loadPercent > 100) conflicts.push({ staffSnapshotId: left.staffSnapshotId, firstId: left.id, secondId: right.id, reason: `Суммарная загрузка ${left.loadPercent + right.loadPercent}% превышает 100%.` });
+  const conflicts: Array<{ id: string; staffSnapshotId: string; firstId: string; secondId: string; reason: string }> = [];
+  for (const staffSnapshotId of new Set(entries.map((entry) => entry.staffSnapshotId).filter(Boolean))) {
+    const allocations = entries.filter((entry) => entry.staffSnapshotId === staffSnapshotId);
+    const emitted = new Set<string>();
+    for (const date of new Set(allocations.map((entry) => entry.startDate || "0000-01-01"))) {
+      const active = allocations.filter((entry) => (!entry.startDate || entry.startDate <= date) && (!entry.endDate || entry.endDate >= date));
+      const load = active.reduce((sum, entry) => sum + (Number.isFinite(entry.loadPercent) ? Math.max(0, entry.loadPercent) : 0), 0);
+      const id = active.map((entry) => entry.id).sort().join(":");
+      if (load <= 100 || emitted.has(id)) continue;
+      emitted.add(id);
+      conflicts.push({ id, staffSnapshotId, firstId: active[0].id, secondId: active[1]?.id || active[0].id,
+        reason: `${active[0].title || "Сотрудник"}: суммарная загрузка ${load}% превышает 100%${date === "0000-01-01" ? " (период не указан)" : ` на ${date}`}. Назначений: ${active.length}.` });
+    }
   }
   return conflicts;
 }
@@ -115,15 +129,35 @@ export function detectContractRisks(text: string): ContractRisk[] {
 
 export function applicationCompleteness(item: ProcurementData) {
   const missing = item.checklist.filter((entry) => entry.mandatory && !entry.done).map((entry) => entry.text || "Обязательный пункт без названия");
-  const invalidFiles = item.checklist.filter((entry) => entry.done && (!entry.fileVersionId || entry.validation.trim())).map((entry) => entry.text || "Пункт заявки");
+  const invalidFiles = item.checklist.filter((entry) => entry.done && (!entry.fileVersionId || entry.validation.trim() || !item.documentVersions.some((document) => document.versionId === entry.fileVersionId && document.relativePath))).map((entry) => entry.text || "Пункт заявки");
   const staleEvidence = item.requirements.flatMap((requirement) => requirement.evidenceLinks.filter((entry) => entry.stale).map(() => requirement.text));
-  return { ready: missing.length === 0 && invalidFiles.length === 0 && staleEvidence.length === 0, missing, invalidFiles, staleEvidence };
+  const blockers: string[] = [];
+  if (!item.name.trim() || !item.customer.trim() || !item.subject.trim()) blockers.push("Заполните название, заказчика и предмет закупки.");
+  if (!Number.isFinite(item.nmc) || item.nmc <= 0) blockers.push("Укажите НМЦ больше нуля.");
+  if (!item.submissionDeadline) blockers.push("Укажите срок подачи заявки.");
+  if (item.requirements.length === 0) blockers.push("Требования закупки ещё не проверены.");
+  for (const requirement of item.requirements) {
+    if (requirement.mandatory && !["Подтверждено", "Неприменимо"].includes(requirement.status)) blockers.push(`Обязательное требование не закрыто: ${requirement.text || "без названия"}.`);
+  }
+  if (item.checklist.length === 0) blockers.push("Комплект заявки ещё не определён.");
+  const decision = item.goNoGoDecision;
+  if (!["Участвовать", "Участвовать при выполнении условий"].includes(decision.confirmed) || !decision.author.trim() || !decision.decidedAt) blockers.push("Решение об участии не подтверждено.");
+  else if (decision.requiresReview || decision.inputRevision < item.revision) blockers.push("Решение об участии требует пересмотра.");
+  if (decision.confirmed === "Участвовать при выполнении условий") blockers.push("Проверьте и закройте условия участия, затем подтвердите решение.");
+  if (calculateGoNoGo(item.goNoGoCriteria).decision !== "Участвовать") blockers.push("Оценка критериев участия не завершена или содержит ограничения.");
+  blockers.push(...resourceConflicts(item.resourcePlan).map((entry) => entry.reason));
+  if (item.resourcePlan.some((entry) => !entry.availabilityConfirmed)) blockers.push("Доступность назначенных сотрудников не подтверждена.");
+  const unassessed = !item.requirements.length && !item.checklist.length;
+  return { ready: blockers.length === 0 && missing.length === 0 && invalidFiles.length === 0 && staleEvidence.length === 0, unassessed, blockers, missing, invalidFiles, staleEvidence };
 }
 
 export function procurementWarnings(item: ProcurementData, now = new Date()) {
   const warnings: string[] = [];
   if (!item.name.trim() || !item.customer.trim() || !item.subject.trim()) warnings.push("Не заполнены название, заказчик или предмет закупки.");
-  if (item.nmc <= 0) warnings.push("НМЦ должна быть больше нуля.");
+  if (!Number.isFinite(item.nmc) || item.nmc <= 0) warnings.push("НМЦ должна быть больше нуля.");
+  if ([item.resultDetails.finalPrice, item.resultDetails.actualCosts, item.resultDetails.initialPrice, item.resultDetails.bestKnownPrice].some((value) => !Number.isFinite(value) || value < 0)) warnings.push("Некорректно заполнены цены или фактические затраты результата: нужны конечные неотрицательные суммы.");
+  if (item.resourcePlan.some((entry) => !Number.isFinite(entry.loadPercent) || entry.loadPercent < 0 || entry.loadPercent > 100 || (entry.startDate && entry.endDate && entry.startDate > entry.endDate))) warnings.push("Некорректно заполнен ресурсный план: загрузка от 0 до 100%, окончание не раньше начала.");
+  if (item.partners.some((entry) => !Number.isFinite(entry.workShare) || entry.workShare < 0)) warnings.push("Некорректно заполнена доля партнёра: укажите неотрицательный процент.");
   if (item.questionDeadline && item.submissionDeadline && item.questionDeadline > item.submissionDeadline) warnings.push("Срок вопросов позже срока подачи заявки.");
   const share = item.partners.reduce((sum, partner) => sum + partner.workShare, 0);
   if (share > 100) warnings.push(`Суммарная доля партнёров ${share}% превышает 100%.`);

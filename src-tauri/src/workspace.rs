@@ -729,6 +729,11 @@ pub(crate) fn ensure_workspace(root: &Path) -> Result<(), String> {
         fs::create_dir_all(root.join(directory))
             .map_err(|error| format!("Не удалось подготовить раздел {directory}: {error}"))?;
     }
+    // Additive modules are created only by initialization/the active editor.
+    // They are deliberately not required by validate_workspace_layout: older
+    // complete shares must remain openable by read-only clients without writes.
+    fs::create_dir_all(root.join("commercial-proposals"))
+        .map_err(|error| format!("Не удалось подготовить раздел КП: {error}"))?;
     Ok(())
 }
 

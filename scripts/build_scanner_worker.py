@@ -16,6 +16,20 @@ TARGET_NAMES = {
 }
 
 
+def package_data_arguments(worker: Path) -> list[str]:
+    # python-docx opens parts/../templates/default-{header,footer}.xml without
+    # normalizing the path. Compiled modules do not create a physical parts/
+    # directory, so shipping templates alone is insufficient on either OS.
+    marker = worker / "packaging/docx-parts-runtime.txt"
+    if not marker.is_file():
+        raise FileNotFoundError(f"Missing python-docx runtime directory marker: {marker}")
+    return [
+        "--include-package-data=pypdfium2",
+        "--include-package-data=docx",
+        f"--include-data-files={marker}=docx/parts/runtime-directory.txt",
+    ]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build the offline scanner sidecar")
     parser.add_argument("--target", help="Rust target triple used by Tauri")
@@ -43,7 +57,8 @@ def main() -> None:
         "--include-package=scandocument", "--include-package=PIL", "--include-package=numpy",
         "--include-package=pypdf", "--include-package=pypdfium2", "--include-package=docx",
         "--include-module=reportlab.pdfgen.canvas", "--include-module=reportlab.pdfbase.pdfmetrics",
-        "--include-module=reportlab.pdfbase.ttfonts", "--include-package-data=pypdfium2",
+        "--include-module=reportlab.pdfbase.ttfonts",
+        *package_data_arguments(worker),
         "--nofollow-import-to=reportlab.lib.testutils,reportlab.graphics.testshapes,numpy.conftest,numpy.tests,numpy.testing,numpy.typing.tests,pypdf.tests,docx.tests,tkinter,_tkinter",
     ]
     if platform.system() == "Windows":

@@ -1,9 +1,11 @@
 import { createContext, useCallback, useContext, useEffect, useId, useMemo, useRef, useState, type Dispatch, type SetStateAction } from "react";
 import { useRecords } from "../../hooks/useRecords";
-import { ConfirmDialog } from "../../components/Dialog";
+import { ConfirmDialog, Dialog } from "../../components/Dialog";
 import { exportText, importText } from "../../lib/files";
 import { clearDraft, readDraft, saveDraft } from "../../lib/storage";
 import { useWorkspaceAccess } from "../../lib/workspaceAccess";
+import type { ProposalData } from "../proposals/types";
+import { proposalFromCalculator } from "../proposals/sources";
 import "./calculator-session.css";
 import { calculate, competitorComparablePrice, priceScenarios, recommendPrice } from "./engine";
 import {
@@ -69,7 +71,7 @@ function NumberField({ value, onChange, min, max, suffix }: {
   </div>;
 }
 
-export function Calculator({ openRecordId, onRecordOpened, active = true }: { openRecordId?: string; onRecordOpened?: () => void; active?: boolean } = {}) {
+export function Calculator({ openRecordId, onRecordOpened, active = true, onCreateProposal }: { openRecordId?: string; onRecordOpened?: () => void; active?: boolean; onCreateProposal?: (proposal: ProposalData) => void } = {}) {
   const workspaceAccess = useWorkspaceAccess();
   const [experienceMode, setExperienceMode] = useState<"guided" | "expert">("guided");
   const [step, setStep] = useState(0);
@@ -104,6 +106,7 @@ export function Calculator({ openRecordId, onRecordOpened, active = true }: { op
   const draftTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const draftQueue = useRef<Promise<void>>(Promise.resolve());
   const [archiving, setArchiving] = useState(false);
+  const [lossProposal, setLossProposal] = useState<ProposalData | null>(null);
   const [savedPayload, setSavedPayload] = useState("");
   const hasRecordChanges = !recordId || JSON.stringify(data) !== savedPayload;
   const queueDraft = useCallback((payload: CalculatorData, id: string) => {
@@ -280,6 +283,7 @@ export function Calculator({ openRecordId, onRecordOpened, active = true }: { op
         <button className="secondary" disabled={!calculationValid} type="button" onClick={() => void exportCalculation()}>Экспорт</button>
         {recordId && <><button data-workspace-mutation data-workspace-managed-disabled="true" className="secondary" disabled={!calculationValid || !workspaceAccess.editor} type="button" onClick={() => void saveCalculation(true)}>Сохранить как копию</button><button data-workspace-mutation data-workspace-managed-disabled="true" className="secondary danger" disabled={!workspaceAccess.editor} type="button" onClick={() => setArchiving(true)}>В архив</button></>}
         <button data-workspace-mutation data-workspace-managed-disabled="true" className="primary" disabled={!calculationValid || !workspaceAccess.editor || (Boolean(recordId) && !hasRecordChanges)} type="button" onClick={() => void saveCalculation(false)}>Сохранить в базу</button>
+        {onCreateProposal && <button className="secondary" type="button" disabled={!calculationValid || busy} onClick={() => { try { const proposal = proposalFromCalculator(data, recordId, hasRecordChanges); if (result.profit < 0) setLossProposal(proposal); else onCreateProposal(proposal); } catch (reason) { setFormError(String(reason)); } }}>Создать КП</button>}
       </div>
     </div>
 
@@ -399,6 +403,7 @@ export function Calculator({ openRecordId, onRecordOpened, active = true }: { op
     </div>
     {experienceMode === "guided" && <div className="calculator-step-actions"><button type="button" className="secondary" disabled={step === 0} onClick={() => setStep((value) => value - 1)}>Назад</button><span>{step + 1} из {steps.length}</span>{step < 4 ? <button type="button" className="primary" disabled={invalidNumberFields.size > 0} onClick={() => setStep((value) => value + 1)}>{step === 3 ? "Получить итог" : "Далее"}</button> : <button type="button" className="primary" disabled={!calculationValid} onClick={() => void exportCalculation()}>Экспортировать результат</button>}</div>}
     {archiving && <ConfirmDialog title="Переместить расчёт в архив?" message={`В архив будет перенесена сохранённая запись «${data.name}». ${hasRecordChanges ? "Изменения текущего черновика в неё не войдут. " : ""}Запись можно восстановить в разделе «Архив».`} confirmLabel="В архив" onClose={() => setArchiving(false)} onConfirm={async () => { if (!workspaceAccess.editor || !recordId) throw new Error("Требуется режим редактора"); await saved.archive(recordId); setArchiving(false); resetCalculation(); }} />}
+    {active && lossProposal && <Dialog title="Цена ниже рассчитанных затрат" onClose={() => setLossProposal(null)} width="520px"><div className="dialog-body"><p>Расчёт показывает убыток. Перенести эту цену в черновик КП? Ничего не отправляется заказчику; состав и цену ещё можно изменить.</p></div><footer className="dialog-actions"><button className="secondary" type="button" onClick={() => setLossProposal(null)}>Вернуться к расчёту</button><button className="primary" type="button" onClick={() => { const proposal = lossProposal; setLossProposal(null); onCreateProposal?.(proposal); }}>Создать черновик с этой ценой</button></footer></Dialog>}
   </fieldset></div></NumberValidityContext.Provider>;
 }
 

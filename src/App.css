@@ -621,8 +621,8 @@ fieldset.settings-form { min-width: 0; margin: 0; padding: 0; border: 0; }
 .registry-module > .table-surface > .table-scroll > table > tbody > tr > .sticky-cell { min-width: 170px; }
 .registry-module > .table-surface > .table-scroll > table > tbody > tr > .sticky-cell .link-button { overflow-wrap: break-word; word-break: normal; }
 .registry-module > .table-surface > .table-scroll > table > tbody > tr > .sticky-cell > small { display: block; color: var(--text-muted); }
-.counterparties-tool > .table-surface > .table-scroll > table > :is(thead, tbody) > tr > :first-child { min-width: 180px; }
-.counterparties-tool > .table-surface > .table-scroll > table > tbody > tr > td:first-child .link-button { overflow-wrap: break-word; word-break: normal; }
+.counterparties-tool > .table-surface > .table-scroll > table > :is(thead, tbody) > tr > :nth-child(2) { min-width: 180px; }
+.counterparties-tool > .table-surface > .table-scroll > table > tbody > tr > td:nth-child(2) .link-button { overflow-wrap: break-word; word-break: normal; }
 .registry-module > .table-surface > .empty-state { flex: 1 1 auto; min-height: 160px; padding: 22px; }
 .registry-module .portable-export-row { font-size: 11px; line-height: 1.5; }
 .registry-module .registry-toolbar .checkbox-row { flex: 0 0 auto; min-width: 0; min-height: 36px; margin: 0; }

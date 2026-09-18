@@ -24,6 +24,14 @@ export interface StaffSelectionCriteria {
 
 export interface StaffMatch { score: number; reasons: string[]; assignmentId?: string }
 
+/** All registry filters must hold for one real assignment, not separate jobs. */
+export function matchesStaffAssignmentFilters(item: StaffData, filters: { legalEntity: string; department: string; basis: string; status: string }): boolean {
+  return staffAssignments(item).some((entry) => (!filters.legalEntity || entry.legalEntity === filters.legalEntity)
+    && (!filters.department || entry.department === filters.department)
+    && (!filters.basis || entry.engagementType === filters.basis)
+    && (!filters.status || entry.status === filters.status));
+}
+
 const genericStems = ["оказан", "услуг", "выполнен", "работ", "закуп", "договор", "постав", "провед", "организац"];
 const words = (value: string) => [...new Set((value.toLowerCase().match(/[a-zа-яё0-9-]+/gi) || [])
   .filter((word) => word.length >= 3 && !genericStems.some((stem) => word.startsWith(stem))))];

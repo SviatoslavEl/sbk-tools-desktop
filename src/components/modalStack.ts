@@ -60,7 +60,7 @@ export class ModalStack {
     if (this.redirectingFocus) return;
     this.redirectingFocus = true;
     try {
-      const preferred = layer.content.querySelector<HTMLElement>("[autofocus]");
+      const preferred = layer.content.querySelector<HTMLElement>("[autofocus], [data-autofocus]");
       const last = preferLast && layer.lastFocus && layer.content.contains(layer.lastFocus) && canFocus(layer.lastFocus)
         ? layer.lastFocus : null;
       const target = last || (canFocus(preferred) ? preferred : focusableElements(layer.content)[0]) || layer.content;

@@ -10,6 +10,7 @@ const hooks = vi.hoisted(() => ({
   slots: [] as Array<{ value?: unknown; deps?: readonly unknown[]; cleanup?: () => void }>,
   effects: [] as Array<() => void>,
   list: vi.fn(), verify: vi.fn(), backup: vi.fn(), intelligence: vi.fn(), save: vi.fn(), reload: vi.fn(),
+  readPolicy: vi.fn(), savePolicy: vi.fn(), saveTimers: vi.fn(), editor: true,
   loading: false, error: null as string | null,
   timers: { refreshSeconds: 30, backupHours: 0, retentionCount: 10, retentionDays: 180 },
 }));
@@ -29,12 +30,12 @@ vi.mock("react", async (original) => ({
   },
 }));
 vi.mock("../../hooks/useRecords", () => ({ useRecords: () => ({ records: [], loading: hooks.loading, error: hooks.error, save: hooks.save, reload: hooks.reload }) }));
-vi.mock("../../lib/workspaceAccess", () => ({ useWorkspaceAccess: () => ({ editor: true, message: "Редактор" }) }));
+vi.mock("../../lib/workspaceAccess", () => ({ useWorkspaceAccess: () => ({ editor: hooks.editor, message: "Редактор" }) }));
 vi.mock("../../lib/storage", async (original) => ({ ...await original<typeof import("../../lib/storage")>(), listBackups: hooks.list, verifyBackup: hooks.verify, createBackup: hooks.backup }));
 vi.mock("../intelligence/api", () => ({ getIntelligenceProviderStatus: hooks.intelligence }));
-vi.mock("../../lib/sharedWorkspace", () => ({ readAccessTimers: () => hooks.timers, saveAccessTimers: (value: unknown) => value }));
+vi.mock("../../lib/sharedWorkspace", () => ({ readAccessTimers: () => hooks.timers, saveAccessTimers: hooks.saveTimers, readSharedBackupPolicy: hooks.readPolicy, saveSharedBackupPolicy: hooks.savePolicy }));
 
-type Props = { children?: ReactNode; hidden?: boolean; disabled?: boolean; className?: string; onClick?: () => unknown; role?: string };
+type Props = { children?: ReactNode; hidden?: boolean; disabled?: boolean; className?: string; onClick?: () => unknown; role?: string; onChange?: (event: { target: { value: string } }) => void; value?: unknown };
 let tree: ReactNode;
 const workspace: WorkspaceInfo = { root: "/tmp/sbk-settings-test", portable: false, configured: true, writable: true, editor: true, editorBusy: false, accessControlled: false, accessMessage: "Редактор", schemaVersion: 1, freeSpaceBytes: 1_000_000 };
 
@@ -51,18 +52,58 @@ function section(title: string) { const found = nodes().find((node) => node.type
 const interfaceFieldset = () => nodes().find((node) => node.type === "fieldset" && node.props.className?.includes("settings-interface-fields"))!;
 function deferred<T>() { let resolve!: (value: T) => void; let reject!: (reason: Error) => void; const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; }
 const copy: BackupListItem = { path: "/tmp/qa-copy.sbkbackup", fileName: "qa-copy.sbkbackup", sizeBytes: 1024, modifiedAt: "2026-09-17T09:00:00Z", pinned: false };
+const sharedPolicy = { source: "shared", policy: { version: 1, backupHours: 24, retentionCount: 13, retentionDays: 75, lastSuccessAt: 0, lastAttemptAt: 0, lastError: "", lastBackupPath: "" } };
 
 beforeEach(() => {
   hooks.cursor = 0; hooks.changed = false; hooks.slots = []; hooks.effects = []; hooks.loading = false; hooks.error = null;
-  for (const fn of [hooks.list, hooks.verify, hooks.backup, hooks.intelligence, hooks.save, hooks.reload]) fn.mockReset();
+  hooks.editor = true;
+  for (const fn of [hooks.list, hooks.verify, hooks.backup, hooks.intelligence, hooks.save, hooks.reload, hooks.readPolicy, hooks.savePolicy, hooks.saveTimers]) fn.mockReset();
   hooks.list.mockResolvedValue([]); hooks.intelligence.mockResolvedValue(null); hooks.save.mockResolvedValue(undefined);
   hooks.verify.mockResolvedValue({ files: 3, unpackedBytes: 1024, sha256: "synthetic" });
   hooks.backup.mockResolvedValue(copy);
+  hooks.readPolicy.mockResolvedValue(sharedPolicy); hooks.savePolicy.mockResolvedValue(sharedPolicy);
+  hooks.saveTimers.mockImplementation((value) => value);
   vi.stubGlobal("window", { confirm: vi.fn(() => true), dispatchEvent: vi.fn(), setTimeout, clearTimeout });
 });
 afterEach(() => { for (const slot of hooks.slots) slot.cleanup?.(); vi.unstubAllGlobals(); });
 
 describe("settings navigation and backup confidence", () => {
+  it("loads shared backup fields without mount writes and saves only after an explicit click", async () => {
+    render(); await flush();
+    const select = nodes(section("Создание и защита копий")).find((node) => node.type === "select")!;
+    expect(select.props.value).toBe(24);
+    expect(hooks.saveTimers).not.toHaveBeenCalled();
+    expect(hooks.savePolicy).not.toHaveBeenCalled();
+    select.props.onChange?.({ target: { value: "6" } }); await flush();
+    expect(hooks.savePolicy).not.toHaveBeenCalled();
+    const save = button("Сохранить общую политику").props.onClick!;
+    save(); save(); await flush();
+    expect(hooks.savePolicy).toHaveBeenCalledOnce();
+    expect(hooks.savePolicy).toHaveBeenCalledWith(workspace.root, { backupHours: 6, retentionCount: 13, retentionDays: 75 });
+    expect(hooks.saveTimers).not.toHaveBeenCalled();
+  });
+
+  it("blocks policy overwrite after a shared read error and exposes an explicit retry", async () => {
+    hooks.readPolicy.mockRejectedValueOnce(new Error("SMB unavailable"));
+    render(); await flush();
+    expect(text()).toContain("Не удалось прочитать общую политику");
+    expect(button("Сохранить общую политику").props.disabled).toBe(true);
+    button("Сохранить общую политику").props.onClick?.(); await flush();
+    expect(hooks.savePolicy).not.toHaveBeenCalled();
+    button("Повторить чтение политики").props.onClick?.(); await flush();
+    expect(button("Сохранить общую политику").props.disabled).toBe(false);
+  });
+
+  it("shows local fallback distinctly and keeps viewers read-only", async () => {
+    hooks.readPolicy.mockResolvedValue({ ...sharedPolicy, source: "local-fallback" }); hooks.editor = false;
+    render(); await flush();
+    expect(text()).toContain("прежние настройки только этого компьютера");
+    expect(button("Сохранить общую политику").props.disabled).toBe(true);
+    button("Сохранить общую политику").props.onClick?.(); await flush();
+    expect(hooks.savePolicy).not.toHaveBeenCalled();
+    expect(hooks.saveTimers).not.toHaveBeenCalled();
+  });
+
   it("shows only the selected one of four groups and enforces hidden in scoped CSS", async () => {
     render(); await flush();
     const groups: Array<[string, string[]]> = [

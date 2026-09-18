@@ -1,4 +1,4 @@
-import type { EditableFacsimile } from "./facsimilePreview";
+import { facsimileGeometry, type EditableFacsimile, type PerPageFacsimile } from "./facsimilePreview";
 
 export interface FacsimilePresetSettings {
   x: number;
@@ -22,6 +22,10 @@ const finite = (value: unknown, fallback: number, minimum: number, maximum: numb
 
 export function captureFacsimilePreset(source: FacsimilePresetSettings): FacsimilePresetSettings {
   return normalizeFacsimilePreset(source);
+}
+
+export function captureFacsimilePresetForPage(source: FacsimilePresetSettings & PerPageFacsimile, pageIndex: number): FacsimilePresetSettings {
+  return captureFacsimilePreset({ ...source, ...facsimileGeometry(source, pageIndex) });
 }
 
 export function normalizeFacsimilePreset(

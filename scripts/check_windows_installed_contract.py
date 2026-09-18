@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from pathlib import Path
 
 
@@ -20,6 +21,42 @@ PORTABLE_SNAPSHOT = {
 
 def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes().replace(b"\r\n", b"\n")).hexdigest()
+
+
+def check_frontend_startup_readiness(frontend: str) -> None:
+    """Keep the splash tied to real readiness, not a minimum display time."""
+    compact = re.sub(r"\s+", "", frontend)
+    for guard, message in (
+        (
+            "if(!installedFastStart&&!workspace)return(",
+            "Portable startup must wait for the workspace, without a timer gate",
+        ),
+        (
+            "if(installedFastStart&&(!workspace||!startup.ready))return(",
+            "Installed startup must wait for both backend readiness and the workspace",
+        ),
+    ):
+        if guard not in compact:
+            raise SystemExit(message)
+
+    if "startupDelayElapsed" in frontend or "setStartupDelayElapsed" in frontend:
+        raise SystemExit("Startup must not restore the artificial splash delay")
+    if (
+        "if(status.ready){constvalue=awaitgetWorkspaceInfo();"
+        "if(stopped)return;setWorkspace(value);"
+    ) not in compact:
+        raise SystemExit("Installed workspace must come from the ready backend response")
+    if "refreshWorkspace();window.addEventListener(" not in compact:
+        raise SystemExit("Workspace readiness must be requested immediately on mount")
+
+    # App currently needs timeouts only to retry the real readiness request.
+    # Reject an added minimum-duration timer (including a renamed delay state)
+    # while preserving the existing short status/error polling intervals.
+    without_readiness_retries = re.sub(
+        r"window\.setTimeout\(refreshWorkspace,(?:140|500)\)", "", compact
+    )
+    if re.search(r"\bsetTimeout\(", without_readiness_retries):
+        raise SystemExit("Startup timeouts must only retry workspace readiness, not delay the UI")
 
 
 def main() -> None:
@@ -92,8 +129,7 @@ def main() -> None:
             raise SystemExit(f"Startup stage is missing: {stage}")
     if "VITE_SBK_INSTALLED_FAST_START" not in frontend:
         raise SystemExit("Installed startup is not isolated behind its build flavor")
-    if "if (installedFastStart) return;" not in frontend:
-        raise SystemExit("Portable startup delay is no longer isolated from the installed flavor")
+    check_frontend_startup_readiness(frontend)
     if "initialize_workspace_in_background" not in startup_source:
         raise SystemExit("Workspace initialization is not running in the background")
     if "report_startup_ui_visible" not in startup_source or "reportStartupUiVisible" not in frontend:

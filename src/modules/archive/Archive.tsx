@@ -8,6 +8,7 @@ const sections: Array<{ module: ModuleId; title: string }> = [
   { module: "contract-experience", title: "Договоры" },
   { module: "staff", title: "Кадры" },
   { module: "procurement", title: "Закупки" },
+  { module: "commercial-proposals", title: "Коммерческие предложения" },
   { module: "tender-calendar", title: "Календарь тендеров" },
 ];
 

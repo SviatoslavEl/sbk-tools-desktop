@@ -6,6 +6,7 @@ import { DrawerBackdrop } from "../../components/DrawerBackdrop";
 import { SortableHeader } from "../../components/SortableHeader";
 import { useRecords } from "../../hooks/useRecords";
 import { useUnsavedChanges } from "../../hooks/useUnsavedChanges";
+import { useViewState } from "../../hooks/useViewState";
 import { parseCsv, toCsv } from "../../lib/csv";
 import { chooseOpenPath, chooseSavePath, exportText } from "../../lib/files";
 import { compareSortValues, toggleSort, type SortDirection } from "../../lib/tableSort";
@@ -57,6 +58,8 @@ import { CompanyNameField, useCompanyDirectory } from "./CompanyDirectory";
 import type { CompanyCard } from "./companies";
 import { ContractReadCard } from "./RegistryReadCard";
 import { RegistryTableView } from "./RegistryTableView";
+import { ContractSelectionDocuments } from "./ContractSelectionDocuments";
+import { contractSelectionArchivePlan, contractSelectionDocumentGroups, pruneContractDocumentSelection } from "./selectionDocuments";
 import "./registry.css";
 
 const money = (value: number) =>
@@ -375,10 +378,10 @@ export function mergeContractImportUpdate(
 export function ContractsRegistry({ openRecordId, onRecordOpened }: { openRecordId?: string; onRecordOpened?: () => void } = {}) {
   const store = useRecords<ContractData>("contract-experience");
   const companyDirectory = useCompanyDirectory(store.records);
-  const [search, setSearch] = useState("");
-  const [stageFilter, setStageFilter] = useState("");
-  const [paymentFilter, setPaymentFilter] = useState("");
-  const [legalEntityFilter, setLegalEntityFilter] = useState("");
+  const [search, setSearch] = useViewState("contracts.search", "");
+  const [stageFilter, setStageFilter] = useViewState("contracts.stageFilter", "");
+  const [paymentFilter, setPaymentFilter] = useViewState("contracts.paymentFilter", "");
+  const [legalEntityFilter, setLegalEntityFilter] = useViewState("contracts.legalEntityFilter", "");
   const [editing, setEditingRecord] = useState<
     StoredRecord<ContractData> | "new" | null
   >(null);
@@ -436,9 +439,12 @@ export function ContractsRegistry({ openRecordId, onRecordOpened }: { openRecord
   const [selectedContracts, setSelectedContracts] = useState<Set<string>>(
     new Set(),
   );
+  const [selectedContractDocuments, setSelectedContractDocuments] = useState<Set<string>>(new Set());
+  const [selectionZipExporting, setSelectionZipExporting] = useState(false);
+  const selectionZipPending = useRef(false);
   const [selectedRegistryContracts, setSelectedRegistryContracts] = useState<Set<string>>(new Set());
   const [bulkArchiveIds, setBulkArchiveIds] = useState<string[]>([]);
-  const [sort, setSort] = useState<{ key: ContractSortKey; direction: SortDirection } | null>(null);
+  const [sort, setSort] = useViewState<{ key: ContractSortKey; direction: SortDirection } | null>("contracts.sort", null);
 
   const filtered = useMemo(
     () =>
@@ -529,6 +535,17 @@ export function ContractsRegistry({ openRecordId, onRecordOpened }: { openRecord
       (current) => new Set([...current].filter((id) => visibleIds.has(id))),
     );
   }, [matches]);
+  const selectionDocumentGroups = useMemo(
+    () => contractSelectionDocumentGroups(matches.map(({ record }) => record), selectedContracts),
+    [matches, selectedContracts],
+  );
+  const selectionArchivePlan = contractSelectionArchivePlan(selectionDocumentGroups, selectedContractDocuments);
+  useEffect(() => {
+    setSelectedContractDocuments((current) => {
+      const next = pruneContractDocumentSelection(selectionDocumentGroups, current);
+      return next.size === current.size ? current : next;
+    });
+  }, [selectionDocumentGroups]);
   useEffect(() => {
     if (companyDirectory.migrationRevision) void store.reload();
   }, [companyDirectory.migrationRevision]);
@@ -657,6 +674,7 @@ export function ContractsRegistry({ openRecordId, onRecordOpened }: { openRecord
   };
   const exportArchive = async (
     recordIds = filtered.map((record) => record.id),
+    attachmentPaths?: string[],
   ) => {
     if (!recordIds.length) return window.alert("Нет договоров для экспорта.");
     const selected = new Set(recordIds);
@@ -671,8 +689,8 @@ export function ContractsRegistry({ openRecordId, onRecordOpened }: { openRecord
     )
       return;
     const path = await chooseSavePath(
-      "Договоры и все документы",
-      "договоры-с-документами.zip",
+      attachmentPaths ? "Подбор договоров и выбранные файлы" : "Договоры и все документы",
+      attachmentPaths ? "подбор-договоров-с-файлами.zip" : "договоры-с-документами.zip",
       ["zip"],
     );
     if (!path) return;
@@ -681,11 +699,23 @@ export function ContractsRegistry({ openRecordId, onRecordOpened }: { openRecord
         "contract-experience",
         path,
         recordIds,
+        attachmentPaths,
       );
       window.alert(`Архив создан: ${result.fileName}`);
     } catch (reason) {
       window.alert(`Не удалось создать архив: ${String(reason)}`);
     }
+  };
+  const exportSelectedDocuments = async () => {
+    if (selectionZipPending.current) return;
+    // Recompute from the visible match set; stale document/record IDs cannot leak into the archive.
+    const plan = contractSelectionArchivePlan(selectionDocumentGroups, selectedContractDocuments);
+    if (!plan.recordIds.length || !plan.attachmentPaths.length) return;
+    selectionZipPending.current = true;
+    setSelectionZipExporting(true);
+    try { await exportArchive(plan.recordIds, plan.attachmentPaths); }
+    catch (reason) { window.alert(`Не удалось создать архив: ${String(reason)}`); }
+    finally { selectionZipPending.current = false; setSelectionZipExporting(false); }
   };
   const reportData = (): ContractReportData => {
     const selected = matches.filter(({ record }) =>
@@ -1309,10 +1339,12 @@ export function ContractsRegistry({ openRecordId, onRecordOpened }: { openRecord
         <Dialog
           title="Подбор договоров под закупку"
           description="Фильтры используют только фактические сведения реестра. Нерелевантные договоры при заданном запросе исключаются."
-          onClose={() => setSelectionOpen(false)}
+          onClose={() => { if (!selectionZipPending.current) setSelectionOpen(false); }}
+          closeDisabled={selectionZipExporting}
           width="1180px"
         >
           <div className="dialog-body">
+            <fieldset className="contract-selection-controls" disabled={selectionZipExporting}>
             <div className="form-grid selection-filters">
               <label className="wide">
                 Название закупки
@@ -1597,11 +1629,14 @@ export function ContractsRegistry({ openRecordId, onRecordOpened }: { openRecord
                 или уточните ключевые слова.
               </div>
             )}
+            <ContractSelectionDocuments groups={selectionDocumentGroups} selected={selectedContractDocuments} onChange={setSelectedContractDocuments} disabled={selectionZipExporting} />
+            </fieldset>
           </div>
           <footer className="dialog-actions">
             <button
               className="secondary"
               type="button"
+              disabled={selectionZipExporting}
               onClick={() => setSelectionOpen(false)}
             >
               Закрыть
@@ -1609,15 +1644,15 @@ export function ContractsRegistry({ openRecordId, onRecordOpened }: { openRecord
             <button
               className="secondary"
               type="button"
-              disabled={!selectedContracts.size}
-              onClick={() => void exportArchive([...selectedContracts])}
+              disabled={selectionZipExporting || !selectionArchivePlan.recordIds.length || !selectionArchivePlan.attachmentPaths.length}
+              onClick={() => void exportSelectedDocuments()}
             >
-              ZIP + документы
+              {selectionZipExporting ? "Создаём архив…" : `ZIP · файлов: ${selectionArchivePlan.attachmentPaths.length}`}
             </button>
             <button
               className="secondary"
               type="button"
-              disabled={!selectedContracts.size}
+              disabled={selectionZipExporting || !selectedContracts.size}
               onClick={() => void exportReport("xlsx")}
             >
               Excel
@@ -1625,7 +1660,7 @@ export function ContractsRegistry({ openRecordId, onRecordOpened }: { openRecord
             <button
               className="secondary"
               type="button"
-              disabled={!selectedContracts.size}
+              disabled={selectionZipExporting || !selectedContracts.size}
               onClick={() => void exportReport("docx")}
             >
               Word
@@ -1633,7 +1668,7 @@ export function ContractsRegistry({ openRecordId, onRecordOpened }: { openRecord
             <button
               className="primary"
               type="button"
-              disabled={!selectedContracts.size}
+              disabled={selectionZipExporting || !selectedContracts.size}
               onClick={() => void exportReport("pdf")}
             >
               PDF

@@ -58,8 +58,10 @@ export function mapStaffRows(rows: string[][], mapping: StaffImportMapping, defa
     const rawExperience = value(row, "experienceYears") || value(row, "experienceText");
     const experienceYears = Number(rawExperience.replace(",", ".")) || Number(rawExperience.match(/\d+(?:[.,]\d+)?/)?.[0]?.replace(",", ".")) || 0;
     const certificateNames = lines(value(row, "certificates"));
-    const certificateStatuses = lines(value(row, "certificateStatuses"));
-    const documents = certificateNames.map((name, index) => { const comment = certificateStatuses[index] || "Срок действия не указан"; return { ...emptyStaffDocument("certificate"), type: "Сертификат", name, comment, ...certificateValidity(comment) }; });
+    // Statuses are positional. Removing an empty/unknown item would shift the
+    // next certificate's expiry onto the previous certificate.
+    const certificateStatuses = value(row, "certificateStatuses").split(/\r?\n|;/).map((entry) => entry.trim());
+    const documents = certificateNames.map((name, index) => { const status = certificateStatuses[index]; const comment = status && !/^не указано$/i.test(status) ? status : "Срок действия не указан"; return { ...emptyStaffDocument("certificate"), type: "Сертификат", name, comment, ...certificateValidity(comment) }; });
     const education = value(row, "education");
     if (education && !/^не указано$/i.test(education)) documents.push({ ...emptyStaffDocument("education"), type: "Образование", name: education });
     const basis = cooperationBases.includes(rawBasis as never) ? rawBasis as StaffData["basis"] : "Иное";

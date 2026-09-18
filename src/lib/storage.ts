@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { trackedOperation } from "./activity";
 
 export type ModuleId =
   | "settings"
@@ -7,7 +8,8 @@ export type ModuleId =
   | "contract-experience"
   | "staff"
   | "procurement"
-  | "tender-calendar";
+  | "tender-calendar"
+  | "commercial-proposals";
 
 export interface StoredRecord<T = unknown> {
   id: string;
@@ -117,7 +119,8 @@ async function invokeMutation<T>(
   args?: Record<string, unknown>,
 ): Promise<T> {
   try {
-    return await invoke<T>(command, args);
+    const labels: Record<string, string> = { create_backup: "Резервная копия", create_encrypted_backup: "Зашифрованная копия", restore_backup: "Восстановление копии", restore_encrypted_backup: "Восстановление зашифрованной копии", upsert_record: "Сохранение карточки", save_draft: "Сохранение черновика", rotate_backups: "Ротация резервных копий" };
+    return await trackedOperation(labels[command] || "Обновление рабочих данных", () => invoke<T>(command, args));
   } catch (reason) {
     if (isWorkspaceAccessError(reason))
       window.dispatchEvent(new Event(workspaceAccessInvalidatedEvent));

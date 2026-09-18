@@ -33,8 +33,12 @@ use zip::write::SimpleFileOptions;
 
 mod administration;
 mod attachments;
+#[cfg(test)]
+mod backup_regression_tests;
+mod backup_restore;
 mod database;
 mod intelligence;
+mod proposals;
 mod scanner_outputs;
 mod workspace;
 use attachments::AttachmentAudit;
@@ -262,6 +266,151 @@ struct WorkspaceInfo {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+struct WorkspaceHealth {
+    checked_at: String,
+    app_version: String,
+    schema_version: i64,
+    root: String,
+    available: bool,
+    writable: bool,
+    writable_basis: &'static str,
+    read_latency_ms: u64,
+    editor: HealthEditor,
+    backup: HealthBackups,
+    issues: Vec<HealthIssue>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HealthEditor {
+    busy: bool,
+    owned_by_this_instance: bool,
+    owner: Option<EditorOwner>,
+    message: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HealthBackup {
+    file_name: String,
+    path: String,
+    size_bytes: u64,
+    modified_at: String,
+    pinned: Option<bool>,
+}
+
+#[derive(Serialize)]
+struct HealthBackups {
+    latest: Option<HealthBackup>,
+    verification: HealthVerification,
+}
+
+#[derive(Serialize)]
+struct HealthVerification {
+    status: &'static str,
+    message: String,
+}
+
+#[derive(Serialize)]
+struct HealthIssue {
+    code: &'static str,
+    severity: &'static str,
+    message: String,
+}
+
+fn workspace_health_impl(workspace: &Workspace) -> WorkspaceHealth {
+    let started = Instant::now();
+    let mut issues = Vec::new();
+    let available =
+        match fs::read_dir(&workspace.root).and_then(|mut entries| entries.next().transpose()) {
+            Ok(_) => true,
+            Err(error) => {
+                issues.push(HealthIssue {
+                    code: "root-unavailable",
+                    severity: "error",
+                    message: format!("Рабочая папка недоступна: {error}"),
+                });
+                false
+            }
+        };
+    let read_latency_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+    let pins = match pinned_backups(&workspace.root) {
+        Ok(pins) => Some(pins),
+        Err(error) => {
+            issues.push(HealthIssue {
+                code: "pins-invalid",
+                severity: "error",
+                message: error,
+            });
+            None
+        }
+    };
+    let backup_rows = (|| -> Result<Vec<HealthBackup>, String> {
+        let mut rows = Vec::new();
+        for entry in fs::read_dir(workspace.root.join("backups")).map_err(|e| e.to_string())? {
+            let entry = entry.map_err(|e| e.to_string())?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !(name.ends_with(".sbkbackup") || name.ends_with(".sbkbackup.enc")) {
+                continue;
+            }
+            let metadata = fs::symlink_metadata(entry.path()).map_err(|e| e.to_string())?;
+            if !metadata.is_file() {
+                continue;
+            }
+            rows.push(HealthBackup {
+                pinned: pins.as_ref().map(|pins| pins.contains(&name)),
+                file_name: name,
+                path: entry.path().to_string_lossy().into_owned(),
+                size_bytes: metadata.len(),
+                modified_at: chrono::DateTime::<Utc>::from(
+                    metadata.modified().map_err(|e| e.to_string())?,
+                )
+                .to_rfc3339(),
+            });
+        }
+        rows.sort_by(|a, b| b.modified_at.cmp(&a.modified_at));
+        Ok(rows)
+    })();
+    let latest = match backup_rows {
+        Ok(rows) => rows.into_iter().next(),
+        Err(error) => {
+            issues.push(HealthIssue {
+                code: "backup-list-unavailable",
+                severity: "error",
+                message: format!("Не удалось прочитать список копий: {error}"),
+            });
+            None
+        }
+    };
+    let editor = workspace.editor_state();
+    if let Some(message) = editor.message.as_ref() {
+        issues.push(HealthIssue {
+            code: "editor-state-unknown",
+            severity: "warning",
+            message: message.clone(),
+        });
+    }
+    WorkspaceHealth {
+        checked_at: Utc::now().to_rfc3339(), app_version: env!("CARGO_PKG_VERSION").into(), schema_version: SCHEMA_VERSION,
+        root: workspace.root.to_string_lossy().into_owned(), available, writable: workspace.writable,
+        writable_basis: "last-known-os-access-not-a-write-probe", read_latency_ms,
+        editor: HealthEditor { busy: editor.busy, owned_by_this_instance: workspace.is_editor(), owner: editor.presence.map(|p| p.owner), message: editor.message },
+        backup: HealthBackups { latest, verification: HealthVerification { status: "not-recorded", message: "Постоянный отчёт проверки не хранится. Дата копии не подтверждает её целостность; выполните проверку в этом сеансе.".into() } },
+        issues,
+    }
+}
+
+#[tauri::command]
+async fn workspace_health(state: State<'_, AppState>) -> Result<WorkspaceHealth, String> {
+    // Deliberately no require_editor, lease cleanup, migrations or write probes.
+    let workspace = state.active_workspace()?;
+    tauri::async_runtime::spawn_blocking(move || workspace_health_impl(workspace.as_ref()))
+        .await
+        .map_err(|error| format!("Проверка состояния недоступна: {error}"))
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct IntelligenceProviderStatus {
     enabled: bool,
     healthy: bool,
@@ -386,6 +535,123 @@ struct BackupManifest {
     files: BTreeMap<String, BackupFileMeta>,
 }
 
+#[derive(Clone, Copy)]
+struct BackupLimits {
+    archive_bytes: u64,
+    unpacked_bytes: u64,
+    file_bytes: u64,
+    manifest_bytes: u64,
+    entries: usize,
+    compression_ratio: u64,
+}
+
+const BACKUP_LIMITS: BackupLimits = BackupLimits {
+    archive_bytes: 2 * 1024 * 1024 * 1024,
+    unpacked_bytes: 2 * 1024 * 1024 * 1024,
+    file_bytes: 1024 * 1024 * 1024,
+    manifest_bytes: 1024 * 1024,
+    entries: 10_000,
+    compression_ratio: 250,
+};
+
+impl BackupLimits {
+    fn entries(self, count: usize) -> Result<(), String> {
+        if count > self.entries {
+            Err("В резервной копии слишком много файлов. Создайте отдельные копии разделов.".into())
+        } else {
+            Ok(())
+        }
+    }
+    fn add_file(self, total: &mut u64, size: u64, compressed: Option<u64>) -> Result<(), String> {
+        *total = total
+            .checked_add(size)
+            .ok_or("Некорректный размер резервной копии")?;
+        if *total > self.unpacked_bytes || size > self.file_bytes {
+            return Err("Размер данных превышает предел восстанавливаемой копии (2 ГБ всего, 1 ГБ на файл). Создайте отдельные копии разделов.".into());
+        }
+        if compressed
+            .is_some_and(|compressed| size > compressed.saturating_mul(self.compression_ratio))
+        {
+            return Err("Резервная копия имеет небезопасно высокий коэффициент сжатия".into());
+        }
+        Ok(())
+    }
+}
+
+// This same gate runs before publishing a new backup, before verification and
+// before restoration. A green verification therefore cannot skip a restore-only
+// budget. The archive is not extracted by this metadata-only preflight.
+fn validate_backup_container(path: &Path) -> Result<(), String> {
+    validate_backup_container_with_limits(path, BACKUP_LIMITS)
+}
+
+fn validate_backup_container_with_limits(path: &Path, limits: BackupLimits) -> Result<(), String> {
+    let size = fs::metadata(path).map_err(|e| e.to_string())?.len();
+    if size == 0 || size > limits.archive_bytes {
+        return Err("Размер резервной копии превышает безопасный предел".into());
+    }
+    let mut archive = zip::ZipArchive::new(File::open(path).map_err(|e| e.to_string())?)
+        .map_err(|_| "Файл не является резервной копией СБК")?;
+    limits.entries(archive.len())?;
+    let manifest: BackupManifest = {
+        let mut entry = archive
+            .by_name("manifest.json")
+            .map_err(|_| "В резервной копии нет manifest.json")?;
+        if entry.size() > limits.manifest_bytes {
+            return Err("Manifest превышает безопасный предел".into());
+        }
+        let mut bytes = Vec::new();
+        entry.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+        serde_json::from_slice(&bytes).map_err(|_| "Manifest повреждён")?
+    };
+    if manifest.product != "sbk-tools-desktop"
+        || manifest.backup_format_version != 2
+        || manifest.schema_version > SCHEMA_VERSION
+    {
+        return Err("Версия или тип резервной копии несовместимы".into());
+    }
+    let modules: HashSet<String> = manifest.modules.iter().cloned().collect();
+    if modules.is_empty()
+        || modules.len() != manifest.modules.len()
+        || modules.iter().any(|name| validated_module(name).is_err())
+    {
+        return Err("Manifest содержит неизвестные, пустые или повторяющиеся разделы".into());
+    }
+    let mut total = 0;
+    let mut found = HashSet::new();
+    let mut manifests = 0;
+    for index in 0..archive.len() {
+        let entry = archive.by_index(index).map_err(|e| e.to_string())?;
+        if entry.name() == "manifest.json" {
+            manifests += 1;
+            continue;
+        }
+        if entry.is_dir() {
+            continue;
+        }
+        let relative = entry.enclosed_name().ok_or("Опасный путь внутри архива")?;
+        if !valid_archive_path(&relative, &modules) {
+            return Err("Недопустимый путь внутри резервной копии".into());
+        }
+        let name = relative.to_string_lossy().replace('\\', "/");
+        if !found.insert(name.clone()) {
+            return Err("Повторяющийся путь внутри резервной копии".into());
+        }
+        limits.add_file(&mut total, entry.size(), Some(entry.compressed_size()))?;
+        let expected = manifest
+            .files
+            .get(&name)
+            .ok_or_else(|| format!("Файл {name} не объявлен в manifest"))?;
+        if entry.size() != expected.size_bytes {
+            return Err(format!("Размер файла {name} не совпадает"));
+        }
+    }
+    if manifests != 1 || found.len() != manifest.files.len() {
+        return Err("Состав резервной копии не совпадает с manifest".into());
+    }
+    Ok(())
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RuntimeFileMeta {
@@ -481,9 +747,9 @@ fn initialize_workspace_in_background(startup: Arc<StartupWorkspace>) {
         startup.set_stage("Открываем базы данных", 2);
         for module in MODULES {
             let result = if workspace.is_editor() {
-                open_database(&workspace.root, module).map(|_| ())
+                initialize_module(&workspace.root, module)
             } else {
-                open_database_read_only(&workspace.root, module).map(|_| ())
+                open_optional_database_read_only(&workspace.root, module).map(|_| ())
             };
             if let Err(error) = result {
                 startup.fail(
@@ -591,7 +857,11 @@ fn switch_workspace_mode(
         .map_err(|_| "Хранилище временно недоступно".to_string())?;
     let workspace = state.active_workspace()?;
     if editor {
-        workspace.acquire_editor_with_password(&password)
+        workspace.acquire_editor_with_password(&password)?;
+        // A viewer can open an older complete workspace without creating the
+        // new module. Initialize it only after the normal editor guard succeeds.
+        workspace.require_editor()?;
+        initialize_module(&workspace.root, "commercial-proposals")
     } else {
         workspace.release_editor_with_password(&password)
     }
@@ -773,11 +1043,13 @@ fn configure_workspace_location(selected: &Path, pointer: &Path) -> Result<Strin
     let _provisional_lease = prepare_workspace_location(&root)?;
     if !existing {
         for module in MODULES {
-            drop(open_database(&root, module)?);
+            initialize_module(&root, module)?;
         }
     } else {
         for module in MODULES {
-            let connection = open_database_read_only(&root, module)?;
+            let Some(connection) = open_optional_database_read_only(&root, module)? else {
+                continue;
+            };
             let version: i64 = connection
                 .query_row("PRAGMA user_version", [], |row| row.get(0))
                 .map_err(|error| error.to_string())?;
@@ -1272,13 +1544,63 @@ fn write_contract_report_pdf(path: String, data: ContractReportData) -> Result<(
         .map_err(|error| format!("Не удалось сохранить PDF: {error}"))
 }
 
+fn initialize_module(root: &Path, module: &str) -> Result<(), String> {
+    validated_module(module)?;
+    if module == "commercial-proposals" {
+        fs::create_dir_all(root.join(module))
+            .map_err(|error| format!("Не удалось подготовить раздел КП: {error}"))?;
+    }
+    drop(open_database(root, module)?);
+    Ok(())
+}
+
+fn open_optional_database_read_only(
+    root: &Path,
+    module: &str,
+) -> Result<Option<Connection>, String> {
+    let path = database::database_path(root, module)?;
+    if module == "commercial-proposals" {
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // Missing on a readable old share is empty, but a disconnected
+                // or inaccessible root must remain an error, not an empty list.
+                fs::read_dir(root)
+                    .and_then(|mut entries| entries.next().transpose())
+                    .map_err(|error| format!("Рабочая папка недоступна: {error}"))?;
+                let directory = root.join(module);
+                match fs::symlink_metadata(&directory) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                    Err(error) => return Err(format!("Раздел КП недоступен: {error}")),
+                    Ok(_) => {
+                        fs::read_dir(&directory)
+                            .and_then(|mut entries| entries.next().transpose())
+                            .map_err(|error| format!("Раздел КП недоступен: {error}"))?;
+                        match fs::symlink_metadata(&path) {
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                                return Ok(None);
+                            }
+                            Err(error) => return Err(format!("База КП недоступна: {error}")),
+                            Ok(_) => {}
+                        }
+                    }
+                }
+            }
+            Err(error) => return Err(format!("База КП недоступна: {error}")),
+            Ok(_) => {}
+        }
+    }
+    open_database_read_only(root, module).map(Some)
+}
+
 #[tauri::command]
 fn list_records(
     state: State<'_, AppState>,
     module: String,
     include_archived: Option<bool>,
 ) -> Result<Vec<StoredRecord>, String> {
-    let connection = open_database_read_only(&state.workspace.root, &module)?;
+    let Some(connection) = open_optional_database_read_only(&state.workspace.root, &module)? else {
+        return Ok(Vec::new());
+    };
     let sql = if include_archived.unwrap_or(false) {
         "SELECT id, title, payload, archived, created_at, updated_at FROM records ORDER BY updated_at DESC"
     } else {
@@ -1298,7 +1620,9 @@ fn get_record(
     module: String,
     id: String,
 ) -> Result<Option<StoredRecord>, String> {
-    let connection = open_database_read_only(&state.workspace.root, &module)?;
+    let Some(connection) = open_optional_database_read_only(&state.workspace.root, &module)? else {
+        return Ok(None);
+    };
     connection
         .query_row(
             "SELECT id, title, payload, archived, created_at, updated_at FROM records WHERE id = ?1",
@@ -1315,7 +1639,9 @@ fn record_history(
     module: String,
     id: String,
 ) -> Result<Vec<HistoryEntry>, String> {
-    let connection = open_database_read_only(&state.workspace.root, &module)?;
+    let Some(connection) = open_optional_database_read_only(&state.workspace.root, &module)? else {
+        return Ok(Vec::new());
+    };
     let mut statement = connection.prepare(
         "SELECT id, action, created_at, snapshot FROM history WHERE record_id = ?1 ORDER BY id DESC LIMIT 100",
     ).map_err(|error| error.to_string())?;
@@ -2373,7 +2699,9 @@ fn read_draft(
     module: String,
     key: String,
 ) -> Result<Option<Value>, String> {
-    let connection = open_database_read_only(&state.workspace.root, &module)?;
+    let Some(connection) = open_optional_database_read_only(&state.workspace.root, &module)? else {
+        return Ok(None);
+    };
     let payload: Option<String> = connection
         .query_row("SELECT payload FROM drafts WHERE key = ?1", [key], |row| {
             row.get(0)
@@ -2799,6 +3127,14 @@ impl Drop for PartialBackup {
 }
 
 fn create_backup_impl(workspace: &Workspace, module: Option<String>) -> Result<BackupInfo, String> {
+    create_backup_with_limits(workspace, module, BACKUP_LIMITS)
+}
+
+fn create_backup_with_limits(
+    workspace: &Workspace,
+    module: Option<String>,
+    limits: BackupLimits,
+) -> Result<BackupInfo, String> {
     let selected_modules: Vec<&str> = match module.as_deref() {
         Some(name) => vec![validated_module(name)?],
         None => MODULES.to_vec(),
@@ -2874,11 +3210,15 @@ fn create_backup_impl(workspace: &Workspace, module: Option<String>) -> Result<B
         )?;
     }
     let mut checksums = BTreeMap::new();
+    limits.entries(backup_files.len().saturating_add(1))?;
+    let mut unpacked_size = 0;
     for (path, name) in &backup_files {
+        let size_bytes = fs::metadata(path).map_err(|error| error.to_string())?.len();
+        limits.add_file(&mut unpacked_size, size_bytes, None)?;
         checksums.insert(
             name.clone(),
             BackupFileMeta {
-                size_bytes: fs::metadata(path).map_err(|error| error.to_string())?.len(),
+                size_bytes,
                 sha256: sha256_file(path)?,
             },
         );
@@ -2895,16 +3235,18 @@ fn create_backup_impl(workspace: &Workspace, module: Option<String>) -> Result<B
         files: checksums,
     };
     let file = File::create(&temporary).map_err(|error| error.to_string())?;
+    let manifest_bytes = serde_json::to_vec_pretty(&manifest).map_err(|error| error.to_string())?;
+    if manifest_bytes.len() as u64 > limits.manifest_bytes {
+        return Err(
+            "Manifest копии превышает безопасный предел. Создайте отдельные копии разделов.".into(),
+        );
+    }
     let mut archive = zip::ZipWriter::new(file);
     archive
         .start_file("manifest.json", SimpleFileOptions::default())
         .map_err(|error| error.to_string())?;
     archive
-        .write_all(
-            serde_json::to_string_pretty(&manifest)
-                .map_err(|error| error.to_string())?
-                .as_bytes(),
-        )
+        .write_all(&manifest_bytes)
         .map_err(|error| error.to_string())?;
     let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
     for (path, name) in backup_files {
@@ -2916,6 +3258,8 @@ fn create_backup_impl(workspace: &Workspace, module: Option<String>) -> Result<B
     }
     let completed = archive.finish().map_err(|error| error.to_string())?;
     completed.sync_all().map_err(|error| error.to_string())?;
+    drop(completed);
+    validate_backup_container_with_limits(&temporary, limits)?;
     fs::rename(&temporary, &destination).map_err(|error| error.to_string())?;
     partial.committed = true;
     let size_bytes = fs::metadata(&destination)
@@ -2974,8 +3318,21 @@ fn create_registry_archive_impl(
         .map_err(|error| error.to_string())?;
     let mut records = Vec::new();
     for row in rows {
-        let record = row.map_err(|error| error.to_string())?;
+        let mut record = row.map_err(|error| error.to_string())?;
         if record_ids.is_none_or(|ids| ids.contains(&record.id)) {
+            if let Some(paths) = attachment_paths
+                && let Some(documents) = record
+                    .payload
+                    .get_mut("documents")
+                    .and_then(Value::as_array_mut)
+            {
+                documents.retain(|document| {
+                    document
+                        .get("relativePath")
+                        .and_then(Value::as_str)
+                        .is_some_and(|path| paths.contains(path))
+                });
+            }
             records.push(record);
         }
     }
@@ -2983,9 +3340,13 @@ fn create_registry_archive_impl(
         return Err("В выбранном наборе нет записей для экспорта".to_string());
     }
 
-    let temporary = destination.with_extension("zip.part");
+    let temporary = destination.with_extension(format!("{}.zip.part", Uuid::new_v4()));
     let result = (|| {
-        let file = File::create(&temporary).map_err(|error| error.to_string())?;
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(|error| error.to_string())?;
         let mut archive = zip::ZipWriter::new(file);
         let options =
             SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
@@ -2993,7 +3354,7 @@ fn create_registry_archive_impl(
             .start_file("README.txt", options)
             .map_err(|error| error.to_string())?;
         let attachment_note = if attachment_paths.is_some() {
-            "В папке attachments находятся только выбранные категории документов."
+            "В records.json и папке attachments находятся только выбранные файлы документов."
         } else {
             "Все прикреплённые документы находятся в папке attachments."
         };
@@ -3062,10 +3423,14 @@ fn create_registry_archive_impl(
         }
         let completed = archive.finish().map_err(|error| error.to_string())?;
         completed.sync_all().map_err(|error| error.to_string())?;
-        if destination.exists() {
-            fs::remove_file(destination).map_err(|error| error.to_string())?;
-        }
-        fs::rename(&temporary, destination).map_err(|error| error.to_string())
+        drop(completed);
+        // Atomic publication, including a file created after the save dialog.
+        // Do not delete an existing archive to make room for a new one.
+        #[cfg(windows)]
+        let publication = fs::rename(&temporary, destination);
+        #[cfg(not(windows))]
+        let publication = fs::hard_link(&temporary, destination);
+        publication.map_err(|error| format!("Не удалось сохранить архив без замены существующего файла: {error}. Выберите другое имя или локальную папку; прежний архив не изменён."))
     })();
     let _ = fs::remove_file(&temporary);
     result?;
@@ -3252,11 +3617,39 @@ fn restore_encrypted_backup(
     restore_backup(state, decrypted.to_string_lossy().into_owned())
 }
 
-fn pinned_backups(root: &Path) -> HashSet<String> {
-    fs::read_to_string(root.join("backups").join("pinned.json"))
-        .ok()
-        .and_then(|text| serde_json::from_str(&text).ok())
-        .unwrap_or_default()
+fn pinned_backups(root: &Path) -> Result<HashSet<String>, String> {
+    let directory = root.join("backups");
+    let path = directory.join("pinned.json");
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // A missing, never-created index is normal; an unavailable share or
+            // directory is not evidence that all backups are unpinned.
+            let mut entries = fs::read_dir(&directory).map_err(|e| {
+                format!("Список закреплений недоступен; удаление копий запрещено: {e}")
+            })?;
+            entries
+                .next()
+                .transpose()
+                .map_err(|e| format!("Не удалось подтвердить доступ к закреплениям: {e}"))?;
+            return match fs::symlink_metadata(&path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(HashSet::new()),
+                _ => Err("Список закреплений изменился при проверке. Повторите операцию; копии не удалены.".into()),
+            };
+        }
+        Err(error) => {
+            return Err(format!(
+                "Список закреплений недоступен; удаление копий запрещено: {error}"
+            ));
+        }
+    };
+    let names: HashSet<String> = serde_json::from_slice(&bytes).map_err(|_| {
+        "Список закреплений повреждён; удаление и ротация копий запрещены".to_string()
+    })?;
+    for name in &names {
+        safe_backup_name(name)?;
+    }
+    Ok(names)
 }
 
 fn write_pinned_backups(root: &Path, names: &HashSet<String>) -> Result<(), String> {
@@ -3282,7 +3675,7 @@ fn safe_backup_name(name: &str) -> Result<&str, String> {
 
 #[tauri::command]
 fn list_backups(state: State<'_, AppState>) -> Result<Vec<BackupListItem>, String> {
-    let pinned = pinned_backups(&state.workspace.root);
+    let pinned = pinned_backups(&state.workspace.root)?;
     let mut rows = Vec::new();
     for entry in
         fs::read_dir(state.workspace.root.join("backups")).map_err(|error| error.to_string())?
@@ -3328,7 +3721,7 @@ fn set_backup_pinned(
     if !state.workspace.root.join("backups").join(name).is_file() {
         return Err("Резервная копия не найдена".to_string());
     }
-    let mut names = pinned_backups(&state.workspace.root);
+    let mut names = pinned_backups(&state.workspace.root)?;
     if pinned {
         names.insert(name.to_string());
     } else {
@@ -3345,7 +3738,7 @@ fn delete_backup(state: State<'_, AppState>, file_name: String) -> Result<(), St
         .map_err(|_| "Хранилище временно недоступно".to_string())?;
     state.workspace.require_editor()?;
     let name = safe_backup_name(&file_name)?;
-    if pinned_backups(&state.workspace.root).contains(name) {
+    if pinned_backups(&state.workspace.root)?.contains(name) {
         return Err("Сначала открепите резервную копию".to_string());
     }
     let path = state.workspace.root.join("backups").join(name);
@@ -3376,38 +3769,33 @@ fn rotate_backups(
 }
 
 fn rotate_backups_impl(root: &Path, keep: usize, max_age_days: u64) -> Result<usize, String> {
-    let pinned = pinned_backups(root);
-    let mut files: Vec<_> = fs::read_dir(root.join("backups"))
-        .map_err(|error| error.to_string())?
-        .filter_map(Result::ok)
-        .filter(|entry| {
-            (entry.file_name().to_string_lossy().ends_with(".sbkbackup")
-                || entry
-                    .file_name()
-                    .to_string_lossy()
-                    .ends_with(".sbkbackup.enc"))
-                && !pinned.contains(&entry.file_name().to_string_lossy().into_owned())
-        })
-        .collect();
-    files.sort_by_key(|entry| {
-        std::cmp::Reverse(
-            entry
-                .metadata()
-                .and_then(|value| value.modified())
-                .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
-        )
-    });
+    let pinned = pinned_backups(root)?;
+    let mut files = Vec::new();
+    // Read every candidate's metadata before deleting anything. A network
+    // metadata error must not turn a protected/recent file into an ancient one.
+    for entry in fs::read_dir(root.join("backups")).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !(name.ends_with(".sbkbackup") || name.ends_with(".sbkbackup.enc"))
+            || pinned.contains(&name)
+        {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(entry.path()).map_err(|error| error.to_string())?;
+        if !metadata.is_file() {
+            continue;
+        }
+        let modified = metadata.modified().map_err(|error| error.to_string())?;
+        files.push((entry.path(), modified));
+    }
+    files.sort_by_key(|(_, modified)| std::cmp::Reverse(*modified));
     let mut removed = 0;
     let cutoff = std::time::SystemTime::now()
         .checked_sub(Duration::from_secs(max_age_days * 86_400))
         .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-    for (index, entry) in files.into_iter().enumerate() {
-        let modified = entry
-            .metadata()
-            .and_then(|value| value.modified())
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+    for (index, (path, modified)) in files.into_iter().enumerate() {
         if index >= keep || modified < cutoff {
-            fs::remove_file(entry.path()).map_err(|error| error.to_string())?;
+            fs::remove_file(path).map_err(|error| error.to_string())?;
             removed += 1;
         }
     }
@@ -3420,7 +3808,8 @@ fn verify_backup(state: State<'_, AppState>, path: String) -> Result<BackupVerif
         .maintenance
         .lock()
         .map_err(|_| "Хранилище временно недоступно".to_string())?;
-    const LIMIT: u64 = 2 * 1024 * 1024 * 1024;
+    validate_backup_container(Path::new(&path))?;
+    const LIMIT: u64 = BACKUP_LIMITS.unpacked_bytes;
     let archive_size = fs::metadata(&path)
         .map_err(|error| error.to_string())?
         .len();
@@ -3429,11 +3818,12 @@ fn verify_backup(state: State<'_, AppState>, path: String) -> Result<BackupVerif
     }
     let mut archive = zip::ZipArchive::new(File::open(&path).map_err(|error| error.to_string())?)
         .map_err(|_| "Файл не является резервной копией СБК".to_string())?;
+    BACKUP_LIMITS.entries(archive.len())?;
     let manifest: BackupManifest = {
         let mut entry = archive
             .by_name("manifest.json")
             .map_err(|_| "В резервной копии нет manifest.json".to_string())?;
-        if entry.size() > 1024 * 1024 {
+        if entry.size() > BACKUP_LIMITS.manifest_bytes {
             return Err("Manifest превышает безопасный предел".to_string());
         }
         let mut text = String::new();
@@ -3479,14 +3869,7 @@ fn verify_backup(state: State<'_, AppState>, path: String) -> Result<BackupVerif
         if !found.insert(name.clone()) {
             return Err("Повторяющийся путь внутри резервной копии".to_string());
         }
-        unpacked = unpacked
-            .checked_add(entry.size())
-            .ok_or_else(|| "Некорректный размер архива".to_string())?;
-        if unpacked > LIMIT
-            || (entry.compressed_size() > 0 && entry.size() / entry.compressed_size() > 250)
-        {
-            return Err("Небезопасный распакованный размер резервной копии".to_string());
-        }
+        BACKUP_LIMITS.add_file(&mut unpacked, entry.size(), Some(entry.compressed_size()))?;
         let expected = manifest
             .files
             .get(&name)
@@ -3567,15 +3950,6 @@ fn validate_sqlite_files(stage: &Path, modules: &[String]) -> Result<(), String>
     Ok(())
 }
 
-fn rollback_workspace_swaps(swaps: &[(PathBuf, PathBuf, bool)]) {
-    for (target, rollback, existed) in swaps.iter().rev() {
-        let _ = fs::remove_dir_all(target);
-        if *existed {
-            let _ = fs::rename(rollback, target);
-        }
-    }
-}
-
 #[tauri::command]
 fn restore_backup(state: State<'_, AppState>, path: String) -> Result<(), String> {
     let _maintenance = state
@@ -3583,16 +3957,21 @@ fn restore_backup(state: State<'_, AppState>, path: String) -> Result<(), String
         .lock()
         .map_err(|_| "Хранилище временно недоступно".to_string())?;
     state.workspace.require_editor()?;
-    const MAX_BACKUP_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-    const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
-    let archive_size = fs::metadata(&path)
+    restore_backup_impl(&state.workspace, Path::new(&path))
+}
+
+fn restore_backup_impl(workspace: &Workspace, path: &Path) -> Result<(), String> {
+    validate_backup_container(path)?;
+    const MAX_BACKUP_BYTES: u64 = BACKUP_LIMITS.unpacked_bytes;
+    const MAX_MANIFEST_BYTES: u64 = BACKUP_LIMITS.manifest_bytes;
+    let archive_size = fs::metadata(path)
         .map_err(|error| format!("Не удалось проверить резервную копию: {error}"))?
         .len();
     if archive_size == 0 || archive_size > MAX_BACKUP_BYTES {
         return Err("Размер файла резервной копии превышает безопасный предел".to_string());
     }
-    let file = File::open(&path)
-        .map_err(|error| format!("Не удалось открыть резервную копию: {error}"))?;
+    let file =
+        File::open(path).map_err(|error| format!("Не удалось открыть резервную копию: {error}"))?;
     let mut archive = zip::ZipArchive::new(file)
         .map_err(|_| "Файл не является резервной копией СБК".to_string())?;
     let manifest: BackupManifest = {
@@ -3624,7 +4003,7 @@ fn restore_backup(state: State<'_, AppState>, path: String) -> Result<(), String
     {
         return Err("Manifest содержит неизвестные или повторяющиеся разделы".to_string());
     }
-    const MAX_BACKUP_ENTRIES: usize = 10_000;
+    const MAX_BACKUP_ENTRIES: usize = BACKUP_LIMITS.entries;
     if archive.len() > MAX_BACKUP_ENTRIES {
         return Err("В резервной копии слишком много файлов".to_string());
     }
@@ -3645,32 +4024,24 @@ fn restore_backup(state: State<'_, AppState>, path: String) -> Result<(), String
         if !declared_names.insert(name) {
             return Err("Резервная копия содержит повторяющийся путь".to_string());
         }
-        declared_size = declared_size
-            .checked_add(entry.size())
-            .ok_or_else(|| "Размер резервной копии некорректен".to_string())?;
-        if declared_size > MAX_BACKUP_BYTES || entry.size() > MAX_BACKUP_BYTES / 2 {
-            return Err(
-                "Распакованный размер резервной копии превышает безопасный предел".to_string(),
-            );
-        }
-        if entry.compressed_size() > 0 && entry.size() / entry.compressed_size() > 250 {
-            return Err("Резервная копия имеет небезопасно высокий коэффициент сжатия".to_string());
-        }
+        BACKUP_LIMITS.add_file(
+            &mut declared_size,
+            entry.size(),
+            Some(entry.compressed_size()),
+        )?;
     }
     let required_space = declared_size.saturating_mul(2).saturating_add(archive_size);
-    let available =
-        fs2::available_space(&state.workspace.root).map_err(|error| error.to_string())?;
+    let available = fs2::available_space(&workspace.root).map_err(|error| error.to_string())?;
     if available < required_space {
         return Err("Недостаточно свободного места для безопасного восстановления".to_string());
     }
-    let stage_parent = state
-        .workspace
+    let stage_parent = workspace
         .root
         .parent()
         .ok_or_else(|| "Не удалось выбрать staging-каталог".to_string())?;
     let stage_path = stage_parent.join(format!(".sbk-tools-restore-{}", Uuid::new_v4()));
     fs::create_dir(&stage_path).map_err(|error| error.to_string())?;
-    let stage = TemporaryDirectory(stage_path.clone());
+    let mut stage = backup_restore::RestoreStage::new(stage_path.clone());
     let mut total_size = 0_u64;
     let mut extracted = BTreeMap::new();
     for index in 0..archive.len() {
@@ -3684,17 +4055,7 @@ fn restore_backup(state: State<'_, AppState>, path: String) -> Result<(), String
         if !valid_archive_path(&enclosed, &modules) {
             return Err("Недопустимый путь внутри резервной копии".to_string());
         }
-        total_size = total_size
-            .checked_add(entry.size())
-            .ok_or_else(|| "Размер резервной копии некорректен".to_string())?;
-        if total_size > MAX_BACKUP_BYTES || entry.size() > MAX_BACKUP_BYTES / 2 {
-            return Err(
-                "Распакованный размер резервной копии превышает безопасный предел".to_string(),
-            );
-        }
-        if entry.compressed_size() > 0 && entry.size() / entry.compressed_size() > 250 {
-            return Err("Резервная копия имеет небезопасно высокий коэффициент сжатия".to_string());
-        }
+        BACKUP_LIMITS.add_file(&mut total_size, entry.size(), Some(entry.compressed_size()))?;
         let name = enclosed.to_string_lossy().replace('\\', "/");
         if extracted.contains_key(&name) {
             return Err("Резервная копия содержит повторяющийся путь".to_string());
@@ -3727,7 +4088,7 @@ fn restore_backup(state: State<'_, AppState>, path: String) -> Result<(), String
     }
     validate_sqlite_files(&stage_path, &manifest.modules)?;
 
-    let safety_backup = create_backup_impl(&state.workspace, None)?;
+    let safety_backup = create_backup_impl(workspace, None)?;
     let rollback_root = stage_path.join("rollback");
     fs::create_dir(&rollback_root).map_err(|error| error.to_string())?;
     let mut replacements = Vec::new();
@@ -3738,7 +4099,7 @@ fn restore_backup(state: State<'_, AppState>, path: String) -> Result<(), String
         ] {
             let staged = stage_path.join(&relative);
             fs::create_dir_all(&staged).map_err(|error| error.to_string())?;
-            let target = state.workspace.root.join(&relative);
+            let target = workspace.root.join(&relative);
             let rollback = rollback_root.join(&relative);
             if let Some(parent) = rollback.parent() {
                 fs::create_dir_all(parent).map_err(|error| error.to_string())?;
@@ -3746,27 +4107,7 @@ fn restore_backup(state: State<'_, AppState>, path: String) -> Result<(), String
             replacements.push((staged, target, rollback));
         }
     }
-    let mut swaps: Vec<(PathBuf, PathBuf, bool)> = Vec::new();
-    for (staged, target, rollback) in replacements {
-        let existed = target.exists();
-        let move_old_result = if existed {
-            fs::rename(&target, &rollback)
-        } else {
-            Ok(())
-        };
-        if let Err(error) = move_old_result {
-            rollback_workspace_swaps(&swaps);
-            return Err(format!("Не удалось подготовить замену данных: {error}"));
-        }
-        if let Err(error) = fs::rename(&staged, &target) {
-            if existed {
-                let _ = fs::rename(&rollback, &target);
-            }
-            rollback_workspace_swaps(&swaps);
-            return Err(format!("Не удалось применить резервную копию: {error}"));
-        }
-        swaps.push((target, rollback, existed));
-    }
+    stage.install(replacements, &safety_backup.path)?;
     let message = format!(
         "{} restore completed; safety backup: {}\n",
         Utc::now().to_rfc3339(),
@@ -3775,7 +4116,7 @@ fn restore_backup(state: State<'_, AppState>, path: String) -> Result<(), String
     if let Ok(mut log) = OpenOptions::new()
         .create(true)
         .append(true)
-        .open(state.workspace.root.join("logs").join("backup-restore.log"))
+        .open(workspace.root.join("logs").join("backup-restore.log"))
     {
         let _ = log.write_all(message.as_bytes());
         let _ = log.sync_all();
@@ -4641,11 +4982,11 @@ pub fn run() {
         let workspace = open_workspace().expect("SBK Tools workspace could not be opened");
         for module in MODULES {
             if workspace.is_editor() {
-                open_database(&workspace.root, module).unwrap_or_else(|error| {
+                initialize_module(&workspace.root, module).unwrap_or_else(|error| {
                     panic!("SBK Tools could not initialize {module}: {error}")
                 });
             } else {
-                open_database_read_only(&workspace.root, module)
+                open_optional_database_read_only(&workspace.root, module)
                     .unwrap_or_else(|error| panic!("SBK Tools could not read {module}: {error}"));
             }
         }
@@ -4686,10 +5027,14 @@ pub fn run() {
             maintenance: Arc::new(Mutex::new(())),
         })
         .invoke_handler(tauri::generate_handler![
+            proposals::proposal_render,
+            proposals::proposal_cleanup_preview,
+            proposals::proposal_open_output,
             report_startup_ui_visible,
             startup_status,
             retry_workspace_initialization,
             workspace_info,
+            workspace_health,
             switch_workspace_mode,
             set_workspace_access_password,
             setup_workspace_owner,

@@ -47,6 +47,11 @@ export const defaultGoNoGoCriteria = (): GoNoGoCriterion[] => [
 
 const emptyDecision = (): GoNoGoDecision => ({ calculated: "Решение не принято", confirmed: "Решение не принято", author: "", decidedAt: "", comment: "", inputRevision: 0, requiresReview: false });
 const emptyResult = (): ProcedureResult => ({ outcome: "Не завершена", initialPrice: 0, finalPrice: 0, bestKnownPrice: 0, reason: "", actualCosts: 0, actualProfit: 0, actualMargin: 0, scopeChange: "", delaysAndIssues: "", forecastDifference: "", lessons: "", confirmed: false });
+/** Derived values are recalculated on read and every edit, never trusted from a snapshot. */
+export function withResultFinancials(result: ProcedureResult): ProcedureResult {
+  const actualProfit = Math.round((result.finalPrice - result.actualCosts) * 100) / 100;
+  return { ...result, actualProfit, actualMargin: result.finalPrice > 0 ? actualProfit / result.finalPrice * 100 : 0 };
+}
 export const emptyProcurement = (): ProcurementData => ({ schemaVersion: 2, revision: 1, name: "", customer: "", subject: "", nmc: 0, platform: "", publishedDate: "", questionDeadline: "", submissionDeadline: "", executionStartDate: "", executionEndDate: "", responsible: "", status: "Черновик", requirements: [], calculations: [], experience: [], team: [], licenses: [], documents: [], documentVersions: [], partners: [], checklist: [], priceHistory: [], goNoGoCriteria: defaultGoNoGoCriteria(), goNoGoDecision: emptyDecision(), questions: [], contractRisks: [], resourcePlan: [], participationScenarios: [], cashFlow: [], resultDetails: emptyResult(), result: "", notes: "" });
 
 export function normalizeProcurement(value: Partial<ProcurementData> & Record<string, unknown>): ProcurementData {
@@ -57,7 +62,7 @@ export function normalizeProcurement(value: Partial<ProcurementData> & Record<st
     revision: Number.isInteger(value.revision) && Number(value.revision) > 0 ? Number(value.revision) : 1,
     requirements: legacyRequirements.map((entry) => ({ ...emptyRequirement(), ...(entry as Partial<ProcurementRequirement>), status: (entry as { status?: string }).status === "Частично" ? "Частично подтверждено" : (entry as Partial<ProcurementRequirement>).status || "Не подтверждено" })),
     checklist: (value.checklist || []).map((entry) => ({ ...emptyChecklist(), ...entry })), priceHistory: (value.priceHistory || []).map((entry) => ({ ...emptyPriceRound(), ...entry })),
-    goNoGoCriteria: value.goNoGoCriteria?.length ? value.goNoGoCriteria : defaultGoNoGoCriteria(), goNoGoDecision: { ...emptyDecision(), ...(value.goNoGoDecision || {}) }, resultDetails: { ...emptyResult(), ...(value.resultDetails || {}) },
+    goNoGoCriteria: value.goNoGoCriteria?.length ? value.goNoGoCriteria : defaultGoNoGoCriteria(), goNoGoDecision: { ...emptyDecision(), ...(value.goNoGoDecision || {}) }, resultDetails: withResultFinancials({ ...emptyResult(), ...(value.resultDetails || {}) }),
     documentVersions: value.documentVersions || [], questions: value.questions || [], contractRisks: value.contractRisks || [], resourcePlan: value.resourcePlan || [], participationScenarios: value.participationScenarios || [], cashFlow: value.cashFlow || [],
   } as ProcurementData;
 }

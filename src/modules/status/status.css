@@ -1,0 +1,11 @@
+.status-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; }
+.status-toolbar p { margin-right: auto; }
+.status-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(270px, 100%), 1fr)); gap: 16px; }
+.status-grid > section, .status-center > section { padding: 20px; min-width: 0; }
+.status-grid h2, .status-center > section h2 { margin-top: 0; font-size: 17px; }
+.status-grid p, .status-path, .activity-list p { overflow-wrap: anywhere; }
+.activity-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+.activity-list li { display: flex; gap: 12px; align-items: start; padding: 10px 0; border-top: 1px solid #e2e9e5; }
+.activity-list small { display: block; color: #53665e; }
+.status-error-count { background: #aa2638; color: white; border-radius: 20px; font-size: 11px; min-width: 18px; padding: 1px 5px; text-align: center; margin-left: auto; }
+.sidebar-collapsed .status-error-count { position: absolute; right: 2px; top: 1px; }

@@ -30,8 +30,11 @@ import {
 } from "../intelligence/api";
 import {
   readAccessTimers,
+  readSharedBackupPolicy,
   saveAccessTimers,
+  saveSharedBackupPolicy,
   type AccessTimers,
+  type SharedBackupPolicySnapshot,
 } from "../../lib/sharedWorkspace";
 import { useWorkspaceAccess } from "../../lib/workspaceAccess";
 import { workspacePasswordError, workspacePasswordHint } from "./passwordPolicy";
@@ -87,6 +90,10 @@ export function Settings({
     useState<IntelligenceProviderStatus | null>(null);
   const [accessTimers, setAccessTimers] =
     useState<AccessTimers>(readAccessTimers);
+  const [backupPolicy, setBackupPolicy] = useState<SharedBackupPolicySnapshot | null>(null);
+  const [policyLoading, setPolicyLoading] = useState(true);
+  const [policyError, setPolicyError] = useState("");
+  const policyLoad = useRef(0);
   const expiryDays =
     store.records.find((record) => record.title === "application")?.payload
       .expiryDays || 60;
@@ -107,27 +114,50 @@ export function Settings({
     catch (reason) { setMessage(`Ошибка: ${String(reason)}`); }
     finally { maintenanceOperation.current = false; setMaintenanceBusy(false); }
   };
+  const loadBackupPolicy = async () => {
+    const generation = ++policyLoad.current;
+    setPolicyLoading(true);
+    setPolicyError("");
+    try {
+      const next = await readSharedBackupPolicy(workspace.root);
+      if (generation !== policyLoad.current) return;
+      setBackupPolicy(next);
+      setAccessTimers((current) => ({ ...current, backupHours: next.policy.backupHours }));
+      setRetention(next.policy.retentionCount);
+      setRetentionDays(next.policy.retentionDays);
+    } catch (error) {
+      if (generation === policyLoad.current) {
+        setBackupPolicy(null);
+        setPolicyError(`Не удалось прочитать общую политику резервирования: ${String(error)}`);
+      }
+    } finally { if (generation === policyLoad.current) setPolicyLoading(false); }
+  };
   useEffect(() => {
     const timers = readAccessTimers(workspace.root);
     setAccessTimers(timers);
     setRetention(timers.retentionCount);
     setRetentionDays(timers.retentionDays);
+    setBackupPolicy(null);
+    void loadBackupPolicy();
     void getIntelligenceProviderStatus().then(setIntelligence).catch(() => setIntelligence(null));
     setVerification(null);
     void reloadBackups();
+    return () => { policyLoad.current += 1; };
   }, [workspace.root]);
-  useEffect(() => {
-    if (!workspace?.root) return;
-    const current = readAccessTimers(workspace.root);
-    setAccessTimers(
-      saveAccessTimers(
-        { ...current, retentionCount: retention, retentionDays },
-        workspace.root,
-      ),
-    );
-  }, [workspace?.root, retention, retentionDays]);
-  const updateAccessTimers = (next: AccessTimers) =>
-    setAccessTimers(saveAccessTimers(next, workspace?.root));
+  const updateAccessTimers = (next: AccessTimers) => {
+    // Refresh cadence is device-local. Unsaved shared backup fields must not be
+    // persisted as a side effect of changing this unrelated preference.
+    saveAccessTimers({ ...readAccessTimers(workspace.root), refreshSeconds: next.refreshSeconds }, workspace.root);
+    setAccessTimers(next);
+  };
+  const saveBackupPolicy = () => runMaintenance(async () => {
+    if (!workspaceAccess.editor || policyLoading || policyError || !backupPolicy) return;
+    const next = await saveSharedBackupPolicy(workspace.root, {
+      backupHours: accessTimers.backupHours, retentionCount: retention, retentionDays,
+    });
+    setBackupPolicy(next);
+    setMessage("Общая политика резервирования сохранена. Она действует для этой рабочей папки на всех компьютерах.");
+  });
   const refreshWorkspace = async () => {
     try {
       const next = await getWorkspaceInfo();
@@ -528,7 +558,16 @@ export function Settings({
           <h2>Создание и защита копий</h2>
         </div>
         <div className="surface-body settings-form">
-          <label>Автоматические резервные копии<select disabled={!workspaceAccess.editor} value={accessTimers.backupHours} onChange={(event) => updateAccessTimers({ ...accessTimers, backupHours: Number(event.target.value) })}><option value="0">выключено</option><option value="6">каждые 6 часов</option><option value="12">каждые 12 часов</option><option value="24">ежедневно</option><option value="168">еженедельно</option></select></label>
+          <label>Автоматические резервные копии<select disabled={!workspaceAccess.editor || policyLoading || Boolean(policyError) || maintenanceBusy} value={accessTimers.backupHours} onChange={(event) => setAccessTimers({ ...accessTimers, backupHours: Number(event.target.value) })}><option value="0">выключено</option><option value="6">каждые 6 часов</option><option value="12">каждые 12 часов</option><option value="24">ежедневно</option><option value="168">еженедельно</option></select></label>
+          <p className="help-text" role="status">{policyLoading ? "Загружаем общую политику резервирования…" : backupPolicy?.source === "shared" ? "Расписание и сроки хранения общие для всех компьютеров. Изменения вступают в силу после сохранения." : backupPolicy?.source === "local-fallback" ? "В общей папке политика ещё не задана. Показаны прежние настройки только этого компьютера. Сохраните их, чтобы сделать общими." : "Общая политика недоступна. Настройки не изменены."}</p>
+          {policyError && <div className="notice error" role="alert"><span>{policyError}</span><button type="button" disabled={policyLoading || maintenanceBusy} onClick={() => void loadBackupPolicy()}>Повторить чтение политики</button></div>}
+          <div className="retention-row">
+            <label>Хранить незакреплённых копий<input disabled={!workspaceAccess.editor || policyLoading || Boolean(policyError) || maintenanceBusy} type="number" min="1" max="100" value={retention} onChange={(event) => setRetention(Number(event.target.value))} /></label>
+            <label>Не дольше, дней<input disabled={!workspaceAccess.editor || policyLoading || Boolean(policyError) || maintenanceBusy} type="number" min="1" max="3650" value={retentionDays} onChange={(event) => setRetentionDays(Number(event.target.value))} /></label>
+          </div>
+          <button type="button" className="secondary" disabled={!workspaceAccess.editor || policyLoading || Boolean(policyError) || !backupPolicy || maintenanceBusy} onClick={() => void saveBackupPolicy()}>Сохранить общую политику</button>
+          {Boolean(backupPolicy?.policy.lastSuccessAt) && <p className="help-text">Последняя автоматическая копия создана: {new Date(backupPolicy!.policy.lastSuccessAt).toLocaleString("ru-RU")}. Целостность этим статусом не подтверждается — используйте «Проверить».</p>}
+          {backupPolicy?.policy.lastError && <div className="notice warning" role="status">Последняя попытка автоматического копирования: {backupPolicy.policy.lastError}</div>}
           <p className="help-text">Создаются, пока программа открыта в режиме редактора. Это полная копия данных, а не архив отдельных записей. Автоматические копии не шифруются; настройка ниже относится к новой ручной копии.</p>
           <label className="checkbox-row">
             <input
@@ -588,33 +627,10 @@ export function Settings({
             </button>
           </div>
           <div className="retention-row">
-            <label>
-              Хранить незакреплённых копий
-              <input
-                disabled={!workspaceAccess.editor}
-                type="number"
-                min="1"
-                max="100"
-                value={retention}
-                onChange={(event) => setRetention(Number(event.target.value))}
-              />
-            </label>
-            <label>
-              Не дольше, дней
-              <input
-                disabled={!workspaceAccess.editor}
-                type="number"
-                min="1"
-                max="3650"
-                value={retentionDays}
-                onChange={(event) =>
-                  setRetentionDays(Number(event.target.value))
-                }
-              />
-            </label>
+            <p className="help-text">Ручная очистка применит выбранные выше ограничения: до {retention} незакреплённых копий, не старше {retentionDays} дней.</p>
             <button
               className="secondary small"
-              disabled={!workspaceAccess.editor}
+              disabled={!workspaceAccess.editor || policyLoading || Boolean(policyError) || !Number.isInteger(retention) || retention < 1 || retention > 100 || !Number.isInteger(retentionDays) || retentionDays < 1 || retentionDays > 3650}
               type="button"
               onClick={() => { if (!window.confirm("Удалить незакреплённые резервные копии сверх выбранного количества и возраста? Закреплённые копии останутся.")) return; void runMaintenance(async () => {
                 const removed = await rotateBackups(retention, retentionDays);

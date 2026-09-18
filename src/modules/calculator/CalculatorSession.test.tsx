@@ -3,6 +3,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { StoredRecord } from "../../lib/storage";
 import { Calculator } from "./Calculator";
 import { initialCalculatorData, type CalculatorData } from "./types";
+import { calculate } from "./engine";
+import { sourcePrice } from "../proposals/sources";
 
 // Run the real component's event handlers and effects, preserving hook slots
 // across renders. This intentionally does not simulate DOM layout or children.
@@ -145,6 +147,34 @@ afterEach(() => {
 });
 
 describe("calculator session data safety", () => {
+  it("requires explicit confirmation before handing a loss-making price to КП", async () => {
+    const data = { ...payload("Убыточный расчёт"), mode: "price-to-margin" as const, proposedPrice: 500_000, expenses: [] };
+    runtime.readDraft.mockResolvedValue(data);
+    const create = vi.fn(); render({ onCreateProposal: create }); await flush();
+    expect(calculate(data).profit).toBeLessThan(0);
+    button("Создать КП").props.onClick?.(); await flush();
+    expect(create).not.toHaveBeenCalled(); expect(text()).toContain("Расчёт показывает убыток");
+    button("Вернуться к расчёту").props.onClick?.(); await flush();
+    expect(create).not.toHaveBeenCalled(); expect(nameInput().props.value).toBe(data.name);
+    button("Создать КП").props.onClick?.(); await flush();
+    button("Создать черновик с этой ценой").props.onClick?.(); await flush();
+    expect(create).toHaveBeenCalledOnce();
+    expect(create.mock.calls[0][0].lines[0].unitPrice).toBe(sourcePrice(calculate(data).priceGross));
+    expect(create.mock.calls[0][0].source.wasUnsaved).toBe(true);
+    expect(runtime.store.save).not.toHaveBeenCalled();
+  });
+
+  it("uses the computed margin-mode price, not the stale proposed-price field", async () => {
+    const data = { ...payload("Положительная маржа"), proposedPrice: 1, expenses: [] };
+    runtime.readDraft.mockResolvedValue(data);
+    const create = vi.fn(); render({ onCreateProposal: create }); await flush();
+    button("Создать КП").props.onClick?.(); await flush();
+    expect(create).toHaveBeenCalledOnce();
+    expect(create.mock.calls[0][0].lines[0].unitPrice).toBe(sourcePrice(calculate(data).priceGross));
+    expect(create.mock.calls[0][0].lines[0].unitPrice).not.toBe("1.00");
+    expect(create.mock.calls[0][0]).not.toHaveProperty("cost");
+  });
+
   it("never overwrites the new draft while a deep-linked registry loads slowly", async () => {
     runtime.store.loading = true;
     const consumed = vi.fn();

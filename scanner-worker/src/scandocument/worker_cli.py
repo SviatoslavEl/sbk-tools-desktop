@@ -377,7 +377,23 @@ def merge(config: dict) -> int:
     original_bytes = sum(source.stat().st_size for source in sources)
 
     from pypdf import PdfReader, PdfWriter
-    from scandocument.pdf_engine import write_atomic
+    from scandocument.pdf_engine import configure_pdfa_2b, write_atomic
+    from scandocument.preview_cache import source_fingerprint
+
+    fingerprints = [source_fingerprint(source) for source in sources]
+    expected = config.get("expectedSourceFingerprints")
+    if expected is not None:
+        if (not isinstance(expected, list) or len(expected) != len(sources)
+                or any(not isinstance(value, str) or len(value) != 64
+                       or any(character not in "0123456789abcdef" for character in value)
+                       for value in expected)):
+            raise ValueError("Недопустимые версии исходных файлов объединения. Добавьте файлы повторно.")
+        if expected != fingerprints:
+            raise ValueError("Исходный документ изменился после предпросмотра. Удалите его из объединения и добавьте повторно.")
+
+    def verify_sources() -> None:
+        if fingerprints != [source_fingerprint(source) for source in sources]:
+            raise ValueError("Исходный документ изменился во время объединения. Результат не сохранён; добавьте файлы повторно.")
 
     with SecureWorkspace() as workspace:
         parts: list[Path] = []
@@ -408,6 +424,7 @@ def merge(config: dict) -> int:
                     "totalPages": len(sources),
                     "percent": round((file_index + event.percent / 100) / len(sources) * 92),
                 }),
+                expected_source_fingerprint=fingerprints[index],
             )
             warnings.extend(part_warnings)
             parts.append(part)
@@ -434,6 +451,9 @@ def merge(config: dict) -> int:
                     raise ValueError(f"Страница №{position} выходит за пределы исходного файла.")
                 writer.add_page(readers[source_index].pages[page_index])
         page_count = len(writer.pages)
+        if bool(config.get("pdfaEnabled", False)):
+            configure_pdfa_2b(writer)
+        verify_sources()
         write_atomic(writer, output)
 
     output_bytes = output.stat().st_size
@@ -452,7 +472,7 @@ def main() -> int:
     cleanup_stale_onefile_dirs()
     SecureWorkspace.cleanup_stale()
     parser = argparse.ArgumentParser(prog="sbk-scanner-worker")
-    parser.add_argument("command", choices=("preview", "preparePreview", "process", "merge", "extract", "info"))
+    parser.add_argument("command", choices=("preview", "preparePreview", "process", "merge", "extract", "info", "proposal"))
     parser.add_argument("--config")
     args = parser.parse_args()
     try:
@@ -462,6 +482,10 @@ def main() -> int:
         if not args.config:
             raise ValueError("Не указан --config")
         config = json.loads(Path(args.config).read_text(encoding="utf-8"))
+        if args.command == "proposal":
+            from scandocument.proposals import render
+            emit(render(config))
+            return 0
         if args.command == "extract":
             validate_protocol(config)
             emit(extract_document(Path(config["inputPath"])))
