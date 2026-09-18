@@ -9,7 +9,7 @@ import subprocess
 import time
 import uuid
 from collections.abc import Callable
-from pathlib import Path
+from pathlib import Path, PurePath, PureWindowsPath
 
 from scandocument.errors import CancelledError, DocxConversionError
 
@@ -134,6 +134,20 @@ def _stop_process_tree(process: subprocess.Popen[bytes]) -> None:
         process.kill()
 
 
+def _office_profile_uri(profile: PurePath) -> str:
+    """Encode a profile URI without treating a Windows verbatim prefix as a host.
+
+    Rust canonical paths may use extended drive/UNC syntax. Keep those filesystem
+    paths intact; only the URI passed to LibreOffice needs the regular form.
+    """
+    value = str(profile)
+    if value[:8].casefold() == "\\\\?\\unc\\":
+        return PureWindowsPath("\\\\" + value[8:]).as_uri()
+    if value.startswith("\\\\?\\"):
+        return PureWindowsPath(value[4:]).as_uri()
+    return profile.as_uri()
+
+
 def convert_with_office(
     source: Path,
     destination: Path,
@@ -150,7 +164,7 @@ def convert_with_office(
     shutil.copyfile(source, input_copy)
     command = [
         str(soffice),
-        f"-env:UserInstallation={profile.resolve().as_uri()}",
+        f"-env:UserInstallation={_office_profile_uri(profile.resolve())}",
         "--headless",
         "--invisible",
         "--nologo",

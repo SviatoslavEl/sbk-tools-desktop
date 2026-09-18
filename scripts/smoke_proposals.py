@@ -94,6 +94,14 @@ def inspect_pdf(data: bytes, forbidden: list[str]) -> int:
 def run_smoke(command: list[str], runtime: Path, directory: Path, *, office_override: Path | None = None) -> dict:
     """office_override is for explicit source-protocol QA, never exposed by the packaged CLI."""
     directory = directory.resolve()
+    if os.name == "nt":
+        # Match Rust Path::canonicalize in the native proposal bridge. A plain
+        # tempfile path hides Office URI bugs involving Windows verbatim paths.
+        windows_path = str(directory)
+        if not windows_path.startswith("\\\\?\\"):
+            windows_path = ("\\\\?\\UNC\\" + windows_path[2:]
+                            if windows_path.startswith("\\\\") else "\\\\?\\" + windows_path)
+        directory = Path(windows_path)
     environment = dict(os.environ)
     for name in ("SCANDOCUMENT_SOFFICE", "PYTHONPATH", "PYTHONHOME"):
         environment.pop(name, None)
