@@ -533,6 +533,24 @@ jobs:
             python scripts/check_versions.py
           }
           python scripts/check_windows_installed_contract.py
+      - name: Run native Windows regression tests before scanner compilation
+        shell: pwsh
+        run: |
+          # Tauri metadata needs the sidecar path, but these library tests do not run it.
+          # Remove only our temporary placeholder before verified reuse or compilation.
+          New-Item -ItemType Directory -Force src-tauri/binaries | Out-Null
+          New-Item -ItemType Directory -Force src-tauri/runtime-resources/resources | Out-Null
+          $workerStub = "src-tauri/binaries/sbk-scanner-worker-$env:TARGET.exe"
+          $createdWorkerStub = -not (Test-Path -LiteralPath $workerStub)
+          try {
+            if ($createdWorkerStub) { New-Item -ItemType File -Path $workerStub | Out-Null }
+            cargo test --manifest-path src-tauri/Cargo.toml --lib
+            if ($LASTEXITCODE -ne 0) { throw 'Windows database/editor regression tests failed' }
+          } finally {
+            if ($createdWorkerStub -and (Test-Path -LiteralPath $workerStub)) {
+              Remove-Item -LiteralPath $workerStub -ErrorAction Stop
+            }
+          }
       - run: python -m pip install -e scanner-worker Nuitka==2.8.10 ordered-set==4.1.0 zstandard==0.23.0
       - name: Reuse verified unchanged Windows scanner worker
         shell: pwsh
@@ -595,8 +613,6 @@ jobs:
       - name: Build independent installed fast-start package
         shell: pwsh
         run: |
-          cargo test --manifest-path src-tauri/Cargo.toml --lib
-          if ($LASTEXITCODE -ne 0) { throw 'Windows database/editor regression tests failed' }
           $version = $env:ARTIFACT_VERSION.TrimStart('v')
           ./scripts/package_windows_installed.ps1 -Target $env:TARGET -Version $version
       - name: Release installed packaging workspace

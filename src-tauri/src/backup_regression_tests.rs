@@ -43,7 +43,7 @@ fn older_workspace_new_module_read_is_empty_without_creating_or_migrating_anythi
             .is_some()
     );
     for (path, bytes) in before {
-        assert_eq!(fs::read(root.join(path)).unwrap(), bytes);
+        assert_eq!(snapshot_file(&root, &root.join(path)).unwrap(), bytes);
     }
     drop(workspace);
     fs::remove_dir_all(root).unwrap();
@@ -299,6 +299,103 @@ fn budget_boundaries_are_inclusive_and_zero_compressed_size_is_not_a_bypass() {
     assert!(limits.add_file(&mut maximum, 1, None).is_err());
 }
 
+#[cfg(windows)]
+fn is_snapshot_lock_path(relative: &Path) -> bool {
+    if relative == Path::new(".workspace.edit.lock")
+        || relative == Path::new(".workspace.edit.guard")
+    {
+        return true;
+    }
+    let parts: Vec<_> = relative.components().collect();
+    parts.len() == 3
+        && parts[0].as_os_str() == "runtime-cache"
+        && parts[2].as_os_str() == ".instance.lock"
+        && parts[1]
+            .as_os_str()
+            .to_str()
+            .and_then(|name| name.strip_prefix("instance-"))
+            .is_some_and(|id| Uuid::parse_str(id).is_ok())
+}
+
+#[cfg(windows)]
+fn read_locked_snapshot_file(path: &Path) -> std::io::Result<Vec<u8>> {
+    use std::ffi::c_void;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn CreateFileMappingW(
+            file: *mut c_void,
+            attributes: *const c_void,
+            protection: u32,
+            maximum_size_high: u32,
+            maximum_size_low: u32,
+            name: *const u16,
+        ) -> *mut c_void;
+        fn MapViewOfFile(
+            mapping: *mut c_void,
+            access: u32,
+            offset_high: u32,
+            offset_low: u32,
+            bytes: usize,
+        ) -> *mut c_void;
+        fn UnmapViewOfFile(address: *const c_void) -> i32;
+    }
+
+    // Test-only read-only mapping preserves exact byte comparisons without
+    // releasing the live editor's lock. LockFileEx explicitly permits mapped
+    // reads even when a new ReadFile handle receives ERROR_LOCK_VIOLATION.
+    // https://learn.microsoft.com/windows/win32/api/fileapi/nf-fileapi-lockfileex
+    let file = File::open(path)?;
+    let length = usize::try_from(file.metadata()?.len())
+        .map_err(|_| std::io::Error::other("Snapshot lock file is too large"))?;
+    if length == 0 {
+        return Ok(Vec::new());
+    }
+    if length > 64 * 1024 {
+        return Err(std::io::Error::other(
+            "Unexpectedly large snapshot lock file",
+        ));
+    }
+    let raw_mapping = unsafe {
+        CreateFileMappingW(
+            file.as_raw_handle(),
+            std::ptr::null(),
+            0x02, // PAGE_READONLY
+            0,
+            0,
+            std::ptr::null(),
+        )
+    };
+    if raw_mapping.is_null() {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mapping = unsafe { OwnedHandle::from_raw_handle(raw_mapping) };
+    let view = unsafe { MapViewOfFile(mapping.as_raw_handle(), 0x04, 0, 0, length) }; // FILE_MAP_READ
+    if view.is_null() {
+        return Err(std::io::Error::last_os_error());
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(view.cast::<u8>(), length).to_vec() };
+    if unsafe { UnmapViewOfFile(view) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(bytes)
+}
+
+fn snapshot_file(root: &Path, path: &Path) -> std::io::Result<Vec<u8>> {
+    let _ = root; // Used by the Windows-only, exact lock-file fallback below.
+    match fs::read(path) {
+        #[cfg(windows)]
+        Err(error)
+            if error.raw_os_error() == Some(33)
+                && path.strip_prefix(root).is_ok_and(is_snapshot_lock_path) =>
+        {
+            read_locked_snapshot_file(path)
+        }
+        result => result,
+    }
+}
+
 fn snapshot(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
     WalkDir::new(root)
         .into_iter()
@@ -307,10 +404,83 @@ fn snapshot(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
         .map(|entry| {
             (
                 entry.path().strip_prefix(root).unwrap().to_path_buf(),
-                fs::read(entry.path()).unwrap(),
+                snapshot_file(root, entry.path()).unwrap(),
             )
         })
         .collect()
+}
+
+#[test]
+fn snapshot_keeps_locked_token_bytes_detects_changes_and_preserves_lock() {
+    use fs2::FileExt;
+    use std::io::{Seek, SeekFrom};
+
+    let root = std::env::temp_dir().join(format!("sbk-snapshot-{}", Uuid::new_v4()));
+    fs::create_dir(&root).unwrap();
+    let relative = Path::new(".workspace.edit.lock");
+    let path = root.join(relative);
+    let mut owner = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .unwrap();
+    owner.write_all(b"original").unwrap();
+    owner.sync_all().unwrap();
+    owner.try_lock_exclusive().unwrap();
+    #[cfg(windows)]
+    assert_eq!(fs::read(&path).unwrap_err().raw_os_error(), Some(33));
+    let before = snapshot(&root);
+    assert_eq!(before.len(), 1);
+    assert_eq!(before[relative], b"original");
+    owner.seek(SeekFrom::Start(0)).unwrap();
+    owner.write_all(b"modified").unwrap();
+    owner.sync_all().unwrap();
+    let after = snapshot(&root);
+    assert_eq!(after[relative], b"modified");
+    assert_ne!(after, before);
+    let contender = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    assert!(contender.try_lock_exclusive().is_err());
+    drop(contender);
+    drop(owner);
+    assert_eq!(fs::read(&path).unwrap(), b"modified");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn snapshot_does_not_hide_unexpected_locks_or_missing_files() {
+    use fs2::FileExt;
+
+    let root = std::env::temp_dir().join(format!("sbk-snapshot-errors-{}", Uuid::new_v4()));
+    fs::create_dir_all(root.join("staff")).unwrap();
+    for relative in ["staff/data.sqlite3", "staff/.workspace.edit.lock"] {
+        let path = root.join(relative);
+        let mut owner = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        owner.write_all(b"must not be skipped").unwrap();
+        owner.sync_all().unwrap();
+        owner.try_lock_exclusive().unwrap();
+        assert_eq!(
+            snapshot_file(&root, &path).unwrap_err().raw_os_error(),
+            Some(33)
+        );
+    }
+    assert_eq!(
+        snapshot_file(&root, &root.join(".workspace.edit.guard"))
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::NotFound
+    );
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

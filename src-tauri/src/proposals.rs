@@ -369,50 +369,6 @@ fn destination_path(path: &str, format: &str, workspace: &Path) -> Result<PathBu
     }
     Ok(destination)
 }
-#[cfg(target_os = "macos")]
-fn publish_no_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-    unsafe extern "C" {
-        fn renamex_np(
-            from: *const std::ffi::c_char,
-            to: *const std::ffi::c_char,
-            flags: u32,
-        ) -> i32;
-    }
-    let from = CString::new(source.as_os_str().as_bytes())?;
-    let to = CString::new(destination.as_os_str().as_bytes())?;
-    // RENAME_EXCL, from the macOS SDK sys/stdio.h: atomically fail if target exists.
-    if unsafe { renamex_np(from.as_ptr(), to.as_ptr(), 0x00000004) } == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-#[cfg(windows)]
-fn publish_no_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn MoveFileExW(from: *const u16, to: *const u16, flags: u32) -> i32;
-    }
-    let from: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
-    let to: Vec<u16> = destination
-        .as_os_str()
-        .encode_wide()
-        .chain(Some(0))
-        .collect();
-    // Same-directory rename, including SMB. No REPLACE_EXISTING/COPY_ALLOWED flags.
-    if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), 0x8) } != 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-#[cfg(not(any(target_os = "macos", windows)))]
-fn publish_no_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
-    fs::hard_link(source, destination)
-}
 fn publish(source: &Path, destination: &Path, cancel: &AtomicBool) -> Result<(), String> {
     let parent = destination.parent().ok_or("Некорректный путь результата")?;
     let stage = parent.join(format!(".sbk-proposal-{}.part", Uuid::new_v4()));
@@ -446,7 +402,7 @@ fn publish(source: &Path, destination: &Path, cancel: &AtomicBool) -> Result<(),
         }
         // Atomic no-clobber publication on the destination filesystem. Do not
         // fall back to rename-overwrite or copy to a visible, incomplete file.
-        publish_no_replace(&stage, destination).map_err(|e| format!("Не удалось безопасно опубликовать КП без перезаписи ({e}). Проверьте свободное имя и доступность папки."))?;
+        crate::publication::publish_no_replace(&stage, destination).map_err(|e| format!("Не удалось безопасно опубликовать КП без перезаписи ({e}). Проверьте свободное имя и доступность папки."))?;
         Ok(())
     })();
     let _ = fs::remove_file(stage);

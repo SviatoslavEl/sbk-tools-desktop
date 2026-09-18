@@ -39,6 +39,7 @@ mod backup_restore;
 mod database;
 mod intelligence;
 mod proposals;
+mod publication;
 mod scanner_outputs;
 mod workspace;
 use attachments::AttachmentAudit;
@@ -3426,10 +3427,7 @@ fn create_registry_archive_impl(
         drop(completed);
         // Atomic publication, including a file created after the save dialog.
         // Do not delete an existing archive to make room for a new one.
-        #[cfg(windows)]
-        let publication = fs::rename(&temporary, destination);
-        #[cfg(not(windows))]
-        let publication = fs::hard_link(&temporary, destination);
+        let publication = publication::publish_no_replace(&temporary, destination);
         publication.map_err(|error| format!("Не удалось сохранить архив без замены существующего файла: {error}. Выберите другое имя или локальную папку; прежний архив не изменён."))
     })();
     let _ = fs::remove_file(&temporary);

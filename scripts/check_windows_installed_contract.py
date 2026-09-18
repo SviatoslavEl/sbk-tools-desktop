@@ -59,6 +59,48 @@ def check_frontend_startup_readiness(frontend: str) -> None:
         raise SystemExit("Startup timeouts must only retry workspace readiness, not delay the UI")
 
 
+def check_windows_native_test_order(workflow: str) -> None:
+    """Fail Windows regressions before spending time compiling the scanner worker."""
+    jobs = re.split(r"(?m)^  build-installed-windows:\s*$", workflow, maxsplit=1)
+    if len(jobs) != 2:
+        raise SystemExit("Installed Windows build job is missing")
+    job = re.split(r"(?m)^  [\w-]+:\s*$", jobs[1], maxsplit=1)[0]
+    steps = re.findall(r"(?ms)^      - .*?(?=^      - |\Z)", job)
+    native_steps = [
+        (index, step) for index, step in enumerate(steps)
+        if "name: Run native Windows regression tests before scanner compilation" in step
+    ]
+    if len(native_steps) != 1:
+        raise SystemExit("Windows native regression tests need one dedicated early step")
+    index, native = native_steps[0]
+    command = "cargo test --manifest-path src-tauri/Cargo.toml --lib"
+    if job.count(command) != 1 or not re.search(rf"(?m)^\s*{re.escape(command)}\s*$", native):
+        raise SystemExit("Windows native regression suite must run once with its existing flags")
+    prerequisite = "\n".join(steps[:index])
+    if "run: npm ci" not in prerequisite or "uses: dtolnay/rust-toolchain@" not in prerequisite:
+        raise SystemExit("Windows native regression tests must follow Node and Rust setup")
+    if any(marker in prerequisite for marker in (
+        "pip install -e scanner-worker",
+        "reuse_verified_windows_worker.ps1",
+        "build_scanner_worker.py",
+        "package_windows_installed.ps1",
+    )):
+        raise SystemExit("Windows native regression tests must precede scanner compilation")
+    if re.search(r"(?m)^        (?:if|continue-on-error):", native):
+        raise SystemExit("Windows native regression tests must be unconditional and fail closed")
+    for required in (
+        "shell: pwsh",
+        "if ($LASTEXITCODE -ne 0) { throw 'Windows database/editor regression tests failed' }",
+        '$createdWorkerStub = -not (Test-Path -LiteralPath $workerStub)',
+        "if ($createdWorkerStub) { New-Item -ItemType File -Path $workerStub | Out-Null }",
+        "} finally {",
+        "if ($createdWorkerStub -and (Test-Path -LiteralPath $workerStub))",
+        "Remove-Item -LiteralPath $workerStub -ErrorAction Stop",
+    ):
+        if required not in native:
+            raise SystemExit(f"Windows native preflight safety check is missing: {required}")
+
+
 def main() -> None:
     for relative, expected in PORTABLE_SNAPSHOT.items():
         actual = sha256(ROOT / relative)
@@ -209,6 +251,7 @@ def main() -> None:
         raise SystemExit("Installed extractor must support long Windows runtime paths")
 
     release_workflow = (ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
+    check_windows_native_test_order(release_workflow)
     for required in (
         "Wait-InstallerProcess",
         "SBK-Tools-Fast-Install-Error.log",
