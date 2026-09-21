@@ -98,8 +98,9 @@ mod tests {
         let root = fixture();
         let destination = root.join("finished.zip");
         let barrier = Arc::new(Barrier::new(2));
-        let workers: Vec<_> = [b'A', b'B']
-            .into_iter()
+        let workers: Vec<_> = b"AB"
+            .iter()
+            .copied()
             .map(|byte| {
                 let source = root.join(format!("{byte}.part"));
                 fs::write(&source, vec![byte; 128 * 1024]).unwrap();
