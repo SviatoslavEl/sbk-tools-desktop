@@ -96,6 +96,15 @@ def check_windows_native_test_order(workflow: str) -> None:
         "} finally {",
         "if ($createdWorkerStub -and (Test-Path -LiteralPath $workerStub))",
         "Remove-Item -LiteralPath $workerStub -ErrorAction Stop",
+        "Get-Content -LiteralPath src-tauri/tauri.windows.conf.json -Raw | ConvertFrom-Json",
+        "$webviewRelative = $windowsMetadata.bundle.windows.webviewInstallMode.path",
+        "$windowsMetadata.bundle.windows.webviewInstallMode.type -ne 'fixedRuntime'",
+        r"$webviewRelative -notmatch '^\./webview2-runtime/[^/\\]+$'",
+        "$webviewStub = Join-Path (Join-Path $env:GITHUB_WORKSPACE 'src-tauri') $webviewRelative",
+        "$createdWebviewStub = -not (Test-Path -LiteralPath $webviewStub)",
+        "if ($createdWebviewStub) { New-Item -ItemType Directory -Force -Path $webviewStub | Out-Null }",
+        "if ($createdWebviewStub -and (Test-Path -LiteralPath $webviewStub))",
+        "[IO.Directory]::Delete($webviewStub, $false)",
     ):
         if required not in native:
             raise SystemExit(f"Windows native preflight safety check is missing: {required}")

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 import unittest
 
@@ -146,6 +147,53 @@ class WindowsNativeTestOrderTests(unittest.TestCase):
                     contract.check_windows_native_test_order(
                         self.workflow.replace(marker, marker + f"        {setting}\n", 1)
                     )
+
+    def test_rejects_missing_configured_webview_metadata_directory(self) -> None:
+        for fragment in (
+            "Get-Content -LiteralPath src-tauri/tauri.windows.conf.json -Raw | ConvertFrom-Json",
+            "$webviewRelative = $windowsMetadata.bundle.windows.webviewInstallMode.path",
+            "$webviewStub = Join-Path (Join-Path $env:GITHUB_WORKSPACE 'src-tauri') $webviewRelative",
+            "if ($createdWebviewStub) { New-Item -ItemType Directory -Force -Path $webviewStub | Out-Null }",
+        ):
+            with self.subTest(fragment=fragment):
+                with self.assertRaisesRegex(SystemExit, "safety check is missing"):
+                    contract.check_windows_native_test_order(
+                        self.workflow.replace(fragment, "", 1)
+                    )
+
+    def test_rejects_unowned_or_recursive_webview_cleanup(self) -> None:
+        for original, replacement in (
+            (
+                "$createdWebviewStub = -not (Test-Path -LiteralPath $webviewStub)",
+                "$createdWebviewStub = $true",
+            ),
+            (
+                "if ($createdWebviewStub -and (Test-Path -LiteralPath $webviewStub))",
+                "if (Test-Path -LiteralPath $webviewStub)",
+            ),
+            (
+                "[IO.Directory]::Delete($webviewStub, $false)",
+                "[IO.Directory]::Delete($webviewStub, $true)",
+            ),
+        ):
+            with self.subTest(replacement=replacement):
+                with self.assertRaisesRegex(SystemExit, "safety check is missing"):
+                    contract.check_windows_native_test_order(
+                        self.workflow.replace(original, replacement, 1)
+                    )
+
+    def test_windows_configs_share_the_scoped_metadata_runtime_path(self) -> None:
+        paths = []
+        for filename in ("tauri.windows.conf.json", "tauri.installed.windows.conf.json"):
+            config = json.loads((ROOT / "src-tauri" / filename).read_text(encoding="utf-8"))
+            runtime = config["bundle"]["windows"]["webviewInstallMode"]
+            self.assertEqual(runtime["type"], "fixedRuntime")
+            self.assertRegex(
+                runtime["path"],
+                r"^\./webview2-runtime/[^/\\]+$",
+            )
+            paths.append(runtime["path"])
+        self.assertEqual(paths[0], paths[1])
 
 
 if __name__ == "__main__":
