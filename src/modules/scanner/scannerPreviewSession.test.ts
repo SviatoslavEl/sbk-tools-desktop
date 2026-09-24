@@ -17,6 +17,78 @@ function harness() {
 afterEach(() => vi.useRealTimers());
 
 describe("bounded page preparation", () => {
+  it("keeps the committed frame until React replaces it even if output cleanup is slow", async () => {
+    const { session, transport } = harness();
+    transport.release = vi.fn();
+    vi.mocked(transport.read).mockImplementation(async (path) => ({ url: `blob:${path}`, retainedBytes: 26 * 1024 * 1024 }));
+    const first = await session.request(settings, "first");
+    session.confirmDisplayed(first!.previewUrl);
+    const cleanup = deferred<unknown>();
+    vi.mocked(transport.remove).mockReturnValue(cleanup.promise);
+    const next = session.request({ ...settings, pageIndex: 1 }, "next");
+    await vi.waitFor(() => expect(transport.remove).toHaveBeenCalledTimes(4));
+    expect(transport.release).not.toHaveBeenCalled();
+    cleanup.resolve(undefined);
+    const second = await next;
+    expect(transport.release).not.toHaveBeenCalled();
+    session.confirmDisplayed(second!.previewUrl);
+    expect(transport.release).toHaveBeenCalledTimes(2);
+    session.clear();
+    expect(transport.release).toHaveBeenCalledTimes(4);
+  });
+  it("releases binary images on clear and budgets bytes instead of short URL length", async () => {
+    const { session, transport } = harness();
+    transport.release = vi.fn();
+    vi.mocked(transport.read).mockImplementation(async (path) => ({ url: `blob:${path}`, retainedBytes: 26 * 1024 * 1024 }));
+    await session.request(settings, "large");
+    expect(session.isCached(settings)).toBe(false);
+    // An over-budget visible page is pinned, not revoked while displayed.
+    expect(transport.release).not.toHaveBeenCalled();
+    await session.request({ ...settings, pageIndex: 1 }, "next");
+    expect(transport.release).toHaveBeenCalledWith("blob:/qa/0.png");
+    expect(transport.release).toHaveBeenCalledWith("blob:/qa/0-original.png");
+    session.clear();
+    expect(transport.release).toHaveBeenCalledTimes(4);
+  });
+
+  it("releases the successfully read half if the other image fails", async () => {
+    const { session, transport } = harness();
+    transport.release = vi.fn();
+    vi.mocked(transport.read).mockResolvedValueOnce({ url: "blob:processed", retainedBytes: 100 }).mockRejectedValueOnce(new Error("missing original"));
+    await expect(session.request(settings, "failed")).rejects.toThrow("missing original");
+    expect(transport.release).toHaveBeenCalledExactlyOnceWith("blob:processed");
+  });
+
+  it("releases late binary reads after changing documents", async () => {
+    const { session, transport } = harness();
+    transport.release = vi.fn();
+    const pending = deferred<{ url: string; retainedBytes: number }>();
+    vi.mocked(transport.read).mockReturnValueOnce(pending.promise).mockResolvedValueOnce({ url: "blob:original", retainedBytes: 100 });
+    const requested = session.request(settings, "old");
+    await vi.waitFor(() => expect(transport.read).toHaveBeenCalledTimes(2));
+    session.clear();
+    pending.resolve({ url: "blob:processed", retainedBytes: 100 });
+    expect(await requested).toBeUndefined();
+    expect(transport.release).toHaveBeenCalledTimes(2);
+    expect(session.isCached(settings)).toBe(false);
+  });
+
+  it("keeps the displayed blob alive when neighbors evict it, then releases on navigation", async () => {
+    vi.useFakeTimers();
+    const { session, transport } = harness();
+    transport.release = vi.fn();
+    vi.mocked(transport.read).mockImplementation(async (path) => ({ url: `blob:${path}`, retainedBytes: 10 * 1024 * 1024 }));
+    await session.request(settings, "first");
+    session.schedule(settings, [0, 1, 2]);
+    await vi.advanceTimersByTimeAsync(500);
+    expect(session.isCached(settings)).toBe(false);
+    expect(transport.release).not.toHaveBeenCalled();
+    await session.request({ ...settings, pageIndex: 1 }, "next");
+    expect(transport.run).toHaveBeenCalledTimes(2);
+    expect(transport.release).toHaveBeenCalledTimes(2);
+    session.clear();
+    expect(transport.release).toHaveBeenCalledTimes(6);
+  });
   it("prepares only two following pages and one preceding in the arranged order", () => {
     expect(neighboringPages([5, 2, 7, 1, 4], 2)).toEqual([7, 1, 5]);
     expect(neighboringPages([5, 2, 7, 1, 4], 5)).toEqual([2, 7]);

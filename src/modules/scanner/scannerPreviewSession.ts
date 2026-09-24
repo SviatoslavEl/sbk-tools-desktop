@@ -1,4 +1,5 @@
 import { BoundedPreviewCache, previewCacheKey } from "./facsimilePreview";
+import type { PreviewImage } from "./scannerPreviewImages";
 
 export interface PreviewSettings {
   inputPath: string;
@@ -11,6 +12,7 @@ export interface PreviewSettings {
   pageRotations: Record<number, number>;
 }
 export interface PreviewResult {
+  retainedBytes?: number;
   previewUrl: string;
   originalUrl: string;
   pageCount: number;
@@ -41,7 +43,8 @@ export const SOURCE_CHANGED_MESSAGE = "Исходный документ изм�
 export interface PreviewTransport {
   run(jobId: string, operation: "preview" | "preparePreview", config: Record<string, unknown>): Promise<WorkerPreview | PreparedPreviews>;
   cancel(jobId: string): Promise<unknown>;
-  read(path: string): Promise<string>;
+  read(path: string): Promise<string | PreviewImage>;
+  release?(url: string): void;
   remove(path: string): Promise<unknown>;
   revision(path: string): Promise<string>;
 }
@@ -66,8 +69,12 @@ function workerConfig(settings: PreviewSettings): Record<string, unknown> {
 
 /** Foreground navigation always preempts bounded, best-effort background work. */
 export class ScannerPreviewSession {
+  private activeResult: PreviewResult | undefined;
+  private displayedResult: PreviewResult | undefined;
+  private readonly retained = new Set<PreviewResult>();
   private readonly cache = new BoundedPreviewCache<PreviewResult>(16, 48 * 1024 * 1024,
-    (value) => (value.previewUrl.length + value.originalUrl.length) * 2);
+    (value) => value.retainedBytes ?? (value.previewUrl.length + value.originalUrl.length) * 2,
+    (value) => { this.retained.delete(value); if (!this.isPinned(value)) this.releaseResult(value); });
   private foreground = "";
   private background = "";
   private generation = 0;
@@ -86,7 +93,7 @@ export class ScannerPreviewSession {
 
   private sourceChanged(): never {
     this.changed = true;
-    this.cache.clear();
+    this.clearImages();
     this.report({ state: "changed", prepared: 0, total: 0 });
     throw new Error(SOURCE_CHANGED_MESSAGE);
   }
@@ -127,7 +134,41 @@ export class ScannerPreviewSession {
     this.sourcePath = "";
     this.changed = false;
     this.sourceEpoch += 1;
+    this.clearImages();
+  }
+
+  private releaseResult(result: PreviewResult) {
+    for (const url of new Set([result.previewUrl, result.originalUrl])) if (url) this.transport.release?.(url);
+  }
+
+  private isPinned(result: PreviewResult) { return result === this.activeResult || result === this.displayedResult; }
+
+  /** React acknowledges the committed image; cleanup cannot revoke the old frame early. */
+  confirmDisplayed(previewUrl: string) {
+    const previous = this.displayedResult;
+    if (previewUrl && this.activeResult?.previewUrl !== previewUrl) return;
+    this.displayedResult = previewUrl ? this.activeResult : undefined;
+    if (previous && !this.isPinned(previous) && !this.retained.has(previous)) this.releaseResult(previous);
+  }
+
+  private clearImages() {
+    const pinned = new Set([this.activeResult, this.displayedResult]);
+    this.activeResult = undefined;
+    this.displayedResult = undefined;
+    for (const value of pinned) if (value && !this.retained.has(value)) this.releaseResult(value);
     this.cache.clear();
+  }
+
+  private activate(result: PreviewResult) {
+    const previous = this.activeResult;
+    this.activeResult = result;
+    // The displayed page survives speculative cache eviction until replaced.
+    if (previous && !this.isPinned(previous) && !this.retained.has(previous)) this.releaseResult(previous);
+  }
+
+  private store(settings: PreviewSettings, result: PreviewResult) {
+    this.retained.add(result);
+    this.cache.set(previewSettingsKey(settings), result);
   }
 
   private async removeOutputs(responses: WorkerPreview[]) {
@@ -136,13 +177,22 @@ export class ScannerPreviewSession {
   }
 
   private async readResult(response: WorkerPreview): Promise<PreviewResult> {
-    if (!Number.isInteger(response.pageCount) || response.pageCount < 1) throw new Error("В документе не удалось определить ни одной страницы.");
+    if (!Number.isInteger(response.pageCount) || response.pageCount < 1 || response.pageCount > 5000) throw new Error("Недопустимое число страниц в документе.");
     const results = await Promise.allSettled([
       this.transport.read(response.outputPath), response.originalPath ? this.transport.read(response.originalPath) : Promise.resolve(""),
     ]);
-    for (const result of results) if (result.status === "rejected") throw result.reason;
-    const [previewUrl, originalUrl] = results.map((result) => result.status === "fulfilled" ? result.value : "");
+    const failed = results.find((result) => result.status === "rejected");
+    if (failed?.status === "rejected") {
+      for (const result of results) if (result.status === "fulfilled") {
+        this.transport.release?.(typeof result.value === "string" ? result.value : result.value.url);
+      }
+      throw failed.reason;
+    }
+    const images = results.map((result) => result.status === "fulfilled" ? result.value : "");
+    const [previewUrl, originalUrl] = images.map((image) => typeof image === "string" ? image : image.url);
+    const retainedBytes = images.reduce((size, image) => size + (typeof image === "string" ? image.length * 2 : image.retainedBytes), 0);
     return { previewUrl, originalUrl, pageCount: response.pageCount, warnings: response.warnings || [],
+      retainedBytes,
       estimatedOutputBytes: response.estimatedOutputBytes || 0, originalBytes: response.originalBytes || 0,
       pageSizePoints: response.pageSizePoints, sourceFingerprint: response.sourceFingerprint };
   }
@@ -152,21 +202,25 @@ export class ScannerPreviewSession {
     this.cancel(this.foreground);
     this.foreground = jobId;
     let response: WorkerPreview | undefined;
+    let loaded: PreviewResult | undefined;
     try {
       if (!await this.checkRevision(settings.inputPath, () => this.foreground === jobId)) return undefined;
       const cached = this.cache.get(previewSettingsKey(settings));
-      if (cached) return cached;
+      if (cached) { this.activate(cached); return cached; }
       response = await this.transport.run(jobId, "preview", workerConfig(settings)) as WorkerPreview;
       if (this.foreground !== jobId) return undefined;
       const result = await this.readResult(response);
+      loaded = result;
       if (this.foreground !== jobId) return undefined;
       if (!await this.checkRevision(settings.inputPath, () => this.foreground === jobId)) return undefined;
       if (this.fingerprint && result.sourceFingerprint && this.fingerprint !== result.sourceFingerprint) return this.sourceChanged();
       this.fingerprint = result.sourceFingerprint;
-      this.cache.set(previewSettingsKey(settings), result);
+      this.activate(result);
+      this.store(settings, result);
       return result;
     } finally {
       if (this.foreground === jobId) this.foreground = "";
+      if (loaded && loaded !== this.activeResult && !this.retained.has(loaded)) this.releaseResult(loaded);
       if (response) await this.removeOutputs([response]);
     }
   }
@@ -203,9 +257,9 @@ export class ScannerPreviewSession {
         if (generation !== this.generation) return;
         if (!Number.isInteger(page.pageIndex) || !pages.includes(page.pageIndex!)) continue;
         const result = await this.readResult(page);
-        if (generation !== this.generation) return;
+        if (generation !== this.generation) { this.releaseResult(result); return; }
         const pageSettings = { ...settings, pageIndex: page.pageIndex! };
-        this.cache.set(previewSettingsKey(pageSettings), result);
+        this.store(pageSettings, result);
         this.report({ state: "preparing", prepared: preparedCount(), total });
       }
       const prepared = preparedCount();

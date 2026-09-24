@@ -350,7 +350,8 @@ def process(config: dict) -> int:
     )
     warnings, confidence, ocr_text, low_confidence_words = process_document(request, lambda event: emit({"type": "progress", "stage": event.stage,
         "currentPage": event.current_page, "totalPages": event.total_pages, "percent": event.percent}),
-        expected_source_fingerprint=expected_fingerprint)
+        expected_source_fingerprint=expected_fingerprint,
+        preview_cache_dir=Path(config["previewCacheDir"]) if config.get("previewCacheDir") else None)
     output_bytes = request.output_path.stat().st_size
     original_bytes = request.input_path.stat().st_size
     emit({"type": "complete", "outputPath": str(request.output_path), "warnings": warnings,
@@ -425,6 +426,7 @@ def merge(config: dict) -> int:
                     "percent": round((file_index + event.percent / 100) / len(sources) * 92),
                 }),
                 expected_source_fingerprint=fingerprints[index],
+                preview_cache_dir=Path(config["previewCacheDir"]) if config.get("previewCacheDir") else None,
             )
             warnings.extend(part_warnings)
             parts.append(part)

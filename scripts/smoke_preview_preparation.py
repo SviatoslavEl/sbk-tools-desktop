@@ -123,10 +123,35 @@ def run_smoke(worker: Path, runtime: Path, directory: Path) -> dict:
         run("preparePreview", {**base, "pageIndices": [0, 0], "outputPaths": [str(p) for p in invalid_paths]},
             f"{kind}-invalid-batch", expect_success=False)
         assert not any(path.exists() for path in invalid_paths)
+        cached_pdf = None
+        cache_digest = None
+        cache_warning = "SCANNER PREPARATION QA: prepared DOCX conversion reused"
+        if kind == "docx":
+            conversions = list(cache.glob(f"docx-*-{fingerprint}.pdf"))
+            assert len(conversions) == 1, "Expected one prepared DOCX conversion"
+            cached_pdf = conversions[0]
+            cache_digest = sha256(cached_pdf)
+            # Modify only metadata of our synthetic, per-run cache. The marker
+            # proves export uses this conversion; a fresh conversion would lose
+            # it. Never alter the installed runtime or repository fixtures.
+            warning_path = cached_pdf.with_suffix(".warnings.json")
+            warnings = json.loads(warning_path.read_text(encoding="utf-8"))
+            assert isinstance(warnings, list)
+            warning_path.write_text(json.dumps([*warnings, cache_warning]), encoding="utf-8")
         output = directory / f"{kind}-unchanged.pdf"
         complete, _ = run("process", {**base, "outputPath": str(output), "expectedSourceFingerprint": fingerprint},
                           f"{kind}-unchanged-process")
         assert complete["type"] == "complete" and len(PdfReader(output).pages) == count
+        if cached_pdf is not None:
+            assert cache_warning in complete["warnings"], "Export did not reuse the prepared DOCX conversion"
+            assert sha256(cached_pdf) == cache_digest, "Export replaced the prepared DOCX conversion"
+            merged_path = directory / "docx-cached-merge.pdf"
+            merged, _ = run("merge", {**base, "inputPaths": [str(source), str(pdf)],
+                                     "outputPath": str(merged_path)}, "docx-cached-merge")
+            assert merged["type"] == "complete"
+            assert len(PdfReader(merged_path).pages) == count + len(PdfReader(pdf).pages)
+            assert cache_warning in merged["warnings"], "Merge did not reuse the prepared DOCX conversion"
+            assert sha256(cached_pdf) == cache_digest, "Merge replaced the prepared DOCX conversion"
         source_metadata = source.stat()
         os.utime(source, ns=(source_metadata.st_atime_ns, source_metadata.st_mtime_ns + 5_000_000_000))
         rejected_path = directory / f"{kind}-stale-must-not-exist.pdf"

@@ -41,6 +41,7 @@ mod intelligence;
 mod proposals;
 mod publication;
 mod scanner_outputs;
+mod scanner_previews;
 mod workspace;
 use attachments::AttachmentAudit;
 use database::{MODULES, SCHEMA_VERSION, open_database, open_database_read_only, validated_module};
@@ -3073,6 +3074,20 @@ fn read_binary_file(path: String, max_bytes: Option<u64>) -> Result<String, Stri
     Ok(format!("data:{mime};base64,{}", BASE64.encode(bytes)))
 }
 
+#[tauri::command]
+async fn read_scanner_preview(
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<tauri::ipc::Response, String> {
+    let workspace = state.active_workspace()?;
+    let bytes = tauri::async_runtime::spawn_blocking(move || {
+        scanner_previews::read(workspace.runtime_root(), Path::new(&path))
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+    Ok(tauri::ipc::Response::new(bytes))
+}
+
 fn sha256_file(path: &Path) -> Result<String, String> {
     let mut input = File::open(path).map_err(|error| error.to_string())?;
     let mut hasher = Sha256::new();
@@ -4487,8 +4502,9 @@ fn run_scanner_worker(
     let input = config
         .get("inputPath")
         .and_then(Value::as_str)
-        .ok_or_else(|| "Не выбран исходный документ".to_string())?;
-    if !Path::new(input).is_file() {
+        .ok_or_else(|| "Не выбран исходный документ".to_string())?
+        .to_owned();
+    if !Path::new(&input).is_file() {
         return Err("Исходный документ не найден".to_string());
     }
     let merge_inputs = if operation == "merge" {
@@ -4564,11 +4580,23 @@ fn run_scanner_worker(
         None
     };
     let mut preview_outputs = Vec::new();
+    // The backend chooses the cache; a frontend-supplied directory must never
+    // redirect processing to another workspace or an arbitrary user folder.
+    config
+        .as_object_mut()
+        .ok_or("Некорректные настройки сканера")?
+        .remove("previewCacheDir");
+    if matches!(
+        operation.as_str(),
+        "preview" | "preparePreview" | "process" | "merge"
+    ) {
+        let source_cache = workspace.runtime_root().join("scanner-source-cache");
+        fs::create_dir_all(&source_cache).map_err(|error| error.to_string())?;
+        config["previewCacheDir"] = Value::String(source_cache.to_string_lossy().into_owned());
+    }
     if operation == "preview" || operation == "preparePreview" {
         let preview_dir = workspace.runtime_root().join("previews");
         fs::create_dir_all(&preview_dir).map_err(|error| error.to_string())?;
-        let source_cache = workspace.runtime_root().join("scanner-source-cache");
-        fs::create_dir_all(&source_cache).map_err(|error| error.to_string())?;
         let outputs: Vec<PathBuf> = (0..prepared_indices.unwrap_or(1))
             .map(|index| preview_dir.join(format!("{job_id}-{index}.png")))
             .collect();
@@ -4584,7 +4612,6 @@ fn run_scanner_worker(
             )));
             preview_outputs.push(output);
         }
-        config["previewCacheDir"] = Value::String(source_cache.to_string_lossy().into_owned());
     } else if operation == "process" || operation == "merge" {
         let output = config
             .get("outputPath")
@@ -4596,7 +4623,7 @@ fn run_scanner_worker(
                 input.canonicalize().ok() == output_path.canonicalize().ok() && output_path.exists()
             })
         } else {
-            Path::new(input).canonicalize().ok() == output_path.canonicalize().ok()
+            Path::new(&input).canonicalize().ok() == output_path.canonicalize().ok()
                 && output_path.exists()
         };
         if overwrites_source {
@@ -5075,6 +5102,7 @@ pub fn run() {
             write_text_file,
             read_text_file,
             read_binary_file,
+            read_scanner_preview,
             create_backup,
             create_registry_archive,
             create_encrypted_backup,

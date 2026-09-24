@@ -28,6 +28,7 @@ import {
 } from "./facsimilePreview";
 import { buildPageWindow } from "./pageNavigation";
 import { ScannerPreviewSession, SOURCE_CHANGED_MESSAGE, type PreviewPreparation, type PreviewResult, type WorkerPreview, type PreparedPreviews } from "./scannerPreviewSession";
+import { readPreviewImage, releasePreviewImage } from "./scannerPreviewImages";
 import { captureFacsimilePresetForPage, normalizeFacsimilePreset, type FacsimilePresetSettings } from "./facsimilePresets";
 import { readCurrentPreview, resumableSplitPlan, runSplitPlan, ScannerSingleFlight, subscribeScannerProgress, type SplitPlan } from "./scannerAsyncOperations";
 import { compressionProfile, type CompressionMode } from "./compression";
@@ -311,11 +312,13 @@ export function Scanner({ active = true }: { active?: boolean }) {
   if (!previewSession.current) previewSession.current = new ScannerPreviewSession({
     run: (jobId, operation, config) => invoke<WorkerPreview | PreparedPreviews>("scanner_run", { jobId, operation, config }),
     cancel: (jobId) => invoke("scanner_cancel", { jobId }),
-    read: (path) => invoke<string>("read_binary_file", { path, maxBytes: 24 * 1024 * 1024 }),
+    read: readPreviewImage,
+    release: releasePreviewImage,
     remove: (path) => invoke("delete_runtime_file", { path }),
     revision: (path) => invoke<string>("scanner_source_revision", { path }),
   }, setPreparation);
   useEffect(() => () => previewSession.current?.clear(), []);
+  useEffect(() => { previewSession.current?.confirmDisplayed(previewUrl); }, [previewUrl]);
   useEffect(() => {
     if (preparation.state === "changed") {
       setReadyPreviewKey(""); setPreviewUrl(""); setOriginalUrl(""); setLoadedPreviewUrl("");

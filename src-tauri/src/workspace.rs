@@ -626,25 +626,89 @@ impl Drop for Workspace {
     }
 }
 
-fn create_runtime_root(root: &Path, workspace_writable: bool) -> Result<(PathBuf, File), String> {
-    // A viewer must also be able to render/convert documents when the shared
-    // workspace is mounted read-only. Keep its ephemeral files in the system
-    // temp directory instead of turning a valid read-only workspace into a
-    // startup error.
-    let base = if workspace_writable {
-        root.join("runtime-cache")
-    } else {
-        std::env::temp_dir().join("SBKTools").join("runtime-cache")
-    };
-    fs::create_dir_all(&base)
-        .map_err(|error| format!("Не удалось подготовить временные данные: {error}"))?;
-    if let Ok(entries) = fs::read_dir(&base) {
+fn local_runtime_base() -> Result<PathBuf, String> {
+    // The authoritative workspace may be on SMB. Preview images, converted
+    // PDFs and worker configs must not follow it onto the share, even for an
+    // editor. The OS cache directory is per-user (LocalAppData on Windows,
+    // Library/Caches on macOS), and does not depend on workspace permissions.
+    dirs::cache_dir()
+        .map(|path| path.join("SBKTools").join("runtime-cache"))
+        .ok_or_else(|| "Не удалось определить локальную папку временных данных пользователя".into())
+}
+
+fn regular_runtime_directory(path: &Path) -> std::io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(std::io::Error::other(
+            "Временная область не является обычным каталогом",
+        ));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes() & 0x400 != 0 {
+            return Err(std::io::Error::other(
+                "Временная область является reparse point",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn create_private_runtime_directory(path: &Path, recursive: bool) -> std::io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(recursive);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    // Windows inherits the current user's LocalAppData ACL. Do not use the
+    // machine-wide temporary directory as a fallback for document contents.
+    builder.create(path)?;
+    regular_runtime_directory(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+fn create_runtime_root() -> Result<(PathBuf, File), String> {
+    create_runtime_root_in(&local_runtime_base()?)
+}
+
+fn create_runtime_root_in(base: &Path) -> Result<(PathBuf, File), String> {
+    create_private_runtime_directory(base, true)
+        .map_err(|error| format!("Не удалось подготовить локальные временные данные: {error}"))?;
+    // Serialize creation and scavenging. Otherwise a simultaneous launch can
+    // observe a just-created instance lock before its owner has acquired it.
+    let maintenance = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(base.join(".maintenance.lock"))
+        .map_err(|error| format!("Не удалось открыть обслуживание временных данных: {error}"))?;
+    maintenance.lock_exclusive().map_err(|error| {
+        format!("Не удалось заблокировать обслуживание временных данных: {error}")
+    })?;
+    if let Ok(entries) = fs::read_dir(base) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if !path.is_dir() || !entry.file_name().to_string_lossy().starts_with("instance-") {
+            let name = entry.file_name();
+            let recognized = name
+                .to_str()
+                .and_then(|name| name.strip_prefix("instance-"))
+                .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok());
+            if !recognized || regular_runtime_directory(&path).is_err() {
                 continue;
             }
             let lock_path = path.join(".instance.lock");
+            if regular_file_metadata(&lock_path).is_err() {
+                continue;
+            }
             let Ok(lock) = OpenOptions::new().read(true).write(true).open(lock_path) else {
                 continue;
             };
@@ -656,18 +720,27 @@ fn create_runtime_root(root: &Path, workspace_writable: bool) -> Result<(PathBuf
         }
     }
     let runtime_root = base.join(format!("instance-{}", uuid::Uuid::new_v4()));
-    fs::create_dir(&runtime_root)
+    create_private_runtime_directory(&runtime_root, false)
         .map_err(|error| format!("Не удалось создать временную область процесса: {error}"))?;
-    let guard = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .open(runtime_root.join(".instance.lock"))
-        .map_err(|error| format!("Не удалось создать блокировку временной области: {error}"))?;
-    guard
-        .try_lock_exclusive()
-        .map_err(|error| format!("Не удалось заблокировать временную область: {error}"))?;
-    Ok((runtime_root, guard))
+    let guard = (|| {
+        let guard = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(runtime_root.join(".instance.lock"))
+            .map_err(|error| format!("Не удалось создать блокировку временной области: {error}"))?;
+        guard
+            .try_lock_exclusive()
+            .map_err(|error| format!("Не удалось заблокировать временную область: {error}"))?;
+        Ok::<_, String>(guard)
+    })();
+    match guard {
+        Ok(guard) => Ok((runtime_root, guard)),
+        Err(error) => {
+            let _ = fs::remove_dir_all(&runtime_root);
+            Err(error)
+        }
+    }
 }
 
 pub(crate) fn workspace_pointer_path() -> Result<PathBuf, String> {
@@ -1006,7 +1079,7 @@ pub(crate) fn open_workspace() -> Result<Workspace, String> {
     let access_controlled = read_access_control(&root)?.is_some();
     let editor_lease = acquire_editor_lease(&root, writable && !access_controlled);
     let editor = editor_lease.active;
-    let (runtime_root, runtime_guard) = create_runtime_root(&root, writable)?;
+    let (runtime_root, runtime_guard) = create_runtime_root()?;
     if editor {
         cleanup_stale_partial_backups(&root);
         let attachment_staging = root.join("attachment-staging");
@@ -1378,8 +1451,7 @@ impl Workspace {
     pub(crate) fn for_test(root: PathBuf, editor: bool) -> Self {
         fs::create_dir_all(&root).expect("test workspace root");
         let lease = acquire_editor_lease(&root, editor);
-        let (runtime_root, runtime_guard) =
-            create_runtime_root(&root, true).expect("test runtime root");
+        let (runtime_root, runtime_guard) = create_runtime_root().expect("test runtime root");
         Self {
             root,
             runtime_root,
@@ -2420,14 +2492,135 @@ mod tests {
     }
 
     #[test]
-    fn read_only_viewer_uses_system_temp_for_runtime_files() {
-        let root = std::env::temp_dir().join(format!("sbk-readonly-runtime-{}", Uuid::new_v4()));
+    fn runtime_stays_local_for_editors_and_viewers_without_changing_shared_data() {
+        let root = std::env::temp_dir().join(format!("sbk-local-runtime-{}", Uuid::new_v4()));
         ensure_workspace(&root).expect("workspace");
-        let (runtime, guard) = create_runtime_root(&root, false).expect("viewer runtime root");
-        assert!(!runtime.starts_with(&root));
-        assert!(runtime.join(".instance.lock").is_file());
+        let database = root.join("staff").join("database.sqlite");
+        let attachment = root.join("attachments").join("document.pdf");
+        let legacy_runtime = root
+            .join("runtime-cache")
+            .join(format!("instance-{}", Uuid::new_v4()));
+        fs::create_dir(&legacy_runtime).expect("legacy runtime");
+        fs::write(legacy_runtime.join(".instance.lock"), b"").expect("legacy lock");
+        fs::write(legacy_runtime.join("preview.png"), b"older running client")
+            .expect("legacy preview");
+        fs::write(&database, b"existing database must not change").expect("database marker");
+        fs::write(&attachment, b"authoritative original").expect("attachment marker");
+
+        for editor in [true, false] {
+            let workspace = Workspace::for_test(root.clone(), editor);
+            let runtime = workspace.runtime_root().to_path_buf();
+            assert_eq!(workspace.root, root);
+            assert!(runtime.starts_with(local_runtime_base().unwrap()));
+            assert!(!runtime.starts_with(&root));
+            assert!(runtime.join(".instance.lock").is_file());
+            fs::write(runtime.join("preview.png"), b"local disposable preview")
+                .expect("local preview");
+            drop(workspace);
+            assert!(
+                !runtime.exists(),
+                "closing removes only this local instance"
+            );
+        }
+
+        assert_eq!(
+            fs::read(database).unwrap(),
+            b"existing database must not change"
+        );
+        assert_eq!(fs::read(attachment).unwrap(), b"authoritative original");
+        assert_eq!(
+            fs::read(legacy_runtime.join("preview.png")).unwrap(),
+            b"older running client"
+        );
+        assert!(legacy_runtime.join(".instance.lock").is_file());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn runtime_cleanup_only_removes_unlocked_recognized_instances() {
+        let base = std::env::temp_dir().join(format!("sbk-runtime-cleanup-{}", Uuid::new_v4()));
+        let (active, active_guard) = create_runtime_root_in(&base).expect("active runtime");
+        let (stale, stale_guard) = create_runtime_root_in(&base).expect("stale runtime");
+        drop(stale_guard);
+        let unrelated = base.join("instance-user-document");
+        fs::create_dir(&unrelated).expect("unrelated directory");
+        fs::write(unrelated.join(".instance.lock"), b"").expect("unrelated lock");
+        let (next, next_guard) = create_runtime_root_in(&base).expect("next runtime");
+        assert!(active.is_dir(), "an active instance must not be cleaned");
+        assert!(
+            !stale.exists(),
+            "an unlocked stale local instance is disposable"
+        );
+        assert!(unrelated.is_dir(), "unrecognized names must not be removed");
+        drop(active_guard);
+        drop(next_guard);
+        assert!(next.is_dir());
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn runtime_concurrent_launches_keep_every_active_directory() {
+        let base = std::env::temp_dir().join(format!("sbk-runtime-launches-{}", Uuid::new_v4()));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let base = base.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    create_runtime_root_in(&base).expect("concurrent runtime")
+                })
+            })
+            .collect();
+        let instances: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().expect("runtime thread"))
+            .collect();
+        for (path, _) in &instances {
+            assert!(path.join(".instance.lock").is_file());
+            assert_eq!(
+                instances.iter().filter(|(other, _)| other == path).count(),
+                1
+            );
+        }
+        drop(instances);
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_directories_are_private_and_cleanup_does_not_follow_symlinks() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let root = std::env::temp_dir().join(format!("sbk-runtime-private-{}", Uuid::new_v4()));
+        let base = root.join("local-cache");
+        let foreign = root.join("do-not-touch");
+        fs::create_dir_all(&foreign).expect("foreign data");
+        fs::write(foreign.join(".instance.lock"), b"").expect("foreign lock");
+        fs::write(foreign.join("original.pdf"), b"preserve").expect("foreign document");
+        fs::create_dir(&base).expect("cache");
+        let alias = base.join(format!("instance-{}", Uuid::new_v4()));
+        symlink(&foreign, &alias).expect("symlink");
+
+        let (runtime, guard) = create_runtime_root_in(&base).expect("private runtime");
+        for path in [&base, &runtime] {
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+        assert!(
+            fs::symlink_metadata(&alias)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read(foreign.join("original.pdf")).unwrap(), b"preserve");
+        assert!(
+            create_runtime_root_in(&alias).is_err(),
+            "cache root must not be a symlink"
+        );
         drop(guard);
-        let _ = fs::remove_dir_all(runtime);
         let _ = fs::remove_dir_all(root);
     }
 

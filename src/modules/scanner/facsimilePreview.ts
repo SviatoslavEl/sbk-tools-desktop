@@ -210,7 +210,8 @@ export function previewCacheKey(input: PreviewCacheKeyInput): string {
 export class BoundedPreviewCache<T> {
   private readonly values = new Map<string, T>();
 
-  constructor(private readonly limit = 8, private readonly maxWeight = Infinity, private readonly weight: (value: T) => number = () => 1) {}
+  constructor(private readonly limit = 8, private readonly maxWeight = Infinity, private readonly weight: (value: T) => number = () => 1,
+    private readonly dispose: (value: T) => void = () => undefined) {}
 
   has(key: string): boolean { return this.values.has(key); }
 
@@ -223,17 +224,23 @@ export class BoundedPreviewCache<T> {
   }
 
   set(key: string, value: T): void {
+    const previous = this.values.get(key);
     this.values.delete(key);
+    if (previous !== undefined && previous !== value) this.dispose(previous);
     this.values.set(key, value);
     while (this.values.size > this.limit || this.totalWeight > this.maxWeight) {
       const oldest = this.values.keys().next().value;
       if (oldest === undefined) break;
+      const evicted = this.values.get(oldest)!;
       this.values.delete(oldest);
+      this.dispose(evicted);
     }
   }
 
   clear(): void {
+    const values = [...this.values.values()];
     this.values.clear();
+    values.forEach(this.dispose);
   }
 
   get size(): number {

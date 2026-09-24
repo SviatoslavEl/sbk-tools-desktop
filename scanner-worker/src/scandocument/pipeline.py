@@ -6,7 +6,7 @@ import threading
 from collections import deque
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -178,12 +178,14 @@ def process_document(
     callback: ProgressCallback | None = None,
     cancellation: CancellationToken | None = None,
     expected_source_fingerprint: str | None = None,
+    preview_cache_dir: Path | None = None,
 ) -> tuple[list[str], float | None, str, list[dict[str, Any]]]:
     import pypdfium2 as pdfium
     from scandocument.pdf_engine import StreamingPdfWriter, render_page
     from scandocument.preview_cache import source_fingerprint
 
     token = cancellation or CancellationToken()
+    token.check()
     warnings: list[str] = []
     requested_output = request.output_path.expanduser()
     # Do not resolve the final component for no-clobber saves: an existing
@@ -198,17 +200,23 @@ def process_document(
         raise SaveError("Выберите другое имя для результата, чтобы не перезаписать исходный документ.")
     kind = detect_kind(source)
     SecureWorkspace.cleanup_stale()
-    with SecureWorkspace() as workspace:
+    with SecureWorkspace() as workspace, ExitStack() as prepared_resources:
         pdf_source = source
         prepared_warnings: list[str] = []
+        prepared_document: PreviewDocument | None = None
         if kind == "docx":
-            from scandocument.docx_engine import convert_docx_to_pdf
-
             token.check()
-            _validate_docx_conversion_space(source, [workspace])
             _notify(callback, "Подготовка DOCX", 0, 1, 2)
-            pdf_source = workspace / "converted.pdf"
-            prepared_warnings = convert_docx_to_pdf(source, pdf_source, lambda: token.cancelled)
+            # Preview and export must use the same conversion revision. The
+            # context retains both the parser and its temporary-file lifetime;
+            # an absent/unavailable cache still uses a private conversion.
+            prepared_document = prepared_resources.enter_context(
+                open_preview_document(source, token, preview_cache_dir)
+            )
+            if prepared_document.fingerprint != initial_fingerprint:
+                raise ScanDocumentError("Исходный документ изменился во время подготовки. Откройте его повторно.")
+            pdf_source = prepared_document.pdf_source
+            prepared_warnings = prepared_document.warnings
         info = inspect_document(
             source,
             cancelled=lambda: token.cancelled,
@@ -233,7 +241,8 @@ def process_document(
                 f"Недостаточно места: для безопасной обработки требуется около {estimated_output * 2 // 1024 // 1024 + 64} МБ."
             )
         try:
-            document = pdfium.PdfDocument(str(pdf_source))
+            document = (prepared_document.document if prepared_document is not None
+                        else pdfium.PdfDocument(str(pdf_source)))
         except Exception as exc:
             raise ScanDocumentError("Документ не удалось подготовить к обработке.") from exc
         source_total = len(document)
@@ -363,7 +372,8 @@ def process_document(
             writer.abort()
             raise
         finally:
-            document.close()
+            if prepared_document is None:
+                document.close()
 
 
 @dataclass
@@ -375,10 +385,14 @@ class PreviewDocument:
     fingerprint: str
 
     def check_source(self) -> None:
-        from scandocument.preview_cache import source_fingerprint
+        _check_source_fingerprint(self.source, self.fingerprint)
 
-        if source_fingerprint(self.source) != self.fingerprint:
-            raise ScanDocumentError("Исходный документ изменился. Откройте обновлённый файл повторно.")
+
+def _check_source_fingerprint(source: Path, expected: str) -> None:
+    from scandocument.preview_cache import source_fingerprint
+
+    if source_fingerprint(source) != expected:
+        raise ScanDocumentError("Исходный документ изменился. Откройте обновлённый файл повторно.")
 
 
 def _cache_preview_conversion(staged_pdf: Path, cached_pdf: Path | None, warnings: list[str]) -> Path:
@@ -446,6 +460,9 @@ def open_preview_document(
                 staged_pdf = workspace / "preview.pdf"
                 prepared_warnings = convert_docx_to_pdf(source, staged_pdf, lambda: token.cancelled)
                 token.check()
+                # Never publish a conversion made while its source was changing
+                # under the old revision key, even when this request is rejected.
+                _check_source_fingerprint(source, fingerprint)
                 pdf_source = _cache_preview_conversion(staged_pdf, cached_pdf, prepared_warnings)
         else:
             prepared_warnings = []
@@ -462,6 +479,7 @@ def open_preview_document(
             recovered_pdf = workspace / "preview-recovered.pdf"
             prepared_warnings = convert_docx_to_pdf(source, recovered_pdf, lambda: token.cancelled)
             token.check()
+            _check_source_fingerprint(source, fingerprint)
             pdf_source = _cache_preview_conversion(recovered_pdf, cached_pdf, prepared_warnings)
             document = pdfium.PdfDocument(str(pdf_source))
         try:
