@@ -1,5 +1,6 @@
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { readTextFile, writeTextFile } from "./storage";
+import { assertNetworkAccess } from "./networkDiagnostics";
 
 const isTauri = () => "__TAURI_INTERNALS__" in window;
 
@@ -7,6 +8,7 @@ export async function chooseOpenPath(
   title: string,
   extensions: string[],
 ): Promise<string | null> {
+  assertNetworkAccess();
   if (!isTauri()) return null;
   const result = await open({
     title,
@@ -18,12 +20,14 @@ export async function chooseOpenPath(
 }
 
 export async function chooseOpenPaths(title: string, extensions: string[]): Promise<string[]> {
+  assertNetworkAccess();
   if (!isTauri()) return [];
   const result = await open({ title, multiple: true, directory: false, filters: [{ name: title, extensions }] });
   return Array.isArray(result) ? result : typeof result === "string" ? [result] : [];
 }
 
 export async function chooseDirectory(title: string): Promise<string | null> {
+  assertNetworkAccess();
   if (!isTauri()) return null;
   const result = await open({ title, multiple: false, directory: true });
   return typeof result === "string" ? result : null;
@@ -34,6 +38,7 @@ export async function chooseSavePath(
   defaultPath: string,
   extensions: string[],
 ): Promise<string | null> {
+  assertNetworkAccess();
   if (!isTauri()) return defaultPath;
   return save({
     title,

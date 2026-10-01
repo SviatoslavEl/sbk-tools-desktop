@@ -32,8 +32,11 @@ describe("предпросмотр сканера", () => {
 
     expect(component).toContain('"open_scanner_output", { path, reveal: action === "reveal" }');
     expect(component).toContain("revealGeneratedFile(resultPath)");
-    expect(capability).toContain('"path": "$HOME/**"');
-    expect(capability).toContain('"path": "$TEMP/**"');
+    // Opening files goes through the native network gate; the generic opener
+    // must not provide an alternate path while workspace access is paused.
+    expect(capability).not.toContain("opener:allow-open-path");
+    expect(component).not.toContain('@tauri-apps/plugin-opener');
+    expect(component).toContain('from "../../lib/networkDiagnostics"');
   });
 
   it("показывает инструменты и эффекты рядом с документом", () => {

@@ -111,7 +111,32 @@ impl EditorLease {
     }
 
     fn cleanup_pending(&self) -> bool {
-        !self.active && self.presence_path.is_some()
+        !self.active
+            && (self.presence_path.is_some() || self.edit.is_some() || self.guard.is_some())
+    }
+
+    fn release_handles(&mut self) -> Result<(), String> {
+        self.release_handles_with(fs2::FileExt::unlock)
+    }
+
+    fn release_handles_with(
+        &mut self,
+        unlock: impl Fn(&File) -> std::io::Result<()>,
+    ) -> Result<(), String> {
+        for handle in [&mut self.edit, &mut self.guard] {
+            if let Some(file) = handle.as_ref() {
+                // Closing only our descriptor is insufficient if a child
+                // temporarily inherited the same open file description. Only
+                // unlock our own handles, after resolving our presence claim.
+                unlock(file).map_err(|error| {
+                    format!(
+                        "Не удалось подтвердить снятие собственной файловой блокировки: {error}"
+                    )
+                })?;
+                handle.take();
+            }
+        }
+        Ok(())
     }
 
     fn release_checked(&mut self) -> Result<(), String> {
@@ -126,9 +151,9 @@ impl EditorLease {
         // both locked handles until its claim has actually been removed.
         self.active = false;
         let Some(path) = self.presence_path.clone() else {
-            self.edit.take();
-            self.guard.take();
-            return Ok(());
+            let result = self.release_handles();
+            self.cleanup_error = result.as_ref().err().cloned();
+            return result;
         };
         let result = (|| {
             let root = path.parent().ok_or("Не определена рабочая папка")?;
@@ -143,7 +168,8 @@ impl EditorLease {
                     // SMB can disappear after the initial directory check.
                     // Missing claim is success only when its parent is freshly
                     // readable and still confirms absence, not a network error.
-                    return confirm_claim_absent_after_error(&path, &error);
+                    confirm_claim_absent_after_error(&path, &error)?;
+                    return self.release_handles();
                 }
                 Err(error) => {
                     return Err(format!("Не удалось проверить собственный сеанс: {error}"));
@@ -154,8 +180,7 @@ impl EditorLease {
             if presence.token != self.token {
                 // No longer ours. Forget local ownership, never touch replacement.
                 self.presence_path = None;
-                self.edit.take();
-                self.guard.take();
+                self.release_handles()?;
                 return Err(
                     "Запись принадлежит другому сеансу; чужая блокировка не изменена".into(),
                 );
@@ -165,15 +190,15 @@ impl EditorLease {
                     "Запись сеанса изменилась во время освобождения; повторите проверку".into(),
                 );
             }
-            remove(&path)
-                .map_err(|error| format!("Не удалось удалить запись собственного сеанса: {error}"))
+            remove(&path).map_err(|error| {
+                format!("Не удалось удалить запись собственного сеанса: {error}")
+            })?;
+            self.release_handles()
         })();
         match result {
             Ok(()) => {
                 self.presence_path = None;
                 self.cleanup_error = None;
-                self.edit.take();
-                self.guard.take();
                 Ok(())
             }
             Err(error) => {
@@ -189,7 +214,7 @@ impl EditorLease {
 
 impl Drop for EditorLease {
     fn drop(&mut self) {
-        if self.presence_path.is_some()
+        if (self.presence_path.is_some() || self.edit.is_some() || self.guard.is_some())
             && let Err(error) = self.release_checked()
         {
             log_release_error(&self.token, &error);
@@ -1044,6 +1069,13 @@ pub(crate) fn prepare_workspace_location(
 }
 
 pub(crate) fn open_workspace() -> Result<Workspace, String> {
+    crate::diagnostics::measure(
+        crate::diagnostics::Operation::WorkspaceOpen,
+        open_workspace_inner,
+    )
+}
+
+fn open_workspace_inner() -> Result<Workspace, String> {
     let (preferred, mut portable, mut configured) = product_directory()?;
     let mut root = preferred.clone();
     let mut warning = None;
@@ -1118,6 +1150,12 @@ fn cleanup_stale_partial_backups(root: &Path) {
 }
 
 impl Workspace {
+    pub(crate) fn refresh_access_control_read_only(&self) -> Result<(), String> {
+        self.access_controlled
+            .store(read_access_control(&self.root)?.is_some(), Ordering::SeqCst);
+        Ok(())
+    }
+
     pub(crate) fn runtime_root(&self) -> &Path {
         &self.runtime_root
     }
@@ -1211,6 +1249,12 @@ impl Workspace {
     }
 
     pub(crate) fn release_editor_on_exit(&self) -> Result<(), String> {
+        crate::diagnostics::measure(crate::diagnostics::Operation::ModeSwitch, || {
+            self.release_editor_on_exit_inner()
+        })
+    }
+
+    fn release_editor_on_exit_inner(&self) -> Result<(), String> {
         // Closing the application never needs a password. This only drops the
         // current process's lease and is also called explicitly by Tauri's Exit
         // event, because std::process::exit does not run Rust Drop handlers.
@@ -1362,6 +1406,12 @@ impl Workspace {
     }
 
     pub(crate) fn require_editor(&self) -> Result<(), String> {
+        crate::diagnostics::measure(crate::diagnostics::Operation::WorkspaceAccess, || {
+            self.require_editor_inner()
+        })
+    }
+
+    fn require_editor_inner(&self) -> Result<(), String> {
         let mut lease = self
             .editor_lease
             .lock()
@@ -1613,6 +1663,67 @@ mod tests {
         let next = acquire_editor_lease(&root, true);
         assert!(next.active);
         drop(next);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn confirmed_release_unlocks_even_while_duplicated_descriptors_remain_open() {
+        // A concurrent process spawn can temporarily inherit an open file
+        // description. Duplicating the descriptors reproduces that lifetime
+        // deterministically, without timing-dependent subprocess scheduling.
+        let root = std::env::temp_dir().join(format!("sbk-release-duplicate-{}", Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let mut lease = acquire_editor_lease(&root, true);
+        assert!(lease.active);
+        let duplicate_edit = lease.edit.as_ref().unwrap().try_clone().unwrap();
+        let duplicate_guard = lease.guard.as_ref().unwrap().try_clone().unwrap();
+        lease.release_checked().unwrap();
+        let next = acquire_editor_lease(&root, true);
+        let next_active = next.active;
+        drop(next);
+        drop(duplicate_edit);
+        drop(duplicate_guard);
+        drop(lease);
+        fs::remove_dir_all(root).unwrap();
+        assert!(
+            next_active,
+            "a confirmed release must unlock, not merely close its original descriptors"
+        );
+    }
+
+    #[test]
+    fn failed_partial_unlock_keeps_remaining_handle_for_checked_retry() {
+        let root =
+            std::env::temp_dir().join(format!("sbk-release-unlock-retry-{}", Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let mut lease = acquire_editor_lease(&root, true);
+        assert!(lease.active);
+        let duplicate_guard = lease.guard.as_ref().unwrap().try_clone().unwrap();
+        lease.active = false;
+        // Simulate a successful claim removal followed by a failure unlocking
+        // the second owned marker. The first marker is already unlocked.
+        fs::remove_file(root.join(EDITOR_PRESENCE_FILE)).unwrap();
+        let calls = std::cell::Cell::new(0);
+        let result = lease.release_handles_with(|file| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 2 {
+                Err(std::io::ErrorKind::PermissionDenied.into())
+            } else {
+                fs2::FileExt::unlock(file)
+            }
+        });
+        assert!(result.is_err());
+        assert!(lease.cleanup_pending());
+        assert!(lease.edit.is_none() && lease.guard.is_some());
+        assert!(!acquire_editor_lease(&root, true).active);
+        lease.release_checked().unwrap();
+        assert!(!lease.cleanup_pending());
+        assert!(lease.edit.is_none() && lease.guard.is_none());
+        let next = acquire_editor_lease(&root, true);
+        assert!(next.active);
+        drop(next);
+        drop(duplicate_guard);
+        drop(lease);
         fs::remove_dir_all(root).unwrap();
     }
 

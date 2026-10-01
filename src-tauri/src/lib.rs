@@ -37,7 +37,12 @@ mod attachments;
 mod backup_regression_tests;
 mod backup_restore;
 mod database;
+mod diagnostics;
+mod diagnostics_commands;
 mod intelligence;
+mod network_diagnostics;
+#[cfg(test)]
+mod network_transition_regression_tests;
 mod proposals;
 mod publication;
 mod scanner_outputs;
@@ -55,6 +60,10 @@ use workspace::{
 };
 
 const GUI_READY_TOKEN_ENV: &str = "SBK_ONEFILE_GUI_READY_TOKEN";
+// Preserve the previous ordering of synchronous IPC commands without running
+// their file/database I/O on the GUI thread. Local diagnosis/status bypass this
+// queue so they remain reachable even while an OS network call is waiting.
+static COMMAND_DISPATCH: Mutex<()> = Mutex::new(());
 
 fn gui_ready_marker_path_for(token: &str, temp: &Path) -> Option<PathBuf> {
     let token = Uuid::parse_str(token).ok()?;
@@ -404,11 +413,18 @@ fn workspace_health_impl(workspace: &Workspace) -> WorkspaceHealth {
 
 #[tauri::command]
 async fn workspace_health(state: State<'_, AppState>) -> Result<WorkspaceHealth, String> {
+    let permit = network_diagnostics::enter_operation()?;
     // Deliberately no require_editor, lease cleanup, migrations or write probes.
     let workspace = state.active_workspace()?;
-    tauri::async_runtime::spawn_blocking(move || workspace_health_impl(workspace.as_ref()))
-        .await
-        .map_err(|error| format!("Проверка состояния недоступна: {error}"))
+    tauri::async_runtime::spawn_blocking(move || {
+        let _permit = permit;
+        let diagnostic = diagnostics::begin(diagnostics::Operation::DirectoryScan);
+        let result = workspace_health_impl(workspace.as_ref());
+        diagnostic.success();
+        result
+    })
+    .await
+    .map_err(|error| format!("Проверка состояния недоступна: {error}"))
 }
 
 #[derive(Serialize)]
@@ -728,10 +744,12 @@ fn initialize_workspace_in_background(startup: Arc<StartupWorkspace>) {
         return;
     }
     thread::spawn(move || {
+        let diagnostic = diagnostics::begin(diagnostics::Operation::Startup);
         startup.set_stage("Проверяем рабочую папку", 1);
         let workspace = match open_workspace() {
             Ok(workspace) => workspace,
             Err(error) => {
+                diagnostic.failure(diagnostics::ErrorCategory::from_message(&error));
                 startup.fail(error, false);
                 return;
             }
@@ -742,6 +760,7 @@ fn initialize_workspace_in_background(startup: Arc<StartupWorkspace>) {
                     .to_string()
             });
             drop(workspace);
+            diagnostic.failure(diagnostics::ErrorCategory::NotFound);
             startup.fail(message, true);
             return;
         }
@@ -754,6 +773,7 @@ fn initialize_workspace_in_background(startup: Arc<StartupWorkspace>) {
                 open_optional_database_read_only(&workspace.root, module).map(|_| ())
             };
             if let Err(error) = result {
+                diagnostic.failure(diagnostics::ErrorCategory::from_message(&error));
                 startup.fail(
                     format!("Не удалось открыть раздел «{module}»: {error}"),
                     false,
@@ -766,13 +786,16 @@ fn initialize_workspace_in_background(startup: Arc<StartupWorkspace>) {
         if workspace.is_editor()
             && let Err(error) = intelligence::recover_interrupted_jobs(&workspace.root)
         {
+            diagnostic.failure(diagnostics::ErrorCategory::from_message(&error));
             startup.fail(
                 format!("Не удалось восстановить очередь обработки: {error}"),
                 false,
             );
             return;
         }
-        if let Err(error) = startup.finish(workspace) {
+        let result = startup.finish(workspace);
+        diagnostic.result(&result);
+        if let Err(error) = result {
             startup.fail(error, false);
         }
     });
@@ -812,7 +835,158 @@ fn retry_workspace_initialization(state: State<'_, AppState>) -> StartupStatus {
 }
 
 #[tauri::command]
+fn network_access_status() -> network_diagnostics::NetworkStatus {
+    network_diagnostics::gate().status()
+}
+
+fn emit_network_status(app: &AppHandle) {
+    let _ = app.emit(
+        "network-access-changed",
+        network_diagnostics::gate().status(),
+    );
+}
+
+fn authorize_network_disconnect(
+    workspace: &Workspace,
+    gate: &network_diagnostics::NetworkGate,
+    password: &str,
+) -> Result<(), String> {
+    administration::authenticate(&workspace.root, password)?;
+    gate.start_disconnect()
+}
+
+fn finish_network_disconnect(
+    workspace: &Workspace,
+    gate: &network_diagnostics::NetworkGate,
+    maintenance: &Mutex<()>,
+    timeout: Duration,
+) -> Result<(), String> {
+    gate.wait_for_idle(timeout)?;
+    let _maintenance = maintenance.lock().map_err(|_| "Хранилище недоступно")?;
+    // No admitted operation remains. Release only the lease owned by this
+    // process; a failed/uncertain release must never be presented as offline.
+    workspace.release_editor_on_exit()?;
+    if workspace.is_editor() || workspace.editor_cleanup_pending() {
+        return Err("Освобождение собственной сессии не подтверждено".into());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn disconnect_workspace_network(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    password: String,
+) -> Result<network_diagnostics::NetworkStatus, String> {
+    diagnostics::measure(diagnostics::Operation::NetworkDisconnect, || {
+        disconnect_workspace_network_inner(app, state, password)
+    })
+}
+
+fn disconnect_workspace_network_inner(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    password: String,
+) -> Result<network_diagnostics::NetworkStatus, String> {
+    let password = Zeroizing::new(password);
+    let gate = network_diagnostics::gate();
+    let _transition = gate
+        .transition
+        .try_lock()
+        .map_err(|_| "Изменение подключения уже выполняется")?;
+    if gate.disconnected() {
+        return Ok(gate.status());
+    }
+    let workspace = state.active_workspace()?;
+    {
+        let _maintenance = state
+            .maintenance
+            .lock()
+            .map_err(|_| "Хранилище недоступно")?;
+        // This is the existing, per-workspace owner credential. No cached UI
+        // unlock, fixed password, alternate verifier, or editor-password bypass.
+        authorize_network_disconnect(&workspace, gate, &password)?;
+    }
+    emit_network_status(&app);
+    if let Ok(jobs) = state.scanner_jobs.lock() {
+        for cancellation in jobs.values() {
+            cancellation.store(true, Ordering::SeqCst);
+        }
+    }
+    let result = finish_network_disconnect(
+        &workspace,
+        gate,
+        &state.maintenance,
+        Duration::from_secs(30),
+    );
+    gate.finish_disconnect(&result);
+    emit_network_status(&app);
+    result?;
+    Ok(gate.status())
+}
+
+fn reconnect_workspace_read_only(workspace: &Workspace) -> Result<(), String> {
+    // Never call acquire_editor/open_workspace here, even when the ordinary
+    // workspace password is absent. Reconnection always starts in view mode.
+    workspace.release_editor_on_exit()?;
+    validate_workspace_layout(&workspace.root)?;
+    workspace.refresh_access_control_read_only()?;
+    for module in MODULES {
+        let _ = open_optional_database_read_only(&workspace.root, module)?;
+    }
+    if workspace.is_editor() || workspace.editor_cleanup_pending() {
+        return Err("Для подключения сначала завершите освобождение собственной сессии".into());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn reconnect_workspace_network(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<network_diagnostics::NetworkStatus, String> {
+    diagnostics::measure(diagnostics::Operation::NetworkReconnect, || {
+        reconnect_workspace_network_inner(app, state)
+    })
+}
+
+fn reconnect_workspace_network_inner(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<network_diagnostics::NetworkStatus, String> {
+    let gate = network_diagnostics::gate();
+    let _transition = gate
+        .transition
+        .try_lock()
+        .map_err(|_| "Изменение подключения уже выполняется")?;
+    if gate.connected() {
+        return Ok(gate.status());
+    }
+    let workspace = state.active_workspace()?;
+    gate.start_reconnect()?;
+    emit_network_status(&app);
+    let result = (|| {
+        gate.wait_for_idle(Duration::from_secs(30))?;
+        let _maintenance = state
+            .maintenance
+            .lock()
+            .map_err(|_| "Хранилище недоступно")?;
+        reconnect_workspace_read_only(&workspace)
+    })();
+    gate.finish_reconnect(&result);
+    emit_network_status(&app);
+    result?;
+    Ok(gate.status())
+}
+
+#[tauri::command]
 fn workspace_info(state: State<'_, AppState>) -> Result<WorkspaceInfo, String> {
+    diagnostics::measure(diagnostics::Operation::WorkspaceStatus, || {
+        workspace_info_inner(state)
+    })
+}
+
+fn workspace_info_inner(state: State<'_, AppState>) -> Result<WorkspaceInfo, String> {
     let _maintenance = state
         .maintenance
         .lock()
@@ -843,7 +1017,10 @@ fn workspace_info(state: State<'_, AppState>) -> Result<WorkspaceInfo, String> {
         owner_configured: administration::configured(&workspace.root).unwrap_or(true),
         administration_notice: workspace.admin_notice(),
         schema_version: SCHEMA_VERSION,
-        free_space_bytes: fs2::available_space(&workspace.root).unwrap_or(0),
+        free_space_bytes: diagnostics::measure(diagnostics::Operation::FreeSpaceProbe, || {
+            fs2::available_space(&workspace.root).map_err(|error| error.to_string())
+        })
+        .unwrap_or(0),
     })
 }
 
@@ -920,6 +1097,15 @@ fn setup_workspace_owner(
 
 #[tauri::command]
 fn workspace_owner_info(state: State<'_, AppState>, password: String) -> Result<OwnerInfo, String> {
+    diagnostics::measure(diagnostics::Operation::WorkspaceAccess, || {
+        workspace_owner_info_inner(state, password)
+    })
+}
+
+fn workspace_owner_info_inner(
+    state: State<'_, AppState>,
+    password: String,
+) -> Result<OwnerInfo, String> {
     let _maintenance = state
         .maintenance
         .lock()
@@ -1078,6 +1264,67 @@ fn configure_workspace_location(selected: &Path, pointer: &Path) -> Result<Strin
 #[tauri::command]
 fn quit_application(app: AppHandle) {
     app.exit(0);
+}
+
+fn authorized_document_path(workspace_root: &Path, path: &Path) -> Result<PathBuf, String> {
+    let root = workspace_root
+        .canonicalize()
+        .map_err(|_| "Рабочая папка недоступна")?;
+    let attachments = root
+        .join("attachments")
+        .canonicalize()
+        .map_err(|_| "Папка вложений недоступна")?;
+    let path = path.canonicalize().map_err(|_| "Документ недоступен")?;
+    if !attachments.starts_with(&root) || !path.starts_with(&attachments) || !path.is_file() {
+        return Err(
+            "Разрешено открывать только документы из вложений текущей рабочей папки".into(),
+        );
+    }
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if !matches!(
+        extension.as_str(),
+        "pdf"
+            | "doc"
+            | "docx"
+            | "xls"
+            | "xlsx"
+            | "csv"
+            | "txt"
+            | "rtf"
+            | "odt"
+            | "ods"
+            | "ppt"
+            | "pptx"
+            | "png"
+            | "jpg"
+            | "jpeg"
+            | "tif"
+            | "tiff"
+            | "bmp"
+            | "webp"
+            | "zip"
+    ) {
+        return Err("Этот тип вложения нельзя открывать из приложения. Исполняемые файлы, ярлыки и сценарии запрещены.".into());
+    }
+    Ok(path)
+}
+
+#[tauri::command]
+fn open_document_path(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<(), String> {
+    let _permit = network_diagnostics::enter_operation()?;
+    let workspace = state.active_workspace()?;
+    let path = authorized_document_path(&workspace.root, Path::new(&path))?;
+    app.opener()
+        .open_path(scanner_outputs::shell_path(&path)?, None::<&str>)
+        .map_err(|_| "Не удалось открыть документ в системном приложении".to_string())
 }
 
 #[tauri::command]
@@ -1596,6 +1843,16 @@ fn open_optional_database_read_only(
 
 #[tauri::command]
 fn list_records(
+    state: State<'_, AppState>,
+    module: String,
+    include_archived: Option<bool>,
+) -> Result<Vec<StoredRecord>, String> {
+    diagnostics::measure(diagnostics::Operation::DatabaseRead, || {
+        list_records_inner(state, module, include_archived)
+    })
+}
+
+fn list_records_inner(
     state: State<'_, AppState>,
     module: String,
     include_archived: Option<bool>,
@@ -3079,8 +3336,10 @@ async fn read_scanner_preview(
     state: State<'_, AppState>,
     path: String,
 ) -> Result<tauri::ipc::Response, String> {
+    let permit = network_diagnostics::enter_operation()?;
     let workspace = state.active_workspace()?;
     let bytes = tauri::async_runtime::spawn_blocking(move || {
+        let _permit = permit;
         scanner_previews::read(workspace.runtime_root(), Path::new(&path))
     })
     .await
@@ -3143,7 +3402,9 @@ impl Drop for PartialBackup {
 }
 
 fn create_backup_impl(workspace: &Workspace, module: Option<String>) -> Result<BackupInfo, String> {
-    create_backup_with_limits(workspace, module, BACKUP_LIMITS)
+    diagnostics::measure(diagnostics::Operation::Backup, || {
+        create_backup_with_limits(workspace, module, BACKUP_LIMITS)
+    })
 }
 
 fn create_backup_with_limits(
@@ -4201,24 +4462,28 @@ fn verify_runtime_file(path: &Path, expected: &RuntimeFileMeta) -> Result<(), St
 fn verify_packaged_runtime(worker: &Path, runtime_root: &Path) -> Result<(), String> {
     RUNTIME_VERIFICATION
         .get_or_init(|| {
-            let manifest: RuntimeManifest = serde_json::from_str(TRUSTED_RUNTIME_MANIFEST)
-                .map_err(|_| "Встроенный manifest компонентов повреждён".to_string())?;
-            if manifest.schema_version != 1 || manifest.resources.is_empty() {
-                return Err("Встроенный manifest компонентов имеет неизвестную версию".to_string());
-            }
-            verify_runtime_file(worker, &manifest.worker)?;
-            let resources = runtime_root.join("resources");
-            for (relative, expected) in &manifest.resources {
-                let relative_path = Path::new(relative);
-                if relative_path
-                    .components()
-                    .any(|component| !matches!(component, Component::Normal(_)))
-                {
-                    return Err("Встроенный manifest содержит опасный путь".to_string());
+            diagnostics::measure(diagnostics::Operation::RuntimeVerification, || {
+                let manifest: RuntimeManifest = serde_json::from_str(TRUSTED_RUNTIME_MANIFEST)
+                    .map_err(|_| "Встроенный manifest компонентов повреждён".to_string())?;
+                if manifest.schema_version != 1 || manifest.resources.is_empty() {
+                    return Err(
+                        "Встроенный manifest компонентов имеет неизвестную версию".to_string()
+                    );
                 }
-                verify_runtime_file(&resources.join(relative_path), expected)?;
-            }
-            Ok(())
+                verify_runtime_file(worker, &manifest.worker)?;
+                let resources = runtime_root.join("resources");
+                for (relative, expected) in &manifest.resources {
+                    let relative_path = Path::new(relative);
+                    if relative_path
+                        .components()
+                        .any(|component| !matches!(component, Component::Normal(_)))
+                    {
+                        return Err("Встроенный manifest содержит опасный путь".to_string());
+                    }
+                    verify_runtime_file(&resources.join(relative_path), expected)?;
+                }
+                Ok(())
+            })
         })
         .clone()
 }
@@ -4680,14 +4945,11 @@ fn run_scanner_worker(
     let mut child = command
         .spawn()
         .map_err(|error| format!("Не удалось запустить локальный модуль обработки: {error}"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "Worker не открыл канал прогресса".to_string())?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| "Worker не открыл канал ошибок".to_string())?;
+    let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
+        terminate_scanner_tree(&mut child);
+        let _ = child.wait();
+        return Err("Worker не открыл каналы вывода".to_string());
+    };
     let (sender, receiver) = std::sync::mpsc::channel::<String>();
     let stdout_thread = thread::spawn(move || {
         for line in BufReader::new(stdout).lines().map_while(Result::ok) {
@@ -4735,7 +4997,17 @@ fn run_scanner_worker(
             }
             return Err("Обработка отменена. Исходный документ не изменён.".to_string());
         }
-        if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
+        let status = match child.try_wait() {
+            Ok(status) => status,
+            Err(error) => {
+                terminate_scanner_tree(&mut child);
+                let _ = child.wait();
+                let _ = stdout_thread.join();
+                let _ = stderr_thread.join();
+                return Err(error.to_string());
+            }
+        };
+        if let Some(status) = status {
             let _ = stdout_thread.join();
             while let Ok(line) = receiver.try_recv() {
                 if let Ok(event) = serde_json::from_str::<Value>(&line) {
@@ -4833,9 +5105,15 @@ fn scanner_source_revision_for(path: &Path) -> Result<String, String> {
 
 #[tauri::command]
 async fn scanner_source_revision(path: String) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || scanner_source_revision_for(Path::new(&path)))
-        .await
-        .map_err(|error| error.to_string())?
+    let permit = network_diagnostics::enter_operation()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _permit = permit;
+        diagnostics::measure(diagnostics::Operation::Scanner, || {
+            scanner_source_revision_for(Path::new(&path))
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 // Planning is advisory only. The worker's no-clobber publication is the final
@@ -4876,8 +5154,12 @@ async fn scanner_plan_outputs(
     directory: String,
     names: Vec<String>,
 ) -> Result<Vec<String>, String> {
+    let permit = network_diagnostics::enter_operation()?;
     tauri::async_runtime::spawn_blocking(move || {
-        plan_scanner_outputs(Path::new(&directory), &names)
+        let _permit = permit;
+        diagnostics::measure(diagnostics::Operation::DirectoryScan, || {
+            plan_scanner_outputs(Path::new(&directory), &names)
+        })
     })
     .await
     .map_err(|error| error.to_string())?
@@ -4891,6 +5173,7 @@ async fn scanner_run(
     operation: String,
     config: Value,
 ) -> Result<Value, String> {
+    let permit = network_diagnostics::enter_operation()?;
     let workspace = state.active_workspace()?;
     let jobs = state.scanner_jobs.clone();
     Uuid::parse_str(&job_id).map_err(|_| "Некорректный идентификатор задачи".to_string())?;
@@ -4903,6 +5186,11 @@ async fn scanner_run(
             return Err("Задача сканера с таким идентификатором уже выполняется".to_string());
         }
         registered.insert(job_id.clone(), cancellation.clone());
+        // A previously admitted async call may register just after disconnect
+        // collected cancellation tokens. It must observe the closed gate too.
+        if !network_diagnostics::gate().connected() {
+            cancellation.store(true, Ordering::SeqCst);
+        }
     }
     let requested_output = if operation == "process" || operation == "merge" {
         config
@@ -4912,7 +5200,10 @@ async fn scanner_run(
     } else {
         None
     };
-    let result = tauri::async_runtime::spawn_blocking(move || {
+    let outputs = state.scanner_outputs.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _permit = permit;
+        let diagnostic = diagnostics::begin(diagnostics::Operation::Scanner);
         let result = run_scanner_worker(
             app,
             workspace,
@@ -4927,20 +5218,19 @@ async fn scanner_run(
         if let Ok(mut registered) = jobs.lock() {
             registered.remove(&job_id);
         }
-        result
+        diagnostic.result(&result);
+        let result = result?;
+        if let Some(requested) = requested_output {
+            let produced = result
+                .get("outputPath")
+                .and_then(Value::as_str)
+                .ok_or("Не удалось подтвердить путь созданного PDF.")?;
+            outputs.register(&requested, Path::new(produced))?;
+        }
+        Ok(result)
     })
     .await
-    .map_err(|error| error.to_string())??;
-    if let Some(requested) = requested_output {
-        let produced = result
-            .get("outputPath")
-            .and_then(Value::as_str)
-            .ok_or("Не удалось подтвердить путь созданного PDF.")?;
-        state
-            .scanner_outputs
-            .register(&requested, Path::new(produced))?;
-    }
-    Ok(result)
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -4950,8 +5240,10 @@ async fn open_scanner_output(
     path: String,
     reveal: Option<bool>,
 ) -> Result<(), String> {
+    let permit = network_diagnostics::enter_operation()?;
     let outputs = state.scanner_outputs.clone();
     tauri::async_runtime::spawn_blocking(move || {
+        let _permit = permit;
         let reveal = reveal.unwrap_or(false);
         let authorized = outputs.resolve(Path::new(&path), reveal)?;
         if reveal {
@@ -5000,6 +5292,9 @@ fn delete_runtime_file(state: State<'_, AppState>, path: String) -> Result<(), S
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    diagnostics::initialize();
+    #[cfg(not(feature = "installed-fast-start"))]
+    let startup_diagnostic = diagnostics::begin(diagnostics::Operation::Startup);
     #[cfg(feature = "installed-fast-start")]
     let workspace = Arc::new(StartupWorkspace::new());
     #[cfg(not(feature = "installed-fast-start"))]
@@ -5024,7 +5319,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        .setup(|app| {
+        .setup(move |app| {
             start_runtime_verification(app.handle());
             #[cfg(not(feature = "installed-fast-start"))]
             if let Some(marker) = gui_ready_marker_path() {
@@ -5043,6 +5338,8 @@ pub fn run() {
                 let startup = app.state::<AppState>().workspace.clone();
                 initialize_workspace_in_background(startup);
             }
+            #[cfg(not(feature = "installed-fast-start"))]
+            startup_diagnostic.success();
             Ok(())
         })
         .manage(AppState {
@@ -5051,76 +5348,127 @@ pub fn run() {
             scanner_outputs: Arc::new(scanner_outputs::ScannerOutputs::default()),
             maintenance: Arc::new(Mutex::new(())),
         })
-        .invoke_handler(tauri::generate_handler![
-            proposals::proposal_render,
-            proposals::proposal_cleanup_preview,
-            proposals::proposal_open_output,
-            report_startup_ui_visible,
-            startup_status,
-            retry_workspace_initialization,
-            workspace_info,
-            workspace_health,
-            switch_workspace_mode,
-            set_workspace_access_password,
-            setup_workspace_owner,
-            workspace_owner_info,
-            request_editor_release,
-            recover_workspace_editor_session,
-            intelligence_provider_status,
-            validate_intelligence_configuration,
-            analysis_job_list,
-            analysis_job_cancel,
-            set_workspace_location,
-            quit_application,
-            read_xlsx,
-            read_docx_table,
-            write_xlsx,
-            write_contract_report_docx,
-            write_contract_report_pdf,
-            list_records,
-            get_record,
-            record_history,
-            restore_history_version,
-            upsert_record,
-            import_records_atomic,
-            update_records_atomic,
-            import_contracts_with_company_directory_atomic,
-            update_contracts_and_company_directory_atomic,
-            save_contract_with_company_directory_atomic,
-            archive_record,
-            archive_records,
-            save_draft,
-            read_draft,
-            clear_draft,
-            delete_record,
-            delete_records,
-            copy_attachment,
-            discard_staged_attachments,
-            delete_attachment,
-            audit_attachments,
-            prune_history,
-            write_text_file,
-            read_text_file,
-            read_binary_file,
-            read_scanner_preview,
-            create_backup,
-            create_registry_archive,
-            create_encrypted_backup,
-            verify_encrypted_backup,
-            restore_encrypted_backup,
-            list_backups,
-            set_backup_pinned,
-            delete_backup,
-            rotate_backups,
-            verify_backup,
-            restore_backup,
-            scanner_run,
-            scanner_source_revision,
-            scanner_plan_outputs,
-            open_scanner_output,
-            scanner_cancel,
-            delete_runtime_file,
-        ])
+        .invoke_handler(|invoke| {
+            // Admission is acquired before queueing, so disconnect also waits
+            // for already queued work. Sync handlers run on blocking workers,
+            // never on the native GUI thread. True async handlers additionally
+            // retain their own permit inside their actual I/O worker closure.
+            let local = network_diagnostics::local_command(invoke.message.command());
+            let permit = if local {
+                None
+            } else {
+                match network_diagnostics::enter_operation() {
+                    Ok(permit) => Some(permit),
+                    Err(error) => {
+                        invoke.resolver.reject(error);
+                        return true;
+                    }
+                }
+            };
+            let resolver = invoke.resolver.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                let _permit = permit;
+                let _dispatch = if local {
+                    None
+                } else {
+                    let diagnostic = diagnostics::begin(diagnostics::Operation::CommandQueueWait);
+                    match COMMAND_DISPATCH.lock() {
+                        Ok(guard) => {
+                            diagnostic.success();
+                            Some(guard)
+                        }
+                        Err(_) => {
+                            diagnostic.failure(diagnostics::ErrorCategory::Locked);
+                            resolver.reject(
+                                "Очередь команд недоступна. Закройте приложение обычным способом.",
+                            );
+                            return;
+                        }
+                    }
+                };
+                let handler: fn(tauri::ipc::Invoke) -> bool = tauri::generate_handler![
+                    proposals::proposal_render,
+                    proposals::proposal_cleanup_preview,
+                    proposals::proposal_open_output,
+                    report_startup_ui_visible,
+                    startup_status,
+                    retry_workspace_initialization,
+                    network_access_status,
+                    disconnect_workspace_network,
+                    reconnect_workspace_network,
+                    diagnostics_commands::diagnostic_status,
+                    diagnostics_commands::set_diagnostic_logging,
+                    diagnostics_commands::export_diagnostic_bundle,
+                    workspace_info,
+                    workspace_health,
+                    switch_workspace_mode,
+                    set_workspace_access_password,
+                    setup_workspace_owner,
+                    workspace_owner_info,
+                    request_editor_release,
+                    recover_workspace_editor_session,
+                    intelligence_provider_status,
+                    validate_intelligence_configuration,
+                    analysis_job_list,
+                    analysis_job_cancel,
+                    set_workspace_location,
+                    quit_application,
+                    open_document_path,
+                    read_xlsx,
+                    read_docx_table,
+                    write_xlsx,
+                    write_contract_report_docx,
+                    write_contract_report_pdf,
+                    list_records,
+                    get_record,
+                    record_history,
+                    restore_history_version,
+                    upsert_record,
+                    import_records_atomic,
+                    update_records_atomic,
+                    import_contracts_with_company_directory_atomic,
+                    update_contracts_and_company_directory_atomic,
+                    save_contract_with_company_directory_atomic,
+                    archive_record,
+                    archive_records,
+                    save_draft,
+                    read_draft,
+                    clear_draft,
+                    delete_record,
+                    delete_records,
+                    copy_attachment,
+                    discard_staged_attachments,
+                    delete_attachment,
+                    audit_attachments,
+                    prune_history,
+                    write_text_file,
+                    read_text_file,
+                    read_binary_file,
+                    read_scanner_preview,
+                    create_backup,
+                    create_registry_archive,
+                    create_encrypted_backup,
+                    verify_encrypted_backup,
+                    restore_encrypted_backup,
+                    list_backups,
+                    set_backup_pinned,
+                    delete_backup,
+                    rotate_backups,
+                    verify_backup,
+                    restore_backup,
+                    scanner_run,
+                    scanner_source_revision,
+                    scanner_plan_outputs,
+                    open_scanner_output,
+                    scanner_cancel,
+                    delete_runtime_file,
+                ];
+                if !handler(invoke) {
+                    resolver.reject("Неизвестная команда приложения");
+                }
+            });
+            true
+        })
         .build(tauri::generate_context!())
         .expect("SBK Tools could not start")
         .run(|app, event| {

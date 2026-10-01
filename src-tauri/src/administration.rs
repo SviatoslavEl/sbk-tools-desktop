@@ -23,6 +23,12 @@ pub(crate) struct AdminEvent {
 }
 
 fn open(root: &Path, writable: bool) -> Result<Connection, String> {
+    crate::diagnostics::measure(crate::diagnostics::Operation::AdminDatabaseOpen, || {
+        open_inner(root, writable)
+    })
+}
+
+fn open_inner(root: &Path, writable: bool) -> Result<Connection, String> {
     let flags = if writable {
         OpenFlags::SQLITE_OPEN_READ_WRITE
     } else {
@@ -37,6 +43,12 @@ fn open(root: &Path, writable: bool) -> Result<Connection, String> {
 }
 
 pub(crate) fn configured(root: &Path) -> Result<bool, String> {
+    crate::diagnostics::measure(crate::diagnostics::Operation::AdminDatabaseRead, || {
+        configured_inner(root)
+    })
+}
+
+fn configured_inner(root: &Path) -> Result<bool, String> {
     if !root.join(FILE).exists() {
         return Ok(false);
     }
@@ -87,11 +99,14 @@ pub(crate) fn authenticate(root: &Path, password: &str) -> Result<(), String> {
     if password.len() > 1024 {
         return Err("Неверный пароль владельца".into());
     }
-    let (salt, verifier): (String, String) = open(root, false)?
-        .query_row("SELECT salt,verifier FROM owner WHERE id=1", [], |row| {
-            Ok((row.get(0)?, row.get(1)?))
-        })
-        .map_err(|_| "Владелец не настроен".to_string())?;
+    let (salt, verifier): (String, String) =
+        crate::diagnostics::measure(crate::diagnostics::Operation::AdminDatabaseRead, || {
+            open(root, false)?
+                .query_row("SELECT salt,verifier FROM owner WHERE id=1", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })
+                .map_err(|_| "Владелец не настроен".to_string())
+        })?;
     let salt = STANDARD_NO_PAD
         .decode(salt)
         .map_err(|_| "Настройки владельца повреждены".to_string())?;
@@ -122,6 +137,18 @@ pub(crate) fn record_request(
     reason: &str,
     revoke: bool,
 ) -> Result<(), String> {
+    crate::diagnostics::measure(crate::diagnostics::Operation::AdminDatabaseWrite, || {
+        record_request_inner(root, actor, target, reason, revoke)
+    })
+}
+
+fn record_request_inner(
+    root: &Path,
+    actor: &str,
+    target: &str,
+    reason: &str,
+    revoke: bool,
+) -> Result<(), String> {
     if Uuid::parse_str(target).is_err() || !(3..=500).contains(&reason.trim().chars().count()) {
         return Err("Укажите текущую сессию и причину длиной от 3 до 500 символов".into());
     }
@@ -146,6 +173,12 @@ pub(crate) fn record_request(
 }
 
 pub(crate) fn latest_request(root: &Path, token: &str) -> Result<Option<AdminEvent>, String> {
+    crate::diagnostics::measure(crate::diagnostics::Operation::AdminDatabaseRead, || {
+        latest_request_inner(root, token)
+    })
+}
+
+fn latest_request_inner(root: &Path, token: &str) -> Result<Option<AdminEvent>, String> {
     if !root.join(FILE).exists() {
         return Ok(None);
     }
@@ -155,6 +188,18 @@ pub(crate) fn latest_request(root: &Path, token: &str) -> Result<Option<AdminEve
 
 /// Append to the existing service journal; never rewrite prior events or schemas.
 pub(crate) fn record_session_event(
+    root: &Path,
+    actor: &str,
+    target: &str,
+    action: &str,
+    reason: &str,
+) -> Result<(), String> {
+    crate::diagnostics::measure(crate::diagnostics::Operation::AdminDatabaseWrite, || {
+        record_session_event_inner(root, actor, target, action, reason)
+    })
+}
+
+fn record_session_event_inner(
     root: &Path,
     actor: &str,
     target: &str,
@@ -194,6 +239,12 @@ fn read_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<AdminEvent> {
 }
 
 pub(crate) fn events(root: &Path) -> Result<Vec<AdminEvent>, String> {
+    crate::diagnostics::measure(crate::diagnostics::Operation::AdminDatabaseRead, || {
+        events_inner(root)
+    })
+}
+
+fn events_inner(root: &Path) -> Result<Vec<AdminEvent>, String> {
     let connection = open(root, false)?;
     let mut statement = connection.prepare("SELECT id,created_at,actor,action,target,reason FROM events ORDER BY id DESC LIMIT 100").map_err(|e| e.to_string())?;
     statement

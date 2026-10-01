@@ -24,8 +24,9 @@ describe("modal workspace policy and accessible markup", () => {
     const origin = (attributes: string[]) => ({ closest: (selector: string) => attributes.includes(selector) ? {} : null }) as Pick<HTMLElement, "closest">;
     const ordinary = readModalWorkspaceMarkers(origin(["[data-workspace-mutation]"]));
     const owner = readModalWorkspaceMarkers(origin(["[data-workspace-mutation]", "[data-workspace-viewer-allowed]"]));
-    expect(ordinary).toEqual({ mutation: true, viewerAllowed: false, componentManaged: false });
-    expect(owner).toEqual({ mutation: true, viewerAllowed: true, componentManaged: false });
+    expect(ordinary).toEqual({ mutation: true, viewerAllowed: false, componentManaged: false, networkLocal: false });
+    expect(owner).toEqual({ mutation: true, viewerAllowed: true, componentManaged: false, networkLocal: false });
+    expect(readModalWorkspaceMarkers(origin(["[data-network-offline-allowed]"])).networkLocal).toBe(true);
     const attributes = new Map<string, string>();
     const control = { disabled: false, dataset: {} as Record<string, string>, getAttribute: (key: string) => attributes.get(key) ?? null, setAttribute: (key: string, value: string) => { attributes.set(key, value); }, removeAttribute: (key: string) => { attributes.delete(key); } };
     applyWorkspaceControlAccess(control, workspaceControlIsBlocked(false, false, ordinary.mutation, false, ordinary.viewerAllowed), "Другой редактор");

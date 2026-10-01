@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import "./App.css";
 import { Dialog } from "./components/Dialog";
+import { NetworkDiagnosticsPanel, NetworkOfflineNotice } from "./modules/settings/NetworkDiagnosticsPanel";
+import { networkAccessIsPaused, networkDiagnosticsShortcutLabel, networkPausedMessage, openNetworkDiagnosticsEvent, startNetworkAccessMonitor, subscribeNetworkDiagnosticsShortcut, useNetworkAccess } from "./lib/networkDiagnostics";
 import { AdministrationNotice } from "./components/AdministrationNotice";
 import { ToolIcon } from "./components/ToolIcon";
 import { GlobalSearch } from "./modules/search/GlobalSearch";
@@ -129,6 +131,19 @@ const helpText: Record<ToolId, string> = {
 
 function App() {
   const [workspace, setWorkspace] = useState<WorkspaceInfo | null>(null);
+  const network = useNetworkAccess();
+  const networkPaused = network.phase !== "connected";
+  const [showNetworkDiagnostics, setShowNetworkDiagnostics] = useState(false);
+  useEffect(startNetworkAccessMonitor, []);
+  useEffect(() => {
+    const open = () => setShowNetworkDiagnostics(true);
+    window.addEventListener(openNetworkDiagnosticsEvent, open);
+    const removeShortcut = subscribeNetworkDiagnosticsShortcut(window, open);
+    return () => { window.removeEventListener(openNetworkDiagnosticsEvent, open); removeShortcut(); };
+  }, []);
+  useEffect(() => {
+    if (networkPaused) setWorkspace((value) => value ? { ...value, editor: false, writable: false, accessMessage: networkPausedMessage } : value);
+  }, [networkPaused]);
   const [startup, setStartup] = useState<StartupStatus>({
     stage: "Запускаем СБК Инструменты",
     stageIndex: 0,
@@ -148,10 +163,11 @@ function App() {
     let timer = 0;
     const refreshWorkspace = () => {
       window.clearTimeout(timer);
+      if (networkAccessIsPaused()) return;
       if (!installedFastStart) {
         void getWorkspaceInfo()
           .then((value) => {
-            if (!stopped) setWorkspace(value);
+            if (!stopped && !networkAccessIsPaused()) setWorkspace(value);
           })
           .catch((reason) => {
             if (!stopped) setWorkspaceError(String(reason));
@@ -160,11 +176,11 @@ function App() {
       }
       void getStartupStatus()
         .then(async (status) => {
-          if (stopped) return;
+          if (stopped || networkAccessIsPaused()) return;
           setStartup(status);
           if (status.ready) {
             const value = await getWorkspaceInfo();
-            if (stopped) return;
+            if (stopped || networkAccessIsPaused()) return;
             setWorkspace(value);
             setWorkspaceError("");
             return;
@@ -196,15 +212,15 @@ function App() {
     if (workspace?.root) setAccessTimers(readAccessTimers(workspace.root));
   }, [workspace?.root]);
   useEffect(() => {
-    if (!workspace?.root) return;
+    if (!workspace?.root || networkPaused) return;
     let stopped = false;
     let running = false;
     const refreshAccess = async () => {
-      if (running) return;
+      if (running || networkAccessIsPaused()) return;
       running = true;
       try {
         const next = await getWorkspaceInfo();
-        if (!stopped) {
+        if (!stopped && !networkAccessIsPaused()) {
           setWorkspace(next);
         }
       } catch {
@@ -220,7 +236,7 @@ function App() {
       window.clearInterval(timer);
       window.removeEventListener("focus", refreshAccess);
     };
-  }, [workspace?.root]);
+  }, [workspace?.root, networkPaused]);
   useEffect(() => {
     if (workspace) window.dispatchEvent(new CustomEvent("sbk-workspace-access-status", { detail: workspace }));
   }, [workspace]);
@@ -233,13 +249,13 @@ function App() {
     return () => window.removeEventListener(accessTimerEvent, update);
   }, []);
   useEffect(() => {
-    if (accessTimers.refreshSeconds <= 0) return;
+    if (accessTimers.refreshSeconds <= 0 || networkPaused) return;
     const timer = window.setInterval(
       () => window.dispatchEvent(new Event("sbk-workspace-refresh")),
       accessTimers.refreshSeconds * 1000,
     );
     return () => window.clearInterval(timer);
-  }, [accessTimers.refreshSeconds]);
+  }, [accessTimers.refreshSeconds, networkPaused]);
   useAutomaticBackup(workspace, setWorkspace);
   const chooseFirstWorkspace = async () => {
     const selected = await chooseDirectory(
@@ -322,6 +338,7 @@ function App() {
         <div className="startup-card">
           <div className="brand-mark large">СБК</div>
           <h1>Подготавливаем рабочее пространство</h1>
+          <details className="startup-diagnostics"><summary>Локальная диагностика запуска</summary><NetworkDiagnosticsPanel /></details>
           <p>
             {workspaceError ||
               "Проверяем папку данных, доступ редактора и встроенные модули…"}
@@ -353,6 +370,7 @@ function App() {
                 ? "Не удалось завершить запуск"
                 : "Запускаем СБК Инструменты"}
           </h1>
+          <details className="startup-diagnostics"><summary>Локальная диагностика запуска</summary><NetworkDiagnosticsPanel /></details>
           {startup.needsWorkspace && (
             <p>
               Выберите постоянную папку для баз, документов и резервных копий.
@@ -489,12 +507,12 @@ function App() {
       </div>
     );
   const access = editorStatus(workspace);
-  const accessLabel = workspace.editor ? "Режим редактора" : access.unknown ? "Доступ не подтверждён" : "Режим просмотра";
+  const accessLabel = networkPaused ? "Связь приостановлена" : workspace.editor ? "Режим редактора" : access.unknown ? "Доступ не подтверждён" : "Режим просмотра";
   const workspaceName = workspace.root.split(/[\\/]/).filter(Boolean).slice(-2).join(" / ");
   return (
     <WorkspaceAccessProvider
-      editor={workspace.editor}
-      message={workspace.accessMessage}
+      editor={!networkPaused && workspace.editor}
+      message={networkPaused ? networkPausedMessage : workspace.accessMessage}
     >
       <div className={`app-shell ${collapsed ? "sidebar-collapsed" : ""}`}>
         <a className="skip-link" href="#main-content">Перейти к рабочей области</a>
@@ -592,10 +610,11 @@ function App() {
               <p>{subtitle}</p>
             </div>
             <div className="topbar-actions">
+            <button className="secondary network-diagnostics-button" type="button" title={`Связь с общей базой и локальная диагностика (${networkDiagnosticsShortcutLabel})`} aria-keyshortcuts="Control+Shift+D Meta+Shift+D" onClick={() => setShowNetworkDiagnostics(true)}>Связь и диагностика</button>
             <button className="secondary global-search-button" type="button" aria-label="Глобальный поиск" title="Поиск по рабочей папке (Ctrl/⌘ K)" onClick={() => setShowSearch(true)}><ToolIcon name="search" /><span>Поиск</span></button>
             <button className={`workspace-access-chip ${workspace.editor ? "is-editor" : access.unknown ? "is-unknown" : "is-viewer"}`} type="button" onClick={() => selectTool("settings")} title={workspace.accessMessage} aria-label={`${accessLabel}. Открыть настройки доступа`}>
               <ToolIcon name={workspace.editor ? "check" : "lock"} />
-              <span><strong>{accessLabel}</strong>{!workspace.editor && access.occupied && !access.unknown && <small>Редактор: {access.text}</small>}</span>
+              <span><strong>{accessLabel}</strong>{networkPaused ? <small>Данные не обновляются</small> : !workspace.editor && access.occupied && !access.unknown && <small>Редактор: {access.text}</small>}</span>
             </button>
             <button
               className="help-button"
@@ -612,6 +631,7 @@ function App() {
             </div>
           </header>
           <div ref={contentRef} id="main-content" tabIndex={-1} className={`tool-content ${["contracts", "staff", "counterparties", "procurement"].includes(activeTool) ? "registry-content" : ""}`}>
+            <NetworkOfflineNotice />
             <AdministrationNotice key={`notice-${workspace.root}`} message={workspace.administrationNotice} />
             {scannerOpened && <div hidden={activeTool !== "scanner"} key={`scanner-${workspace.root}`}>
               <ReadOnlyWorkspaceBoundary allowMutations>
@@ -635,6 +655,7 @@ function App() {
             </ReadOnlyWorkspaceBoundary>
           </div>
         </main>
+        {showNetworkDiagnostics && <div data-network-offline-allowed><Dialog title="Связь и диагностика" width="620px" onClose={() => setShowNetworkDiagnostics(false)}><div className="dialog-body" data-network-offline-allowed><NetworkDiagnosticsPanel ownerConfigured={workspace.ownerConfigured} /></div></Dialog></div>}
         {showSearch && <GlobalSearch key={`search-${workspace.root}`} onClose={() => setShowSearch(false)} onNavigate={selectTool} />}
         {showHelp && (
           <Dialog

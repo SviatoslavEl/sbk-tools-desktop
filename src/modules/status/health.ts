@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "../../lib/networkDiagnostics";
 import type { WorkspaceInfo } from "../../lib/storage";
 export interface WorkspaceHealth {
   checkedAt: string; appVersion: string; schemaVersion: number; root: string;

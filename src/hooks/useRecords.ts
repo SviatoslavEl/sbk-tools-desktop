@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { networkAccessIsPaused, networkAccessEvent } from "../lib/networkDiagnostics";
 import {
   archiveRecord,
   archiveRecords,
@@ -16,10 +17,11 @@ export function useRecords<T>(module: ModuleId) {
 
   const reload = useCallback(async () => {
     const currentGeneration = ++generation.current;
+    if (networkAccessIsPaused()) { setLoading(false); return; }
     setLoading(true);
     try {
       const next = await listRecords<T>(module);
-      if (currentGeneration === generation.current) {
+      if (currentGeneration === generation.current && !networkAccessIsPaused()) {
         setRecords(next);
         setError(null);
       }
@@ -33,8 +35,10 @@ export function useRecords<T>(module: ModuleId) {
   useEffect(() => {
     void reload();
     const refresh = () => void reload();
+    const pause = () => { if (networkAccessIsPaused()) { generation.current++; setLoading(false); } };
     window.addEventListener("sbk-workspace-refresh", refresh);
-    return () => window.removeEventListener("sbk-workspace-refresh", refresh);
+    window.addEventListener(networkAccessEvent, pause);
+    return () => { generation.current++; window.removeEventListener("sbk-workspace-refresh", refresh); window.removeEventListener(networkAccessEvent, pause); };
   }, [reload]);
 
   const save = useCallback(async (title: string, payload: T, id?: string) => {

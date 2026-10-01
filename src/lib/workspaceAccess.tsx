@@ -5,6 +5,7 @@ import {
   useLayoutEffect,
   useRef,
 } from "react";
+import { networkPausedMessage, useNetworkAccess } from "./networkDiagnostics";
 
 interface WorkspaceAccessValue {
   editor: boolean;
@@ -113,6 +114,7 @@ export function ReadOnlyWorkspaceBoundary({
   disableFormControls?: boolean;
 }) {
   const access = useWorkspaceAccess();
+  const network = useNetworkAccess();
   const root = useRef<HTMLDivElement>(null);
   useLayoutEffect(() => {
     const container = root.current;
@@ -136,17 +138,25 @@ export function ReadOnlyWorkspaceBoundary({
             control instanceof HTMLInputElement ||
             control instanceof HTMLSelectElement ||
             control instanceof HTMLTextAreaElement;
-          const blocked = workspaceControlIsBlocked(
+          const paused = network.phase !== "connected";
+          // Keep mounted form values, but disable operations and source-file exports.
+          // Closing a dialog is local; diagnostics has its own explicit exemption.
+          const closeControl = control instanceof HTMLButtonElement && (
+            /^(Закрыть|Отмена|Отменить)$/.test(control.textContent?.trim() || "") ||
+            /^Закрыть(?:\s|$)/.test(control.getAttribute("aria-label") || "")
+          );
+          const localControl = Boolean(control.closest("[data-network-offline-allowed]")) || closeControl;
+          const blocked = paused ? !localControl : workspaceControlIsBlocked(
             access.editor,
             allowMutations,
             explicitMutation,
             disableFormControls && formControl,
             viewerAllowed,
           );
-          const disabledOwner = control.closest('[data-workspace-managed-disabled="true"]')
+          const disabledOwner = !paused && control.closest('[data-workspace-managed-disabled="true"]')
             ? "component"
             : "boundary";
-          applyWorkspaceControlAccess(control, blocked, access.message, disabledOwner);
+          applyWorkspaceControlAccess(control, blocked, paused ? networkPausedMessage : access.message, disabledOwner);
         });
     update();
     const observer = new MutationObserver(update);
@@ -158,6 +168,7 @@ export function ReadOnlyWorkspaceBoundary({
     allowMutations,
     disableFormControls,
     children,
+    network.phase,
   ]);
   return (
     <WorkspaceBoundaryPolicyContext.Provider value={{ allowMutations, disableFormControls }}>

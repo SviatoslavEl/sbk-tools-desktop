@@ -1,5 +1,5 @@
 import { useState, type ReactNode } from "react";
-import { openPath } from "@tauri-apps/plugin-opener";
+import { openDocumentPath as openPath } from "../../lib/networkDiagnostics";
 import { DrawerBackdrop } from "../../components/DrawerBackdrop";
 import { VersionHistory } from "../../components/VersionHistory";
 import { getWorkspaceInfo, type ModuleId, type StoredRecord } from "../../lib/storage";

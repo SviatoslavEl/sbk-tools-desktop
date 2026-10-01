@@ -47,6 +47,12 @@ fn backup_database_before_migration(path: &Path, module: &str) -> Result<(), Str
 }
 
 pub(crate) fn open_database(root: &Path, module: &str) -> Result<Connection, String> {
+    crate::diagnostics::measure(crate::diagnostics::Operation::DatabaseWrite, || {
+        open_database_inner(root, module)
+    })
+}
+
+fn open_database_inner(root: &Path, module: &str) -> Result<Connection, String> {
     let path = database_path(root, module)?;
     let existed = path.exists();
     let mut connection = Connection::open(&path)
@@ -248,6 +254,12 @@ pub(crate) fn open_database(root: &Path, module: &str) -> Result<Connection, Str
 }
 
 pub(crate) fn open_database_read_only(root: &Path, module: &str) -> Result<Connection, String> {
+    crate::diagnostics::measure(crate::diagnostics::Operation::DatabaseRead, || {
+        open_database_read_only_inner(root, module)
+    })
+}
+
+fn open_database_read_only_inner(root: &Path, module: &str) -> Result<Connection, String> {
     let path = database_path(root, module)?;
     let connection = Connection::open_with_flags(
         &path,

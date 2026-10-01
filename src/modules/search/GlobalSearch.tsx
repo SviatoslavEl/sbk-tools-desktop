@@ -2,8 +2,10 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Dialog } from "../../components/Dialog";
 import { loadSearchIndex, searchEntries, searchLabels, type SearchEntry, type SearchTool } from "./index";
 import "./search.css";
+import { networkAccessIsPaused, useNetworkAccess } from "../../lib/networkDiagnostics";
 
 export function GlobalSearch({ onClose, onNavigate }: { onClose: () => void; onNavigate: (tool: SearchTool | "archive", id?: string) => void }) {
+  const network = useNetworkAccess();
   const [query, setQuery] = useState("");
   const [tool, setTool] = useState<SearchTool | "all">("all");
   const [archived, setArchived] = useState(false);
@@ -15,14 +17,15 @@ export function GlobalSearch({ onClose, onNavigate }: { onClose: () => void; onN
   const input = useRef<HTMLInputElement>(null);
   useEffect(() => { input.current?.focus(); }, []);
   useEffect(() => {
+    if (network.phase !== "connected") { setLoading(false); return; }
     let stopped = false;
     setLoading(true);
     void loadSearchIndex().then((result) => {
-      if (stopped) return;
+      if (stopped || networkAccessIsPaused()) return;
       setEntries(result.entries); setErrors(result.errors); setUpdated(new Date().toLocaleTimeString("ru"));
     }).catch((error) => { if (!stopped) setErrors([String(error)]); }).finally(() => { if (!stopped) setLoading(false); });
     return () => { stopped = true; };
-  }, [revision]);
+  }, [revision, network.phase]);
   const results = useMemo(() => searchEntries(entries, query, tool, archived), [entries, query, tool, archived]);
   return <Dialog title="Поиск по рабочей папке" onClose={onClose} width="860px">
     <div className="dialog-body global-search" data-workspace-viewer-allowed>

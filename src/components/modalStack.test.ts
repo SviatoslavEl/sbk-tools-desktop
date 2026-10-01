@@ -72,6 +72,21 @@ function fixture() {
 }
 
 describe("shared modal stack", () => {
+  it("keeps local offline diagnostics keyboard-accessible without closing a dirty editor", async () => {
+    const { document, layer } = fixture();
+    const editor = layer("dirty-editor");
+    const notice = editor.backdrop.add(new ElementStub(document, "offline-notice", false));
+    notice.setAttribute("data-network-offline-allowed", "");
+    const diagnostics = notice.add(new ElementStub(document, "open-diagnostics"));
+    diagnostics.focus();
+    expect(document.activeElement).toBe(diagnostics);
+    const panel = layer("diagnostics"); panel.dispose(); await Promise.resolve();
+    expect(document.activeElement).toBe(diagnostics);
+    expect(editor.onClose).not.toHaveBeenCalled();
+    expect(document.key("Tab").defaultPrevented).toBe(true);
+    expect(document.activeElement).toBe(editor.first);
+    editor.dispose();
+  });
   it("stacks directory → company editor → confirmation, then restores focus in reverse order", async () => {
     const { document, launch, layer } = fixture();
     const directory = layer("directory");

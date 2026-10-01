@@ -481,15 +481,18 @@ fn render_worker(
     let mut child = command
         .spawn()
         .map_err(|e| format!("Не удалось запустить подготовку КП: {e}"))?;
-    let stdout = child.stdout.take().ok_or("Нет ответа модуля КП")?;
-    let stderr = child.stderr.take().ok_or("Нет журнала модуля КП")?;
+    let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
+        crate::terminate_scanner_tree(&mut child);
+        let _ = child.wait();
+        return Err("Нет каналов ответа модуля КП".into());
+    };
     let (sender, receiver) = mpsc::channel();
-    std::thread::spawn(move || {
+    let stdout_thread = std::thread::spawn(move || {
         for line in BufReader::new(stdout).lines().map_while(Result::ok) {
             let _ = sender.send(line);
         }
     });
-    std::thread::spawn(move || {
+    let stderr_thread = std::thread::spawn(move || {
         let mut reader = BufReader::new(stderr);
         let _ = std::io::copy(&mut reader, &mut std::io::sink());
     });
@@ -510,6 +513,8 @@ fn render_worker(
             }
             crate::terminate_scanner_tree(&mut child);
             let _ = child.wait();
+            let _ = stdout_thread.join();
+            let _ = stderr_thread.join();
             return Err(if cancellation.load(Ordering::SeqCst) {
                 "Экспорт КП отменён"
             } else {
@@ -531,7 +536,17 @@ fn render_worker(
                 }
             }
         }
-        match child.try_wait().map_err(|e| e.to_string())? {
+        let status = match child.try_wait() {
+            Ok(status) => status,
+            Err(error) => {
+                crate::terminate_scanner_tree(&mut child);
+                let _ = child.wait();
+                let _ = stdout_thread.join();
+                let _ = stderr_thread.join();
+                return Err(error.to_string());
+            }
+        };
+        match status {
             Some(status) => {
                 // stdout may reach EOF just after the process exits.
                 for line in receiver.iter() {
@@ -548,6 +563,8 @@ fn render_worker(
                         }
                     }
                 }
+                let _ = stdout_thread.join();
+                let _ = stderr_thread.join();
                 if !status.success() || error.is_some() {
                     return Err(
                         error.unwrap_or_else(|| "Модуль подготовки КП завершился с ошибкой".into())
@@ -629,6 +646,7 @@ pub(crate) async fn proposal_render(
     format: String,
     output_path: Option<String>,
 ) -> Result<Value, String> {
+    let operation_permit = crate::network_diagnostics::enter_operation()?;
     let workspace = state.active_workspace()?;
     Uuid::parse_str(&job_id).map_err(|_| "Некорректный идентификатор задачи КП")?;
     let jobs = state.scanner_jobs.clone();
@@ -642,7 +660,13 @@ pub(crate) async fn proposal_render(
         }
         guard.insert(job_id.clone(), cancellation.clone());
     }
+    // A pause can begin after admission but before this job joins the registry.
+    if !crate::network_diagnostics::gate().connected() {
+        cancellation.store(true, Ordering::SeqCst);
+    }
     tauri::async_runtime::spawn_blocking(move || {
+        let _operation_permit = operation_permit;
+        let diagnostic = crate::diagnostics::begin(crate::diagnostics::Operation::Scanner);
         let result = render_worker(
             app,
             workspace,
@@ -655,6 +679,7 @@ pub(crate) async fn proposal_render(
         if let Ok(mut guard) = jobs.lock() {
             guard.remove(&job_id);
         }
+        diagnostic.result(&result);
         result
     })
     .await
@@ -662,6 +687,7 @@ pub(crate) async fn proposal_render(
 }
 #[tauri::command]
 pub(crate) fn proposal_cleanup_preview(output_path: String) -> Result<(), String> {
+    let _operation_permit = crate::network_diagnostics::enter_operation()?;
     let path = PathBuf::from(output_path);
     let mut registry = outputs()
         .lock()
@@ -683,6 +709,7 @@ pub(crate) fn proposal_open_output(
     path: String,
     reveal: Option<bool>,
 ) -> Result<(), String> {
+    let _operation_permit = crate::network_diagnostics::enter_operation()?;
     let path = PathBuf::from(path)
         .canonicalize()
         .map_err(|_| "Результат КП недоступен")?;

@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "../../lib/networkDiagnostics";
 
 export interface PreviewImage { url: string; retainedBytes: number }
 

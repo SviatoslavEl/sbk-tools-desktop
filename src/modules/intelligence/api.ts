@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "../../lib/networkDiagnostics";
 
 export const intelligenceCapabilities = ["tender.extract_requirements", "tender.summarize", "tender.generate_questions", "contract.detect_risks", "experience.rank", "team.rank", "document.detect_conflicts", "document.classify", "application.review_completeness"] as const;
 export type IntelligenceCapability = typeof intelligenceCapabilities[number];

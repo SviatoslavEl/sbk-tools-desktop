@@ -57,6 +57,24 @@ class InstalledStartupContractTests(unittest.TestCase):
                 self.frontend.replace("if (status.ready)", "if (true)", 1)
             )
 
+    def test_accepts_additional_network_pause_cancellation_only(self) -> None:
+        original = "if (stopped || networkAccessIsPaused()) return;"
+        self.assertIn(original, self.frontend)
+        contract.check_frontend_startup_readiness(self.frontend)
+        contract.check_frontend_startup_readiness(
+            self.frontend.replace(original, "if (stopped) return;")
+        )
+        for replacement in (
+            "if (networkAccessIsPaused()) return;",
+            "if (stopped && networkAccessIsPaused()) return;",
+            "if (false) return;",
+        ):
+            with self.subTest(replacement=replacement):
+                with self.assertRaisesRegex(SystemExit, "ready backend response"):
+                    contract.check_frontend_startup_readiness(
+                        self.frontend.replace(original, replacement)
+                    )
+
     def test_rejects_delayed_initial_readiness_request(self) -> None:
         original = 'refreshWorkspace();\n    window.addEventListener('
         self.assertIn(original, self.frontend)

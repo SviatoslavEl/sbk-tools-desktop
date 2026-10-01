@@ -31,6 +31,16 @@ interface Layer {
   original: { zIndex: string; inert: string | null; hidden: string | null; modal: string | null; tabIndex: string | null };
 }
 
+function layerContainsFocus(layer: Layer, target: Element | null): boolean {
+  return Boolean(target && (layer.content.contains(target) || (
+    layer.backdrop.contains(target) && target.closest("[data-network-offline-allowed]")
+  )));
+}
+
+function layerControls(layer: Layer): HTMLElement[] {
+  return focusableElements(layer.backdrop).filter((control) => layerContainsFocus(layer, control));
+}
+
 export interface ModalRegistration {
   requestClose: () => void;
   dispose: () => void;
@@ -61,9 +71,11 @@ export class ModalStack {
     this.redirectingFocus = true;
     try {
       const preferred = layer.content.querySelector<HTMLElement>("[autofocus], [data-autofocus]");
-      const last = preferLast && layer.lastFocus && layer.content.contains(layer.lastFocus) && canFocus(layer.lastFocus)
+      const last = preferLast && layer.lastFocus && layerContainsFocus(layer, layer.lastFocus) && canFocus(layer.lastFocus)
         ? layer.lastFocus : null;
-      const target = last || (canFocus(preferred) ? preferred : focusableElements(layer.content)[0]) || layer.content;
+      // The auxiliary diagnostics button participates in Tab traversal, but it
+      // must not steal initial focus from the actual card/confirmation controls.
+      const target = last || (canFocus(preferred) ? preferred : focusableElements(layer.content)[0] || layerControls(layer)[0]) || layer.content;
       target.focus({ preventScroll: true });
       layer.lastFocus = target;
     } finally {
@@ -75,7 +87,7 @@ export class ModalStack {
     const layer = this.top();
     if (!layer || this.redirectingFocus) return;
     const target = event.target as HTMLElement | null;
-    if (target && layer.content.contains(target)) layer.lastFocus = target;
+    if (layerContainsFocus(layer, target)) layer.lastFocus = target;
     else this.focusInside(layer, true);
   };
 
@@ -89,11 +101,11 @@ export class ModalStack {
       return;
     }
     if (event.key !== "Tab") return;
-    const controls = focusableElements(layer.content);
+    const controls = layerControls(layer);
     const active = this.document.activeElement;
     const first = controls[0];
     const last = controls[controls.length - 1];
-    if (!first || !layer.content.contains(active)
+    if (!first || !layerContainsFocus(layer, active)
       || (event.shiftKey ? active === first || active === layer.content : active === last || active === layer.content)) {
       event.preventDefault();
       event.stopPropagation();
@@ -147,7 +159,7 @@ export class ModalStack {
         queueMicrotask(() => {
           if (revision !== this.revision) return;
           const current = this.top();
-          if (canFocus(layer.returnFocus) && (!current || current.content.contains(layer.returnFocus))) {
+          if (canFocus(layer.returnFocus) && (!current || layerContainsFocus(current, layer.returnFocus))) {
             layer.returnFocus.focus({ preventScroll: true });
           } else if (current) this.focusInside(current, true);
         });

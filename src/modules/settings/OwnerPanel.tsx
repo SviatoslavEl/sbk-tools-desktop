@@ -1,9 +1,10 @@
 import { useEffect, useId, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, networkAccessIsPaused, useNetworkAccess } from "../../lib/networkDiagnostics";
 import { ConfirmDialog } from "../../components/Dialog";
 import type { WorkspaceInfo } from "../../lib/storage";
 import { editorStatus } from "../../lib/editorStatus";
 import { OwnerRecoveryDialog, type RecoveryInput } from "./OwnerRecoveryDialog";
+import { NetworkDiagnosticsPanel } from "./NetworkDiagnosticsPanel";
 
 interface OwnerInfo {
   editor?: { token: string; owner: NonNullable<WorkspaceInfo["editorOwner"]> };
@@ -18,11 +19,12 @@ export function OwnerPanel({ workspace }: { workspace: WorkspaceInfo | null }) {
   const panelId = useId();
   return <section className="owner-panel-disclosure" data-workspace-viewer-allowed aria-label="Администрирование сетевой папки">
     <button type="button" className="owner-panel-toggle" aria-expanded={expanded} aria-controls={panelId} onClick={() => setExpanded((value) => !value)}><span>Администрирование сетевой папки</span><span aria-hidden="true">{expanded ? "−" : "+"}</span></button>
-    <div id={panelId} hidden={!expanded}>{expanded && <OwnerPanelContent workspace={workspace} />}</div>
+    <div id={panelId} hidden={!expanded}>{expanded && <><NetworkDiagnosticsPanel ownerConfigured={workspace?.ownerConfigured} /><OwnerPanelContent workspace={workspace} /></>}</div>
   </section>;
 }
 
 function OwnerPanelContent({ workspace }: { workspace: WorkspaceInfo | null }) {
+  const network = useNetworkAccess();
   const [password, setPassword] = useState("");
   const [repeat, setRepeat] = useState("");
   const [workspacePassword, setWorkspacePassword] = useState("");
@@ -46,15 +48,15 @@ function OwnerPanelContent({ workspace }: { workspace: WorkspaceInfo | null }) {
     return () => window.clearTimeout(timer);
   }, [authenticatedAt]);
   useEffect(() => {
-    if (!authenticatedAt || !password) return;
+    if (!authenticatedAt || !password || network.phase !== "connected") return;
     let cancelled = false;
     let refreshing = false;
     const refresh = async () => {
-      if (refreshing || operation.current) return;
+      if (refreshing || operation.current || networkAccessIsPaused()) return;
       refreshing = true;
       try {
         const value = await invoke<OwnerInfo>("workspace_owner_info", { password });
-        if (!cancelled) { setInfo(value); setInfoError(""); }
+        if (!cancelled && !networkAccessIsPaused()) { setInfo(value); setInfoError(""); }
       } catch {
         if (!cancelled) { setInfoError("Не удалось обновить сеанс. Действия недоступны до восстановления связи."); setPending(undefined); }
       } finally { refreshing = false; }
@@ -63,7 +65,7 @@ function OwnerPanelContent({ workspace }: { workspace: WorkspaceInfo | null }) {
     const timer = window.setInterval(() => void refresh(), 3000);
     window.addEventListener("focus", refresh);
     return () => { cancelled = true; window.clearInterval(timer); window.removeEventListener("focus", refresh); };
-  }, [authenticatedAt, password]);
+  }, [authenticatedAt, password, network.phase]);
   const run = async (action: () => Promise<void>) => {
     if (operation.current) return;
     operation.current = true;

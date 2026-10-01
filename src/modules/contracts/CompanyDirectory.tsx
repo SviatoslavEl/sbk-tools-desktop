@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { openPath } from "@tauri-apps/plugin-opener";
+import { openDocumentPath as openPath, networkAccessEvent, networkAccessIsPaused, networkPausedMessage } from "../../lib/networkDiagnostics";
 import { Dialog } from "../../components/Dialog";
 import { CollapsibleEditorBlock } from "../../components/CollapsibleEditorBlock";
 import { DrawerBackdrop } from "../../components/DrawerBackdrop";
@@ -65,10 +65,11 @@ export function useCompanyDirectory(contracts: StoredRecord<ContractData>[]) {
 
   const reload = useCallback(() => {
     const currentGeneration = ++reloadGeneration.current;
+    if (networkAccessIsPaused()) { setLoading(false); setEditor(false); return Promise.resolve(); }
     const task = reloadQueue.current
       .catch(() => undefined)
       .then(async () => {
-        if (currentGeneration !== reloadGeneration.current) return;
+        if (currentGeneration !== reloadGeneration.current || networkAccessIsPaused()) return;
         setLoading(true);
         try {
           const [stored, workspace] = await Promise.all([
@@ -78,7 +79,7 @@ export function useCompanyDirectory(contracts: StoredRecord<ContractData>[]) {
             ),
             getWorkspaceInfo(),
           ]);
-          if (currentGeneration !== reloadGeneration.current) return;
+          if (currentGeneration !== reloadGeneration.current || networkAccessIsPaused()) return;
           setEditor(workspace.editor);
           setAccessMessage(workspace.accessMessage);
           const migration = buildCompanyDirectoryMigration(
@@ -122,12 +123,15 @@ export function useCompanyDirectory(contracts: StoredRecord<ContractData>[]) {
   useEffect(() => {
     void reload();
     const refresh = () => void reload();
+    const pause = () => { if (networkAccessIsPaused()) { reloadGeneration.current++; setLoading(false); setEditor(false); setAccessMessage(networkPausedMessage); } };
     const unsubscribe = subscribeCompanyDirectoryRefresh(window, refresh);
     window.addEventListener(workspaceAccessInvalidatedEvent, refresh);
+    window.addEventListener(networkAccessEvent, pause);
     return () => {
       reloadGeneration.current += 1;
       unsubscribe();
       window.removeEventListener(workspaceAccessInvalidatedEvent, refresh);
+      window.removeEventListener(networkAccessEvent, pause);
     };
   }, [reload]);
 

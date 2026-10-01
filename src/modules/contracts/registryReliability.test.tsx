@@ -20,7 +20,7 @@ vi.mock("react", async (original) => ({
 }));
 vi.mock("../../lib/workspaceAccess", async (original) => ({ ...await original<typeof import("../../lib/workspaceAccess")>(), useWorkspaceAccess: () => ({ editor: hooks.editor, message: "" }) }));
 
-type Props = { children?: ReactNode; onClick?: () => void; disabled?: boolean; onClose?: () => void; value?: unknown };
+type Props = { children?: ReactNode; onClick?: () => void; disabled?: boolean; onClose?: () => void; value?: unknown; onChange?: (event: { target: { value: string } }) => void };
 function text(node: ReactNode): string {
   if (typeof node === "string" || typeof node === "number") return String(node);
   if (Array.isArray(node)) return node.map(text).join("");
@@ -36,6 +36,22 @@ const company = { ...emptyCompany("2026-09-17", "test"), name: "Тестовая
 
 describe("actual registry save handlers retain drafts on failure", () => {
   beforeEach(() => { hooks.values = []; hooks.refs = []; hooks.editor = true; });
+  it.each(["contract", "staff", "company"] as const)("%s retains edited fields when access becomes viewer and never auto-saves on reconnection", (kind) => {
+    const onSave = vi.fn(); const onClose = vi.fn();
+    const original = kind === "contract" ? "ТЕСТ-1" : kind === "staff" ? "Тестовый сотрудник" : "Тестовая компания";
+    const render = () => {
+      hooks.stateIndex = 0; hooks.refIndex = 0;
+      return kind === "contract" ? ContractEditor({ initialValue: contract, companies: [], onSave, onClose }) : kind === "staff" ? StaffEditor({ initialValue: staff, onSave, onClose }) : CompanyEditor({ company, companies: [], readOnly: !hooks.editor, onSave, onClose });
+    };
+    find(render(), (type, props) => type === "input" && props.value === original)!.onChange!({ target: { value: "Несохранённое изменение" } });
+    hooks.editor = false;
+    expect(find(render(), (type, props) => type === "input" && props.value === "Несохранённое изменение")).toBeDefined();
+    find(render(), (type, props) => type === "button" && text(props.children).startsWith("Сохранить"))!.onClick!();
+    expect(onSave).not.toHaveBeenCalled(); expect(onClose).not.toHaveBeenCalled();
+    hooks.editor = true;
+    expect(find(render(), (type, props) => type === "input" && props.value === "Несохранённое изменение")).toBeDefined();
+    expect(onSave).not.toHaveBeenCalled();
+  });
   it.each(["contract", "staff", "company"] as const)("%s prevents duplicate writes and close while pending, then supports retry", async (kind) => {
     let reject!: (reason: Error) => void;
     const onSave = vi.fn().mockImplementationOnce(() => new Promise((_, fail) => { reject = fail; })).mockResolvedValue(undefined);

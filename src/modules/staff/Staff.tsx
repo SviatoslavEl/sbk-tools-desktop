@@ -1,6 +1,6 @@
 import { Fragment, useEffect, useId, useMemo, useRef, useState } from "react";
 import { useViewState } from "../../hooks/useViewState";
-import { openPath } from "@tauri-apps/plugin-opener";
+import { openDocumentPath as openPath } from "../../lib/networkDiagnostics";
 import { ConfirmDialog, Dialog } from "../../components/Dialog";
 import { DrawerBackdrop } from "../../components/DrawerBackdrop";
 import { CollapsibleEditorBlock } from "../../components/CollapsibleEditorBlock";

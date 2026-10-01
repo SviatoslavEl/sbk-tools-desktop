@@ -41,10 +41,13 @@ def check_frontend_startup_readiness(frontend: str) -> None:
 
     if "startupDelayElapsed" in frontend or "setStartupDelayElapsed" in frontend:
         raise SystemExit("Startup must not restore the artificial splash delay")
-    if (
-        "if(status.ready){constvalue=awaitgetWorkspaceInfo();"
-        "if(stopped)return;setWorkspace(value);"
-    ) not in compact:
+    # Network pause adds a second cancellation condition after the awaited read;
+    # neither cancellation nor actual backend readiness may be bypassed.
+    if not re.search(
+        r"if\(status\.ready\)\{constvalue=awaitgetWorkspaceInfo\(\);"
+        r"if\(stopped(?:\|\|networkAccessIsPaused\(\))?\)return;setWorkspace\(value\);",
+        compact,
+    ):
         raise SystemExit("Installed workspace must come from the ready backend response")
     if "refreshWorkspace();window.addEventListener(" not in compact:
         raise SystemExit("Workspace readiness must be requested immediately on mount")

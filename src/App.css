@@ -856,6 +856,24 @@ input[type="checkbox"]:disabled, input[type="radio"]:disabled { cursor: not-allo
 .owner-panel input, .owner-panel textarea { width: 100%; min-width: 0; }
 .owner-panel .button-row { display: flex; flex-wrap: wrap; gap: 8px; }
 .owner-panel td { overflow-wrap: anywhere; }
+.network-diagnostics-panel { display: grid; gap: 12px; max-width: 760px; min-width: 0; padding: 16px; margin-block: 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
+.network-diagnostics-panel h3 { margin: 0; font-size: 14px; }
+.network-diagnostics-panel p { margin: 0; line-height: 1.5; }
+.network-diagnostics-panel .inline-heading { flex-wrap: wrap; gap: 8px; }
+.network-diagnostics-panel label { display: grid; gap: 6px; }
+.network-diagnostics-panel input { min-width: 0; width: 100%; }
+.network-diagnostics-panel .button-row { display: flex; flex-wrap: wrap; gap: 8px; }
+.network-diagnostics-logging { display: grid; gap: 10px; border-top: 1px solid var(--line); padding-top: 14px; }
+.network-offline-notice { display: flex; flex-direction: row; align-items: center; align-self: start; flex-shrink: 0; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
+.network-offline-notice > div { display: grid; gap: 4px; flex: 1 1 260px; }
+.network-offline-notice button { flex-shrink: 0; }
+.dialog-backdrop > .network-offline-notice, .drawer-backdrop > .network-offline-notice { position: fixed; z-index: 2; bottom: 12px; left: 12px; width: min(520px, calc(100vw - 24px)); margin: 0; box-shadow: var(--shadow); }
+.network-diagnostics-button { font-size: 11px; }
+.network-overlay-access { position: fixed; z-index: 2; bottom: 12px; left: 12px; }
+.network-overlay-access button { padding: 7px 10px; font-size: 11px; background: var(--surface); box-shadow: var(--shadow); }
+.startup-diagnostics { margin-top: 16px; text-align: left; }
+.startup-diagnostics summary { cursor: pointer; color: var(--text-muted); font-size: 12px; }
+@media (max-width: 1000px) { .topbar-actions { flex-wrap: wrap; gap: 6px; } .network-diagnostics-button { padding: 6px 8px; } }
 .administration-notice { position: fixed; left: 16px; bottom: 16px; z-index: 500; width: min(370px, calc(100vw - 32px)); max-height: 50vh; overflow: auto; box-shadow: 0 8px 30px rgba(15, 23, 42, .18); }
 .administration-notice .icon-button { float: right; }
 /* Field help and validation are separate readable lines, not inline fragments. */

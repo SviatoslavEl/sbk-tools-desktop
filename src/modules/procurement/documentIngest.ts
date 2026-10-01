@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "../../lib/networkDiagnostics";
 import { chooseOpenPath } from "../../lib/files";
 import { copyAttachment } from "../../lib/storage";
 import type { DocumentTextFragment, ProcurementDocumentVersion } from "./types";

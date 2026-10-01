@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "../../lib/networkDiagnostics";
 import { Dialog } from "../../components/Dialog";
 import { VersionHistory } from "../../components/VersionHistory";
 import { useRecords } from "../../hooks/useRecords";

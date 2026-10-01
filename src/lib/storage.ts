@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "./networkDiagnostics";
 import { trackedOperation } from "./activity";
 
 export type ModuleId =

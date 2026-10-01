@@ -1,23 +1,24 @@
 import { useEffect } from "react";
+import { networkAccessIsPaused } from "../lib/networkDiagnostics";
 import { startActivity } from "../lib/activity";
 import { createBackup, getWorkspaceInfo, rotateBackups, type WorkspaceInfo } from "../lib/storage";
 import { AutomaticBackupGate, lastAutomaticBackupAttemptKey, lastAutomaticBackupKey, readSharedBackupPolicy, saveSharedBackupPolicy, sharedBackupPolicyEvent, workspaceLocalKey, type SharedBackupPolicySnapshot } from "../lib/sharedWorkspace";
 
 export function useAutomaticBackup(workspace: WorkspaceInfo | null, onWorkspace: (next: WorkspaceInfo) => void) {
   useEffect(() => {
-    if (!workspace?.editor) return;
+    if (!workspace?.editor || networkAccessIsPaused()) return;
     let stopped = false;
     let checking = false;
     const gate = new AutomaticBackupGate();
     const root = workspace.root;
     const run = async () => {
-      if (checking || stopped) return;
+      if (checking || stopped || networkAccessIsPaused()) return;
       checking = true;
       let finish: ReturnType<typeof startActivity> | undefined;
       let snapshot: SharedBackupPolicySnapshot | undefined;
       try {
         const current = await getWorkspaceInfo();
-        if (stopped || current.root !== root) return;
+        if (stopped || networkAccessIsPaused() || current.root !== root) return;
         onWorkspace(current);
         if (!current.editor) return;
         snapshot = await readSharedBackupPolicy(root);

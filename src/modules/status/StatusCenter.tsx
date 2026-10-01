@@ -3,9 +3,11 @@ import { activityEvent, getActivities, type ActivityEntry } from "../../lib/acti
 import type { WorkspaceInfo } from "../../lib/storage";
 import { readSharedBackupPolicy, type SharedBackupPolicySnapshot } from "../../lib/sharedWorkspace";
 import { getWorkspaceHealth, type WorkspaceHealth } from "./health";
+import { networkAccessIsPaused, useNetworkAccess } from "../../lib/networkDiagnostics";
 import "./status.css";
 
 export function StatusCenter({ workspace, onSettings }: { workspace: WorkspaceInfo; onSettings: () => void }) {
+  const network = useNetworkAccess();
   const [health, setHealth] = useState<WorkspaceHealth | null>(null);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
@@ -17,11 +19,11 @@ export function StatusCenter({ workspace, onSettings }: { workspace: WorkspaceIn
   const generation = useRef(0);
   const running = useRef(false);
   const refresh = useCallback(async () => {
-    if (running.current) return;
+    if (running.current || networkAccessIsPaused()) return;
     running.current = true; const token = generation.current; setLoading(true);
     try {
       const [next, backupPolicy] = await Promise.allSettled([getWorkspaceHealth(workspaceRef.current), readSharedBackupPolicy(workspace.root)]);
-      if (token === generation.current) {
+      if (token === generation.current && !networkAccessIsPaused()) {
         if (next.status === "fulfilled" && next.value.root === workspace.root) { setHealth(next.value); setError(""); }
         else setError(next.status === "rejected" ? String(next.reason) : "Получено состояние другой рабочей папки. Повторите проверку.");
         if (backupPolicy.status === "fulfilled") { setPolicy(backupPolicy.value); setPolicyError(""); }
@@ -31,11 +33,11 @@ export function StatusCenter({ workspace, onSettings }: { workspace: WorkspaceIn
     catch (reason) { if (token === generation.current) setError(String(reason)); }
     finally { if (token === generation.current) { running.current = false; setLoading(false); } }
   }, [workspace.root]);
-  useEffect(() => { void refresh(); const timer = window.setInterval(() => void refresh(), 15_000); return () => { window.clearInterval(timer); generation.current++; running.current = false; }; }, [refresh]);
+  useEffect(() => { if (network.phase !== "connected") { setLoading(false); return; } void refresh(); const timer = window.setInterval(() => void refresh(), 15_000); return () => { window.clearInterval(timer); generation.current++; running.current = false; }; }, [refresh, network.phase]);
   useEffect(() => { const update = () => setActivities(getActivities()); window.addEventListener(activityEvent, update); return () => window.removeEventListener(activityEvent, update); }, []);
   const latest = health?.backup.latest;
-  const editorUnknown = !health || Boolean(error) || health.issues.some((issue) => issue.code === "editor-state-unknown" || issue.code === "root-unavailable");
-  const backupsUnknown = !health || Boolean(error) || health.issues.some((issue) => issue.code === "backup-list-unavailable" || issue.code === "root-unavailable" || issue.code === "preview");
+  const editorUnknown = network.phase !== "connected" || !health || Boolean(error) || health.issues.some((issue) => issue.code === "editor-state-unknown" || issue.code === "root-unavailable");
+  const backupsUnknown = network.phase !== "connected" || !health || Boolean(error) || health.issues.some((issue) => issue.code === "backup-list-unavailable" || issue.code === "root-unavailable" || issue.code === "preview");
   return <div className="module-stack status-center" data-workspace-viewer-allowed>
     <div className="status-toolbar"><p role="status">{loading ? "Проверяем состояние…" : health ? `Проверено: ${new Date(health.checkedAt).toLocaleString("ru")}` : "Нет результатов проверки"}</p><button type="button" className="secondary" disabled={loading} onClick={() => void refresh()}>Проверить сейчас</button><button type="button" className="secondary" onClick={onSettings}>Настройки и резервные копии</button></div>
     {error && <div className="notice error" role="alert"><strong>Свежая проверка не выполнена.</strong><span>{error}</span><span>Сведения ниже — последние полученные, не подтверждение текущего доступа.</span></div>}
