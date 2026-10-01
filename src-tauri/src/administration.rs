@@ -105,7 +105,10 @@ pub(crate) fn authenticate(root: &Path, password: &str) -> Result<(), String> {
                 .query_row("SELECT salt,verifier FROM owner WHERE id=1", [], |row| {
                     Ok((row.get(0)?, row.get(1)?))
                 })
-                .map_err(|_| "Владелец не настроен".to_string())
+                .map_err(|error| match error {
+                    rusqlite::Error::QueryReturnedNoRows => "Владелец не настроен".to_string(),
+                    other => format!("Не удалось прочитать настройки владельца: {other}"),
+                })
         })?;
     let salt = STANDARD_NO_PAD
         .decode(salt)
@@ -266,7 +269,10 @@ mod tests {
         setup(&root, "test-owner-password-only", "test").unwrap();
         assert!(configured(&root).unwrap());
         assert!(setup(&root, "replacement-password", "other").is_err());
-        assert!(authenticate(&root, "incorrect-password").is_err());
+        assert_eq!(
+            authenticate(&root, "incorrect-password").unwrap_err(),
+            "Неверный пароль владельца"
+        );
         authenticate(&root, "test-owner-password-only").unwrap();
         let bytes = std::fs::read(root.join(FILE)).unwrap();
         assert!(
@@ -295,6 +301,44 @@ mod tests {
                 .is_none()
         );
         assert_eq!(events(&root).unwrap().len(), 7);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn locked_owner_database_rejects_authentication_without_claiming_owner_is_missing() {
+        let root = std::env::temp_dir().join(format!("sbk-owner-auth-locked-{}", Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let password = "synthetic-owner-password-only";
+        setup(&root, password, "synthetic fixture").unwrap();
+        authenticate(&root, password).unwrap();
+        let blocker = Connection::open(root.join(FILE)).unwrap();
+        blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        // Correct credentials cannot authenticate while their verifier cannot
+        // be read. Keep the SQLite cause so local diagnostics classify Locked.
+        let error = authenticate(&root, password).expect_err("locked verifier must fail closed");
+        assert!(error.starts_with("Не удалось прочитать настройки владельца:"));
+        assert!(!error.contains("Владелец не настроен"));
+        assert!(matches!(
+            crate::diagnostics::ErrorCategory::from_message(&error),
+            crate::diagnostics::ErrorCategory::Locked
+        ));
+        blocker.execute_batch("ROLLBACK").unwrap();
+        drop(blocker);
+        authenticate(&root, password).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn empty_owner_table_still_reports_not_configured_and_never_authenticates() {
+        let root = std::env::temp_dir().join(format!("sbk-owner-auth-missing-{}", Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let connection = Connection::open(root.join(FILE)).unwrap();
+        connection.execute_batch("CREATE TABLE owner(id INTEGER PRIMARY KEY, salt TEXT NOT NULL, verifier TEXT NOT NULL)").unwrap();
+        drop(connection);
+        assert_eq!(
+            authenticate(&root, "synthetic-owner-password-only").unwrap_err(),
+            "Владелец не настроен"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 }

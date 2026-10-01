@@ -34,10 +34,13 @@ export function NetworkDiagnosticsPanel({ ownerConfigured = false }: { ownerConf
   const [editorError, setEditorError] = useState("");
   const [diagnostics, setDiagnostics] = useState<DiagnosticStatus | null>(null);
   const [diagnosticError, setDiagnosticError] = useState("");
-  const [message, setMessage] = useState("");
-  const [busy, setBusy] = useState(false);
-  const inFlight = useRef(false);
-  const operationGeneration = useRef(0);
+  const [networkMessage, setNetworkMessage] = useState("");
+  const [localMessage, setLocalMessage] = useState("");
+  const [networkBusy, setNetworkBusy] = useState(false);
+  const [localBusy, setLocalBusy] = useState(false);
+  const networkInFlight = useRef(false);
+  const localInFlight = useRef(false);
+  const localOperationGeneration = useRef(0);
   const mounted = useRef(true);
   useEffect(() => {
     mounted.current = true;
@@ -51,24 +54,32 @@ export function NetworkDiagnosticsPanel({ ownerConfigured = false }: { ownerConf
     let cancelled = false;
     let reading = false;
     const refresh = async () => {
-      if (reading || inFlight.current) return;
+      if (reading || localInFlight.current) return;
       reading = true;
-      const generation = operationGeneration.current;
-      try { const next = await getDiagnosticStatus(); if (!cancelled && generation === operationGeneration.current) { setDiagnostics(next); setDiagnosticError(""); } }
-      catch { if (!cancelled) setDiagnosticError("Не удалось прочитать локальное состояние диагностики."); }
+      const generation = localOperationGeneration.current;
+      try { const next = await getDiagnosticStatus(); if (!cancelled && generation === localOperationGeneration.current) { setDiagnostics(next); setDiagnosticError(""); } }
+      catch { if (!cancelled && generation === localOperationGeneration.current) setDiagnosticError("Не удалось прочитать локальное состояние диагностики."); }
       finally { reading = false; }
     };
     void refresh();
     const timer = window.setInterval(() => void refresh(), 3000);
     return () => { cancelled = true; window.clearInterval(timer); };
   }, [native]);
-  const run = async (action: () => Promise<void>) => {
-    if (inFlight.current) return;
-    inFlight.current = true; operationGeneration.current++; setBusy(true); setMessage("");
-    try { await action(); } catch (error) { if (mounted.current) setMessage(String(error)); }
-    finally { inFlight.current = false; if (mounted.current) setBusy(false); }
+  // A shared-folder request can wait on Windows/SMB. Local diagnostics must
+  // remain usable in this same panel while that request is still pending.
+  const runNetwork = async (action: () => Promise<void>) => {
+    if (networkInFlight.current) return;
+    networkInFlight.current = true; setNetworkBusy(true); setNetworkMessage("");
+    try { await action(); } catch (error) { if (mounted.current) setNetworkMessage(String(error)); }
+    finally { networkInFlight.current = false; if (mounted.current) setNetworkBusy(false); }
   };
-  const disconnect = () => run(async () => {
+  const runLocal = async (action: () => Promise<void>) => {
+    if (localInFlight.current) return;
+    localInFlight.current = true; localOperationGeneration.current++; setLocalBusy(true); setLocalMessage("");
+    try { await action(); } catch (error) { if (mounted.current) setLocalMessage(String(error)); }
+    finally { localInFlight.current = false; if (mounted.current) setLocalBusy(false); }
+  };
+  const disconnect = () => runNetwork(async () => {
     try { await disconnectWorkspaceNetwork(password); }
     finally { if (mounted.current) setPassword(""); }
   });
@@ -84,18 +95,18 @@ export function NetworkDiagnosticsPanel({ ownerConfigured = false }: { ownerConf
       return null;
     }
   };
-  const reconnect = () => run(async () => {
+  const reconnect = () => runNetwork(async () => {
     const result = await reconnectWorkspaceNetwork();
     if (mounted.current && result.phase === "connected") {
-      setMessage("Подключение восстановлено в режиме просмотра. Для редактирования потребуется отдельный обычный вход.");
+      setNetworkMessage("Подключение восстановлено в режиме просмотра. Для редактирования потребуется отдельный обычный вход.");
       await refreshEditorAccess();
     }
   });
-  const enterEditor = () => run(async () => {
+  const enterEditor = () => runNetwork(async () => {
     try {
       const fresh = await refreshEditorAccess();
       if (!fresh || networkAccessIsPaused()) return;
-      if (fresh.editor) { if (mounted.current) setMessage("Обычный режим редактора уже активен на этом компьютере."); return; }
+      if (fresh.editor) { if (mounted.current) setNetworkMessage("Обычный режим редактора уже активен на этом компьютере."); return; }
       const status = editorStatus(fresh);
       if (!status.canAcquire) throw new Error(status.unknown ? "Доступ редактора не подтверждён. Обновите сведения." : `Вход недоступен: ${status.text}. Чужой сеанс не изменён.`);
       if (fresh.accessControlled && !workspacePassword) throw new Error("Введите обычный пароль рабочей папки, не пароль владельца.");
@@ -105,18 +116,18 @@ export function NetworkDiagnosticsPanel({ ownerConfigured = false }: { ownerConf
       const confirmed = await getWorkspaceInfo();
       if (mounted.current && !networkAccessIsPaused()) setEditorWorkspace(confirmed);
       if (!confirmed.editor || networkAccessIsPaused()) throw new Error("Вход редактора не подтверждён. Несохранённые поля остались в карточке.");
-      if (mounted.current) setMessage("Обычный вход редактора выполнен. Закройте только окно диагностики и сохраните изменения в оставшейся открытой карточке.");
+      if (mounted.current) setNetworkMessage("Обычный вход редактора выполнен. Закройте только окно диагностики и сохраните изменения в оставшейся открытой карточке.");
     } finally { if (mounted.current) setWorkspacePassword(""); }
   });
-  const toggleLogging = () => run(async () => {
+  const toggleLogging = () => runLocal(async () => {
     const next = await setDiagnosticLogging(!diagnostics?.enabled);
     if (mounted.current) { setDiagnostics(next); setDiagnosticError(""); }
   });
-  const exportLogs = () => run(async () => {
+  const exportLogs = () => runLocal(async () => {
     const path = await save({ title: "Сохранить диагностику на локальный диск (не в общую папку)", defaultPath: `SBK-diagnostics-${new Date().toISOString().replace(/[:.]/g, "-")}.zip`, filters: [{ name: "Диагностический архив", extensions: ["zip"] }] });
     if (!path) return;
     await exportDiagnosticBundle(path);
-    if (mounted.current) setMessage("Диагностический ZIP сохранён. Он никуда не отправлен. При необходимости отправьте файл вручную.");
+    if (mounted.current) setLocalMessage("Диагностический ZIP сохранён. Он никуда не отправлен. При необходимости отправьте файл вручную.");
   });
   const transitioning = network.phase === "disconnecting" || network.phase === "reconnecting";
   const ordinaryAccess = editorStatus(editorWorkspace);
@@ -129,21 +140,23 @@ export function NetworkDiagnosticsPanel({ ownerConfigured = false }: { ownerConf
     {network.error && <p className="field-error" role="alert">{network.error}</p>}
     {transitioning && <p role="status">Активных операций: {network.activeOperations}. Ожидаем подтверждения от приложения; пока отключение не подтверждено, файловые операции могут ещё завершаться.</p>}
     {(network.phase === "connected" || network.phase === "disconnectFailed") && <>
-      {ownerConfigured ? <label>Пароль владельца для отключения<input type="password" autoComplete="current-password" value={password} disabled={!native || busy || transitioning} onChange={(event) => setPassword(event.target.value)} /></label> : <p className="help-text">Для отключения требуется ранее настроенный владелец общей папки. Локальная диагностика ниже доступна без входа владельца.</p>}
-      <button className="secondary" type="button" disabled={!native || busy || !ownerConfigured || !password || transitioning} onClick={() => void disconnect()}>{network.phase === "disconnectFailed" ? "Повторить завершение отключения" : "Отключить связь на этом компьютере"}</button>
+      {ownerConfigured ? <label>Пароль владельца для отключения<input type="password" autoComplete="current-password" value={password} disabled={!native || networkBusy || transitioning} onChange={(event) => setPassword(event.target.value)} /></label> : <p className="help-text">Для отключения требуется ранее настроенный владелец общей папки. Локальная диагностика ниже доступна без входа владельца.</p>}
+      <button className="secondary" type="button" disabled={!native || networkBusy || !ownerConfigured || !password || transitioning} onClick={() => void disconnect()}>{network.phase === "disconnectFailed" ? "Повторить завершение отключения" : "Отключить связь на этом компьютере"}</button>
     </>}
-    {network.phase !== "connected" && <button className="secondary" type="button" disabled={!native || busy || transitioning} onClick={() => void reconnect()}>Подключить в режиме просмотра</button>}
+    {network.phase !== "connected" && <button className="secondary" type="button" disabled={!native || networkBusy || transitioning} onClick={() => void reconnect()}>Подключить в режиме просмотра</button>}
     {network.phase === "connected" && <div className="network-diagnostics-logging">
-      {!showEditorAccess ? <button className="secondary" type="button" disabled={!native || busy} onClick={() => void run(async () => { await refreshEditorAccess(); })}>Вернуться к редактированию</button> : <>
+      {!showEditorAccess ? <button className="secondary" type="button" disabled={!native || networkBusy} onClick={() => void runNetwork(async () => { await refreshEditorAccess(); })}>Вернуться к редактированию</button> : <>
         <h3>Вернуться к редактированию</h3>
         <p className="help-text">Это отдельный обычный вход в общую папку, без передачи прав владельца и без перехвата занятого сеанса. Открытая карточка остаётся на месте.</p>
         <p role="status">{editorWorkspace?.editor ? "Режим редактора активен" : ordinaryAccess.unknown ? "Доступ редактора не подтверждён" : ordinaryAccess.text}</p>
         {editorError && <p className="field-error" role="alert">{editorError}</p>}
-        {editorWorkspace?.accessControlled && !editorWorkspace.editor && <label>Обычный пароль рабочей папки<input type="password" autoComplete="current-password" value={workspacePassword} disabled={!native || busy || !ordinaryAccess.canAcquire} onChange={(event) => setWorkspacePassword(event.target.value)} /></label>}
+        {editorWorkspace?.accessControlled && !editorWorkspace.editor && <label>Обычный пароль рабочей папки<input type="password" autoComplete="current-password" value={workspacePassword} disabled={!native || networkBusy || !ordinaryAccess.canAcquire} onChange={(event) => setWorkspacePassword(event.target.value)} /></label>}
         {editorWorkspace && !editorWorkspace.accessControlled && !editorWorkspace.editor && <p className="help-text">Для этой папки обычный пароль не настроен. Вход всё равно требует отдельного нажатия и свободного сеанса редактора.</p>}
-        <div className="button-row"><button className="secondary" type="button" disabled={!native || busy} onClick={() => void run(async () => { await refreshEditorAccess(); })}>Обновить доступ редактора</button>{!editorWorkspace?.editor && <button className="primary" type="button" disabled={!native || busy || !ordinaryAccess.canAcquire || Boolean(editorWorkspace?.accessControlled && !workspacePassword)} onClick={() => void enterEditor()}>Войти в обычный режим редактора</button>}</div>
+        <div className="button-row"><button className="secondary" type="button" disabled={!native || networkBusy} onClick={() => void runNetwork(async () => { await refreshEditorAccess(); })}>Обновить доступ редактора</button>{!editorWorkspace?.editor && <button className="primary" type="button" disabled={!native || networkBusy || !ordinaryAccess.canAcquire || Boolean(editorWorkspace?.accessControlled && !workspacePassword)} onClick={() => void enterEditor()}>Войти в обычный режим редактора</button>}</div>
       </>}
     </div>}
+    {networkMessage && <p className="notice" role="status">{networkMessage}</p>}
+    {networkBusy && <p role="status">Ожидаем ответ общей папки. Локальный журнал и экспорт диагностики доступны во время ожидания.</p>}
     <div className="network-diagnostics-logging">
       <h3>Локальный журнал диагностики</h3>
       <p className="help-text">Без паролей, содержимого документов и автоматической отправки. Сохраняются технические события и длительность операций. Экспорт — только в новый ZIP на локальном диске.</p>
@@ -151,9 +164,9 @@ export function NetworkDiagnosticsPanel({ ownerConfigured = false }: { ownerConf
       <p role="status">{diagnostics ? diagnostics.enabled ? "Журналирование включено" : "Журналирование выключено" : native ? "Читаем локальное состояние…" : "Состояние недоступно в предпросмотре"}</p>
       {diagnosticError && <p className="field-error" role="alert">{diagnosticError}</p>}
       {diagnostics && (!diagnostics.available || diagnostics.writeFailures > 0 || diagnostics.droppedEvents > 0) && <p className="notice warning">Журнал может быть неполным: ошибок записи {diagnostics.writeFailures}, пропущено событий {diagnostics.droppedEvents}.{!diagnostics.available && " Локальное хранилище журнала недоступно."}</p>}
-      <div className="button-row"><button className="secondary" type="button" disabled={!native || busy || !diagnostics} onClick={() => void toggleLogging()}>{diagnostics?.enabled ? "Выключить журналирование" : "Включить журналирование"}</button><button className="secondary" type="button" disabled={!native || busy || !diagnostics?.available} onClick={() => void exportLogs()}>Экспорт диагностики…</button></div>
+      <div className="button-row"><button className="secondary" type="button" disabled={!native || localBusy || !diagnostics} onClick={() => void toggleLogging()}>{diagnostics?.enabled ? "Выключить журналирование" : "Включить журналирование"}</button><button className="secondary" type="button" disabled={!native || localBusy || !diagnostics?.available} onClick={() => void exportLogs()}>Экспорт диагностики…</button></div>
+      {localMessage && <p className="notice" role="status">{localMessage}</p>}
+      {localBusy && <p role="status">Выполняем локальное действие…</p>}
     </div>
-    {message && <p className="notice" role="status">{message}</p>}
-    {busy && <p role="status">Выполняем действие…</p>}
   </section>;
 }

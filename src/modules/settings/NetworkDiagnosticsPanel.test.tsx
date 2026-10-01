@@ -157,6 +157,99 @@ describe("network diagnostics panel real handlers and lifecycle", () => {
     expect(nativeInvoke).toHaveBeenCalledWith("reconnect_workspace_network");
     expect(vi.mocked(nativeInvoke).mock.calls.some(([command]) => command === "switch_workspace_mode")).toBe(false);
   });
+  it("exports in the same panel while owner authentication is pending, without duplicate local or network actions", async () => {
+    const disconnect = deferred<NetworkAccessStatus>();
+    const exporting = deferred<void>();
+    vi.mocked(nativeInvoke).mockImplementation(async (command) => {
+      if (command === "disconnect_workspace_network") return disconnect.promise;
+      if (command === "export_diagnostic_bundle") return exporting.promise;
+      return diagnostic();
+    });
+    vi.mocked(save).mockResolvedValue("C:\\Temp\\diagnostics-pending.zip");
+    render(); await flush();
+    nodes().find((node) => node.type === "input")!.props.onChange!({ target: { value: "synthetic-owner-password" } }); await flush();
+    const disconnectClick = button("Отключить связь на этом компьютере").props.onClick!;
+    disconnectClick(); disconnectClick(); await flush();
+    // Authentication can wait before the backend has even entered disconnecting.
+    expect(text()).toContain("Подключено");
+    expect(button("Отключить связь на этом компьютере").props.disabled).toBe(true);
+    expect(button("Экспорт диагностики…").props.disabled).toBe(false);
+    expect(text()).toContain("экспорт диагностики доступны во время ожидания");
+    const exportClick = button("Экспорт диагностики…").props.onClick!;
+    exportClick(); exportClick(); await flush();
+    expect(save).toHaveBeenCalledOnce();
+    expect(nativeInvoke).toHaveBeenCalledWith("export_diagnostic_bundle", { path: "C:\\Temp\\diagnostics-pending.zip" });
+    expect(button("Экспорт диагностики…").props.disabled).toBe(true);
+    expect(button("Включить журналирование").props.disabled).toBe(true);
+    button("Включить журналирование").props.onClick!(); await flush();
+    expect(vi.mocked(nativeInvoke).mock.calls.some(([command]) => command === "set_diagnostic_logging")).toBe(false);
+    expect(vi.mocked(nativeInvoke).mock.calls.filter(([command]) => command === "disconnect_workspace_network")).toHaveLength(1);
+    expect(vi.mocked(nativeInvoke).mock.calls.filter(([command]) => command === "export_diagnostic_bundle")).toHaveLength(1);
+    exporting.resolve(); await flush();
+    expect(text()).toContain("Диагностический ZIP сохранён");
+    expect(button("Экспорт диагностики…").props.disabled).toBe(false);
+    expect(button("Отключить связь на этом компьютере").props.disabled).toBe(true);
+    disconnect.resolve(net("disconnected")); await flush();
+    expect(text()).toContain("Диагностический ZIP сохранён");
+  });
+  it("keeps local status and logging available during disconnecting, with independent duplicate protection", async () => {
+    const disconnect = deferred<NetworkAccessStatus>();
+    const logging = deferred<DiagnosticStatus>();
+    vi.mocked(nativeInvoke).mockImplementation(async (command) => {
+      if (command === "disconnect_workspace_network") return disconnect.promise;
+      if (command === "set_diagnostic_logging") return logging.promise;
+      return diagnostic();
+    });
+    render(); await flush();
+    nodes().find((node) => node.type === "input")!.props.onChange!({ target: { value: "synthetic-owner-password" } }); await flush();
+    button("Отключить связь на этом компьютере").props.onClick!(); await flush();
+    applyNetworkAccessStatus(net("disconnecting")); await flush();
+    await vi.advanceTimersByTimeAsync(3000); await flush();
+    expect(vi.mocked(nativeInvoke).mock.calls.filter(([command]) => command === "diagnostic_status")).toHaveLength(2);
+    expect(button("Включить журналирование").props.disabled).toBe(false);
+    const loggingClick = button("Включить журналирование").props.onClick!;
+    loggingClick(); loggingClick(); await flush();
+    expect(vi.mocked(nativeInvoke).mock.calls.filter(([command]) => command === "set_diagnostic_logging")).toEqual([["set_diagnostic_logging", { enabled: true }]]);
+    expect(button("Экспорт диагностики…").props.disabled).toBe(true);
+    expect(button("Подключить в режиме просмотра").props.disabled).toBe(true);
+    logging.resolve(diagnostic(true)); await flush();
+    expect(text()).toContain("Журналирование включено");
+    expect(button("Экспорт диагностики…").props.disabled).toBe(false);
+    expect(button("Подключить в режиме просмотра").props.disabled).toBe(true);
+    disconnect.resolve(net("disconnected")); await flush();
+  });
+  it.each(["reconnect_workspace_network", "workspace_info", "switch_workspace_mode"])("keeps local diagnostics usable while %s waits and preserves export success on completion", async (pendingCommand) => {
+    const pending = deferred<unknown>();
+    let acquired = false;
+    vi.mocked(nativeInvoke).mockImplementation(async (command, args) => {
+      if (command === pendingCommand) return pending.promise;
+      if (command === "workspace_info") return workspace({ accessControlled: false, editor: acquired });
+      if (command === "set_diagnostic_logging") return diagnostic(Boolean((args as { enabled: boolean }).enabled));
+      return diagnostic();
+    });
+    component = () => NetworkDiagnosticsPanel({ ownerConfigured: false });
+    if (pendingCommand === "reconnect_workspace_network") applyNetworkAccessStatus(net("disconnected"));
+    render(); await flush();
+    button(pendingCommand === "reconnect_workspace_network" ? "Подключить в режиме просмотра" : "Вернуться к редактированию").props.onClick!(); await flush();
+    if (pendingCommand === "switch_workspace_mode") { button("Войти в обычный режим редактора").props.onClick!(); await flush(); }
+    expect(vi.mocked(nativeInvoke).mock.calls.filter(([command]) => command === pendingCommand)).toHaveLength(1);
+    expect(text()).toContain("экспорт диагностики доступны во время ожидания");
+    expect(button("Включить журналирование").props.disabled).toBe(false);
+    button("Включить журналирование").props.onClick!(); await flush();
+    expect(nativeInvoke).toHaveBeenCalledWith("set_diagnostic_logging", { enabled: true });
+    expect(text()).toContain("Журналирование включено");
+    vi.mocked(save).mockResolvedValueOnce("C:\\Temp\\diagnostics-wait.zip");
+    expect(button("Экспорт диагностики…").props.disabled).toBe(false);
+    button("Экспорт диагностики…").props.onClick!(); await flush();
+    expect(nativeInvoke).toHaveBeenCalledWith("export_diagnostic_bundle", { path: "C:\\Temp\\diagnostics-wait.zip" });
+    expect(text()).toContain("Диагностический ZIP сохранён");
+    acquired = pendingCommand === "switch_workspace_mode";
+    pending.resolve(pendingCommand === "reconnect_workspace_network" ? net("connected") : pendingCommand === "workspace_info" ? workspace() : undefined); await flush();
+    expect(text()).toContain("Диагностический ZIP сохранён");
+    expect(text()).not.toContain("экспорт диагностики доступны во время ожидания");
+    if (pendingCommand === "reconnect_workspace_network") expect(text()).toContain("Подключение восстановлено в режиме просмотра");
+    if (pendingCommand === "switch_workspace_mode") expect(text()).toContain("Обычный вход редактора выполнен");
+  });
   it("exports locally while disconnected, and cancelling the picker does not export", async () => {
     applyNetworkAccessStatus(net("disconnected")); render(); await flush();
     vi.mocked(save).mockResolvedValueOnce(null);
