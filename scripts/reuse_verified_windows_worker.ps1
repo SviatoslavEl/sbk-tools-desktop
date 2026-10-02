@@ -2,10 +2,12 @@ param([string]$Target = 'x86_64-pc-windows-msvc')
 $ErrorActionPreference = 'Stop'
 # Reuse only the identical worker from a successful installed-build job.
 # Never launch the downloaded installer, application, or bundled extractor.
-$sourceRun = '34363270973'
-$sourceJob = '102507431765'
-$sourceCommit = '3a4c7a4ac8effab2413be7044d1607f1c9b7735d'
-$sourceRunNumber = 62
+$sourceRun = '36847897394'
+$sourceJob = '110323434296'
+$sourceCommit = '35aa57143193c3aaef9b606478607d537622681a'
+$sourceRunNumber = 76
+$sourceArtifact = '11157815132'
+$sourceArtifactDigest = 'sha256:9d1c51dc76edfdbb0b6226f77ab92c06ff1249fdf01370f8b037f7aa2781b5b9'
 $repo = 'SviatoslavEl/sbk-tools-desktop'
 $artifactName = 'SBK-Tools-Windows-x64-Installed'
 $download = $null
@@ -24,12 +26,13 @@ try {
     $run = gh api "repos/$repo/actions/runs/$sourceRun" | ConvertFrom-Json
     if ($LASTEXITCODE -ne 0 -or $run.head_sha -ne $sourceCommit -or $run.repository.full_name -ne $repo -or
         $run.path -ne '.github/workflows/release.yml' -or $run.run_attempt -ne $job.run_attempt -or
-        $run.run_number -ne $sourceRunNumber -or $run.event -ne 'push' -or
-        $run.head_branch -ne 'codex/v2.8.6-scanner-shared-lock-fixes') { throw 'Unexpected source workflow, repository, commit, attempt, or candidate run' }
+        $run.run_number -ne $sourceRunNumber -or $run.event -ne 'workflow_dispatch' -or
+        $run.head_branch -ne 'codex/reliability-proposals-search') { throw 'Unexpected source workflow, repository, commit, attempt, or candidate run' }
     $artifacts = gh api "repos/$repo/actions/runs/$sourceRun/artifacts?per_page=100" | ConvertFrom-Json
     if ($LASTEXITCODE -ne 0) { throw 'Could not inspect source artifacts' }
     $matching = @($artifacts.artifacts | Where-Object { $_.name -eq $artifactName -and -not $_.expired })
-    if ($matching.Count -ne 1 -or "$($matching[0].workflow_run.id)" -ne $sourceRun -or
+    if ($matching.Count -ne 1 -or "$($matching[0].id)" -ne $sourceArtifact -or
+        $matching[0].digest -ne $sourceArtifactDigest -or "$($matching[0].workflow_run.id)" -ne $sourceRun -or
         $matching[0].workflow_run.head_sha -ne $sourceCommit) { throw 'Expected one unexpired installed artifact from the verified source' }
 
     $sevenZipCommand = Get-Command 7z -ErrorAction SilentlyContinue
@@ -40,8 +43,8 @@ try {
     New-Item -ItemType Directory -Path $download | Out-Null
     gh run download $sourceRun --repo $repo --name $artifactName --dir $download
     if ($LASTEXITCODE -ne 0) { throw 'Could not download verified installed artifact' }
-    # The pinned non-tag push uses format('2.8.6-test.{0}', github.run_number).
-    $installer = Join-Path $download ('SBK-Tools-Fast-Setup-2.8.6-test.{0}-x64.exe' -f $sourceRunNumber)
+    # The pinned manual candidate uses format('2.9.0-test.{0}', github.run_number).
+    $installer = Join-Path $download ('SBK-Tools-Fast-Setup-2.9.0-test.{0}-x64.exe' -f $sourceRunNumber)
     $checksum = ((Get-Content -LiteralPath "$installer.sha256" -Raw).Trim() -split '\s+', 2)
     if ($checksum.Count -ne 2 -or $checksum[0] -notmatch '^[a-fA-F0-9]{64}$' -or
         $checksum[1] -ne (Split-Path -Leaf $installer) -or

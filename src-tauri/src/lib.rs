@@ -48,6 +48,8 @@ mod publication;
 mod scanner_outputs;
 mod scanner_previews;
 mod workspace;
+#[cfg(test)]
+mod workspace_read_regression_tests;
 use attachments::AttachmentAudit;
 use database::{MODULES, SCHEMA_VERSION, open_database, open_database_read_only, validated_module};
 use intelligence::{
@@ -98,6 +100,46 @@ struct AppState {
     scanner_jobs: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     scanner_outputs: Arc<scanner_outputs::ScannerOutputs>,
     maintenance: Arc<Mutex<()>>,
+    workspace_observations: Arc<Mutex<WorkspaceObservationCache>>,
+}
+
+const WORKSPACE_OBSERVATION_TTL: Duration = Duration::from_secs(30);
+
+/// Presentation-only observations. Editor ownership, authentication and write
+/// admission are deliberately absent: those must always be checked freshly.
+#[derive(Clone, Copy)]
+struct WorkspaceObservations {
+    owner_configured: bool,
+    free_space_bytes: u64,
+}
+
+#[derive(Default)]
+struct WorkspaceObservationCache {
+    // One active root keeps memory bounded and prevents cross-workspace reuse.
+    entry: Option<(PathBuf, Instant, WorkspaceObservations)>,
+}
+
+impl WorkspaceObservationCache {
+    fn get_or_probe(
+        &mut self,
+        root: &Path,
+        now: Instant,
+        probe: impl FnOnce() -> WorkspaceObservations,
+    ) -> WorkspaceObservations {
+        if let Some((cached_root, checked_at, observations)) = &self.entry
+            && cached_root == root
+            && now.saturating_duration_since(*checked_at) < WORKSPACE_OBSERVATION_TTL
+        {
+            return *observations;
+        }
+        let observations = probe();
+        self.entry = Some((root.to_path_buf(), now, observations));
+        observations
+    }
+
+    fn invalidate(&mut self) {
+        self.entry = None;
+    }
 }
 
 impl AppState {
@@ -971,6 +1013,11 @@ fn reconnect_workspace_network_inner(
             .maintenance
             .lock()
             .map_err(|_| "Хранилище недоступно")?;
+        state
+            .workspace_observations
+            .lock()
+            .map_err(|_| "Состояние рабочей папки недоступно")?
+            .invalidate();
         reconnect_workspace_read_only(&workspace)
     })();
     gate.finish_reconnect(&result);
@@ -982,11 +1029,11 @@ fn reconnect_workspace_network_inner(
 #[tauri::command]
 fn workspace_info(state: State<'_, AppState>) -> Result<WorkspaceInfo, String> {
     diagnostics::measure(diagnostics::Operation::WorkspaceStatus, || {
-        workspace_info_inner(state)
+        workspace_info_inner(&state)
     })
 }
 
-fn workspace_info_inner(state: State<'_, AppState>) -> Result<WorkspaceInfo, String> {
+fn workspace_info_inner(state: &AppState) -> Result<WorkspaceInfo, String> {
     let _maintenance = state
         .maintenance
         .lock()
@@ -1000,6 +1047,19 @@ fn workspace_info_inner(state: State<'_, AppState>) -> Result<WorkspaceInfo, Str
     let editor = workspace.is_editor();
     let editor_state = workspace.editor_state();
     let access_message = workspace.access_message_for(&editor_state);
+    let observations = state
+        .workspace_observations
+        .lock()
+        .map_err(|_| "Состояние рабочей папки недоступно")?
+        .get_or_probe(&workspace.root, Instant::now(), || WorkspaceObservations {
+            // On failure do not reuse an earlier "not configured" result.
+            // These fields inform the UI only; owner setup/auth checks the DB.
+            owner_configured: administration::configured(&workspace.root).unwrap_or(true),
+            free_space_bytes: diagnostics::measure(diagnostics::Operation::FreeSpaceProbe, || {
+                fs2::available_space(&workspace.root).map_err(|error| error.to_string())
+            })
+            .unwrap_or(0),
+        });
     Ok(WorkspaceInfo {
         root: workspace.root.to_string_lossy().into_owned(),
         portable: workspace.portable,
@@ -1014,13 +1074,10 @@ fn workspace_info_inner(state: State<'_, AppState>) -> Result<WorkspaceInfo, Str
         editor_state_message: editor_state.message,
         editor_cleanup_pending: workspace.editor_cleanup_pending(),
         editor_cleanup_message: workspace.editor_cleanup_message(),
-        owner_configured: administration::configured(&workspace.root).unwrap_or(true),
+        owner_configured: observations.owner_configured,
         administration_notice: workspace.admin_notice(),
         schema_version: SCHEMA_VERSION,
-        free_space_bytes: diagnostics::measure(diagnostics::Operation::FreeSpaceProbe, || {
-            fs2::available_space(&workspace.root).map_err(|error| error.to_string())
-        })
-        .unwrap_or(0),
+        free_space_bytes: observations.free_space_bytes,
     })
 }
 
@@ -1092,7 +1149,13 @@ fn setup_workspace_owner(
         &workspace.root,
         &Zeroizing::new(password),
         &workspace.actor_name(),
-    )
+    )?;
+    state
+        .workspace_observations
+        .lock()
+        .map_err(|_| "Состояние рабочей папки недоступно")?
+        .invalidate();
+    Ok(())
 }
 
 #[tauri::command]
@@ -1839,6 +1902,67 @@ fn open_optional_database_read_only(
         }
     }
     open_database_read_only(root, module).map(Some)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ContractWorkspaceSnapshot {
+    records: Vec<StoredRecord>,
+    directory: Option<Value>,
+}
+
+#[tauri::command]
+fn read_contract_workspace(
+    state: State<'_, AppState>,
+) -> Result<ContractWorkspaceSnapshot, String> {
+    let workspace = state.active_workspace()?;
+    read_contract_workspace_with(&workspace.root, |root| {
+        open_database_read_only(root, "contract-experience")
+    })
+}
+
+fn read_contract_workspace_with(
+    root: &Path,
+    open: impl FnOnce(&Path) -> Result<Connection, String>,
+) -> Result<ContractWorkspaceSnapshot, String> {
+    diagnostics::measure(diagnostics::Operation::ContractsSnapshot, || {
+        let mut connection =
+            diagnostics::measure(diagnostics::Operation::ContractsDatabaseOpen, || open(root))?;
+        // One short read transaction makes records and their directory one
+        // coherent view, even if another editor commits between the queries.
+        // The connection is READ_ONLY + query_only; no schema setup or writes.
+        let transaction = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
+            .map_err(|error| error.to_string())?;
+        let records = diagnostics::measure(diagnostics::Operation::ContractsRecordsRead, || {
+            let mut statement = transaction
+                .prepare("SELECT id, title, payload, archived, created_at, updated_at FROM records WHERE archived = 0 ORDER BY updated_at DESC")
+                .map_err(|error| error.to_string())?;
+            statement
+                .query_map([], parse_record)
+                .map_err(|error| error.to_string())?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|error| error.to_string())
+        })?;
+        let directory = diagnostics::measure(diagnostics::Operation::CompanyDirectoryRead, || {
+            let payload: Option<String> = transaction
+                .query_row(
+                    "SELECT payload FROM drafts WHERE key = ?1",
+                    [COMPANY_DIRECTORY_DRAFT_KEY],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?;
+            payload
+                .map(|text| {
+                    serde_json::from_str(&text)
+                        .map_err(|_| "Сохранённый справочник повреждён".to_string())
+                })
+                .transpose()
+        })?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(ContractWorkspaceSnapshot { records, directory })
+    })
 }
 
 #[tauri::command]
@@ -5347,6 +5471,7 @@ pub fn run() {
             scanner_jobs: Arc::new(Mutex::new(HashMap::new())),
             scanner_outputs: Arc::new(scanner_outputs::ScannerOutputs::default()),
             maintenance: Arc::new(Mutex::new(())),
+            workspace_observations: Arc::new(Mutex::new(WorkspaceObservationCache::default())),
         })
         .invoke_handler(|invoke| {
             // Admission is acquired before queueing, so disconnect also waits
@@ -5354,6 +5479,11 @@ pub fn run() {
             // never on the native GUI thread. True async handlers additionally
             // retain their own permit inside their actual I/O worker closure.
             let local = network_diagnostics::local_command(invoke.message.command());
+            let queue_operation = match invoke.message.command() {
+                "read_contract_workspace" => diagnostics::Operation::ContractsQueueWait,
+                "workspace_info" => diagnostics::Operation::WorkspaceStatusQueueWait,
+                _ => diagnostics::Operation::CommandQueueWait,
+            };
             let permit = if local {
                 None
             } else {
@@ -5371,7 +5501,7 @@ pub fn run() {
                 let _dispatch = if local {
                     None
                 } else {
-                    let diagnostic = diagnostics::begin(diagnostics::Operation::CommandQueueWait);
+                    let diagnostic = diagnostics::begin(queue_operation);
                     match COMMAND_DISPATCH.lock() {
                         Ok(guard) => {
                             diagnostic.success();
@@ -5400,6 +5530,7 @@ pub fn run() {
                     diagnostics_commands::set_diagnostic_logging,
                     diagnostics_commands::export_diagnostic_bundle,
                     workspace_info,
+                    read_contract_workspace,
                     workspace_health,
                     switch_workspace_mode,
                     set_workspace_access_password,

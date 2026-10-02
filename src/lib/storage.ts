@@ -1,5 +1,6 @@
 import { invoke } from "./networkDiagnostics";
 import { trackedOperation } from "./activity";
+import { beginUiListMutation, invalidateUiLists, setUiListWorkspace } from "./uiListCache";
 
 export type ModuleId =
   | "settings"
@@ -118,6 +119,12 @@ async function invokeMutation<T>(
   command: string,
   args?: Record<string, unknown>,
 ): Promise<T> {
+  const module = typeof args?.module === "string" ? args.module : undefined;
+  const affectsRecords = ["upsert_record", "import_records_atomic", "update_records_atomic", "archive_record", "archive_records", "delete_record", "delete_records", "restore_history_version"].includes(command);
+  const affectsContracts = ["import_contracts_with_company_directory_atomic", "update_contracts_and_company_directory_atomic", "save_contract_with_company_directory_atomic"].includes(command)
+    || (["save_draft", "clear_draft"].includes(command) && module === "contract-experience" && args?.key === "company-directory-v1");
+  const affectsWorkspace = ["restore_backup", "restore_encrypted_backup"].includes(command);
+  const endMutation = affectsContracts ? beginUiListMutation("contract-experience") : affectsRecords || affectsWorkspace ? beginUiListMutation(affectsWorkspace ? undefined : module) : undefined;
   try {
     const labels: Record<string, string> = { create_backup: "Резервная копия", create_encrypted_backup: "Зашифрованная копия", restore_backup: "Восстановление копии", restore_encrypted_backup: "Восстановление зашифрованной копии", upsert_record: "Сохранение карточки", save_draft: "Сохранение черновика", rotate_backups: "Ротация резервных копий" };
     return await trackedOperation(labels[command] || "Обновление рабочих данных", () => invoke<T>(command, args));
@@ -125,7 +132,7 @@ async function invokeMutation<T>(
     if (isWorkspaceAccessError(reason))
       window.dispatchEvent(new Event(workspaceAccessInvalidatedEvent));
     throw reason;
-  }
+  } finally { endMutation?.(); }
 }
 
 function readFallback<T>(module: ModuleId): StoredRecord<T>[] {
@@ -140,11 +147,16 @@ function readFallback<T>(module: ModuleId): StoredRecord<T>[] {
 
 function writeFallback<T>(module: ModuleId, records: StoredRecord<T>[]) {
   localStorage.setItem(fallbackKey(module), JSON.stringify(records));
+  invalidateUiLists(module);
 }
 
 export async function getWorkspaceInfo(): Promise<WorkspaceInfo> {
-  if (isTauri()) return invoke<WorkspaceInfo>("workspace_info");
-  return {
+  if (isTauri()) {
+    const workspace = await invoke<WorkspaceInfo>("workspace_info");
+    setUiListWorkspace(workspace);
+    return workspace;
+  }
+  const workspace: WorkspaceInfo = {
     root: "ProductData (режим предпросмотра)",
     portable: true,
     configured: true,
@@ -158,6 +170,8 @@ export async function getWorkspaceInfo(): Promise<WorkspaceInfo> {
     schemaVersion: 1,
     freeSpaceBytes: 0,
   };
+  setUiListWorkspace(workspace);
+  return workspace;
 }
 
 export async function getStartupStatus(): Promise<StartupStatus> {
@@ -183,9 +197,12 @@ export async function retryWorkspaceInitialization(): Promise<StartupStatus> {
 
 export async function switchWorkspaceMode(editor: boolean, password: string): Promise<void> {
   if (!isTauri()) return;
-  await invoke<void>("switch_workspace_mode", { editor, password });
-  window.dispatchEvent(new Event(workspaceAccessInvalidatedEvent));
-  window.dispatchEvent(new Event("sbk-workspace-refresh"));
+  const endMutation = beginUiListMutation();
+  try {
+    await invoke<void>("switch_workspace_mode", { editor, password });
+    window.dispatchEvent(new Event(workspaceAccessInvalidatedEvent));
+    window.dispatchEvent(new Event("sbk-workspace-refresh"));
+  } finally { endMutation(); }
 }
 
 export async function setWorkspaceAccessPassword(currentPassword: string, newPassword: string): Promise<void> {
@@ -267,6 +284,16 @@ export async function listRecords<T>(
   return readFallback<T>(module).filter(
     (record) => includeArchived || !record.archived,
   );
+}
+
+/** A fresh readonly native snapshot; only UI consumers may cache its result. */
+export async function readContractWorkspace<T, D>(): Promise<{ records: StoredRecord<T>[]; directory: D | null }> {
+  if (isTauri()) return invoke("read_contract_workspace");
+  const [records, directory] = await Promise.all([
+    listRecords<T>("contract-experience"),
+    readDraft<D>("contract-experience", "company-directory-v1"),
+  ]);
+  return { records, directory };
 }
 
 export async function recordHistory(
@@ -707,6 +734,7 @@ export async function saveDraft<T>(
     `sbk-tools:draft:${key}:${draftKey}`,
     JSON.stringify({ value, savedAt: new Date().toISOString() }),
   );
+  if (key === "contract-experience" && draftKey === "company-directory-v1") invalidateUiLists(key);
 }
 
 export async function readDraft<T>(
@@ -735,6 +763,7 @@ export async function clearDraft(
     return;
   }
   localStorage.removeItem(`sbk-tools:draft:${key}:${draftKey}`);
+  if (key === "contract-experience" && draftKey === "company-directory-v1") invalidateUiLists(key);
 }
 
 export async function pruneHistory(limit: number): Promise<number> {

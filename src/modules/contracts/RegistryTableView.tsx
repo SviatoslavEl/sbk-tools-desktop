@@ -7,7 +7,7 @@ export function normalizeRegistryColumns(value: unknown, columns: RegistryColumn
   return [...new Set([columns[0].key, ...selected])];
 }
 
-export function RegistryTableView({ name, columns, count }: { name: "contracts" | "staff"; columns: RegistryColumn[]; count: number }) {
+export function RegistryTableView({ name, columns, count, cacheNotice = "" }: { name: "contracts" | "staff"; columns: RegistryColumn[]; count: number; cacheNotice?: string }) {
   const storageKey = `sbk-registry-columns-${name}-v1`;
   const [selected, setSelected] = useState(() => {
     try { return normalizeRegistryColumns(JSON.parse(localStorage.getItem(storageKey) || "null"), columns); }
@@ -21,6 +21,7 @@ export function RegistryTableView({ name, columns, count }: { name: "contracts" 
   const hidden = columns.flatMap((column, index) => selected.includes(column.key) ? [] : [index + 2]);
   return <div className="registry-display-options" data-workspace-viewer-allowed>
     <strong role="status">Найдено: {count}</strong>
+    {cacheNotice && <small role="status" title={cacheNotice}>{cacheNotice}</small>}
     <button className="secondary small" type="button" onClick={() => update(columns.filter((column) => column.compact).map((column) => column.key))}>Кратко</button>
     <button className="secondary small" type="button" onClick={() => update(columns.map((column) => column.key))}>Подробно</button>
     <details><summary>Столбцы ({selected.length})</summary><div className="column-options">{columns.map((column, index) => <label className="checkbox-row" key={column.key}><input type="checkbox" disabled={index === 0} checked={selected.includes(column.key)} onChange={(event) => update(event.target.checked ? [...selected, column.key] : selected.filter((key) => key !== column.key))} />{column.label}</label>)}</div></details>

@@ -28,6 +28,12 @@ const EXPORT_README: &str = "SBK Tools diagnostic report\n\nThis report is creat
 pub enum Operation {
     Startup,
     CommandQueueWait,
+    ContractsQueueWait,
+    WorkspaceStatusQueueWait,
+    ContractsSnapshot,
+    ContractsDatabaseOpen,
+    ContractsRecordsRead,
+    CompanyDirectoryRead,
     WorkspaceOpen,
     WorkspaceAccess,
     WorkspaceStatus,

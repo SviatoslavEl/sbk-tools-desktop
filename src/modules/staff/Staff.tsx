@@ -889,7 +889,7 @@ export function StaffRegistry({ openRecordId, onRecordOpened }: { openRecordId?:
         </div>
       )}
       <div className="surface table-surface">
-        <RegistryTableView name="staff" count={filtered.length} columns={[
+        <RegistryTableView name="staff" count={filtered.length} cacheNotice={store.cacheNotice} columns={[
           { key: "name", label: "ФИО", compact: true }, { key: "legalEntity", label: "Юрлицо", compact: false }, { key: "department", label: "Отдел", compact: false }, { key: "position", label: "Должность", compact: true }, { key: "basis", label: "Основание", compact: true }, { key: "status", label: "Статус", compact: false }, { key: "qualification", label: "Квалификация", compact: false }, { key: "document", label: "Документы", compact: true }, { key: "readiness", label: "Полнота карточки", compact: true },
         ]} />
         <div className="table-scroll">

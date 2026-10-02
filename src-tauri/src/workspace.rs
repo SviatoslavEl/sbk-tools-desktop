@@ -901,40 +901,48 @@ fn acquire_editor_lease_with(
     writable: bool,
     publish: impl FnOnce(&Path, &str, &EditorOwner) -> Result<(PathBuf, Option<String>), String>,
 ) -> EditorLease {
-    let token = uuid::Uuid::new_v4().to_string();
+    acquire_editor_lease_with_locker(root, writable, publish, lock_editor_file)
+}
+
+fn acquire_editor_lease_with_locker(
+    root: &Path,
+    writable: bool,
+    publish: impl FnOnce(&Path, &str, &EditorOwner) -> Result<(PathBuf, Option<String>), String>,
+    mut lock: impl FnMut(&Path) -> Result<File, String>,
+) -> EditorLease {
+    let mut lease = EditorLease::inactive();
     if !writable {
-        return EditorLease::inactive();
+        return lease;
     }
     // Obtain both handles first, without changing either ownership marker.
     // A failed contender must never corrupt the incumbent's first token just
     // because the second lock could not be obtained.
-    let Ok(mut edit) = lock_editor_file(&root.join(".workspace.edit.lock")) else {
-        return EditorLease::inactive();
+    let Ok(edit) = lock(&root.join(".workspace.edit.lock")) else {
+        return lease;
     };
-    let Ok(mut guard) = lock_editor_file(&root.join(".workspace.edit.guard")) else {
-        return EditorLease::inactive();
+    // Take ownership immediately. Early failures must explicitly unlock our
+    // handles, not merely close a descriptor that a spawned child may inherit.
+    // No presence path is owned yet, so cleanup cannot remove another claim.
+    lease.edit = Some(edit);
+    let Ok(guard) = lock(&root.join(".workspace.edit.guard")) else {
+        let _ = lease.release_checked();
+        return lease;
     };
+    lease.guard = Some(guard);
     let owner = current_editor_owner();
-    let Ok((presence_path, publication_error)) = publish(root, &token, &owner) else {
-        return EditorLease::inactive();
+    let Ok((presence_path, publication_error)) = publish(root, &lease.token, &owner) else {
+        let _ = lease.release_checked();
+        return lease;
     };
-    let active = publication_error.is_none()
-        && initialize_locked_token(&mut edit, &token)
-            .and_then(|_| initialize_locked_token(&mut guard, &token))
-            .and_then(|_| verify_presence_token(root, &token))
+    lease.presence_path = Some(presence_path);
+    lease.owner = Some(owner);
+    lease.cleanup_error = publication_error;
+    lease.active = lease.cleanup_error.is_none()
+        && initialize_locked_token(lease.edit.as_mut().unwrap(), &lease.token)
+            .and_then(|_| initialize_locked_token(lease.guard.as_mut().unwrap(), &lease.token))
+            .and_then(|_| verify_presence_token(root, &lease.token))
             .is_ok();
-    let mut lease = EditorLease {
-        active,
-        token,
-        edit: Some(edit),
-        guard: Some(guard),
-        presence_path: Some(presence_path),
-        owner: Some(owner),
-        cleanup_error: publication_error,
-        release_reason: None,
-        failure_audited: false,
-    };
-    if !active {
+    if !lease.active {
         // Only this newly created claim is removed, while both handles remain
         // held. Drop checks the exact session token before removing it.
         let _ = lease.release_checked();
@@ -1688,6 +1696,88 @@ mod tests {
         assert!(
             next_active,
             "a confirmed release must unlock, not merely close its original descriptors"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_second_lock_unlocks_own_first_handle_even_with_inherited_duplicate() {
+        let root = std::env::temp_dir().join(format!("sbk-acquire-duplicate-{}", Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let mut occupied_guard = lock_editor_file(&root.join(".workspace.edit.guard")).unwrap();
+        initialize_locked_token(&mut occupied_guard, "synthetic incumbent").unwrap();
+        let before = fs::read(root.join(".workspace.edit.guard")).unwrap();
+        let mut duplicate_edit = None;
+        let failed = acquire_editor_lease_with_locker(
+            &root,
+            true,
+            |_, _, _| panic!("publication is forbidden when the second lock is busy"),
+            |path| {
+                let file = lock_editor_file(path)?;
+                duplicate_edit = Some(file.try_clone().unwrap());
+                Ok(file)
+            },
+        );
+        assert!(!failed.active);
+        assert_eq!(
+            fs::read(root.join(".workspace.edit.guard")).unwrap(),
+            before
+        );
+        assert!(!root.join(EDITOR_PRESENCE_FILE).exists());
+        FileExt::unlock(&occupied_guard).unwrap();
+        drop(occupied_guard);
+        let next = acquire_editor_lease(&root, true);
+        let acquired = next.active;
+        drop(next);
+        drop(duplicate_edit);
+        drop(failed);
+        fs::remove_dir_all(root).unwrap();
+        assert!(
+            acquired,
+            "failed acquisition must unlock its first handle before returning, even while an inherited descriptor remains open"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_publication_unlocks_owned_handles_and_preserves_foreign_claim() {
+        let root = std::env::temp_dir().join(format!("sbk-publish-duplicate-{}", Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let presence = root.join(EDITOR_PRESENCE_FILE);
+        fs::write(&presence, b"synthetic foreign claim, never ours").unwrap();
+        let before = fs::read(&presence).unwrap();
+        let mut duplicates = Vec::new();
+        let failed = acquire_editor_lease_with_locker(
+            &root,
+            true,
+            |_, _, _| Err("synthetic publication refused".into()),
+            |path| {
+                let file = lock_editor_file(path)?;
+                duplicates.push(file.try_clone().unwrap());
+                Ok(file)
+            },
+        );
+        assert!(!failed.active);
+        assert_eq!(fs::read(&presence).unwrap(), before);
+        assert_eq!(duplicates.len(), 2);
+        let edit = lock_editor_file(&root.join(".workspace.edit.lock"));
+        let guard = lock_editor_file(&root.join(".workspace.edit.guard"));
+        let both_available = edit.is_ok() && guard.is_ok();
+        if let Ok(file) = &edit {
+            FileExt::unlock(file).unwrap();
+        }
+        if let Ok(file) = &guard {
+            FileExt::unlock(file).unwrap();
+        }
+        drop(edit);
+        drop(guard);
+        drop(duplicates);
+        drop(failed);
+        assert_eq!(fs::read(&presence).unwrap(), before);
+        fs::remove_dir_all(root).unwrap();
+        assert!(
+            both_available,
+            "refused publication must explicitly release both owned advisory locks, not rely on descriptor close"
         );
     }
 

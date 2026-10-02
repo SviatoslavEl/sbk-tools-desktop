@@ -546,9 +546,6 @@ export function ContractsRegistry({ openRecordId, onRecordOpened }: { openRecord
       return next.size === current.size ? current : next;
     });
   }, [selectionDocumentGroups]);
-  useEffect(() => {
-    if (companyDirectory.migrationRevision) void store.reload();
-  }, [companyDirectory.migrationRevision]);
   const readOnly = !companyDirectory.editor;
 
   const stats = useMemo(
@@ -1155,7 +1152,7 @@ export function ContractsRegistry({ openRecordId, onRecordOpened }: { openRecord
         </div>
       )}
       <div className="surface table-surface">
-        <RegistryTableView name="contracts" count={filtered.length} columns={[
+        <RegistryTableView name="contracts" count={filtered.length} cacheNotice={store.cacheNotice} columns={[
           { key: "number", label: "Номер и дата", compact: true }, { key: "performer", label: "Юрлицо", compact: false }, { key: "customer", label: "Заказчик", compact: true }, { key: "subject", label: "Предмет", compact: false }, { key: "amount", label: "Сумма", compact: true }, { key: "period", label: "Период", compact: false }, { key: "stage", label: "Стадия", compact: true }, { key: "payment", label: "Оплата", compact: true }, { key: "acts", label: "Акты", compact: true }, { key: "importantDate", label: "Важная дата", compact: false }, { key: "responsible", label: "Ответственный", compact: false },
         ]} />
         <div className="table-scroll">

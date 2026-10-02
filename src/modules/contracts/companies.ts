@@ -238,7 +238,7 @@ export function companyUsedAsPerformer(
 export function mergeCompaniesFromContracts(
   directory: CompanyDirectoryData,
   contracts: ContractSource[],
-  idFactory: () => string = () => crypto.randomUUID(),
+  idFactory: (name: string) => string = () => crypto.randomUUID(),
   now = new Date().toISOString(),
 ): { directory: CompanyDirectoryData; changed: boolean } {
   const normalized = normalizeCompanyDirectory(directory);
@@ -263,7 +263,7 @@ export function mergeCompaniesFromContracts(
       return;
     }
     const company: CompanyCard = {
-      ...emptyCompany(now, idFactory()),
+      ...emptyCompany(now, idFactory(name)),
       name,
       scope: role === "ours" ? "internal" : "external",
       source: "contracts",
@@ -296,8 +296,14 @@ export function linkContractToDirectory(contract: ContractData, companies: Compa
   };
 }
 
-export function buildCompanyDirectoryMigration(directory: CompanyDirectoryData, records: StoredRecord<ContractData>[]) {
-  const merged = mergeCompaniesFromContracts(directory, records);
+export function buildCompanyDirectoryMigration(directory: CompanyDirectoryData, records: StoredRecord<ContractData>[], inferredIds?: ReadonlyMap<string, string>) {
+  const usedIds = new Set(directory.companies.map((company) => company.id));
+  const merged = mergeCompaniesFromContracts(directory, records, (name) => {
+    const inferred = inferredIds?.get(normalizeCompanyName(name));
+    const id = inferred && !usedIds.has(inferred) ? inferred : crypto.randomUUID();
+    usedIds.add(id);
+    return id;
+  });
   const updates = records.map((record) => ({ record, payload: linkContractToDirectory(record.payload, merged.directory.companies) }))
     .filter(({ record, payload }) =>
       record.payload.performingLegalEntityId !== payload.performingLegalEntityId

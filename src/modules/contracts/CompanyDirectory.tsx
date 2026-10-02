@@ -1,6 +1,9 @@
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { openDocumentPath as openPath, networkAccessEvent, networkAccessIsPaused, networkPausedMessage } from "../../lib/networkDiagnostics";
+import { openDocumentPath as openPath, networkAccessIsPaused, networkPausedMessage } from "../../lib/networkDiagnostics";
+import { useUiListSnapshot } from "../../hooks/useRecords";
+import { useWorkspaceAccess } from "../../lib/workspaceAccess";
+import type { UiListData } from "../../lib/uiListCache";
 import { Dialog } from "../../components/Dialog";
 import { CollapsibleEditorBlock } from "../../components/CollapsibleEditorBlock";
 import { DrawerBackdrop } from "../../components/DrawerBackdrop";
@@ -11,10 +14,9 @@ import {
   discardStagedAttachments,
   importContractsWithCompanyDirectoryAtomic,
   listRecords,
-  readDraft,
+  readContractWorkspace,
   saveContractWithCompanyDirectoryAtomic,
   updateContractsAndCompanyDirectoryAtomic,
-  workspaceAccessInvalidatedEvent,
   type StoredRecord,
 } from "../../lib/storage";
 import { chooseOpenPath } from "../../lib/files";
@@ -51,96 +53,45 @@ export function subscribeCompanyDirectoryRefresh(
   return () => target.removeEventListener(companyDirectoryRefreshEvent, reload);
 }
 
-export function useCompanyDirectory(contracts: StoredRecord<ContractData>[]) {
-  const [directory, setDirectory] = useState<CompanyDirectoryData>(
-    emptyCompanyDirectory(),
-  );
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState("");
-  const [editor, setEditor] = useState(false);
-  const [accessMessage, setAccessMessage] = useState("");
-  const [migrationRevision, setMigrationRevision] = useState(0);
-  const reloadGeneration = useRef(0);
-  const reloadQueue = useRef<Promise<void>>(Promise.resolve());
+// Share inferred legacy identities between both views of the same RAM snapshot.
+// Merely opening a list must never persist a migration or request editor rights.
+const directoryReadModels = new WeakMap<UiListData<ContractData, CompanyDirectoryData>, ReturnType<typeof buildCompanyDirectoryMigration>>();
+function directoryReadModel(snapshot: UiListData<ContractData, CompanyDirectoryData>) {
+  let model = directoryReadModels.get(snapshot);
+  if (!model) { model = buildCompanyDirectoryMigration(snapshot.directory || emptyCompanyDirectory(), snapshot.records); directoryReadModels.set(snapshot, model); }
+  return model;
+}
 
-  const reload = useCallback(() => {
-    const currentGeneration = ++reloadGeneration.current;
-    if (networkAccessIsPaused()) { setLoading(false); setEditor(false); return Promise.resolve(); }
-    const task = reloadQueue.current
-      .catch(() => undefined)
-      .then(async () => {
-        if (currentGeneration !== reloadGeneration.current || networkAccessIsPaused()) return;
-        setLoading(true);
-        try {
-          const [stored, workspace] = await Promise.all([
-            readDraft<CompanyDirectoryData>(
-              "contract-experience",
-              directoryDraftKey,
-            ),
-            getWorkspaceInfo(),
-          ]);
-          if (currentGeneration !== reloadGeneration.current || networkAccessIsPaused()) return;
-          setEditor(workspace.editor);
-          setAccessMessage(workspace.accessMessage);
-          const migration = buildCompanyDirectoryMigration(
-            stored || emptyCompanyDirectory(),
-            contracts,
-          );
-          setDirectory(migration.directory);
-          const directoryErrors = validateCompanyDirectory(
-            migration.directory.companies,
-          );
-          if (directoryErrors.length) {
-            setError(
-              `Справочник требует исправления: ${directoryErrors.join(" ")}`,
-            );
-            return;
-          }
-          if (
-            workspace.editor &&
-            (migration.directoryChanged || migration.updates.length)
-          ) {
-            await updateContractsAndCompanyDirectoryAtomic(
-              migration.updates,
-              migration.directory,
-            );
-            if (currentGeneration !== reloadGeneration.current) return;
-            if (migration.updates.length)
-              setMigrationRevision((value) => value + 1);
-          }
-          setError("");
-        } catch (reason) {
-          if (currentGeneration === reloadGeneration.current)
-            setError(String(reason));
-        } finally {
-          if (currentGeneration === reloadGeneration.current) setLoading(false);
-        }
-      });
-    reloadQueue.current = task;
-    return task;
-  }, [contracts]);
+export function useCompanyDirectory(_contracts: StoredRecord<ContractData>[]) {
+  const snapshot = useUiListSnapshot<ContractData, CompanyDirectoryData>("contract-experience");
+  const access = useWorkspaceAccess();
+  const directory = useMemo(() => snapshot.data ? directoryReadModel(snapshot.data).directory : emptyCompanyDirectory(), [snapshot.data]);
+  const directoryErrors = useMemo(() => validateCompanyDirectory(directory.companies), [directory]);
+  const error = snapshot.error || (directoryErrors.length ? `Справочник требует исправления: ${directoryErrors.join(" ")}` : "");
+  const editor = access.editor && !networkAccessIsPaused();
+  const accessMessage = networkAccessIsPaused() ? networkPausedMessage : access.message;
 
-  useEffect(() => {
-    void reload();
-    const refresh = () => void reload();
-    const pause = () => { if (networkAccessIsPaused()) { reloadGeneration.current++; setLoading(false); setEditor(false); setAccessMessage(networkPausedMessage); } };
-    const unsubscribe = subscribeCompanyDirectoryRefresh(window, refresh);
-    window.addEventListener(workspaceAccessInvalidatedEvent, refresh);
-    window.addEventListener(networkAccessEvent, pause);
-    return () => {
-      reloadGeneration.current += 1;
-      unsubscribe();
-      window.removeEventListener(workspaceAccessInvalidatedEvent, refresh);
-      window.removeEventListener(networkAccessEvent, pause);
-    };
-  }, [reload]);
+  const prepareMutation = useCallback(async () => {
+    // A cached display is not a validation snapshot. Re-read before every
+    // company cascade/import/save so unrelated fresh companies are preserved.
+    const fresh = await readContractWorkspace<ContractData, CompanyDirectoryData>();
+    const ids = new Map(directory.companies.map((company) => [normalizeCompanyName(company.name), company.id]));
+    const migration = buildCompanyDirectoryMigration(fresh.directory || emptyCompanyDirectory(), fresh.records, ids);
+    const errors = validateCompanyDirectory(migration.directory.companies);
+    if (errors.length) throw new Error(`Справочник требует исправления: ${errors.join(" ")}`);
+    const updates = new Map(migration.updates.map((update) => [update.id, update]));
+    return { ...migration, records: fresh.records.map((record) => updates.has(record.id) ? { ...record, payload: updates.get(record.id)!.payload } : record) };
+  }, [directory]);
 
   const save = useCallback(
     async (
       company: CompanyCard,
       previous?: CompanyCard,
-      records: StoredRecord<ContractData>[] = [],
+      _records: StoredRecord<ContractData>[] = [],
     ) => {
+      const fresh = await prepareMutation();
+      const records = fresh.records;
+      const currentPrevious = fresh.directory.companies.find((item) => item.id === company.id) || previous;
       const now = new Date().toISOString();
       const normalized = {
         ...company,
@@ -152,7 +103,7 @@ export function useCompanyDirectory(contracts: StoredRecord<ContractData>[]) {
       if (
         normalized.scope === "external" &&
         (companyUsedAsPerformer(normalized, records) ||
-          (previous != null && companyUsedAsPerformer(previous, records)))
+          (currentPrevious != null && companyUsedAsPerformer(currentPrevious, records)))
       )
         throw new Error(
           "Компания используется как юрлицо-исполнитель и должна оставаться во внутренней группе.",
@@ -161,16 +112,16 @@ export function useCompanyDirectory(contracts: StoredRecord<ContractData>[]) {
         schemaVersion: 3,
         companies: [
           normalized,
-          ...directory.companies.filter((item) => item.id !== normalized.id),
+          ...fresh.directory.companies.filter((item) => item.id !== normalized.id),
         ],
       });
-      const mutations = previous
+      const mutations = currentPrevious
         ? records
             .map((record) => ({
               record,
               update: updateContractCompanyReference(
                 record.payload,
-                previous,
+                currentPrevious,
                 normalized,
               ),
             }))
@@ -181,35 +132,38 @@ export function useCompanyDirectory(contracts: StoredRecord<ContractData>[]) {
               payload: update.contract,
             }))
         : [];
-      await updateContractsAndCompanyDirectoryAtomic(mutations, next);
-      setDirectory(next);
+      const updates = new Map([...fresh.updates, ...mutations].map((update) => [update.id, update]));
+      await updateContractsAndCompanyDirectoryAtomic([...updates.values()], next);
       return { company: normalized, updatedContracts: mutations.length };
     },
-    [directory],
+    [prepareMutation],
   );
 
   const persistContractThenDirectory = useCallback(
     async (item: ContractData, id?: string) => {
-      const merged = mergeCompaniesFromContracts(directory, [item]);
+      const fresh = await prepareMutation();
+      const merged = mergeCompaniesFromContracts(fresh.directory, [item]);
       const linked = linkContractToDirectory(item, merged.directory.companies);
+      if (fresh.updates.length) await updateContractsAndCompanyDirectoryAtomic(fresh.updates, fresh.directory);
       const saved = await saveContractWithCompanyDirectoryAtomic(
         `${linked.number} — ${linked.customer}`,
         linked,
         merged.directory,
         id,
       );
-      setDirectory(merged.directory);
       return saved;
     },
-    [directory],
+    [prepareMutation],
   );
 
   const persistContractsThenDirectory = useCallback(
     async (items: ContractData[]) => {
-      const merged = mergeCompaniesFromContracts(directory, items);
+      const fresh = await prepareMutation();
+      const merged = mergeCompaniesFromContracts(fresh.directory, items);
       const linked = items.map((item) =>
         linkContractToDirectory(item, merged.directory.companies),
       );
+      if (fresh.updates.length) await updateContractsAndCompanyDirectoryAtomic(fresh.updates, fresh.directory);
       await importContractsWithCompanyDirectoryAtomic(
         linked.map((item) => ({
           id: crypto.randomUUID(),
@@ -218,67 +172,72 @@ export function useCompanyDirectory(contracts: StoredRecord<ContractData>[]) {
         })),
         merged.directory,
       );
-      setDirectory(merged.directory);
       return linked;
     },
-    [directory],
+    [prepareMutation],
   );
 
   const persistContractUpdatesThenDirectory = useCallback(async (items: Array<{ id: string; payload: ContractData }>) => {
-    const merged = mergeCompaniesFromContracts(directory, items.map((item) => item.payload));
+    const fresh = await prepareMutation();
+    const merged = mergeCompaniesFromContracts(fresh.directory, items.map((item) => item.payload));
     const updates = items.map((item) => {
       const payload = linkContractToDirectory(item.payload, merged.directory.companies);
       return { id: item.id, title: `${payload.number} — ${payload.customer}`, payload };
     });
-    await updateContractsAndCompanyDirectoryAtomic(updates, merged.directory);
-    setDirectory(merged.directory);
+    const allUpdates = new Map([...fresh.updates, ...updates].map((update) => [update.id, update]));
+    await updateContractsAndCompanyDirectoryAtomic([...allUpdates.values()], merged.directory);
     return updates.length;
-  }, [directory]);
+  }, [prepareMutation]);
 
   const setCompaniesArchived = useCallback(async (ids: string[], archived: boolean) => {
+    const fresh = await prepareMutation();
     const selected = new Set(ids);
     const now = new Date().toISOString();
     const next = normalizeCompanyDirectory({
       schemaVersion: 3,
-      companies: directory.companies.map((company) => selected.has(company.id)
+      companies: fresh.directory.companies.map((company) => selected.has(company.id)
         ? { ...company, archived, updatedAt: now }
         : company),
     });
-    await updateContractsAndCompanyDirectoryAtomic([], next);
-    setDirectory(next);
-  }, [directory]);
+    await updateContractsAndCompanyDirectoryAtomic(fresh.updates, next);
+  }, [prepareMutation]);
 
-  const deleteArchivedCompanies = useCallback(async (ids: string[], records: StoredRecord<ContractData>[]) => {
+  const deleteArchivedCompanies = useCallback(async (ids: string[], _records: StoredRecord<ContractData>[]) => {
+    const fresh = await prepareMutation();
     const selected = new Set(ids);
     // A company referenced by an archived contract must remain recoverable too.
     // If this read fails, abort deletion rather than treating it as an empty base.
-    const allRecords = [...records, ...await listRecords<ContractData>("contract-experience", true)];
-    const referenced = directory.companies.filter((company) => selected.has(company.id) && allRecords.some((record) =>
+    const allRecords = [...fresh.records, ...await listRecords<ContractData>("contract-experience", true)];
+    const referenced = fresh.directory.companies.filter((company) => selected.has(company.id) && allRecords.some((record) =>
       record.payload.performingLegalEntityId === company.id || record.payload.customerCompanyId === company.id
+      || normalizeCompanyName(record.payload.performingLegalEntity) === normalizeCompanyName(company.name)
+      || normalizeCompanyName(record.payload.customer) === normalizeCompanyName(company.name)
     ));
     if (referenced.length) throw new Error(`Нельзя удалить связанные с договорами компании: ${referenced.map((company) => company.shortName || company.name).join(", ")}. Их можно оставить в архиве.`);
     const next = normalizeCompanyDirectory({
       schemaVersion: 3,
-      companies: directory.companies.filter((company) => !selected.has(company.id) || !company.archived),
+      companies: fresh.directory.companies.filter((company) => !selected.has(company.id) || !company.archived),
     });
-    await updateContractsAndCompanyDirectoryAtomic([], next);
-    setDirectory(next);
-  }, [directory]);
+    await updateContractsAndCompanyDirectoryAtomic(fresh.updates, next);
+  }, [prepareMutation]);
 
   return {
     companies: directory.companies,
-    loading,
+    loading: snapshot.loading,
+    refreshing: snapshot.refreshing,
+    stale: snapshot.stale,
+    cacheNotice: snapshot.cacheNotice,
     error,
     editor,
     accessMessage,
-    migrationRevision,
+    migrationRevision: 0,
     save,
     persistContractThenDirectory,
     persistContractsThenDirectory,
     persistContractUpdatesThenDirectory,
     setCompaniesArchived,
     deleteArchivedCompanies,
-    reload,
+    reload: snapshot.reload,
   };
 }
 
