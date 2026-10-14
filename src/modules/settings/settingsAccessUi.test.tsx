@@ -77,7 +77,9 @@ describe("settings workspace access rendered UI", () => {
     const html = renderSettings(workspace({ editorBusy: true, editorOwner: owner }));
     expect(html).toContain(owner.displayName);
     expect(html).toContain(`Компьютер: ${owner.deviceName}`);
-    expect(html).toContain("Права заняты:");
+    expect(html).toContain("Зафиксирован сеанс редактора");
+    expect(html).toContain("Активность этого сеанса не подтверждена");
+    expect(html).toContain("Вход заблокирован:");
     expect(html).toContain("Ввод пароля не освобождает чужой сеанс");
     expect(accessControls(html).attributes).toContain('disabled=""');
     expect(html).not.toContain("Редактор свободен");
@@ -142,6 +144,37 @@ describe("settings workspace access rendered UI", () => {
     const next = renderSettings(workspace({ accessControlled: false }));
     expect(next).toContain("Редактор свободен");
     expect(next).not.toContain(owner.displayName);
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it("keeps a compact owner path available to viewers without opening or authorizing recovery", () => {
+    const html = renderSettings(workspace({ editorBusy: true, editorOwner: { ...owner, deviceName: "" } }));
+    expect(html).toContain("Компьютер не указан");
+    const action = buttonAttributes(html, "Открыть управление сеансом");
+    expect(action).not.toContain("disabled");
+    expect(action).toContain('data-workspace-viewer-allowed="true"');
+    expect(action).toContain('aria-controls="workspace-owner-panel"');
+    expect(accessControls(html).attributes).toContain('aria-describedby="workspace-editor-access-help"');
+    expect(html).toMatch(/class="owner-panel-toggle"[^>]*aria-expanded="false"/);
+    expect(html).not.toContain("Восстановить завершённый сеанс…");
+    expect(html).toContain("с отдельным паролем");
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it("explains the unconfigured owner case instead of suggesting a password bypass", () => {
+    const html = renderSettings(workspace({ editorBusy: true, editorOwner: owner, ownerConfigured: false }));
+    expect(html).toContain("Владелец этой папки ещё не настроен");
+    expect(html).toContain("не удаляйте служебные файлы блокировки вручную");
+    expect(accessControls(html).attributes).toContain('disabled=""');
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it("offers guidance rather than recovery on an unknown state and explains read-only storage", () => {
+    const html = renderSettings(workspace({ editorStateMessage: "Сеть недоступна", writable: false }));
+    expect(html).toContain("Вход заблокирован до подтверждения состояния общей папки");
+    expect(html).toContain("нет прав записи в рабочую папку");
+    expect(buttonAttributes(html, "Открыть управление сеансом")).not.toContain("disabled");
+    expect(accessControls(html).attributes).toContain('disabled=""');
     expect(invoke).not.toHaveBeenCalled();
   });
 });

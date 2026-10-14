@@ -1,8 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { documentHtml, experienceReferenceBody, teamListBody, workAllocationBody } from "./documents";
+import { documentHtml, experienceReferenceBody, nmcLabel, teamListBody, workAllocationBody } from "./documents";
 import { emptyProcurement } from "./types";
 
 describe("procurement documents", () => {
+  it("shows an unfilled legacy NMC as unknown rather than a zero-ruble price", () => {
+    expect(nmcLabel(0)).toBe("Не указана");
+    const output = documentHtml(emptyProcurement(), "Черновик", "");
+    expect(output).toContain("<b>НМЦ:</b> Не указана");
+    expect(nmcLabel(1500)).toContain("500");
+  });
   it("escapes user-entered HTML in generated documents", () => {
     const item = { ...emptyProcurement(), name: "<script>alert(1)</script>", customer: "Заказчик", subject: "Работы", nmc: 100 };
     const output = documentHtml(item, "Сводка", workAllocationBody(item));

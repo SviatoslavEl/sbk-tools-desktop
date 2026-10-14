@@ -3,6 +3,7 @@ import { isValidElement, type ReactElement, type ReactNode } from "react";
 import { readFileSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Settings } from "./Settings";
+import { OwnerPanel } from "./OwnerPanel";
 import type { BackupListItem, WorkspaceInfo } from "../../lib/storage";
 
 const hooks = vi.hoisted(() => ({
@@ -35,13 +36,14 @@ vi.mock("../../lib/storage", async (original) => ({ ...await original<typeof imp
 vi.mock("../intelligence/api", () => ({ getIntelligenceProviderStatus: hooks.intelligence }));
 vi.mock("../../lib/sharedWorkspace", () => ({ readAccessTimers: () => hooks.timers, saveAccessTimers: hooks.saveTimers, readSharedBackupPolicy: hooks.readPolicy, saveSharedBackupPolicy: hooks.savePolicy }));
 
-type Props = { children?: ReactNode; hidden?: boolean; disabled?: boolean; className?: string; onClick?: () => unknown; role?: string; onChange?: (event: { target: { value: string } }) => void; value?: unknown };
+type Props = { children?: ReactNode; hidden?: boolean; disabled?: boolean; className?: string; onClick?: () => unknown; role?: string; onChange?: (event: { target: { value: string } }) => void; value?: unknown; expanded?: boolean; onExpandedChange?: (value: boolean) => void; "aria-controls"?: string; "data-workspace-viewer-allowed"?: boolean };
 let tree: ReactNode;
 const workspace: WorkspaceInfo = { root: "/tmp/sbk-settings-test", portable: false, configured: true, writable: true, editor: true, editorBusy: false, accessControlled: false, accessMessage: "Редактор", schemaVersion: 1, freeSpaceBytes: 1_000_000 };
+let currentWorkspace = workspace;
 
 function render() {
   hooks.cursor = 0; hooks.changed = false;
-  tree = Settings({ collapsed: false, onCollapsed: vi.fn(), workspace, onWorkspaceChange: vi.fn() });
+  tree = Settings({ collapsed: false, onCollapsed: vi.fn(), workspace: currentWorkspace, onWorkspaceChange: vi.fn() });
   for (const effect of hooks.effects.splice(0)) effect();
 }
 async function flush() { for (let i = 0; i < 20; i += 1) { await Promise.resolve(); if (hooks.changed) render(); } }
@@ -57,6 +59,7 @@ const sharedPolicy = { source: "shared", policy: { version: 1, backupHours: 24, 
 beforeEach(() => {
   hooks.cursor = 0; hooks.changed = false; hooks.slots = []; hooks.effects = []; hooks.loading = false; hooks.error = null;
   hooks.editor = true;
+  currentWorkspace = workspace;
   for (const fn of [hooks.list, hooks.verify, hooks.backup, hooks.intelligence, hooks.save, hooks.reload, hooks.readPolicy, hooks.savePolicy, hooks.saveTimers]) fn.mockReset();
   hooks.list.mockResolvedValue([]); hooks.intelligence.mockResolvedValue(null); hooks.save.mockResolvedValue(undefined);
   hooks.verify.mockResolvedValue({ files: 3, unpackedBytes: 1024, sha256: "synthetic" });
@@ -194,5 +197,29 @@ describe("settings navigation and backup confidence", () => {
     expect(text()).toContain("Ошибка: Error: Папка недоступна");
     expect(text()).not.toContain("Резервная копия создана");
     expect(interfaceFieldset().props.disabled).toBe(false);
+  });
+
+  it("opens and closes the existing compact owner panel from blocked viewer guidance without an access mutation", async () => {
+    hooks.editor = false;
+    currentWorkspace = { ...workspace, editor: false, editorBusy: true, ownerConfigured: true, editorOwner: { displayName: "QA user", userName: "qa", deviceName: "", startedAt: "2000-01-01T00:00:00Z" } };
+    render(); await flush();
+    const panel = () => nodes().find((node) => node.type === OwnerPanel)!;
+    expect(panel().props.expanded).toBe(false);
+    const open = button("Открыть управление сеансом");
+    expect(open.props.disabled).not.toBe(true);
+    expect(open.props["data-workspace-viewer-allowed"]).toBe(true);
+    expect(open.props["aria-controls"]).toBe("workspace-owner-panel");
+    expect(text()).toContain("Активность этого сеанса не подтверждена");
+    open.props.onClick?.(); await flush();
+    expect(panel().props.expanded).toBe(true);
+    panel().props.onExpandedChange?.(false); await flush();
+    expect(panel().props.expanded).toBe(false);
+    button("Открыть управление сеансом").props.onClick?.(); await flush();
+    expect(panel().props.expanded).toBe(true);
+    currentWorkspace = { ...currentWorkspace, root: "/tmp/sbk-settings-other-test" };
+    render(); await flush();
+    expect(panel().props.expanded).toBe(false);
+    expect(hooks.save).not.toHaveBeenCalled();
+    expect(hooks.savePolicy).not.toHaveBeenCalled();
   });
 });

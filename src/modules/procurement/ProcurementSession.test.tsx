@@ -73,6 +73,22 @@ beforeEach(() => {
 afterEach(() => { for (const slot of runtime.slots) slot.cleanup?.(); vi.unstubAllGlobals(); });
 
 describe("procurement save and close lifecycle", () => {
+  it("saves an unknown-NMC draft without converting it to a known price", async () => {
+    props = { initialValue: { ...emptyProcurement(), name: "Извещение без НМЦ", customer: "Заказчик", subject: "Аудит", notes: "НМЦ в источнике не указана" }, onSave: saved, onClose: closed };
+    render(); await flush();
+    const nmcLabel = nodes().find((node) => node.type === "label" && text(node).trim() === "НМЦ")!;
+    expect(nodes(nmcLabel).find((node) => node.type === "input")!.props.value).toBe("");
+    expect(text()).toContain("Черновик можно сохранить");
+    button("Сохранить закупку").props.onClick!(); await flush();
+    expect(saved).toHaveBeenCalledOnce();
+    expect(saved.mock.calls[0][0]).toMatchObject({ status: "Черновик", nmc: 0, notes: "НМЦ в источнике не указана" });
+  });
+
+  it.each([[-1, "Черновик"], [Number.NaN, "Черновик"], [0, "Подготовка"], [0, "Подана"]] as const)("does not waive invalid/required NMC for %s and %s", async (nmc, status) => {
+    props = { initialValue: { ...emptyProcurement(), name: "Закупка", customer: "Заказчик", subject: "Аудит", nmc, status }, onSave: saved, onClose: closed };
+    render(); await flush(); button("Сохранить закупку").props.onClick!(); await flush();
+    expect(saved).not.toHaveBeenCalled(); expect(text()).toContain("Исправьте отмеченные");
+  });
   it("opens an intelligence result as an unsaved new card and saves only on the normal action", async () => {
     const seed = { ...emptyProcurement(), name: "Закупка из ИИ", customer: "Заказчик", subject: "Услуги", nmc: 250_000, notes: "Источник: тестовый документ" };
     props = { initialValue: seed, onSave: saved, onClose: closed };

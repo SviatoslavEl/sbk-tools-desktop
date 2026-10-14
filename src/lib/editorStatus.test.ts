@@ -31,6 +31,9 @@ describe("shared-folder editor status", () => {
       canAcquire: false,
       text: owner.displayName,
       device: "OFFICE-PC-02",
+      label: "Зафиксирован сеанс редактора",
+      detail: "Активность этого сеанса не подтверждена. Запись не показывает, работает ли приложение редактора сейчас.",
+      deviceLabel: "Компьютер: OFFICE-PC-02",
     });
   });
 
@@ -38,6 +41,9 @@ describe("shared-folder editor status", () => {
     const status = editorStatus(workspace({ editorBusy: true }));
     expect(status).toMatchObject({ unknown: false, occupied: true, canAcquire: false, device: "" });
     expect(status.text).toBe("Имя редактора недоступно");
+    expect(status.label).toBe("Сеанс редактора занят");
+    expect(status.detail).toContain("Кто удерживает сеанс, не подтверждено");
+    expect(status.label).not.toContain("Зафиксирован");
     expect(status.text).not.toBe("Редактор свободен");
   });
 
@@ -101,6 +107,22 @@ describe("shared-folder editor status", () => {
       device: "OFFICE-PC-02",
       canAcquire: false,
     });
+  });
+
+  it("does not infer liveness from an old marker or missing device", () => {
+    const status = editorStatus(workspace({ editorBusy: true, editorOwner: { ...owner, deviceName: "  ", startedAt: "2000-01-01T00:00:00Z" } }));
+    expect(status).toMatchObject({ canAcquire: false, label: "Зафиксирован сеанс редактора", device: "", deviceLabel: "Компьютер не указан" });
+    expect(status.detail).toContain("Активность этого сеанса не подтверждена");
+    expect(status.detail).not.toMatch(/(?:завершён|завершен|активен)/);
+  });
+
+  it("distinguishes this instance's editor rights from a recorded remote session", () => {
+    expect(editorStatus(workspace({ editor: true, editorBusy: true, editorOwner: owner }))).toMatchObject({ label: "Сеанс редактора этого экземпляра", detail: "", canAcquire: false });
+  });
+
+  it("does not present an unreadable state as a confirmed recorded session", () => {
+    const status = editorStatus(workspace({ editorBusy: true, editorOwner: owner, editorStateMessage: "Ошибка чтения" }));
+    expect(status).toMatchObject({ label: "Состояние сеанса не подтверждено", detail: "", canAcquire: false });
   });
 
   it("accepts an empty optional status message as a successful check", () => {

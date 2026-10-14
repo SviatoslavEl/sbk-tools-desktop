@@ -631,7 +631,7 @@ function App() {
             <button className="secondary global-search-button" type="button" aria-label="Глобальный поиск" title="Поиск по рабочей папке (Ctrl/⌘ K)" onClick={() => setShowSearch(true)}><ToolIcon name="search" /><span>Поиск</span></button>
             <button className={`workspace-access-chip ${workspace.editor ? "is-editor" : access.unknown ? "is-unknown" : "is-viewer"}`} type="button" onClick={() => selectTool("settings")} title={workspace.accessMessage} aria-label={`${accessLabel}. Открыть настройки доступа`}>
               <ToolIcon name={workspace.editor ? "check" : "lock"} />
-              <span><strong>{accessLabel}</strong>{networkPaused ? <small>Данные не обновляются</small> : !workspace.editor && access.occupied && !access.unknown && <small>Редактор: {access.text}</small>}</span>
+              <span><strong>{accessLabel}</strong>{networkPaused ? <small>Данные не обновляются</small> : !workspace.editor && access.occupied && !access.unknown && <small>{workspace.editorOwner ? `Сеанс закреплён: ${access.text}` : "Сеанс занят: имя не подтверждено"}</small>}</span>
             </button>
             <button
               className="help-button"

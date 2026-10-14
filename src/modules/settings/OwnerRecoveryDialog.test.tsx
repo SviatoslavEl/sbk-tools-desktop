@@ -22,4 +22,12 @@ describe("explicit owner recovery UI", () => {
     expect(html).not.toContain("synthetic-owner-only");
     expect(html).toContain("Права редактора не передаются автоматически");
   });
+  it("labels a marker without implying liveness and explicitly shows a missing computer", () => {
+    const html = renderToStaticMarkup(<OwnerRecoveryDialog target={{ token: "test-session", owner: { displayName: "QA user", deviceName: "", startedAt: "2000-01-01T00:00:00Z" } }} busy={false} onClose={vi.fn()} onSubmit={vi.fn()} />);
+    expect(html).toContain("Зафиксирован сеанс: QA user");
+    expect(html).toContain("Компьютер не указан");
+    expect(html).toContain("Активность этого сеанса не подтверждена");
+    expect(html).toMatch(/<button[^>]+disabled=""[^>]*>Подтвердить восстановление/);
+    expect(html).not.toContain('checked=""');
+  });
 });

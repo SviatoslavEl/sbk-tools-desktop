@@ -154,7 +154,9 @@ export function applicationCompleteness(item: ProcurementData) {
 export function procurementWarnings(item: ProcurementData, now = new Date()) {
   const warnings: string[] = [];
   if (!item.name.trim() || !item.customer.trim() || !item.subject.trim()) warnings.push("Не заполнены название, заказчик или предмет закупки.");
-  if (!Number.isFinite(item.nmc) || item.nmc <= 0) warnings.push("НМЦ должна быть больше нуля.");
+  if (!Number.isFinite(item.nmc) || item.nmc <= 0) warnings.push(item.status === "Черновик" && item.nmc === 0
+    ? "НМЦ не указана. Черновик можно сохранить; для решения об участии и расчётов нужна цена."
+    : "НМЦ должна быть больше нуля.");
   if ([item.resultDetails.finalPrice, item.resultDetails.actualCosts, item.resultDetails.initialPrice, item.resultDetails.bestKnownPrice].some((value) => !Number.isFinite(value) || value < 0)) warnings.push("Некорректно заполнены цены или фактические затраты результата: нужны конечные неотрицательные суммы.");
   if (item.resourcePlan.some((entry) => !Number.isFinite(entry.loadPercent) || entry.loadPercent < 0 || entry.loadPercent > 100 || (entry.startDate && entry.endDate && entry.startDate > entry.endDate))) warnings.push("Некорректно заполнен ресурсный план: загрузка от 0 до 100%, окончание не раньше начала.");
   if (item.partners.some((entry) => !Number.isFinite(entry.workShare) || entry.workShare < 0)) warnings.push("Некорректно заполнена доля партнёра: укажите неотрицательный процент.");

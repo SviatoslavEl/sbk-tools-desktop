@@ -36,7 +36,7 @@ export function OwnerRecoveryDialog({ target, busy, onSubmit, onClose }: {
   return <Dialog title="Восстановление завершённого сеанса" description="Только после согласованного закрытия редакторов на всех компьютерах." width="620px" onClose={() => { if (!locked) onClose(); }}>
     <div className="dialog-body settings-form" aria-busy={locked}>
       <div className="notice warning"><strong>Не используйте при работающем или отключённом от сети редакторе</strong><span>Отсутствие ответа, старая дата и свободная блокировка на одном компьютере не доказывают, что другой пользователь завершил работу. Сначала свяжитесь с ним и подтвердите закрытие приложения.</span></div>
-      <div className="editor-presence"><strong>{target.owner.displayName}</strong><small>Компьютер: {target.owner.deviceName || "не указан"}</small><small>Начало: {new Date(target.owner.startedAt).toLocaleString("ru-RU")}</small></div>
+      <div className="editor-presence"><strong>Зафиксирован сеанс: {target.owner.displayName}</strong><small>{target.owner.deviceName.trim() ? `Компьютер: ${target.owner.deviceName.trim()}` : "Компьютер не указан"}</small><small>Начало: {new Date(target.owner.startedAt).toLocaleString("ru-RU")}</small><small>Активность этого сеанса не подтверждена.</small></div>
       <p className="help-text">Программа проверит обе файловые блокировки и сохранит исходную запись сеанса в отдельный служебный файл. Базы и пароли не изменяются. Права редактора не передаются автоматически.</p>
       {error && <div className="notice error" role="alert">{error}</div>}
       <fieldset className="settings-form" disabled={locked}>

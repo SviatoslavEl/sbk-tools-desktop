@@ -25,7 +25,7 @@ vi.mock("../../lib/files", () => ({ chooseOpenPath: runtime.chooseOpen }));
 vi.mock("../../lib/storage", () => ({ getWorkspaceInfo: runtime.workspace }));
 vi.mock("./connectionApi", async (original) => ({ ...await original<typeof import("./connectionApi")>(), testIntelligenceConnection: runtime.testConnection, runIntelligenceAnalysis: runtime.analyze, cancelIntelligenceRequest: runtime.cancel }));
 
-interface NodeProps { children?: ReactNode; value?: unknown; id?: string; type?: string; disabled?: boolean; "aria-label"?: string; onClick?: () => unknown; onChange?: (event: { target: { value: string; checked: boolean } }) => unknown; onConfirm?: () => unknown; onClose?: () => void; }
+interface NodeProps { children?: ReactNode; value?: unknown; checked?: boolean; id?: string; type?: string; disabled?: boolean; className?: string; open?: boolean; "aria-label"?: string; onClick?: () => unknown; onChange?: (event: { target: { value: string; checked: boolean } }) => unknown; onConfirm?: () => unknown; onClose?: () => void; }
 let tree: ReactNode;
 let props: Parameters<typeof IntelligenceWorkbench>[0];
 let localValues: Map<string, string>;
@@ -168,5 +168,73 @@ describe("unified intelligence workflow", () => {
     for (let index = 0; index < 100; index++) await click("Добавить карточку вручную");
     expect(button("Добавить карточку вручную").props.disabled).toBe(true); expect(button("Открыть черновик: Закупки").props.disabled).toBe(true);
     button("Добавить карточку вручную").props.onClick!(); await flush(); expect(text()).toContain("не более 100 карточек");
+  });
+  it("keeps malformed numeric and dated values visible until explicitly corrected or deselected", async () => {
+    await paste([{ destination: "procurement", title: "Тендер с исправлениями", fields: { name: "Реальная закупка", nmc: "0,00", submissionDeadline: "2026-10-31T12:30:00+03:00", publishedDate: null } }]);
+    expect(field("nmc").props.type).toBe("text"); expect(field("nmc").props.value).toBe("0,00");
+    expect(field("submissionDeadline").props.type).toBe("text"); expect(field("submissionDeadline").props.value).toBe("2026-10-31T12:30:00+03:00");
+    expect(field("publishedDate").props.value).toBe(""); expect(button("Открыть черновик: Закупки").props.disabled).toBe(true);
+    await click("Скопировать значение в примечания"); expect(field("notes").props.value).toContain("2026-10-31T12:30:00+03:00"); expect(field("submissionDeadline").props.value).toBe("2026-10-31T12:30:00+03:00");
+    field("nmc").props.onChange!({ target: { value: "1500,50", checked: false } }); await flush(); expect(field("nmc").props.value).toBe("1500.5");
+    field("submissionDeadline").props.onChange!({ target: { value: "2026-10-31", checked: false } }); await flush(); expect(field("submissionDeadline").props.type).toBe("text"); expect(field("submissionDeadline").props.value).toBe("2026-10-31");
+    expect(button("Открыть черновик: Закупки").props.disabled).toBe(false); await click("Открыть черновик: Закупки");
+    const handoff = transfer.mock.calls[0][0]; expect(handoff.destination).toBe("procurement");
+    if (handoff.destination === "procurement") { expect(handoff.data.nmc).toBe(1500.5); expect(handoff.data.submissionDeadline).toBe("2026-10-31"); expect(handoff.data.notes).toContain("12:30:00+03:00"); }
+  });
+  it("does not turn a provider's zero string into a confirmed numeric zero without user input", async () => {
+    await paste([{ destination: "procurement", title: "Без НМЦ", fields: { name: "Закупка", nmc: "0,00" } }]);
+    expect(field("nmc").props.value).toBe("0,00"); expect(button("Открыть черновик: Закупки").props.disabled).toBe(true);
+    await toggle("Передать поле Начальная цена, ₽ результата 1", false); expect(field("nmc").props.value).toBe("0,00"); expect(button("Открыть черновик: Закупки").props.disabled).toBe(false);
+    await toggle("Передать поле Начальная цена, ₽ результата 1", true); field("nmc").props.onChange!({ target: { value: "0,00", checked: false } }); await flush();
+    expect(field("nmc").props.value).toBe("0"); expect(text()).toContain("нулевая цена строки спецификации не подтверждает");
+  });
+  it("treats empty answers as warnings and preserves existing corrected cards and raw answer", async () => {
+    await configureModel(); await addText(); await paste(); field("customer").props.onChange!({ target: { value: "Проверенный заказчик", checked: false } }); await flush();
+    runtime.analyze.mockResolvedValueOnce({ text: '{"items":[]}', model: "qa-model" }); await click("Отправить выбранные источники"); await confirm();
+    expect(text()).toContain("Модель не подготовила ни одной карточки"); expect(text()).not.toContain("Подготовлено карточек: 0");
+    expect(field("customer").props.value).toBe("Проверенный заказчик"); expect(control("iw-response").props.value).toBe('{"items":[]}');
+    expect(nodes().find((node) => node.props.className === "iw-raw-response")?.props.open).toBe(true); expect(text()).toContain("предыдущий разобранный результат");
+  });
+  it("keeps preset scope after instruction edits and sends a matching schema, independent of words in the instruction", async () => {
+    await configureModel(); await addText(); await click("Закупка"); await edit("iw-instruction", "Дополнительно проверь имена сотрудников и компании, но подготовь результат текущего сценария.");
+    expect(button("Закупка").props.className).toContain("iw-preset-active");
+    expect(nodes().find((node) => node.props["aria-label"] === "Подготовить Закупки")?.props.checked).toBe(true);
+    expect(nodes().find((node) => node.props["aria-label"] === "Подготовить Кадры")?.props.checked).toBe(false);
+    await click("Отправить выбранные источники"); const schema = runtime.analyze.mock.calls[0][4] as Record<string, unknown>;
+    expect(schema).toBeTruthy(); const encoded = JSON.stringify(schema); expect(encoded).toContain("procurement"); expect(encoded).not.toContain('"staff"');
+    const prompt = runtime.analyze.mock.calls[0][1] as string; expect(prompt).toContain("Дополнительно проверь");
+  });
+  it("rejects cards outside the requested scope without overwriting old cards, and ignores late replies after changing scope", async () => {
+    await configureModel(); await addText(); await click("Закупка"); await paste();
+    runtime.analyze.mockResolvedValueOnce({ text: result([{ destination: "staff", title: "Не запрашивали", fields: { fullName: "Иванов" } }]), model: "qa-model" });
+    await click("Отправить выбранные источники"); await confirm(); expect(field("name").props.value).toBe("Тестовая закупка"); expect(text()).toContain("карточки не разобраны");
+    const late = deferred<{ text: string; model: string }>(); runtime.analyze.mockReturnValueOnce(late.promise);
+    await click("Отправить выбранные источники"); await confirm(); await click("Кадры");
+    late.resolve({ text: result([procurement]), model: "late-model" }); await flush();
+    expect(nodes().find((node) => node.props["aria-label"] === "Подготовить Кадры")?.props.checked).toBe(true); expect(text()).not.toContain("late-model"); expect(field("name").props.value).toBe("Тестовая закупка");
+  });
+  it("defaults new Ollama profiles to schemas, keeps legacy profiles in JSON, and shows only returned metrics", async () => {
+    await configureModel(); expect(control("iw-output-mode").props.value).toBe("schema"); await addText();
+    runtime.analyze.mockResolvedValueOnce({ text: result([procurement]), model: "qa-model", metrics: { elapsedMilliseconds: 1250, inputTokens: 300, outputTokens: 120, totalTokens: 420, loadMilliseconds: 250 } });
+    await click("Отправить выбранные источники"); expect(text()).toContain("Время: 1,25 с"); expect(text()).toContain("На входе: 300 токенов"); expect(text()).toContain("На выходе: 120 токенов");
+    await edit("iw-response", result([procurement])); expect(text()).not.toContain("На входе: 300 токенов");
+    const legacy = { id: "legacy", name: "Старое подключение", scope: "local", protocol: "openai-compatible", endpoint: "http://localhost:1234/v1", model: "old-model", timeoutSeconds: 120 };
+    localValues.set("sbk-intelligence-connections-v1", JSON.stringify([legacy])); for (const slot of runtime.slots) slot.cleanup?.(); runtime.slots = []; runtime.effects = []; render(); await flush(); await click("Настроить подключение");
+    expect(control("iw-output-mode").props.value).toBe("json"); expect(JSON.parse(localValues.get("sbk-intelligence-connections-v1")!)[0]).not.toHaveProperty("outputMode");
+  });
+  it("keeps date inputs as text before correction, after valid correction, and when cleared", async () => {
+    await paste([{ destination: "procurement", title: "Дата", fields: { name: "Закупка", submissionDeadline: "2026-10-21 16:00" } }]);
+    expect(field("submissionDeadline").props.type).toBe("text"); expect(field("submissionDeadline").props.value).toBe("2026-10-21 16:00");
+    field("submissionDeadline").props.onChange!({ target: { value: "2026-10-21", checked: false } }); await flush();
+    expect(field("submissionDeadline").props.type).toBe("text"); expect(field("submissionDeadline").props.value).toBe("2026-10-21");
+    expect(button("Открыть черновик: Закупки").props.disabled).toBe(false);
+    field("submissionDeadline").props.onChange!({ target: { value: "", checked: false } }); await flush();
+    expect(field("submissionDeadline").props.type).toBe("text"); expect(field("submissionDeadline").props.value).toBe("");
+  });
+  it("clears the previous success notice when a manual response fails to parse", async () => {
+    await paste(); expect(text()).toContain("Подготовлено карточек: 1");
+    await edit("iw-response", "not JSON"); await click("Разобрать ответ"); await confirm();
+    expect(text()).not.toContain("Подготовлено карточек: 1"); expect(text()).toContain("не является корректным JSON");
+    expect(control("iw-response").props.value).toBe("not JSON"); expect(field("name").props.value).toBe("Тестовая закупка");
   });
 });

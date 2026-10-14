@@ -6,9 +6,11 @@ import type { ProcurementData } from "./types";
 export const html = (value: unknown) => String(value ?? "").replace(/[&<>"']/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[character] || character);
 export const safeBase = (value: string) => value.replace(/[^\p{L}\p{N}._ -]+/gu, "_").trim() || "закупка";
 export const money = (value: number) => new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 0 }).format(value) + " ₽";
+/** Existing records use zero for an unfilled NMC; do not present it as a price. */
+export const nmcLabel = (value: number) => Number.isFinite(value) && value > 0 ? money(value) : "Не указана";
 
 export function documentHtml(item: ProcurementData, title: string, body: string) {
-  return `<!doctype html><html lang="ru"><meta charset="utf-8"><title>${html(title)}</title><style>body{font:14px/1.5 Arial,sans-serif;max-width:960px;margin:36px auto;color:#17221d}h1,h2{color:#226b37}table{width:100%;border-collapse:collapse}th,td{padding:8px;border:1px solid #b9c9bd;text-align:left;vertical-align:top}.meta{color:#607067;font-size:12px}.warn{color:#9b2d34}.muted{color:#607067}</style><h1>${html(title)}</h1><p class="meta">Шаблон SBK-PROCUREMENT/1 · создано ${html(new Date().toLocaleString("ru-RU"))}</p><p><b>Закупка:</b> ${html(item.name)}<br><b>Заказчик:</b> ${html(item.customer)}<br><b>Предмет:</b> ${html(item.subject)}<br><b>НМЦ:</b> ${html(money(item.nmc))}</p>${body}</html>`;
+  return `<!doctype html><html lang="ru"><meta charset="utf-8"><title>${html(title)}</title><style>body{font:14px/1.5 Arial,sans-serif;max-width:960px;margin:36px auto;color:#17221d}h1,h2{color:#226b37}table{width:100%;border-collapse:collapse}th,td{padding:8px;border:1px solid #b9c9bd;text-align:left;vertical-align:top}.meta{color:#607067;font-size:12px}.warn{color:#9b2d34}.muted{color:#607067}</style><h1>${html(title)}</h1><p class="meta">Шаблон SBK-PROCUREMENT/1 · создано ${html(new Date().toLocaleString("ru-RU"))}</p><p><b>Закупка:</b> ${html(item.name)}<br><b>Заказчик:</b> ${html(item.customer)}<br><b>Предмет:</b> ${html(item.subject)}<br><b>НМЦ:</b> ${html(nmcLabel(item.nmc))}</p>${body}</html>`;
 }
 
 export function summaryBody(item: ProcurementData) {

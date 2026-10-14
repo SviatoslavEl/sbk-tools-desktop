@@ -67,7 +67,15 @@ export function Settings({
   const [maintenanceBusy, setMaintenanceBusy] = useState(false);
   const maintenanceOperation = useRef(false);
   const accessOperation = useRef(false);
+  const [ownerPanelExpanded, setOwnerPanelExpanded] = useState(false);
+  const ownerPanelRef = useRef<HTMLDivElement | null>(null);
   const editor = editorStatus(workspace);
+  const openOwnerPanel = () => {
+    setOwnerPanelExpanded(true);
+    ownerPanelRef.current?.scrollIntoView({ block: "start", behavior: "smooth" });
+    ownerPanelRef.current?.querySelector<HTMLButtonElement>(".owner-panel-toggle")?.focus({ preventScroll: true });
+  };
+  useEffect(() => setOwnerPanelExpanded(false), [workspace.root]);
   const [message, setMessage] = useState("");
   const [accessMessage, setAccessMessage] = useState("");
   const [restorePath, setRestorePath] = useState("");
@@ -370,16 +378,19 @@ export function Settings({
             </strong>
           </div>
           <div className="settings-row editor-presence" aria-live="polite">
-            <span>Текущий редактор</span>
+            <span>Сеанс редактора</span>
             <strong>
-              {editor.unknown ? "Статус не подтверждён" : editor.text}
-              {editor.device && <small>Компьютер: {editor.device}</small>}
+              {editor.label}
+              {!editor.unknown && editor.occupied && <small>{editor.text}</small>}
+              {editor.deviceLabel && <small>{editor.deviceLabel}</small>}
               {workspace.editorOwner?.startedAt && <small>с {new Date(workspace.editorOwner.startedAt).toLocaleString("ru-RU")}</small>}
+              {editor.detail && <small>{editor.detail}</small>}
             </strong>
           </div>
           {workspace.editorCleanupPending && <div className="notice warning" role="alert"><strong>Освобождение своего сеанса не завершено</strong><span>{workspace.editorCleanupMessage || "Запись запрещена. Восстановите подключение к сетевой папке и повторите освобождение. Идентификатор вашего сеанса сохранён для повторной попытки."}</span></div>}
-          {!workspace.editor && !workspace.editorCleanupPending && (editor.occupied || editor.unknown) && <p className="notice warning" role="status">{editor.unknown ? editor.text : `Права заняты: ${editor.text}. Попросите редактора перейти в режим просмотра или закрыть программу.`} Ввод пароля не освобождает чужой сеанс. Статус обновляется автоматически.</p>}
-          <fieldset className="settings-form workspace-password-controls" aria-busy={accessBusy} disabled={accessBusy || !workspace.writable || (!workspace.editorCleanupPending && (editor.unknown || (!workspace.editor && !editor.canAcquire)))}>
+          {!workspace.editor && !workspace.editorCleanupPending && (editor.occupied || editor.unknown) && <div className="notice warning" id="workspace-editor-access-help" role="status"><span>{editor.unknown ? `${editor.text}. Вход заблокирован до подтверждения состояния общей папки.` : workspace.editorOwner ? `Вход заблокирован: зафиксирован сеанс ${editor.text}. Свяжитесь с пользователем и уточните, работает ли его приложение; при необходимости попросите перейти в просмотр или закрыть программу.` : "Вход заблокирован: сеанс занят, но пользователь не определён. Обновите сведения и проверьте доступ к общей папке."} Ввод пароля не освобождает чужой сеанс. Статус обновляется автоматически.</span><button type="button" className="link-button" data-workspace-viewer-allowed aria-controls="workspace-owner-panel" onClick={openOwnerPanel}>Открыть управление сеансом</button><small>{workspace.ownerConfigured ? "Восстановление после сбоя выполняет владелец с отдельным паролем, только после подтверждения закрытия всех редакторов." : "Владелец этой папки ещё не настроен. Обратитесь к ответственному за папку; не удаляйте служебные файлы блокировки вручную."}</small></div>}
+          {!workspace.writable && <p className="help-text">Вход в режим редактирования недоступен: нет прав записи в рабочую папку. Проверьте доступ к ней.</p>}
+          <fieldset className="settings-form workspace-password-controls" aria-busy={accessBusy} aria-describedby={!workspace.editor && !workspace.editorCleanupPending && (editor.occupied || editor.unknown) ? "workspace-editor-access-help" : undefined} disabled={accessBusy || !workspace.writable || (!workspace.editorCleanupPending && (editor.unknown || (!workspace.editor && !editor.canAcquire)))}>
             {workspace?.accessControlled ? <>
               <label>Пароль рабочей папки<input type="password" autoComplete="current-password" aria-invalid={Boolean(currentWorkspacePasswordError)} aria-describedby="workspace-password-hint" value={workspacePassword} onChange={(event) => setWorkspacePassword(event.target.value)} />{currentWorkspacePasswordError && <small className="field-error">{currentWorkspacePasswordError}</small>}</label>
               <p className="help-text" id="workspace-password-hint">{workspacePasswordHint}</p>
@@ -741,7 +752,7 @@ export function Settings({
         </div>
       </section>
       </div>
-      <OwnerPanel key={workspace.root} workspace={workspace} />
+      <div id="workspace-owner-panel" ref={ownerPanelRef}><OwnerPanel key={workspace.root} workspace={workspace} expanded={ownerPanelExpanded} onExpandedChange={setOwnerPanelExpanded} /></div>
       {workspaceAccess.editor && restorePath && (
         <ConfirmDialog
           title="Проверить и восстановить данные из копии?"

@@ -5,8 +5,8 @@ import { chooseOpenPath } from "../../lib/files";
 import { getWorkspaceInfo } from "../../lib/storage";
 import { invoke, networkAccessIsPaused, useNetworkAccess } from "../../lib/networkDiagnostics";
 import { useWorkspaceAccess } from "../../lib/workspaceAccess";
-import { cancelIntelligenceRequest, runIntelligenceAnalysis, testIntelligenceConnection, validateConnectionProfile, type ConnectionProfile } from "./connectionApi";
-import { buildIntelligenceHandoff, buildIntelligencePrompt, destinationLabels, emptyIntelligenceItem, fieldDefinitions, parseIntelligenceResult, validateIntelligenceItem } from "./workbenchModel";
+import { cancelIntelligenceRequest, runIntelligenceAnalysis, testIntelligenceConnection, validateConnectionProfile, type ConnectionProfile, type IntelligenceAnalysisResult } from "./connectionApi";
+import { buildIntelligenceHandoff, buildIntelligencePrompt, buildIntelligenceResponseSchema, destinationLabels, emptyIntelligenceItem, fieldDefinitions, fieldInputValue, intelligenceFieldError, parseFieldInput, parseIntelligenceResult, validateIntelligenceItem } from "./workbenchModel";
 import type { IntelligenceDestination, IntelligenceFieldValue, IntelligenceHandoff, IntelligenceItem, IntelligenceSource } from "./workbenchTypes";
 import "./intelligence-workbench.css";
 
@@ -17,20 +17,20 @@ const maxSources = 100;
 const localAttributes = { "data-workspace-viewer-allowed": true, "data-network-offline-allowed": true } as const;
 const scopes: Record<ConnectionProfile["scope"], string> = { local: "На этом компьютере", network: "В локальной сети", external: "Внешний сервис" };
 const destinations: IntelligenceDestination[] = ["procurement", "contracts", "staff", "counterparties", "proposals"];
-const presetTasks = [
-  { label: "Распределить всё", text: "Разбери выбранные источники и подготовь отдельные карточки закупок, опыта по договорам, сотрудников, контрагентов и коммерческих предложений. Создавай только карточки, для которых в источниках есть сведения. Не придумывай отсутствующие данные." },
-  { label: "Закупка", text: "Извлеки сведения о закупке: наименование, заказчик, предмет, стоимость, сроки и требования. Подготовь карточку закупки. Не придумывай отсутствующие данные." },
-  { label: "Договоры", text: "Выдели договоры и опыт выполненных работ: номер, заказчик, исполнитель, предмет, стоимость и сроки. Каждый договор — отдельная карточка опыта. Не придумывай отсутствующие данные." },
-  { label: "Кадры", text: "Выдели сотрудников, их должности, образование, навыки и сертификаты. Каждый сотрудник — отдельная карточка. Не придумывай отсутствующие данные." },
-  { label: "Контрагенты", text: "Выдели компании и их реквизиты, контактных лиц, телефоны и адреса электронной почты. Каждая компания — отдельная карточка. Не придумывай отсутствующие данные." },
-  { label: "КП", text: "Подготовь проект коммерческого предложения по выбранным источникам: получатель, предмет, состав работ, сроки и условия оплаты. Не придумывай стоимость и реквизиты." },
+const presetTasks: Array<{ label: string; destinations: IntelligenceDestination[]; text: string }> = [
+  { label: "Распределить всё", destinations, text: "Разбери выбранные источники и подготовь отдельные карточки закупок, опыта по договорам, сотрудников, контрагентов и коммерческих предложений. Создавай только карточки, для которых в источниках есть сведения. Не придумывай отсутствующие данные." },
+  { label: "Закупка", destinations: ["procurement"], text: "Извлеки сведения о закупке: наименование, заказчик, предмет, явно указанная НМЦ, сроки и все требования. Подготовь только карточку закупки. Если НМЦ не указана, пропусти поле nmc: нулевые цены строк спецификации не являются НМЦ. Дата редакции технического задания не является датой публикации закупки. Заполняй даты только по явно указанному событию в формате ГГГГ-ММ-ДД, а время и часовой пояс сохрани в примечаниях. Каждое обязательное условие, требование к участнику, срокам, составу работ и подтверждающим документам укажи отдельным пунктом requirements без сокращения важных ограничений. Не придумывай отсутствующие данные." },
+  { label: "Договоры", destinations: ["contracts"], text: "Выдели договоры и опыт выполненных работ: номер, заказчик, исполнитель, предмет, стоимость и сроки. Каждый договор — отдельная карточка опыта. Не придумывай отсутствующие данные." },
+  { label: "Кадры", destinations: ["staff"], text: "Выдели сотрудников, их должности, образование, навыки и сертификаты. Каждый сотрудник — отдельная карточка. Не придумывай отсутствующие данные." },
+  { label: "Контрагенты", destinations: ["counterparties"], text: "Выдели компании и их реквизиты, контактных лиц, телефоны и адреса электронной почты. Каждая компания — отдельная карточка. Не придумывай отсутствующие данные." },
+  { label: "КП", destinations: ["proposals"], text: "Подготовь проект коммерческого предложения по выбранным источникам: получатель, предмет, состав работ, сроки и условия оплаты. Не придумывай стоимость и реквизиты." },
 ];
 type WorkbenchSource = IntelligenceSource & { selected: boolean; warnings: string[] };
 interface ExtractionResult { fileName: string; sha256: string; extractedText: string; fragments: Array<{ locator: string; text: string }>; warnings: string[]; }
 interface PendingRequest { id: string; epoch: number; }
 
 function defaultProfile(): ConnectionProfile {
-  return { id: crypto.randomUUID(), name: "Локальная модель", scope: "local", protocol: "ollama", endpoint: "http://127.0.0.1:11434", model: "", timeoutSeconds: 120 };
+  return { id: crypto.randomUUID(), name: "Локальная модель", scope: "local", protocol: "ollama", endpoint: "http://127.0.0.1:11434", model: "", timeoutSeconds: 120, outputMode: "schema" };
 }
 function safeProfiles(value: unknown): ConnectionProfile[] {
   if (!Array.isArray(value)) return [];
@@ -40,7 +40,7 @@ function safeProfiles(value: unknown): ConnectionProfile[] {
     if (typeof item.id !== "string" || typeof item.name !== "string" || typeof item.endpoint !== "string" || typeof item.model !== "string"
       || !["local", "network", "external"].includes(String(item.scope)) || !["ollama", "openai-compatible"].includes(String(item.protocol))) return [];
     // Only this allowlist is stored. Credentials never survive a reload.
-    const profile: ConnectionProfile = { id: item.id.slice(0, 100), name: item.name.slice(0, 100), scope: item.scope as ConnectionProfile["scope"], protocol: item.protocol as ConnectionProfile["protocol"], endpoint: item.endpoint, model: item.model, timeoutSeconds: Number(item.timeoutSeconds) };
+    const profile: ConnectionProfile = { id: item.id.slice(0, 100), name: item.name.slice(0, 100), scope: item.scope as ConnectionProfile["scope"], protocol: item.protocol as ConnectionProfile["protocol"], endpoint: item.endpoint, model: item.model, timeoutSeconds: Number(item.timeoutSeconds), outputMode: (item.outputMode === undefined ? "json" : item.outputMode) as ConnectionProfile["outputMode"] };
     try { validateConnectionProfile(profile); return [profile]; } catch { return []; }
   });
 }
@@ -71,7 +71,11 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
   const [sourceText, setSourceText] = useState("");
   const [extracting, setExtracting] = useState(false);
   const [instruction, setInstruction] = useState(presetTasks[0].text);
+  const [taskDestinations, setTaskDestinations] = useState<IntelligenceDestination[]>([...destinations]);
+  const [activePreset, setActivePreset] = useState(presetTasks[0].label);
   const [rawResponse, setRawResponse] = useState("");
+  const [emptyWarning, setEmptyWarning] = useState("");
+  const [responseDetails, setResponseDetails] = useState<{ model: string; metrics?: IntelligenceAnalysisResult["metrics"] } | null>(null);
   const [manualDestination, setManualDestination] = useState<IntelligenceDestination>("procurement");
   const [items, setItems] = useState<IntelligenceItem[]>([]);
   const [resultSources, setResultSources] = useState<IntelligenceSource[]>([]);
@@ -108,7 +112,7 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
     if (request) void cancelIntelligenceRequest(request.id).catch(() => undefined);
     setRunning(false);
   };
-  const invalidateTask = () => { cancelPending(); if (items.length || rawResponse) setResultStale(true); setError(""); };
+  const invalidateTask = () => { cancelPending(); if (items.length || rawResponse) setResultStale(true); setEmptyWarning(""); setError(""); };
   useEffect(() => {
     mounted.current = true;
     return () => { mounted.current = false; epoch.current++; extractionEpoch.current++; connectionEpoch.current++; const request = pending.current; pending.current = null; if (request) void cancelIntelligenceRequest(request.id).catch(() => undefined); };
@@ -169,32 +173,41 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
     } catch (reason) { if (mounted.current && token === extractionEpoch.current) setError(errorMessage(reason)); }
     finally { if (extractionPending.current === token) extractionPending.current = null; if (mounted.current && token === extractionEpoch.current) setExtracting(false); }
   };
-  const acceptResponse = (raw: string, snapshot: IntelligenceSource[]) => {
-    const parsed = parseIntelligenceResult(raw, snapshot.map((source) => source.id));
+  const acceptResponse = (raw: string, snapshot: IntelligenceSource[], requestedDestinations: IntelligenceDestination[]) => {
+    const parsed = parseIntelligenceResult(raw, snapshot.map((source) => source.id), { editableFields: true, destinations: requestedDestinations });
+    if (!parsed.length) {
+      setError(""); setNotice(""); setResultStale(items.length > 0);
+      setEmptyWarning("Модель не подготовила ни одной карточки. Проверьте выбранные источники и направления, уточните задание или посмотрите исходный ответ ниже. Предыдущие карточки, если они были, сохранены отдельно.");
+      return;
+    }
     setItems(parsed); setResultSources(snapshot); setOpenedItems([]); setResultStale(false); setError("");
+    setEmptyWarning("");
     setNotice(`Подготовлено карточек: ${parsed.length}. Проверьте поля и откройте нужные карточки в соответствующих инструментах.`);
   };
   const analyze = async () => {
     if (pending.current) return;
     if (!selectedSources.length) { setError("Выберите хотя бы один источник."); return; }
+    if (!taskDestinations.length) { setError("Выберите хотя бы одно направление для подготовки карточек."); return; }
     if (!instruction.trim()) { setError("Укажите, что нужно сделать с выбранными источниками."); return; }
     if (!profile.model.trim()) { setConnectionOpen(true); setError("Укажите модель или выберите её после проверки подключения."); return; }
-    let prompt: string;
-    try { prompt = buildIntelligencePrompt(instruction, selectedSources); } catch (reason) { setError(errorMessage(reason)); return; }
+    const destinationSnapshot = [...taskDestinations];
+    let prompt: string; let responseSchema: Record<string, unknown>;
+    try { prompt = buildIntelligencePrompt(instruction, selectedSources, destinationSnapshot); responseSchema = buildIntelligenceResponseSchema(destinationSnapshot); } catch (reason) { setError(errorMessage(reason)); return; }
     if (bytes(prompt) > maxTextBytes) { setError("Задание и выбранные источники превышают 2 МБ. Уменьшите текст или число источников."); return; }
     const request = { id: crypto.randomUUID(), epoch: epoch.current }; pending.current = request;
-    const snapshot = structuredClone(selectedSources); setRunning(true); setError(""); setNotice("");
+    const snapshot = structuredClone(selectedSources); setRunning(true); setError(""); setNotice(""); setEmptyWarning(""); setResponseDetails(null);
     try {
-      const result = await runIntelligenceAnalysis(profile, prompt, apiKey || undefined, request.id);
+      const result = await runIntelligenceAnalysis(profile, prompt, apiKey || undefined, request.id, responseSchema);
       if (!mounted.current || pending.current?.id !== request.id || epoch.current !== request.epoch) return;
       setRawResponse(result.text);
-      try { acceptResponse(result.text, snapshot); } catch (reason) { setResultStale(true); setError(`Ответ получен, но карточки не разобраны: ${errorMessage(reason)}. Текст ответа доступен ниже. Ранее подготовленные карточки относятся к предыдущему ответу.`); }
+      setResponseDetails({ model: result.model, metrics: result.metrics });
+      try { acceptResponse(result.text, snapshot, destinationSnapshot); } catch (reason) { setResultStale(true); setError(`Ответ получен, но карточки не разобраны: ${errorMessage(reason)}. Текст ответа доступен ниже. Ранее подготовленные карточки относятся к предыдущему ответу.`); }
     } catch (reason) { if (mounted.current && pending.current?.id === request.id && epoch.current === request.epoch) setError(errorMessage(reason)); }
     finally { if (mounted.current && pending.current?.id === request.id) { pending.current = null; setRunning(false); } }
   };
   const parseManualResponse = () => {
-    cancelPending();
-    try { if (!rawResponse.trim()) throw new Error("Вставьте ответ модели в формате JSON."); if (bytes(rawResponse) > maxTextBytes) throw new Error("Ответ превышает 2 МБ."); acceptResponse(rawResponse, structuredClone(selectedSources)); }
+    cancelPending(); setNotice(""); setEmptyWarning("");
+    try { if (!rawResponse.trim()) throw new Error("Вставьте ответ модели в формате JSON."); if (bytes(rawResponse) > maxTextBytes) throw new Error("Ответ превышает 2 МБ."); acceptResponse(rawResponse, structuredClone(selectedSources), [...taskDestinations]); setResponseDetails(null); }
     catch (reason) { setError(errorMessage(reason)); }
   };
   const requestAnalysis = () => {
@@ -224,14 +237,14 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
     finally { transferPending.current = false; if (mounted.current) setTransferring(null); }
   };
   const reset = () => {
-    cancelPending(); extractionEpoch.current++; extractionPending.current = null; setExtracting(false); updateSources(() => []); setSourceName(""); setSourceText(""); setRawResponse(""); setItems([]); setResultSources([]); setOpenedItems([]); setResultStale(false); setError(""); setNotice(""); setConfirm(null);
+    cancelPending(); extractionEpoch.current++; extractionPending.current = null; setExtracting(false); updateSources(() => []); setSourceName(""); setSourceText(""); setRawResponse(""); setItems([]); setResultSources([]); setOpenedItems([]); setResultStale(false); setEmptyWarning(""); setResponseDetails(null); setError(""); setNotice(""); setConfirm(null);
   };
   const requestReset = () => {
     if (sources.length || sourceText || rawResponse || items.length) setConfirm({ title: "Очистить окно ИИ?", message: "Источники, ответ и подготовленные здесь карточки будут удалены из этого окна. Уже сохранённые карточки в других инструментах останутся.", run: reset });
     else reset();
   };
   const copyPrompt = async () => {
-    try { const prompt = buildIntelligencePrompt(instruction, selectedSources); if (!navigator.clipboard) throw new Error("Буфер обмена недоступен."); await navigator.clipboard.writeText(prompt); setNotice("Запрос с выбранными текстами скопирован."); }
+    try { const prompt = buildIntelligencePrompt(instruction, selectedSources, taskDestinations); if (!navigator.clipboard) throw new Error("Буфер обмена недоступен."); await navigator.clipboard.writeText(prompt); setNotice("Запрос с выбранными текстами скопирован."); }
     catch (reason) { setError(errorMessage(reason)); }
   };
 
@@ -246,18 +259,20 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
         <div className="iw-form-grid">
           <label>Название<input id="iw-profile-name" value={profile.name} maxLength={100} onChange={(event) => editProfile({ name: event.target.value })} /></label>
           <label>Где работает модель<select aria-label="Где работает модель" value={profile.scope} onChange={(event) => editProfile({ scope: event.target.value as ConnectionProfile["scope"] })}>{Object.entries(scopes).map(([key, label]) => <option value={key} key={key}>{label}</option>)}</select></label>
-          <label>Протокол<select aria-label="Протокол подключения" value={profile.protocol} onChange={(event) => editProfile({ protocol: event.target.value as ConnectionProfile["protocol"] })}><option value="ollama">Ollama</option><option value="openai-compatible">Совместимый с OpenAI API</option></select></label>
+          <label>Протокол<select aria-label="Протокол подключения" value={profile.protocol} onChange={(event) => editProfile({ protocol: event.target.value as ConnectionProfile["protocol"], outputMode: event.target.value === "ollama" ? "schema" : "json" })}><option value="ollama">Ollama</option><option value="openai-compatible">Совместимый с OpenAI API</option></select></label>
           <label>Адрес сервиса<input id="iw-endpoint" type="url" value={profile.endpoint} maxLength={2048} placeholder={profile.scope === "local" ? "http://127.0.0.1:11434" : "https://…/v1"} onChange={(event) => editProfile({ endpoint: event.target.value })} /></label>
           <label>Модель<input id="iw-model" value={profile.model} maxLength={200} list="iw-discovered-models" placeholder="Проверьте подключение или введите название" onChange={(event) => editProfile({ model: event.target.value })} /><datalist id="iw-discovered-models">{models.map((model) => <option value={model} key={model} />)}</datalist></label>
           <label>Ожидание ответа, секунд<input id="iw-timeout" type="number" min={5} max={600} value={profile.timeoutSeconds} onChange={(event) => editProfile({ timeoutSeconds: Number(event.target.value) })} /></label>
+          <label>Формат ответа<select id="iw-output-mode" value={profile.outputMode || "json"} onChange={(event) => editProfile({ outputMode: event.target.value as ConnectionProfile["outputMode"] })}><option value="schema">По схеме карточек</option><option value="json">Обычный JSON</option></select></label>
           <label className="iw-full">Ключ доступа, если нужен<input id="iw-api-key" type="password" autoComplete="off" value={apiKey} placeholder="Хранится только до закрытия программы" onChange={(event) => { invalidateTask(); connectionEpoch.current++; connectionPending.current = null; setConnectionBusy(false); setApiKey(event.target.value); }} /></label>
         </div>
         <p className="help-text">Для сервиса на этом компьютере разрешён HTTP с адресом localhost. Для сети и внешнего сервиса нужен HTTPS. Сохраняются только адрес, модель и параметры подключения на этом компьютере; ключ и документы не сохраняются.</p>
+        <p className="help-text">«По схеме карточек» задаёт модели структуру выбранных карточек. Если сервис не поддерживает этот режим, выберите «Обычный JSON» и отправьте запрос повторно вручную. Формат не переключается автоматически.</p>
         <div className="iw-actions"><button type="button" className="secondary" disabled={connectionBusy} onClick={() => void testConnection()}>{connectionBusy ? "Проверяем…" : "Проверить подключение"}</button><button type="button" className="secondary" onClick={saveProfile}>Сохранить подключение</button>{profiles.some((entry) => entry.id === profile.id) && <button type="button" className="text-danger" onClick={() => setConfirm({ title: "Удалить подключение?", message: `Параметры «${profile.name}» будут удалены только с этого компьютера.`, run: () => { const next = profiles.filter((entry) => entry.id !== profile.id); try { window.localStorage.setItem(profilesKey, JSON.stringify(next)); setProfiles(next); editProfile(next[0] || defaultProfile()); setApiKey(""); setConfirm(null); } catch { setConnectionMessage("Не удалось удалить подключение."); setConfirm(null); } } })}>Удалить подключение</button>}</div>
         {connectionMessage && <p className="iw-connection-message" role="status">{connectionMessage}</p>}
       </div>}
     </section>
-    {error && <div className="notice error" role="alert">{error}</div>}{notice && <div className="notice success" role="status">{notice}</div>}
+    {error && <div className="notice error" role="alert">{error}</div>}{notice && <div className="notice success" role="status">{notice}</div>}{emptyWarning && <div className="notice warning" role="status">{emptyWarning}</div>}
     <div className="iw-workspace-grid">
       <section className="surface iw-sources"><div className="iw-section-heading"><span className="iw-step">1</span><div><h3>Источники</h3><p>В модель отправятся только отмеченные тексты.</p></div></div>
         <button type="button" className="secondary iw-add-document" disabled={extracting || network.phase !== "connected"} onClick={() => void addDocument()}><ToolIcon name="folder" />{extracting ? "Извлекаем текст…" : "Добавить PDF, DOCX или XLSX"}</button>
@@ -265,10 +280,13 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
         <div className="iw-text-source"><label>Название источника<input id="iw-source-name" value={sourceName} maxLength={200} placeholder="Например: Техническое задание" onChange={(event) => setSourceName(event.target.value)} /></label><label>Текст<textarea id="iw-source-text" rows={5} maxLength={maxTextBytes} value={sourceText} placeholder="Вставьте текст документа, письма или заметки" onChange={(event) => { if (bytes(event.target.value) > maxTextBytes) setError("Текст одного источника не должен превышать 2 МБ."); else setSourceText(event.target.value); }} /></label><button type="button" className="secondary" disabled={!sourceText.trim() || sources.length >= maxSources} onClick={addTextSource}>Добавить текст</button></div>
         {sources.length ? <ul className="iw-source-list">{sources.map((source) => <li key={source.id}><div className="iw-source-line"><label><input type="checkbox" checked={source.selected} aria-label={`Отправить источник ${source.name}`} onChange={(event) => { invalidateTask(); updateSources((previous) => previous.map((entry) => entry.id === source.id ? { ...entry, selected: event.target.checked } : entry)); }} /><strong>{source.name}</strong></label><button type="button" className="icon-button" aria-label={`Удалить источник ${source.name}`} title="Удалить источник" onClick={() => setConfirm({ title: "Удалить источник?", message: `Текст «${source.name}» будет убран из текущей задачи. Подготовленные ранее карточки сохранят свои ссылки на исходный снимок.`, run: () => { invalidateTask(); updateSources((previous) => previous.filter((entry) => entry.id !== source.id)); setConfirm(null); } })}>×</button></div><small>{source.text.length.toLocaleString("ru")} символов{source.fragments?.length ? ` · ${source.fragments.length} фрагментов` : ""}</small><details><summary>Просмотреть текст</summary><textarea aria-label={`Текст источника ${source.name}`} maxLength={maxTextBytes} rows={5} value={source.text} onChange={(event) => editSourceText(source.id, event.target.value)} /></details>{source.warnings.map((warning, index) => <p className="iw-source-warning" key={index}>{warning}</p>)}</li>)}</ul> : <div className="iw-empty">Добавьте документы или текст. Общая база автоматически в модель не передаётся.</div>}
       </section>
-      <section className="surface iw-task"><div className="iw-section-heading"><span className="iw-step">2</span><div><h3>Задача</h3><p>Выберите сценарий и уточните результат.</p></div></div><div className="iw-presets">{presetTasks.map((preset) => <button type="button" className={`secondary ${instruction === preset.text ? "iw-preset-active" : ""}`} key={preset.label} onClick={() => { invalidateTask(); setInstruction(preset.text); }}>{preset.label}</button>)}</div><label>Что нужно сделать<textarea id="iw-instruction" rows={7} maxLength={20000} value={instruction} onChange={(event) => { if (event.target.value.length > 20000) { setError("Задание не должно превышать 20 000 символов."); return; } invalidateTask(); setInstruction(event.target.value); }} /></label>
-        <div className="iw-send-summary"><strong>Перед отправкой</strong><span>{scopes[profile.scope]} · {profile.model || "Модель не выбрана"}</span><code>{profile.endpoint || "Адрес не указан"}</code><span>Источников: {selectedSources.length} · символов: {sourceCharacters.toLocaleString("ru")}</span>{profile.scope !== "local" && <p>Тексты выбранных источников будут переданы указанному сервису.</p>}</div>
+      <section className="surface iw-task"><div className="iw-section-heading"><span className="iw-step">2</span><div><h3>Задача</h3><p>Выберите сценарий и уточните результат.</p></div></div><div className="iw-presets">{presetTasks.map((preset) => <button type="button" className={`secondary ${activePreset === preset.label ? "iw-preset-active" : ""}`} key={preset.label} onClick={() => { invalidateTask(); setActivePreset(preset.label); setTaskDestinations([...preset.destinations]); setInstruction(preset.text); }}>{preset.label}</button>)}</div>
+        <fieldset className="iw-destinations"><legend>Какие карточки подготовить</legend>{destinations.map((destination) => <label key={destination}><input type="checkbox" aria-label={`Подготовить ${destinationLabels[destination]}`} checked={taskDestinations.includes(destination)} onChange={(event) => { invalidateTask(); setActivePreset(""); setTaskDestinations((previous) => event.target.checked ? [...new Set([...previous, destination])] : previous.filter((entry) => entry !== destination)); }} />{destinationLabels[destination]}</label>)}</fieldset>
+        <label>Что нужно сделать<textarea id="iw-instruction" rows={7} maxLength={20000} value={instruction} onChange={(event) => { if (event.target.value.length > 20000) { setError("Задание не должно превышать 20 000 символов."); return; } invalidateTask(); setInstruction(event.target.value); }} /></label>
+        <div className="iw-send-summary"><strong>Перед отправкой</strong><span>{scopes[profile.scope]} · {profile.model || "Модель не выбрана"}</span><code>{profile.endpoint || "Адрес не указан"}</code><span>Источников: {selectedSources.length} · символов: {sourceCharacters.toLocaleString("ru")}</span><span>Карточки: {taskDestinations.map((destination) => destinationLabels[destination]).join(", ") || "не выбраны"} · {profile.outputMode === "schema" ? "по схеме" : "обычный JSON"}</span>{profile.scope !== "local" && <p>Тексты выбранных источников будут переданы указанному сервису.</p>}</div>
         <div className="iw-actions"><button type="button" className="primary" disabled={running || !selectedSources.length} onClick={requestAnalysis}>{running ? "Модель готовит ответ…" : "Отправить выбранные источники"}</button>{running && <button type="button" className="secondary" onClick={() => { cancelPending(); setNotice("Запрос отменён. Поздний ответ не будет добавлен."); }}>Остановить запрос</button>}</div>
-        <details className="iw-raw-response"><summary>Ответ модели / вставить готовый ответ</summary><p className="help-text">Можно использовать ответ другой модели. Нужен JSON с массивом items. Формат и названия полей включены в текст запроса.</p><textarea id="iw-response" rows={8} maxLength={maxTextBytes} value={rawResponse} placeholder={'{"items": [{"destination": "procurement", "title": "Закупка", "fields": {"name": "…"}}]}'} onChange={(event) => { if (bytes(event.target.value) > maxTextBytes) { setError("Ответ не должен превышать 2 МБ."); return; } cancelPending(); setRawResponse(event.target.value); setResultStale(true); }} /><div className="iw-actions"><button type="button" className="secondary" disabled={!rawResponse.trim()} onClick={requestParse}>Разобрать ответ</button><button type="button" className="secondary" onClick={() => void copyPrompt()}>Скопировать запрос для другой модели</button></div></details>
+        {responseDetails && <div className="iw-response-metrics" role="status"><strong>Последний ответ: {responseDetails.model}</strong>{responseDetails.metrics && <><span>Время: {(responseDetails.metrics.elapsedMilliseconds / 1000).toLocaleString("ru", { maximumFractionDigits: 2 })} с</span>{responseDetails.metrics.inputTokens !== undefined && <span>На входе: {responseDetails.metrics.inputTokens.toLocaleString("ru")} токенов</span>}{responseDetails.metrics.outputTokens !== undefined && <span>На выходе: {responseDetails.metrics.outputTokens.toLocaleString("ru")} токенов</span>}{responseDetails.metrics.totalTokens !== undefined && <span>Всего: {responseDetails.metrics.totalTokens.toLocaleString("ru")} токенов</span>}{responseDetails.metrics.loadMilliseconds !== undefined && <span>Загрузка модели: {(responseDetails.metrics.loadMilliseconds / 1000).toLocaleString("ru", { maximumFractionDigits: 2 })} с</span>}</>}</div>}
+        <details className="iw-raw-response" open={Boolean(emptyWarning)}><summary>Ответ модели / вставить готовый ответ</summary><p className="help-text">Можно использовать ответ другой модели. Нужен JSON с массивом items. Формат и названия полей включены в текст запроса.</p><textarea id="iw-response" rows={8} maxLength={maxTextBytes} value={rawResponse} placeholder={'{"items": [{"destination": "procurement", "title": "Закупка", "fields": {"name": "…"}}]}'} onChange={(event) => { if (bytes(event.target.value) > maxTextBytes) { setError("Ответ не должен превышать 2 МБ."); return; } cancelPending(); setRawResponse(event.target.value); setResultStale(true); setEmptyWarning(""); setResponseDetails(null); }} /><div className="iw-actions"><button type="button" className="secondary" disabled={!rawResponse.trim()} onClick={requestParse}>Разобрать ответ</button><button type="button" className="secondary" onClick={() => void copyPrompt()}>Скопировать запрос для другой модели</button></div></details>
       </section>
     </div>
     <section className="surface iw-results"><div className="iw-section-heading"><span className="iw-step">3</span><div><h3>Проверка и распределение</h3><p>Отметьте нужные поля. Кнопка откроет новый черновик; сохранение выполняется в самой карточке.</p></div></div>
@@ -282,8 +300,28 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
           <div className="iw-card-body"><label>Название результата<input aria-label={`Название результата ${index + 1}`} value={item.title} maxLength={200} onChange={(event) => editItem(item.id, { title: event.target.value })} /></label><p className="help-text">Источники: {sourceNames.join(", ") || "Не указаны"}</p><div className="iw-field-grid">{fieldDefinitions[item.destination].map((field) => {
             const value = item.fields[field.key]; const enabled = item.selectedFields.includes(field.key);
             const setValue = (next: IntelligenceFieldValue) => editItem(item.id, { fields: { ...item.fields, [field.key]: next }, selectedFields: [...new Set([...item.selectedFields, field.key])] });
+            const problem = value === undefined ? undefined : intelligenceFieldError(field, value);
+            const setInput = (input: string) => { try { setValue(parseFieldInput(field, input)); } catch { setValue(input); } };
             const inputId = `iw-${item.id}-${field.key}`;
-            return <div className={`iw-field ${enabled ? "" : "iw-field-unselected"}`} key={field.key}><div className="iw-field-heading"><input type="checkbox" aria-label={`Передать поле ${field.label} результата ${index + 1}`} checked={enabled} onChange={(event) => editItem(item.id, { fields: event.target.checked && value === undefined ? { ...item.fields, [field.key]: field.kind === "list" ? [] : "" } : item.fields, selectedFields: event.target.checked ? [...item.selectedFields, field.key] : item.selectedFields.filter((key) => key !== field.key) })} /><label htmlFor={inputId}>{field.label}</label></div>{field.kind === "choice" ? <select id={inputId} value={String(value ?? "")} onChange={(event) => setValue(event.target.value)}><option value="">Не указано</option>{field.options?.map((option) => <option key={option} value={option}>{option === "external" ? "Внешняя компания" : option === "internal" ? "Внутренняя компания" : option}</option>)}</select> : field.kind === "list" ? <textarea id={inputId} rows={3} value={Array.isArray(value) ? value.join("\n") : String(value ?? "")} placeholder="Каждый пункт с новой строки" onChange={(event) => setValue(event.target.value.split("\n").map((line) => line.trim()).filter(Boolean))} /> : field.kind === "text" ? <textarea id={inputId} rows={2} value={String(value ?? "")} onChange={(event) => setValue(event.target.value)} /> : <input id={inputId} type={field.kind === "date" ? "date" : "number"} step={field.kind === "number" ? "any" : undefined} value={String(value ?? "")} onChange={(event) => setValue(field.kind === "number" && event.target.value !== "" ? Number(event.target.value) : event.target.value)} />}</div>;
+            const problemId = `${inputId}-problem`;
+            return <div className={`iw-field ${enabled ? "" : "iw-field-unselected"} ${problem ? "iw-field-invalid" : ""}`} key={field.key}>
+              <div className="iw-field-heading"><input type="checkbox" aria-label={`Передать поле ${field.label} результата ${index + 1}`} checked={enabled} onChange={(event) => editItem(item.id, { fields: event.target.checked && value === undefined ? { ...item.fields, [field.key]: field.kind === "list" ? [] : "" } : item.fields, selectedFields: event.target.checked ? [...item.selectedFields, field.key] : item.selectedFields.filter((key) => key !== field.key) })} /><label htmlFor={inputId}>{field.label}</label></div>
+              {field.kind === "choice" ? <select id={inputId} aria-invalid={Boolean(problem && enabled)} aria-describedby={problem ? problemId : undefined} value={String(value ?? "")} onChange={(event) => setInput(event.target.value)}><option value="">Не указано</option>{problem && value !== undefined && <option value={String(value)}>Из ответа: {String(value)}</option>}{field.options?.map((option) => <option key={option} value={option}>{option === "external" ? "Внешняя компания" : option === "internal" ? "Внутренняя компания" : option}</option>)}</select>
+                : field.kind === "list" ? <textarea id={inputId} aria-invalid={Boolean(problem && enabled)} aria-describedby={problem ? problemId : undefined} maxLength={200000} rows={3} value={fieldInputValue(value)} placeholder="Каждый пункт с новой строки" onChange={(event) => setInput(event.target.value)} />
+                  : field.kind === "text" ? <textarea id={inputId} aria-invalid={Boolean(problem && enabled)} aria-describedby={problem ? problemId : undefined} maxLength={20000} rows={2} value={fieldInputValue(value)} onChange={(event) => setInput(event.target.value)} />
+                    : <input id={inputId} aria-invalid={Boolean(problem && enabled)} aria-describedby={problem ? problemId : undefined} type="text" inputMode={field.kind === "number" ? "decimal" : undefined} maxLength={20000} value={fieldInputValue(value)} placeholder={field.kind === "date" ? "ГГГГ-ММ-ДД" : "Например: 1500,50"} onChange={(event) => setInput(event.target.value)} />}
+              {problem && <p id={problemId} className="iw-field-problem">{problem} {enabled ? "Исправьте значение или снимите отметку передачи этого поля." : "Поле не будет передано."}</p>}
+              {problem && field.kind === "date" && typeof value === "string" && /\d{1,2}:\d{2}/.test(value) && <><p className="help-text">В ответе есть дата со временем. Укажите дату отдельно; время и часовой пояс можно сохранить в примечаниях.</p><button type="button" className="secondary iw-copy-date" onClick={() => {
+                const noteKey = item.destination === "proposals" ? "internalNote" : "notes";
+                const oldNote = typeof item.fields[noteKey] === "string" ? item.fields[noteKey] as string : "";
+                const entry = `${field.label}: ${value}`;
+                const note = oldNote.includes(entry) ? oldNote : [oldNote, entry].filter(Boolean).join("\n");
+                if (note.length > 20000) { setError("Примечания превышают 20 000 символов. Скопируйте время в отдельный фрагмент вручную."); return; }
+                editItem(item.id, { fields: { ...item.fields, [noteKey]: note }, selectedFields: [...new Set([...item.selectedFields, noteKey])] });
+              }}>Скопировать значение в примечания</button></>}
+              {item.destination === "procurement" && field.key === "nmc" && value === 0 && <p className="help-text">Проверьте НМЦ по источнику: нулевая цена строки спецификации не подтверждает начальную цену закупки. Если НМЦ не указана, снимите отметку этого поля.</p>}
+              {item.destination === "procurement" && field.key === "publishedDate" && value !== undefined && <p className="help-text">Дата редакции технического задания не является датой публикации закупки.</p>}
+            </div>;
           })}</div>{errors.length > 0 && <p className="iw-validation" role="status">{errors.join(" ")}</p>}<footer className="iw-card-actions"><button type="button" className="primary" disabled={!canTransfer || Boolean(transferring) || Boolean(errors.length)} onClick={() => void transfer(item)}>{transferring === item.id ? "Проверяем доступ…" : `Открыть черновик: ${destinationLabels[item.destination]}`}</button><button type="button" className="text-danger" onClick={() => setConfirm({ title: "Удалить результат?", message: "Эта подготовленная карточка будет удалена из окна ИИ. Данные в общей базе не изменятся.", run: () => { cancelPending(); setItems((previous) => previous.filter((entry) => entry.id !== item.id)); setConfirm(null); } })}>Удалить результат</button></footer></div>
         </details>;
       })}</div> : <div className="iw-empty">Результаты появятся после анализа или разбора вставленного ответа. Также можно подготовить карточку вручную.</div>}

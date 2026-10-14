@@ -14,11 +14,13 @@ interface OwnerInfo {
 }
 const actionLabels: Record<string, string> = { "owner-setup": "Настройка владельца", "revoke-requested": "Запрошен отзыв редактора", "release-requested": "Просьба освободить редактора", "release-acknowledged": "Освобождение подтверждено", "release-failed": "Освобождение не завершено", "recovery-intent": "Начата проверка восстановления", "recovery-completed": "Завершённый сеанс восстановлен", "recovery-failed": "Восстановление не выполнено" };
 
-export function OwnerPanel({ workspace }: { workspace: WorkspaceInfo | null }) {
-  const [expanded, setExpanded] = useState(false);
+export function OwnerPanel({ workspace, expanded: controlledExpanded, onExpandedChange }: { workspace: WorkspaceInfo | null; expanded?: boolean; onExpandedChange?: (value: boolean) => void }) {
+  const [localExpanded, setLocalExpanded] = useState(false);
+  const expanded = controlledExpanded ?? localExpanded;
+  const setExpanded = onExpandedChange ?? setLocalExpanded;
   const panelId = useId();
   return <section className="owner-panel-disclosure" data-workspace-viewer-allowed aria-label="Администрирование сетевой папки">
-    <button type="button" className="owner-panel-toggle" aria-expanded={expanded} aria-controls={panelId} onClick={() => setExpanded((value) => !value)}><span>Администрирование сетевой папки</span><span aria-hidden="true">{expanded ? "−" : "+"}</span></button>
+    <button type="button" className="owner-panel-toggle" aria-expanded={expanded} aria-controls={panelId} onClick={() => setExpanded(!expanded)}><span>Администрирование сетевой папки</span><span aria-hidden="true">{expanded ? "−" : "+"}</span></button>
     <div id={panelId} hidden={!expanded}>{expanded && <><NetworkDiagnosticsPanel ownerConfigured={workspace?.ownerConfigured} /><OwnerPanelContent workspace={workspace} /></>}</div>
   </section>;
 }
@@ -139,7 +141,7 @@ function OwnerPanelContent({ workspace }: { workspace: WorkspaceInfo | null }) {
   const knownEditor = info ? info.editor?.owner : workspace?.editorOwner;
   const canRequest = !busy && !status.unknown && status.occupied && Boolean(knownEditor) && validReason && Boolean(workspace?.writable);
   return <div className="owner-panel" aria-busy={busy}>
-    <div className="editor-presence" aria-live="polite"><strong>Текущий редактор: {status.text}</strong>{status.device && <small>Компьютер: {status.device}</small>}</div>
+    <div className="editor-presence" aria-live="polite"><strong>{status.label}</strong>{(status.unknown || status.occupied) && <small>{status.text}</small>}{status.deviceLabel && <small>{status.deviceLabel}</small>}{status.detail && <small>{status.detail}</small>}</div>
     {status.occupied && !status.unknown && !knownEditor && <p className="help-text">Режим занят, но адресат неизвестен. Запрос станет доступен после получения сведений о редакторе.</p>}
     {message && <div className="notice" role="status">{message}</div>}
     {!workspace ? <p role="status">Загружаем сведения об общей папке…</p> : !workspace.ownerConfigured ? <fieldset className="settings-form" disabled={busy || !workspace.editor || status.unknown}>
@@ -161,7 +163,7 @@ function OwnerPanelContent({ workspace }: { workspace: WorkspaceInfo | null }) {
         <button type="button" className="secondary" disabled={!canRequest} onClick={() => void request()}>Попросить освободить редактора</button>
         {info && <button type="button" className="danger-button" disabled={!canRequest || !info.editor || !revokePassword} onClick={() => setPending(info.editor)}>Отозвать текущего редактора…</button>}
       </div>
-      {info && <details className="owner-panel-help"><summary>Сеанс остался после сбоя или закрытия программы</summary><p>Обычный отзыв — это запрос работающему приложению. Если оно уже закрыто, подтверждение не придёт. После согласованного закрытия всех редакторов владелец может восстановить завершённый сеанс отдельно.</p><p>Не восстанавливайте доступ, если компьютер редактора просто потерял сеть. Сначала подтвердите закрытие приложения на нём. База и пароли не меняются.</p><button type="button" className="secondary" disabled={busy || status.unknown || !info.editor || Boolean(workspace?.editor) || Boolean(workspace?.editorCleanupPending)} onClick={() => setRecoveryTarget(info.editor)}>Восстановить завершённый сеанс…</button>{workspace?.editorCleanupPending && <p className="help-text">Сначала повторите освобождение собственного сеанса в настройках доступа выше.</p>}</details>}
+      <details className="owner-panel-help"><summary>Как восстановить сеанс после сбоя или закрытия программы</summary><p>Обычный отзыв — это запрос работающему приложению. Если оно уже закрыто, подтверждение не придёт. По записи сеанса это определить нельзя. После согласованного закрытия всех редакторов владелец может восстановить завершённый сеанс отдельно.</p><p>Не восстанавливайте доступ, если компьютер редактора просто потерял сеть. Сначала подтвердите закрытие приложения на нём. База и пароли не меняются.</p>{!info ? <p className="help-text">Войдите выше с отдельным паролем владельца. Затем станет доступно восстановление выбранного сеанса с повторным подтверждением.</p> : <><button type="button" className="secondary" disabled={busy || status.unknown || !info.editor || Boolean(workspace?.editor) || Boolean(workspace?.editorCleanupPending)} onClick={() => setRecoveryTarget(info.editor)}>Восстановить завершённый сеанс…</button>{status.unknown && <p className="help-text">Состояние не подтверждено. Обновите сведения и проверьте доступ к папке; восстановление пока недоступно.</p>}{!info.editor && !status.unknown && <p className="help-text">Нет определённого сеанса для восстановления. Обновите сведения.</p>}{workspace?.editorCleanupPending && <p className="help-text">Сначала повторите освобождение собственного сеанса в настройках доступа выше.</p>}</>}</details>
       {info && <details><summary>Журнал администрирования · последние {info.events.length}</summary><div className="table-scroll"><table><thead><tr><th>Когда</th><th>Кто</th><th>Действие</th><th>Причина</th></tr></thead><tbody>{info.events.map((entry) => <tr key={entry.id}><td>{new Date(entry.createdAt).toLocaleString("ru-RU")}</td><td>{entry.actor}</td><td>{actionLabels[entry.action] || entry.action}</td><td>{entry.reason}</td></tr>)}</tbody></table></div></details>}
     </>}
     <details className="owner-panel-help"><summary>Как устроены права и резервирование</summary><p>Защита действует внутри приложения. Прямые права записи в сетевую папку позволяют менять файлы вне программы. Обновите все рабочие места.</p><p>Отзыв касается только выбранного сеанса. Он не передаёт права автоматически: следующий редактор входит с обычным паролем рабочей папки. Удаления базы здесь нет. Служебное хранилище владельца резервируйте вместе с сетевой папкой при закрытых приложениях.</p></details>

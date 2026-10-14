@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cancelIntelligenceRequest, intelligenceTransportLimitBytes, publicConnectionProfile,
-  runIntelligenceAnalysis, testIntelligenceConnection, validateConnectionProfile, type ConnectionProfile } from "./connectionApi";
+  intelligenceSchemaLimitBytes, runIntelligenceAnalysis, testIntelligenceConnection, validateConnectionProfile, type ConnectionProfile } from "./connectionApi";
 
 const ipc = vi.hoisted(() => vi.fn());
 vi.mock("@tauri-apps/api/core", () => ({ invoke: ipc }));
@@ -59,6 +59,29 @@ describe("explicit AI transport API", () => {
   it("counts UTF-8 prompt bytes and rejects blank prompts before IPC", async () => {
     await expect(runIntelligenceAnalysis(profile, " ", undefined, requestId)).rejects.toThrow("текст");
     await expect(runIntelligenceAnalysis(profile, "я".repeat(intelligenceTransportLimitBytes), undefined, requestId)).rejects.toThrow("2 МБ");
+    expect(ipc).not.toHaveBeenCalled();
+  });
+  it("sends the explicit output schema and optional mode without persisting credentials", async () => {
+    const schemaProfile = { ...profile, outputMode: "schema" as const };
+    const responseSchema = { type: "object", properties: { items: { type: "array", items: { type: "string" } } }, required: ["items"], additionalProperties: false };
+    ipc.mockResolvedValue({ text: '{"items":[]}', model: "qwen", metrics: { elapsedMilliseconds: 100, inputTokens: 12 } });
+    const result = await runIntelligenceAnalysis(schemaProfile, "JSON: synthetic", "session-key", requestId, responseSchema);
+    expect(ipc).toHaveBeenCalledWith("run_intelligence_analysis", { profile: schemaProfile, prompt: "JSON: synthetic", apiKey: "session-key", requestId, responseSchema });
+    expect(result.metrics).toEqual({ elapsedMilliseconds: 100, inputTokens: 12 });
+    expect(publicConnectionProfile({ ...schemaProfile, apiKey: "do-not-store" } as ConnectionProfile)).toEqual(schemaProfile);
+  });
+  it("preserves old JSON requests and excludes an unnecessary schema in JSON mode", async () => {
+    await runIntelligenceAnalysis({ ...profile, outputMode: "json" }, "JSON: synthetic", undefined, requestId, { type: "object", unused: true });
+    expect(ipc.mock.calls[0][1]).not.toHaveProperty("responseSchema");
+    expect(() => validateConnectionProfile({ ...profile, outputMode: "automatic-fallback" } as unknown as ConnectionProfile)).toThrow("формат ответа");
+  });
+  it("requires a bounded serializable object schema before starting transport", async () => {
+    const schemaProfile = { ...profile, outputMode: "schema" as const };
+    await expect(runIntelligenceAnalysis(schemaProfile, "JSON: test", undefined, requestId)).rejects.toThrow("JSON-схема");
+    await expect(runIntelligenceAnalysis(schemaProfile, "JSON: test", undefined, requestId, { type: "array" })).rejects.toThrow("JSON-схема");
+    await expect(runIntelligenceAnalysis(schemaProfile, "JSON: test", undefined, requestId, { type: "object", description: "я".repeat(intelligenceSchemaLimitBytes) })).rejects.toThrow("64 КБ");
+    const cycle: Record<string, unknown> = { type: "object" }; cycle.self = cycle;
+    await expect(runIntelligenceAnalysis(schemaProfile, "JSON: test", undefined, requestId, cycle)).rejects.toThrow("подготовить JSON-схему");
     expect(ipc).not.toHaveBeenCalled();
   });
 });

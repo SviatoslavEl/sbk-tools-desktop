@@ -55,7 +55,7 @@ afterEach(() => { runtime.slots.forEach((slot) => slot.cleanup?.()); clearActivi
 describe("status center lifecycle", () => {
   it("does not invent a free editor or absent backups before the first response", async () => {
     const pending = deferred<WorkspaceHealth>(); runtime.health.mockReturnValue(pending.promise);
-    render(); await flush(); expect(text()).not.toContain("Нет активного редактора"); expect(text()).not.toContain("Копий не найдено");
+    render(); await flush(); expect(text()).not.toContain("Редактор свободен"); expect(text()).not.toContain("Копий не найдено");
     pending.reject(new Error("SMB disconnected")); await flush(); expect(text()).toContain("Состояние неизвестно"); expect(text()).toContain("SMB disconnected"); expect(button("Проверить сейчас").props.disabled).toBe(false);
   });
   it("keeps the independently read backup policy when disk health fails", async () => {
@@ -84,6 +84,24 @@ describe("status center lifecycle", () => {
     render(); await flush(); const pending = deferred<WorkspaceHealth>(); runtime.health.mockReturnValue(pending.promise);
     button("Проверить сейчас").props.onClick!(); await flush(); await vi.advanceTimersByTimeAsync(45_000); await flush(); expect(runtime.health).toHaveBeenCalledTimes(2);
     pending.reject(new Error("network lost")); await flush(); expect(text()).toContain("Иванов"); expect(text()).toContain("Свежая проверка не выполнена"); expect(text()).toContain("Состояние неизвестно");
+  });
+  it("distinguishes a recorded session from current activity and displays a missing device", async () => {
+    const snapshot = health(); snapshot.editor.owner!.deviceName = ""; snapshot.editor.owner!.startedAt = "2000-01-01T00:00:00Z";
+    runtime.health.mockResolvedValue(snapshot); render(); await flush();
+    expect(text()).toContain("Зафиксирован сеанс редактора");
+    expect(text()).toContain("Активность этого сеанса не подтверждена");
+    expect(text()).toContain("Компьютер не указан");
+    expect(text()).not.toContain("Занято другим пользователем");
+  });
+  it("shows only this instance's known editor rights and confirmed availability without liveness claims", async () => {
+    const snapshot = health(); snapshot.editor.ownedByThisInstance = true;
+    runtime.health.mockResolvedValueOnce(snapshot); render(); await flush();
+    expect(text()).toContain("Сеанс редактора этого экземпляра");
+    expect(text()).not.toContain("Активность этого сеанса не подтверждена");
+    runtime.health.mockResolvedValueOnce({ ...snapshot, editor: { busy: false, ownedByThisInstance: false } });
+    button("Проверить сейчас").props.onClick!(); await flush();
+    expect(text()).toContain("Редактор свободен");
+    expect(text()).not.toContain("Нет активного редактора");
   });
 });
 

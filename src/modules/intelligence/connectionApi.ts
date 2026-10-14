@@ -8,11 +8,24 @@ export interface ConnectionProfile {
   endpoint: string;
   model: string;
   timeoutSeconds: number;
+  /** Missing in saved legacy profiles: retain JSON-object compatibility. */
+  outputMode?: "schema" | "json";
 }
 export interface ConnectionTestResult { models: string[]; message: string; }
-export interface IntelligenceAnalysisResult { text: string; model: string; }
+export interface IntelligenceAnalysisMetrics {
+  elapsedMilliseconds: number;
+  inputTokens?: number;
+  outputTokens?: number;
+  totalTokens?: number;
+  providerMilliseconds?: number;
+  loadMilliseconds?: number;
+  promptMilliseconds?: number;
+  generationMilliseconds?: number;
+}
+export interface IntelligenceAnalysisResult { text: string; model: string; metrics?: IntelligenceAnalysisMetrics; }
 
 export const intelligenceTransportLimitBytes = 2 * 1024 * 1024;
+export const intelligenceSchemaLimitBytes = 64 * 1024;
 
 function requireDesktop() {
   if (typeof window === "undefined" || !("__TAURI_INTERNALS__" in window)) {
@@ -23,7 +36,8 @@ function requireDesktop() {
 /** Only the public connection fields cross IPC; credentials never enter the profile. */
 export function publicConnectionProfile(profile: ConnectionProfile): ConnectionProfile {
   return { id: profile.id, name: profile.name, scope: profile.scope, protocol: profile.protocol,
-    endpoint: profile.endpoint, model: profile.model, timeoutSeconds: profile.timeoutSeconds };
+    endpoint: profile.endpoint, model: profile.model, timeoutSeconds: profile.timeoutSeconds,
+    ...(profile.outputMode === undefined ? {} : { outputMode: profile.outputMode }) };
 }
 
 export function validateConnectionProfile(profile: ConnectionProfile, requireModel = false): void {
@@ -32,6 +46,9 @@ export function validateConnectionProfile(profile: ConnectionProfile, requireMod
   }
   if (!["local", "network", "external"].includes(profile.scope)
     || !["ollama", "openai-compatible"].includes(profile.protocol)) throw new Error("Выберите тип подключения.");
+  if (profile.outputMode !== undefined && !["schema", "json"].includes(profile.outputMode)) {
+    throw new Error("Выберите формат ответа: схема или JSON.");
+  }
   if (!Number.isInteger(profile.timeoutSeconds) || profile.timeoutSeconds < 5 || profile.timeoutSeconds > 600) {
     throw new Error("Время ожидания должно быть от 5 до 600 секунд.");
   }
@@ -60,15 +77,28 @@ export async function testIntelligenceConnection(profile: ConnectionProfile, api
 
 export async function runIntelligenceAnalysis(
   profile: ConnectionProfile, prompt: string, apiKey?: string, requestId = crypto.randomUUID(),
+  responseSchema?: Record<string, unknown>,
 ): Promise<IntelligenceAnalysisResult> {
   validateConnectionProfile(profile, true);
   if (!prompt.trim()) throw new Error("Добавьте текст для анализа.");
   if (new TextEncoder().encode(prompt).byteLength > intelligenceTransportLimitBytes) {
     throw new Error("Текст слишком большой. Разделите его на части размером до 2 МБ.");
   }
+  if (profile.outputMode === "schema") {
+    if (!responseSchema || Array.isArray(responseSchema) || responseSchema.type !== "object") {
+      throw new Error("Для ответа по схеме нужна JSON-схема объекта.");
+    }
+    let serialized: string;
+    try { serialized = JSON.stringify(responseSchema); }
+    catch { throw new Error("Не удалось подготовить JSON-схему ответа."); }
+    if (new TextEncoder().encode(serialized).byteLength > intelligenceSchemaLimitBytes) {
+      throw new Error("JSON-схема ответа превышает 64 КБ.");
+    }
+  }
   requireDesktop();
   return invoke<IntelligenceAnalysisResult>("run_intelligence_analysis", {
     profile: publicConnectionProfile(profile), prompt, apiKey: apiKey || null, requestId,
+    ...(profile.outputMode === "schema" ? { responseSchema } : {}),
   });
 }
 

@@ -26,6 +26,7 @@ import {
   experienceReferenceBody,
   html,
   money,
+  nmcLabel,
   safeBase,
   summaryBody,
   teamListBody,
@@ -209,7 +210,7 @@ export function ProcurementRegistry({ openRecordId, onRecordOpened, onCreateProp
                     </td>
                     <td>{item.customer}</td>
                     <td className="wide-cell">{item.subject}</td>
-                    <td>{money(item.nmc)}</td>
+                    <td>{nmcLabel(item.nmc)}</td>
                     <td>{item.platform || "—"}</td>
                     <td>
                       <span
@@ -366,7 +367,7 @@ export function ProcurementEditor({
     const blocking = procurementWarnings(item).filter(
       (warning) =>
         warning.startsWith("Не заполнены") ||
-        warning.startsWith("НМЦ") ||
+        (warning.startsWith("НМЦ") && !(item.status === "Черновик" && item.nmc === 0)) ||
         warning.startsWith("Срок вопросов") ||
         warning.startsWith("Ставка НДС") ||
         warning.startsWith("Некорректно") ||
@@ -567,7 +568,8 @@ export function ProcurementEditor({
                 <input
                   type="number"
                   min="0"
-                  value={item.nmc}
+                  value={item.nmc === 0 ? "" : item.nmc}
+                  placeholder="Не указана"
                   onChange={(event) =>
                     update("nmc", Number(event.target.value))
                   }

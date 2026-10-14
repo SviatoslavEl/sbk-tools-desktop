@@ -37,6 +37,10 @@
 .iw-presets { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 16px; }
 .iw-presets button { padding: 6px 10px; font-size: 11px; }
 .iw-presets .iw-preset-active { color: var(--primary); background: var(--primary-soft); border-color: var(--primary); }
+.iw-destinations { margin: 0 0 16px; padding: 12px; min-width: 0; border: 1px solid var(--line); border-radius: 9px; display: flex; flex-wrap: wrap; gap: 8px 16px; }
+.iw-destinations legend { color: var(--text-secondary); font-weight: 550; padding: 0 4px; }
+.iw-destinations > label { flex-direction: row; align-items: center; font-size: 11px; font-weight: 400; }
+.iw-destinations input { margin: 0; }
 .iw-send-summary { display: grid; gap: 5px; margin-top: 18px; padding: 14px; border-radius: 10px; background: var(--surface-muted); border: 1px solid var(--line); color: var(--text-secondary); }
 .iw-send-summary code { display: block; overflow-wrap: anywhere; white-space: normal; font-size: 11px; color: var(--text-muted); }
 .iw-send-summary p { margin: 3px 0 0; color: var(--warning); }
@@ -61,6 +65,11 @@
 .iw-field-heading input { margin: 0; }
 .iw-field-unselected { background: var(--surface-muted); }
 .iw-field-unselected .iw-field-heading { color: var(--text-muted); }
+.iw-field-invalid { border-color: var(--warning); }
+.iw-field-problem { margin: 8px 0 0; font-size: 11px; color: var(--warning); overflow-wrap: anywhere; }
+.iw-copy-date { padding: 6px 9px; font-size: 11px; white-space: normal; }
+.iw-response-metrics { display: flex; flex-wrap: wrap; gap: 5px 14px; margin-top: 16px; padding: 11px 12px; border: 1px solid var(--line); border-radius: 8px; color: var(--text-muted); font-size: 11px; }
+.iw-response-metrics strong { flex: 1 0 100%; color: var(--text-secondary); overflow-wrap: anywhere; }
 .iw-validation { color: var(--warning); font-size: 12px; margin: 16px 0; }
 .iw-card-actions { margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--line); flex-wrap: wrap; }
 .iw-progress { display: flex; gap: 9px; flex-wrap: wrap; align-items: center; margin-top: 10px; color: var(--text-muted); }
