@@ -122,7 +122,8 @@ export const getDiagnosticStatus = () => nativeInvoke<DiagnosticStatus>("diagnos
 export const setDiagnosticLogging = (enabled: boolean) => nativeInvoke<DiagnosticStatus>("set_diagnostic_logging", { enabled });
 export const exportDiagnosticBundle = (path: string) => nativeInvoke<void>("export_diagnostic_bundle", { path });
 
-const localCommands = new Set(["startup_status", "report_startup_ui_visible", "quit_application"]);
+const localCommands = new Set(["startup_status", "report_startup_ui_visible", "quit_application",
+  "test_intelligence_connection", "run_intelligence_analysis", "cancel_intelligence_request"]);
 /** UI guard supplements the native gate; it is not an authorization boundary. */
 export function assertNetworkAccess() {
   if (networkAccessIsPaused()) throw new Error(networkPausedMessage);

@@ -44,3 +44,6 @@ argon2 = "0.5"
 chacha20poly1305 = "0.10"
 getrandom = "0.3"
 zeroize = "1"
+reqwest = { version = "=0.13.4", default-features = false, features = ["json", "rustls"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+tokio = { version = "1", features = ["rt", "time"] }

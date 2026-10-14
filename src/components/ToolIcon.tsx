@@ -1,8 +1,9 @@
 import type { SVGProps } from "react";
 
-export type ToolIconName = "dashboard" | "procurement" | "calculator" | "scanner" | "contracts" | "counterparties" | "staff" | "archive" | "settings" | "about" | "chevron-left" | "chevron-right" | "folder" | "lock" | "check" | "arrow-right" | "proposals" | "status" | "search";
+export type ToolIconName = "dashboard" | "procurement" | "calculator" | "scanner" | "contracts" | "counterparties" | "staff" | "archive" | "settings" | "about" | "chevron-left" | "chevron-right" | "folder" | "lock" | "check" | "arrow-right" | "proposals" | "status" | "search" | "intelligence";
 
 const paths: Record<ToolIconName, React.ReactNode> = {
+  intelligence: <><path d="m12 3 2.3 6.7L21 12l-6.7 2.3L12 21l-2.3-6.7L3 12l6.7-2.3z" /><path d="M19 3v4m-2-2h4" /></>,
   proposals: <><path d="M14 3H5v18h14V8zM14 3v5h5M8 12h8M8 16h5" /><path d="m15 18 2 2 4-4" /></>,
   status: <><path d="M3 12h4l3-7 4 14 3-7h4" /><path d="M3 3h18v18H3z" /></>,
   search: <><circle cx="10" cy="10" r="6" /><path d="m15 15 6 6" /></>,

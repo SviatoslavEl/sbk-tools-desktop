@@ -1,5 +1,6 @@
 import { Fragment, useEffect, useId, useMemo, useRef, useState } from "react";
 import { useViewState } from "../../hooks/useViewState";
+import type { IntelligenceHandoff } from "../intelligence/workbenchTypes";
 import { openDocumentPath as openPath } from "../../lib/networkDiagnostics";
 import { ConfirmDialog, Dialog } from "../../components/Dialog";
 import { DrawerBackdrop } from "../../components/DrawerBackdrop";
@@ -139,7 +140,7 @@ const requiredStaffImportFields: ImportRequiredField<StaffData>[] = [
   },
 ];
 
-export function StaffRegistry({ openRecordId, onRecordOpened }: { openRecordId?: string; onRecordOpened?: () => void } = {}) {
+export function StaffRegistry({ openRecordId, onRecordOpened, intelligenceHandoff, onIntelligenceHandoffConsumed }: { openRecordId?: string; onRecordOpened?: () => void; intelligenceHandoff?: Extract<IntelligenceHandoff, { destination: "staff" }>; onIntelligenceHandoffConsumed?: () => void } = {}) {
   const workspaceAccess = useWorkspaceAccess();
   const readOnly = !workspaceAccess.editor;
   const store = useRecords<StaffData>("staff");
@@ -159,10 +160,21 @@ export function StaffRegistry({ openRecordId, onRecordOpened }: { openRecordId?:
     StoredRecord<StaffData> | "new" | null
   >(null);
   const [viewingCard, setViewingCard] = useState(false);
+  const [intelligenceSeed, setIntelligenceSeed] = useState<{ id: string; data: StaffData } | null>(null);
+  const consumedIntelligence = useRef("");
   const setEditing = (record: StoredRecord<StaffData> | "new" | null) => {
+    setIntelligenceSeed(null);
     if (record !== null) setViewingCard(readOnly);
     setEditingRecord(record);
   };
+  useEffect(() => {
+    if (!intelligenceHandoff || consumedIntelligence.current === intelligenceHandoff.id || editing || readOnly) return;
+    consumedIntelligence.current = intelligenceHandoff.id;
+    setIntelligenceSeed({ id: intelligenceHandoff.id, data: structuredClone(intelligenceHandoff.data) });
+    setViewingCard(false);
+    setEditingRecord("new");
+    onIntelligenceHandoffConsumed?.();
+  }, [intelligenceHandoff, editing, readOnly, onIntelligenceHandoffConsumed]);
   useEffect(() => {
     if (!openRecordId || store.loading || store.error || editing) return;
     const record = store.records.find((entry) => entry.id === openRecordId);
@@ -1053,7 +1065,9 @@ export function StaffRegistry({ openRecordId, onRecordOpened }: { openRecordId?:
       </div>
       {editing && viewingCard && editing !== "new" ? <StaffReadCard record={{ ...editing, payload: normalizeStaffData(editing.payload) }} onClose={() => setEditing(null)} /> : editing && (
         <StaffEditor
+          key={intelligenceSeed?.id || (editing === "new" ? "new" : editing.id)}
           record={editing === "new" ? undefined : editing}
+          initialValue={editing === "new" ? intelligenceSeed?.data : undefined}
           onClose={() => setEditing(null)}
           onSave={async (item, id) => {
             await store.save(item.fullName, item, id);
@@ -1848,7 +1862,7 @@ export function StaffEditor({
   const [item, setItem] = useState<StaffData>(() =>
     normalizeStaffData(record?.payload || initialValue || emptyStaff()),
   );
-  const [savedSnapshot, setSavedSnapshot] = useState(() => JSON.stringify(item));
+  const [savedSnapshot, setSavedSnapshot] = useState(() => initialValue && !record && !importMode ? "" : JSON.stringify(item));
   const [tab, setTab] = useState<StaffTab>("general");
   const [error, setError] = useState("");
   const [history, setHistory] = useState<HistoryEntry[]>([]);

@@ -73,6 +73,29 @@ beforeEach(() => {
 afterEach(() => { for (const slot of runtime.slots) slot.cleanup?.(); vi.unstubAllGlobals(); });
 
 describe("procurement save and close lifecycle", () => {
+  it("opens an intelligence result as an unsaved new card and saves only on the normal action", async () => {
+    const seed = { ...emptyProcurement(), name: "Закупка из ИИ", customer: "Заказчик", subject: "Услуги", nmc: 250_000, notes: "Источник: тестовый документ" };
+    props = { initialValue: seed, onSave: saved, onClose: closed };
+    render(); await flush();
+    expect(nameInput().props.value).toBe("Закупка из ИИ");
+    expect(stage().props.item.notes).toBe("Источник: тестовый документ");
+    expect(saved).not.toHaveBeenCalled();
+    nameInput().props.onChange!({ target: { value: "Проверенная закупка" } }); await flush();
+    expect(seed.name).toBe("Закупка из ИИ");
+    button("Сохранить закупку").props.onClick!(); await flush();
+    expect(saved).toHaveBeenCalledOnce();
+    expect(saved.mock.calls[0][0]).toMatchObject({ name: "Проверенная закупка", nmc: 250_000, notes: seed.notes });
+    expect(saved.mock.calls[0][1]).toBeUndefined();
+  });
+
+  it("does not let an intelligence seed replace the payload of an existing record", async () => {
+    props = { ...props, initialValue: { ...emptyProcurement(), name: "Чужой ответ ИИ", nmc: 999 } };
+    render(); await flush();
+    expect(nameInput().props.value).toBe("Закупка");
+    expect(stage().props.item.nmc).toBe(100);
+    expect(saved).not.toHaveBeenCalled();
+  });
+
   it("blocks same-tick duplicate saves and stale mutation handlers until the write finishes", async () => {
     const writing = deferred<void>(); saved.mockReturnValueOnce(writing.promise);
     render();

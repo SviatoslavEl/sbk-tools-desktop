@@ -7,6 +7,7 @@ import { ConfirmDialog } from "../../components/Dialog";
 const hooks = vi.hoisted(() => ({ index: 0, values: [] as unknown[], companies: [] as CompanyCard[], archive: vi.fn(), loading: false, error: "" }));
 vi.mock("react", async (original) => ({
   ...await original<typeof import("react")>(), useEffect: vi.fn(), useMemo: (fn: () => unknown) => fn(),
+  useRef: (initial: unknown) => { const index = hooks.index++; if (!(index in hooks.values)) hooks.values[index] = { current: initial }; return hooks.values[index]; },
   useState: (initial: unknown) => { const index = hooks.index++; if (!(index in hooks.values)) hooks.values[index] = typeof initial === "function" ? initial() : initial; return [hooks.values[index], (next: unknown) => { hooks.values[index] = typeof next === "function" ? next(hooks.values[index]) : next; }]; },
 }));
 vi.mock("../../hooks/useRecords", () => ({ useRecords: () => ({ records: [], loading: false, error: "", reload: vi.fn() }) }));

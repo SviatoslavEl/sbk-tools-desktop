@@ -1,9 +1,10 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { ConfirmDialog } from "../../components/Dialog";
 import { VersionHistory } from "../../components/VersionHistory";
 import { useRecords } from "../../hooks/useRecords";
 import { useViewState } from "../../hooks/useViewState";
+import type { IntelligenceHandoff } from "../intelligence/workbenchTypes";
 import { useWorkspaceAccess } from "../../lib/workspaceAccess";
 import { CompanyEditor, useCompanyDirectory } from "./CompanyDirectory";
 import { companyRelationshipLabel, emptyCompany, type CompanyCard } from "./companies";
@@ -11,7 +12,7 @@ import type { ContractData } from "./types";
 
 type PendingAction = { kind: "archive" | "restore" | "delete"; ids: string[] } | null;
 
-export function CounterpartiesRegistry({ openRecordId, onRecordOpened }: { openRecordId?: string; onRecordOpened?: () => void } = {}) {
+export function CounterpartiesRegistry({ openRecordId, onRecordOpened, intelligenceHandoff, onIntelligenceHandoffConsumed }: { openRecordId?: string; onRecordOpened?: () => void; intelligenceHandoff?: Extract<IntelligenceHandoff, { destination: "counterparties" }>; onIntelligenceHandoffConsumed?: () => void } = {}) {
   const contracts = useRecords<ContractData>("contract-experience");
   const directory = useCompanyDirectory(contracts.records);
   const access = useWorkspaceAccess();
@@ -19,6 +20,18 @@ export function CounterpartiesRegistry({ openRecordId, onRecordOpened }: { openR
   const [scope, setScope] = useViewState<"all" | "internal" | "external">("counterparties:scope", "external");
   const [showArchived, setShowArchived] = useViewState("counterparties:archive", false);
   const [editing, setEditing] = useState<CompanyCard | null>(null);
+  const [intelligenceSeedId, setIntelligenceSeedId] = useState("");
+  const consumedIntelligence = useRef("");
+  useEffect(() => {
+    if (!intelligenceHandoff || consumedIntelligence.current === intelligenceHandoff.id || editing || !access.editor || directory.loading || directory.error) return;
+    consumedIntelligence.current = intelligenceHandoff.id;
+    const company = structuredClone(intelligenceHandoff.data);
+    setIntelligenceSeedId(company.id);
+    setScope(company.scope);
+    setShowArchived(false);
+    setEditing(company);
+    onIntelligenceHandoffConsumed?.();
+  }, [intelligenceHandoff, editing, access.editor, directory.loading, directory.error, onIntelligenceHandoffConsumed]);
   const [pending, setPending] = useState<PendingAction>(null);
   const [message, setMessage] = useState("");
   const [selected, setSelected] = useState<Set<string>>(new Set());
@@ -85,7 +98,7 @@ export function CounterpartiesRegistry({ openRecordId, onRecordOpened }: { openR
       {(directory.loading || contracts.loading) && <div className="empty-state" role="status">Загружаем контрагентов…</div>}
       {!directory.loading && !contracts.loading && !directory.error && !contracts.error && filtered.length === 0 && <div className="empty-state"><h2>{directory.companies.length ? "Нет совпадений" : "Справочник пока пуст"}</h2><p>{directory.companies.length ? "Измените поиск или выбранный раздел." : "Добавьте компанию или импортируйте договоры — связанные компании появятся здесь."}</p>{(search || scope !== "all") && directory.companies.length > 0 && <button className="secondary" type="button" onClick={() => { setSearch(""); setScope("all"); }}>Сбросить фильтры</button>}</div>}
     </section>
-    {editing && createPortal(<CompanyEditor company={editing} companies={directory.companies} readOnly={!canMutate} onClose={() => setEditing(null)} onSave={async (company) => { if (!canMutate) throw new Error("Доступ редактора завершён или справочник недоступен."); const previous = directory.companies.find((item) => item.id === company.id); await directory.save(company, previous, contracts.records); setEditing(null); }} />, document.body)}
+    {editing && createPortal(<CompanyEditor company={editing} companies={directory.companies} readOnly={!canMutate} unsavedSeed={editing.id === intelligenceSeedId} onClose={() => { setEditing(null); setIntelligenceSeedId(""); }} onSave={async (company) => { if (!canMutate) throw new Error("Доступ редактора завершён или справочник недоступен."); const previous = directory.companies.find((item) => item.id === company.id); await directory.save(company, previous, contracts.records); setEditing(null); setIntelligenceSeedId(""); }} />, document.body)}
     {pending && <ConfirmDialog title={pending.kind === "delete" ? "Удалить выбранные карточки навсегда?" : pending.kind === "archive" ? "Перенести выбранные карточки в архив?" : "Восстановить выбранные карточки?"} message={`Выбрано: ${pending.ids.length}. ${directory.companies.filter((company) => pending.ids.includes(company.id)).map((company) => company.name).join("; ")}. ${pending.kind === "delete" ? "Удаление необратимо. При наличии связей с договорами вся операция будет отменена." : pending.kind === "archive" ? "Карточки можно восстановить. Существующие связи в договорах сохранятся." : "Карточки вернутся в рабочий справочник."}`} confirmLabel={pending.kind === "delete" ? "Удалить" : "Подтвердить"} onClose={() => setPending(null)} onConfirm={runPending} />}
   </div>;
 }

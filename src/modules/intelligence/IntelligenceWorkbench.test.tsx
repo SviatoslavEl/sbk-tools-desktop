@@ -1,0 +1,172 @@
+import { isValidElement, type ReactElement, type ReactNode } from "react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { ConfirmDialog } from "../../components/Dialog";
+import { IntelligenceWorkbench } from "./IntelligenceWorkbench";
+import type { IntelligenceHandoff } from "./workbenchTypes";
+
+// Exercise the real component's state, effects and callbacks. Native IO and
+// inference are mocked boundaries; the response schema and handoff model are real.
+const runtime = vi.hoisted(() => ({ cursor: 0, changed: false,
+  slots: [] as Array<{ value?: unknown; deps?: readonly unknown[]; cleanup?: () => void }>, effects: [] as Array<() => void>,
+  editor: true, phase: "connected", chooseOpen: vi.fn(), invoke: vi.fn(), workspace: vi.fn(), testConnection: vi.fn(), analyze: vi.fn(), cancel: vi.fn(),
+}));
+vi.mock("react", async (original) => {
+  const same = (a?: readonly unknown[], b?: readonly unknown[]) => a && b && a.length === b.length && a.every((value, index) => Object.is(value, b[index]));
+  const memo = (factory: () => unknown, deps?: readonly unknown[]) => { const index = runtime.cursor++; if (!runtime.slots[index] || !same(runtime.slots[index].deps, deps)) runtime.slots[index] = { value: factory(), deps }; return runtime.slots[index].value; };
+  return { ...await original<typeof import("react")>(),
+    useState: (initial: unknown) => { const index = runtime.cursor++; if (!runtime.slots[index]) runtime.slots[index] = { value: typeof initial === "function" ? initial() : initial }; return [runtime.slots[index].value, (next: unknown) => { const value = typeof next === "function" ? next(runtime.slots[index].value) : next; if (!Object.is(value, runtime.slots[index].value)) { runtime.slots[index].value = value; runtime.changed = true; } }]; },
+    useRef: (initial: unknown) => { const index = runtime.cursor++; if (!runtime.slots[index]) runtime.slots[index] = { value: { current: initial } }; return runtime.slots[index].value; }, useMemo: memo,
+    useEffect: (effect: () => void | (() => void), deps?: readonly unknown[]) => { const index = runtime.cursor++; const previous = runtime.slots[index]; if (previous && same(previous.deps, deps)) return; runtime.slots[index] = { ...previous, deps }; runtime.effects.push(() => { previous?.cleanup?.(); const cleanup = effect(); runtime.slots[index].cleanup = typeof cleanup === "function" ? cleanup : undefined; }); },
+  };
+});
+vi.mock("../../lib/workspaceAccess", () => ({ useWorkspaceAccess: () => ({ editor: runtime.editor, message: "Тестовый режим" }) }));
+vi.mock("../../lib/networkDiagnostics", () => ({ useNetworkAccess: () => ({ phase: runtime.phase }), networkAccessIsPaused: () => runtime.phase !== "connected", invoke: runtime.invoke }));
+vi.mock("../../lib/files", () => ({ chooseOpenPath: runtime.chooseOpen }));
+vi.mock("../../lib/storage", () => ({ getWorkspaceInfo: runtime.workspace }));
+vi.mock("./connectionApi", async (original) => ({ ...await original<typeof import("./connectionApi")>(), testIntelligenceConnection: runtime.testConnection, runIntelligenceAnalysis: runtime.analyze, cancelIntelligenceRequest: runtime.cancel }));
+
+interface NodeProps { children?: ReactNode; value?: unknown; id?: string; type?: string; disabled?: boolean; "aria-label"?: string; onClick?: () => unknown; onChange?: (event: { target: { value: string; checked: boolean } }) => unknown; onConfirm?: () => unknown; onClose?: () => void; }
+let tree: ReactNode;
+let props: Parameters<typeof IntelligenceWorkbench>[0];
+let localValues: Map<string, string>;
+let transfer: ReturnType<typeof vi.fn<(handoff: IntelligenceHandoff) => void>>;
+function render(next = props) { props = next; runtime.cursor = 0; runtime.changed = false; tree = IntelligenceWorkbench(props); for (const effect of runtime.effects.splice(0)) effect(); }
+async function flush() { for (let i = 0; i < 30; i++) { await Promise.resolve(); if (runtime.changed) render(); } }
+function nodes(node: ReactNode = tree): ReactElement<NodeProps>[] { if (Array.isArray(node)) return node.flatMap((child) => nodes(child ?? null)); if (!isValidElement<NodeProps>(node)) return []; return [node, ...nodes(node.props.children ?? null)]; }
+function text(node: ReactNode = tree): string { if (Array.isArray(node)) return node.map((child) => text(child ?? null)).join(""); if (isValidElement<NodeProps>(node)) return text(node.props.children ?? null); return typeof node === "string" || typeof node === "number" ? String(node) : ""; }
+function button(label: string) { const found = nodes().find((node) => node.type === "button" && text(node.props.children) === label); if (!found) throw new Error(`Кнопка не найдена: ${label}`); return found; }
+function control(id: string) { const found = nodes().find((node) => node.props.id === id); if (!found) throw new Error(`Поле не найдено: ${id}`); return found; }
+function field(key: string) { const found = nodes().find((node) => typeof node.props.id === "string" && /^iw-[0-9a-f]{8}-/.test(node.props.id) && node.props.id.endsWith(`-${key}`)); if (!found) throw new Error(`Поле карточки не найдено: ${key}`); return found; }
+async function click(label: string) { button(label).props.onClick!(); await flush(); }
+async function edit(id: string, value: string) { control(id).props.onChange!({ target: { value, checked: false } }); await flush(); }
+async function toggle(label: string, checked: boolean) { const found = nodes().find((node) => node.props["aria-label"] === label); if (!found) throw new Error(`Чекбокс не найден: ${label}`); found.props.onChange!({ target: { value: "", checked } }); await flush(); }
+async function confirm() { nodes().find((node) => node.type === ConfirmDialog)!.props.onConfirm!(); await flush(); }
+function deferred<T>() { let resolve!: (value: T) => void; const promise = new Promise<T>((yes) => { resolve = yes; }); return { promise, resolve }; }
+const result = (items: unknown[]) => JSON.stringify({ items });
+const procurement = { destination: "procurement", title: "Тендер", fields: { name: "Тестовая закупка", customer: "Заказчик", nmc: 1000 } };
+async function addText(name = "ТЗ", value = "Открытый текст закупки") { await edit("iw-source-name", name); await edit("iw-source-text", value); await click("Добавить текст"); }
+async function paste(items: unknown[] = [procurement]) { await edit("iw-response", result(items)); await click("Разобрать ответ"); }
+async function configureModel() { if (!nodes().some((node) => node.props.id === "iw-model")) await click("Настроить подключение"); await edit("iw-model", "qa-model"); }
+
+beforeEach(() => {
+  runtime.cursor = 0; runtime.changed = false; runtime.slots = []; runtime.effects = []; runtime.editor = true; runtime.phase = "connected";
+  for (const mock of [runtime.chooseOpen, runtime.invoke, runtime.workspace, runtime.testConnection, runtime.analyze, runtime.cancel]) mock.mockReset();
+  runtime.workspace.mockResolvedValue({ root: "/qa-workspace", editor: true }); runtime.cancel.mockResolvedValue(undefined); runtime.chooseOpen.mockResolvedValue("/qa/source.pdf");
+  runtime.invoke.mockResolvedValue({ fileName: "ТЗ.pdf", extractedText: "Документ закупки", sha256: "a".repeat(64), fragments: [{ locator: "Страница 1", text: "Документ закупки" }], warnings: [] });
+  runtime.testConnection.mockResolvedValue({ models: ["qa-model"], message: "Соединение установлено" }); runtime.analyze.mockResolvedValue({ text: result([procurement]), model: "qa-model" });
+  localValues = new Map();
+  vi.stubGlobal("window", { __TAURI_INTERNALS__: {}, localStorage: { getItem: (key: string) => localValues.get(key) ?? null, setItem: (key: string, value: string) => localValues.set(key, value) } });
+  transfer = vi.fn(); props = { workspaceRoot: "/qa-workspace", onTransfer: transfer }; render();
+});
+afterEach(() => { for (const slot of runtime.slots) slot.cleanup?.(); vi.unstubAllGlobals(); });
+
+describe("unified intelligence workflow", () => {
+  it("does not call inference or shared storage on opening; retains local material across navigation", async () => {
+    expect(runtime.analyze).not.toHaveBeenCalled(); expect(runtime.workspace).not.toHaveBeenCalled(); expect(runtime.invoke).not.toHaveBeenCalled();
+    await addText(); await paste(); render({ ...props, active: false }); await flush(); render({ ...props, active: true }); await flush();
+    expect(text()).toContain("ТЗ"); expect(text()).toContain("Тендер"); expect(control("iw-response").props.value).toContain("Тестовая закупка");
+  });
+  it("sends only selected sources on explicit request and exposes the destination before sending", async () => {
+    await configureModel(); await addText(); await addText("Не отправлять", "CONFIDENTIAL-UNSELECTED"); await toggle("Отправить источник Не отправлять", false);
+    expect(text()).toContain("http://127.0.0.1:11434"); expect(runtime.analyze).not.toHaveBeenCalled(); await click("Отправить выбранные источники");
+    expect(runtime.analyze).toHaveBeenCalledTimes(1); expect(runtime.analyze.mock.calls[0][1]).toContain("Открытый текст закупки"); expect(runtime.analyze.mock.calls[0][1]).not.toContain("CONFIDENTIAL-UNSELECTED");
+    expect(text()).toContain("Подготовлено карточек: 1"); expect(transfer).not.toHaveBeenCalled();
+  });
+  it("distributes mixed results to five unsaved editors independently with only selected fields", async () => {
+    await addText(); await paste([procurement,
+      { destination: "contracts", title: "Договор", fields: { number: "QA-1", customer: "Контрагент", subject: "Работы" } },
+      { destination: "staff", title: "Сотрудник", fields: { fullName: "Иванов Иван", skills: ["Аудит"] } },
+      { destination: "counterparties", title: "Компания", fields: { name: "Компания QA", inn: "1234567890" } },
+      { destination: "proposals", title: "Предложение", fields: { title: "КП QA", lines: ["Аудит"] } },
+    ]);
+    await toggle("Передать поле Заказчик результата 1", false);
+    for (const label of ["Закупки", "Опыт по договорам", "Кадры", "Контрагенты", "Коммерческие предложения"]) { await click(`Открыть черновик: ${label}`); render({ ...props, active: false }); render({ ...props, active: true }); await flush(); }
+    expect(transfer.mock.calls.map(([handoff]) => handoff.destination)).toEqual(["procurement", "contracts", "staff", "counterparties", "proposals"]);
+    const first = transfer.mock.calls[0][0]; expect(first.workspaceRoot).toBe("/qa-workspace"); expect(first.destination === "procurement" && first.data.customer).toBe("");
+    expect(text()).toContain("черновик открыт"); expect(text()).toContain("Остальные результаты остаются"); expect(text()).not.toContain("успешно сохранена");
+  });
+  it("lets a viewer prepare results but blocks transfer even through a captured callback", async () => {
+    await paste(); const oldCallback = button("Открыть черновик: Закупки").props.onClick!;
+    runtime.editor = false; render(); await flush(); expect(button("Открыть черновик: Закупки").props.disabled).toBe(true);
+    oldCallback(); await flush(); expect(transfer).not.toHaveBeenCalled(); expect(runtime.workspace).not.toHaveBeenCalled(); expect(text()).toContain("режим редактора");
+  });
+  it("keeps inference usable with RAM texts while paused, but blocks file IO and transfer", async () => {
+    await configureModel(); await addText(); runtime.phase = "disconnected"; render(); await flush();
+    expect(button("Добавить PDF, DOCX или XLSX").props.disabled).toBe(true); expect(button("Проверить подключение").props.disabled).toBe(false);
+    await click("Отправить выбранные источники"); expect(runtime.analyze).toHaveBeenCalledTimes(1); expect(button("Открыть черновик: Закупки").props.disabled).toBe(true);
+    button("Добавить PDF, DOCX или XLSX").props.onClick!(); await flush(); expect(runtime.chooseOpen).not.toHaveBeenCalled();
+  });
+  it("rechecks real access and workspace root before transfer and serializes a double click", async () => {
+    await paste(); const read = deferred<{ root: string; editor: boolean }>(); runtime.workspace.mockReturnValueOnce(read.promise);
+    const handler = button("Открыть черновик: Закупки").props.onClick!; handler(); handler(); await flush(); expect(runtime.workspace).toHaveBeenCalledTimes(1);
+    read.resolve({ root: "/different-workspace", editor: true }); await flush(); expect(transfer).not.toHaveBeenCalled(); expect(text()).toContain("рабочую папку");
+  });
+  it("invalidates an inference reply after source/task edits and sends a real cancellation", async () => {
+    await configureModel(); await addText(); const answer = deferred<{ text: string; model: string }>(); runtime.analyze.mockReturnValueOnce(answer.promise);
+    await click("Отправить выбранные источники"); expect(button("Модель готовит ответ…").props.disabled).toBe(true);
+    await edit("iw-instruction", "Новая задача"); expect(runtime.cancel).toHaveBeenCalledWith(runtime.analyze.mock.calls[0][3]);
+    answer.resolve({ text: result([procurement]), model: "qa-model" }); await flush(); expect(text()).not.toContain("Подготовлено карточек: 1"); expect(control("iw-response").props.value).toBe("");
+  });
+  it("protects corrected cards from a late replacement response", async () => {
+    await configureModel(); await addText(); await paste(); const answer = deferred<{ text: string; model: string }>(); runtime.analyze.mockReturnValueOnce(answer.promise);
+    await click("Отправить выбранные источники"); expect(runtime.analyze).not.toHaveBeenCalled(); await confirm();
+    field("customer").props.onChange!({ target: { value: "Исправленный заказчик", checked: false } }); await flush();
+    answer.resolve({ text: result([{ ...procurement, fields: { name: "Поздний результат" } }]), model: "qa-model" }); await flush();
+    expect(field("customer").props.value).toBe("Исправленный заказчик"); expect(text()).not.toContain("Поздний результат");
+  });
+  it("retains prior valid cards after a malformed response and allows correcting or deselecting invalid edited fields", async () => {
+    await paste([{ destination: "staff", title: "Сотрудник", fields: { fullName: "Иванов", email: "qa@example.com" } }]);
+    await edit("iw-response", '{"items":[{"destination":"staff","title":"Плохой","fields":{"password":"x"}}]}'); await click("Разобрать ответ"); await confirm();
+    expect(text()).toContain("Недопустимое поле"); expect(field("fullName").props.value).toBe("Иванов");
+    field("email").props.onChange!({ target: { value: "invalid-email", checked: false } }); await flush(); expect(button("Открыть черновик: Кадры").props.disabled).toBe(true);
+    await toggle("Передать поле Почта результата 1", false); expect(button("Открыть черновик: Кадры").props.disabled).toBe(false); await click("Открыть черновик: Кадры");
+    const handoff = transfer.mock.calls[0][0]; expect(handoff.destination === "staff" && handoff.data.email).toBe("");
+  });
+  it("loads a document without attachment writes; ignores cancelled extraction and explains scans without text", async () => {
+    const extraction = deferred<unknown>(); runtime.invoke.mockReturnValueOnce(extraction.promise); await click("Добавить PDF, DOCX или XLSX");
+    expect(runtime.invoke.mock.calls[0][0]).toBe("scanner_run"); expect(runtime.invoke.mock.calls[0][1].operation).toBe("extract"); await click("Отмена");
+    extraction.resolve({ fileName: "Поздний.pdf", extractedText: "text", sha256: "a", fragments: [], warnings: [] }); await flush(); expect(text()).not.toContain("Поздний.pdf");
+    runtime.invoke.mockResolvedValueOnce({ fileName: "Скан.pdf", extractedText: "", sha256: "a", fragments: [], warnings: [] }); await click("Добавить PDF, DOCX или XLSX");
+    expect(text()).toContain("распознавание в сканере"); expect(runtime.workspace).not.toHaveBeenCalled();
+  });
+  it("stores several public connection profiles but never the key, text, or credential-bearing URL", async () => {
+    await configureModel(); await edit("iw-api-key", "MEMORY-ONLY-SECRET"); await addText("PRIVATE-SOURCE", "PRIVATE-CONTENT"); await click("Сохранить подключение");
+    const stored = localValues.get("sbk-intelligence-connections-v1")!; expect(stored).toContain("qa-model"); expect(stored).not.toMatch(/MEMORY-ONLY-SECRET|PRIVATE-CONTENT|PRIVATE-SOURCE|apiKey/);
+    await edit("iw-endpoint", "http://user:password@localhost:11434"); expect(control("iw-api-key").props.value).toBe(""); await click("Сохранить подключение"); expect(localValues.get("sbk-intelligence-connections-v1")).toBe(stored);
+    await click("Добавить подключение"); await edit("iw-profile-name", "Второй сервис"); await edit("iw-endpoint", "http://localhost:1234/v1"); await click("Сохранить подключение"); expect(JSON.parse(localValues.get("sbk-intelligence-connections-v1")!)).toHaveLength(2);
+  });
+  it("rejects invalid profile timeouts and coalesces duplicate connection checks", async () => {
+    await configureModel(); await edit("iw-timeout", "3"); await click("Сохранить подключение"); expect(localValues.size).toBe(0); expect(text()).toContain("от 5 до 600");
+    await edit("iw-timeout", "120"); const test = deferred<{ models: string[]; message: string }>(); runtime.testConnection.mockReturnValueOnce(test.promise);
+    const handler = button("Проверить подключение").props.onClick!; handler(); handler(); await flush(); expect(runtime.testConnection).toHaveBeenCalledTimes(1);
+    test.resolve({ models: ["new-model"], message: "Проверено" }); await flush(); expect(text()).toContain("Проверено");
+  });
+  it("warns before clearing local material and keeps it when the dialog is cancelled", async () => {
+    await addText(); await paste(); await click("Новая задача"); const dialog = nodes().find((node) => node.type === ConfirmDialog)!;
+    expect(text()).toContain("Тендер"); dialog.props.onClose!(); await flush(); expect(control("iw-response").props.value).not.toBe("");
+    await click("Новая задача"); await confirm(); expect(control("iw-response").props.value).toBe(""); expect(text()).not.toContain("Тендер"); expect(transfer).not.toHaveBeenCalled();
+  });
+  it("marks retained cards as a previous snapshot after a malformed inference reply", async () => {
+    await configureModel(); await addText(); await paste(); runtime.analyze.mockResolvedValueOnce({ text: "not JSON", model: "qa-model" });
+    await click("Отправить выбранные источники"); await confirm(); expect(field("name").props.value).toBe("Тестовая закупка");
+    expect(text()).toContain("предыдущий разобранный результат"); expect(text()).toContain("карточки не разобраны");
+  });
+  it("never resurrects a removed or unselected source when another source is added", async () => {
+    await addText("Удаляемый", "Удаляемый текст"); await addText("Оставляемый", "Исходный текст"); await toggle("Отправить источник Оставляемый", false);
+    const remove = nodes().find((node) => node.props["aria-label"] === "Удалить источник Удаляемый")!; remove.props.onClick!(); await flush(); await confirm();
+    await addText("Новый", "Новый текст"); expect(text()).not.toContain("Удаляемый");
+    expect(nodes().find((node) => node.props["aria-label"] === "Отправить источник Оставляемый")?.props).toHaveProperty("checked", false);
+  });
+  it("bounds UTF-8 text and task input before state changes", async () => {
+    await edit("iw-source-text", "я".repeat(1024 * 1024 + 1)); expect(control("iw-source-text").props.value).toBe(""); expect(text()).toContain("2 МБ");
+    await edit("iw-instruction", "x".repeat(20001)); expect(String(control("iw-instruction").props.value).length).toBeLessThan(20001);
+    await edit("iw-response", "я".repeat(1024 * 1024 + 1)); expect(control("iw-response").props.value).toBe("");
+  });
+  it("caps source count and manual cards and keeps transfer unavailable for empty cards", async () => {
+    for (let index = 0; index < 100; index++) await addText(`Источник ${index + 1}`, "x");
+    expect(button("Добавить текст").props.disabled).toBe(true); await edit("iw-source-text", "Ещё один"); button("Добавить текст").props.onClick!(); await flush(); expect(text()).toContain("не более 100 источников");
+    for (let index = 0; index < 100; index++) await click("Добавить карточку вручную");
+    expect(button("Добавить карточку вручную").props.disabled).toBe(true); expect(button("Открыть черновик: Закупки").props.disabled).toBe(true);
+    button("Добавить карточку вручную").props.onClick!(); await flush(); expect(text()).toContain("не более 100 карточек");
+  });
+});

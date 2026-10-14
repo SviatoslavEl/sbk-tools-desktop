@@ -545,18 +545,20 @@ export function CompanyEditor({
   onClose,
   onSave,
   readOnly = false,
+  unsavedSeed = false,
 }: {
   company: CompanyCard;
   companies: CompanyCard[];
   onClose: () => void;
   onSave: (company: CompanyCard) => Promise<void>;
   readOnly?: boolean;
+  unsavedSeed?: boolean;
 }) {
   const [item, setItem] = useState(() => structuredClone(company));
   const [viewingCard] = useState(readOnly);
   const [existingAffiliationIds] = useState(() => new Set(company.affiliations.map((relation) => relation.id)));
   const [revealInvalidBlocks, setRevealInvalidBlocks] = useState(0);
-  const [savedSnapshot, setSavedSnapshot] = useState(() => JSON.stringify(item));
+  const [savedSnapshot, setSavedSnapshot] = useState(() => unsavedSeed ? "" : JSON.stringify(item));
   const [error, setError] = useState("");
   const [saving, setSaving] = useState(false);
   const saveInFlight = useRef(false);

@@ -221,6 +221,9 @@ pub(crate) fn local_command(command: &str) -> bool {
             | "startup_status"
             | "report_startup_ui_visible"
             | "quit_application"
+            | "test_intelligence_connection"
+            | "run_intelligence_analysis"
+            | "cancel_intelligence_request"
     )
 }
 
@@ -314,6 +317,9 @@ mod tests {
             "set_diagnostic_logging",
             "export_diagnostic_bundle",
             "quit_application",
+            "test_intelligence_connection",
+            "run_intelligence_analysis",
+            "cancel_intelligence_request",
         ] {
             assert!(local_command(command), "{command}");
         }

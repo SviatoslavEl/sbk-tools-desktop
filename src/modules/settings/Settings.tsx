@@ -25,10 +25,6 @@ import {
   type WorkspaceInfo,
 } from "../../lib/storage";
 import {
-  getIntelligenceProviderStatus,
-  type IntelligenceProviderStatus,
-} from "../intelligence/api";
-import {
   readAccessTimers,
   readSharedBackupPolicy,
   saveAccessTimers,
@@ -53,11 +49,13 @@ export function Settings({
   onCollapsed,
   workspace,
   onWorkspaceChange: setWorkspace,
+  onOpenIntelligence,
 }: {
   collapsed: boolean;
   onCollapsed: (value: boolean) => void;
   workspace: WorkspaceInfo;
   onWorkspaceChange: (value: WorkspaceInfo) => void;
+  onOpenIntelligence?: () => void;
 }) {
   const workspaceAccess = useWorkspaceAccess();
   const store = useRecords<AppSettings>("settings");
@@ -86,8 +84,6 @@ export function Settings({
   const newWorkspacePasswordError = newWorkspacePassword
     ? workspacePasswordError(newWorkspacePassword)
     : "";
-  const [intelligence, setIntelligence] =
-    useState<IntelligenceProviderStatus | null>(null);
   const [accessTimers, setAccessTimers] =
     useState<AccessTimers>(readAccessTimers);
   const [backupPolicy, setBackupPolicy] = useState<SharedBackupPolicySnapshot | null>(null);
@@ -139,7 +135,6 @@ export function Settings({
     setRetentionDays(timers.retentionDays);
     setBackupPolicy(null);
     void loadBackupPolicy();
-    void getIntelligenceProviderStatus().then(setIntelligence).catch(() => setIntelligence(null));
     setVerification(null);
     void reloadBackups();
     return () => { policyLoad.current += 1; };
@@ -534,22 +529,15 @@ export function Settings({
       </section>
       <section className="surface" hidden={section !== "advanced"}>
         <div className="surface-title">
-          <h2>Локальный AI-сервер</h2>
-          <span className="status neutral">Выключен</span>
+          <h2>Подключения ИИ</h2>
+          <span className="status neutral">В рабочем окне ИИ</span>
         </div>
         <div className="surface-body">
-          <p>{intelligence?.message || "Проверяем состояние…"}</p>
-          <div className="notice warning">
-            <strong>Подключение ещё не активировано.</strong>
-            <span>
-              Это подготовленный безопасный контур, а не имитация AI. Ручной
-              ввод, расчёты и экспорт работают полностью офлайн.
-            </span>
-          </div>
+          <p>Подключения к модели на этом компьютере, серверу в локальной сети и внешнему сервису настраиваются в едином рабочем окне ИИ.</p>
+          {onOpenIntelligence && <button className="secondary" type="button" onClick={onOpenIntelligence}>Открыть рабочее окно ИИ</button>}
           <p className="help-text">
-            После появления сервера потребуется утверждённый API, HTTPS/mTLS для
-            локальной сети и секрет из системного хранилища. WebView не будет
-            обращаться к серверу напрямую.
+            Материал отправляется только по вашей команде выбранному подключению.
+            Ключ хранится только в памяти текущего сеанса; общая база его не получает.
           </p>
         </div>
       </section>
@@ -793,9 +781,10 @@ export function About() {
         </div>
         <div className="surface-body">
           <p>
-            Приложение работает офлайн. Расчёты, реестры, документы и OCR не
-            отправляются в облако. Сетевой сервис для обработки файлов не
-            запускается.
+            Расчёты, реестры, обработка документов и OCR работают локально.
+            В рабочем окне ИИ выбранный материал отправляется указанной модели
+            только после нажатия кнопки отправки. При внешнем подключении этот
+            материал получает выбранный сервис.
           </p>
         </div>
       </section>

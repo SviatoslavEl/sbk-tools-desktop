@@ -3,6 +3,7 @@ import { ConfirmDialog } from "../../components/Dialog";
 import { DrawerBackdrop } from "../../components/DrawerBackdrop";
 import { useRecords } from "../../hooks/useRecords";
 import { useViewState } from "../../hooks/useViewState";
+import type { IntelligenceHandoff } from "../intelligence/workbenchTypes";
 import { useUnsavedChanges } from "../../hooks/useUnsavedChanges";
 import { chooseSavePath, exportText } from "../../lib/files";
 import { writeTextFile, writeXlsx, type StoredRecord } from "../../lib/storage";
@@ -65,7 +66,7 @@ function snapshot(
   };
 }
 
-export function ProcurementRegistry({ openRecordId, onRecordOpened, onCreateProposal }: { openRecordId?: string; onRecordOpened?: () => void; onCreateProposal?: (proposal: ProposalData) => void } = {}) {
+export function ProcurementRegistry({ openRecordId, onRecordOpened, onCreateProposal, intelligenceHandoff, onIntelligenceHandoffConsumed }: { openRecordId?: string; onRecordOpened?: () => void; onCreateProposal?: (proposal: ProposalData) => void; intelligenceHandoff?: Extract<IntelligenceHandoff, { destination: "procurement" }>; onIntelligenceHandoffConsumed?: () => void } = {}) {
   const workspaceAccess = useWorkspaceAccess();
   const readOnly = !workspaceAccess.editor;
   const store = useRecords<ProcurementData>("procurement");
@@ -74,6 +75,15 @@ export function ProcurementRegistry({ openRecordId, onRecordOpened, onCreateProp
   const [editing, setEditing] = useState<
     StoredRecord<ProcurementData> | "new" | null
   >(null);
+  const [intelligenceSeed, setIntelligenceSeed] = useState<{ id: string; data: ProcurementData } | null>(null);
+  const consumedIntelligence = useRef("");
+  useEffect(() => {
+    if (!intelligenceHandoff || consumedIntelligence.current === intelligenceHandoff.id || editing || readOnly) return;
+    consumedIntelligence.current = intelligenceHandoff.id;
+    setIntelligenceSeed({ id: intelligenceHandoff.id, data: structuredClone(intelligenceHandoff.data) });
+    setEditing("new");
+    onIntelligenceHandoffConsumed?.();
+  }, [intelligenceHandoff, editing, readOnly, onIntelligenceHandoffConsumed]);
   const [archiving, setArchiving] =
     useState<StoredRecord<ProcurementData> | null>(null);
   const [actionError, setActionError] = useState("");
@@ -260,12 +270,14 @@ export function ProcurementRegistry({ openRecordId, onRecordOpened, onCreateProp
       {proposalSource && onCreateProposal && <ProcurementProposalSource data={normalizeProcurement({ ...proposalSource.payload })} recordId={proposalSource.id} onClose={() => setProposalSource(null)} onCreate={(proposal) => { setProposalSource(null); onCreateProposal(proposal); }} />}
       {editing && (
         <ProcurementEditor
-          key={editing === "new" ? "new" : editing.id}
+          key={editing === "new" ? intelligenceSeed?.id || "new" : editing.id}
           record={editing === "new" ? undefined : editing}
+          initialValue={editing === "new" ? intelligenceSeed?.data : undefined}
           readOnly={readOnly}
-          onClose={() => setEditing(null)}
+          onClose={() => { setEditing(null); setIntelligenceSeed(null); }}
           onSave={async (item, id) => {
             const saved = await store.save(item.name, item, id);
+            setIntelligenceSeed(null);
             setEditing(saved);
           }}
         />
@@ -289,11 +301,13 @@ export function ProcurementRegistry({ openRecordId, onRecordOpened, onCreateProp
 
 export function ProcurementEditor({
   record,
+  initialValue,
   onSave,
   onClose,
   readOnly = false,
 }: {
   record?: StoredRecord<ProcurementData>;
+  initialValue?: ProcurementData;
   onSave: (item: ProcurementData, id?: string) => Promise<void>;
   onClose: () => void;
   readOnly?: boolean;
@@ -307,9 +321,9 @@ export function ProcurementEditor({
           structuredClone(record.payload) as ProcurementData &
             Record<string, unknown>,
         )
-      : emptyProcurement(),
+      : initialValue ? normalizeProcurement(structuredClone(initialValue) as ProcurementData & Record<string, unknown>) : emptyProcurement(),
   );
-  const [savedSnapshot, setSavedSnapshot] = useState(() => JSON.stringify(item));
+  const [savedSnapshot, setSavedSnapshot] = useState(() => initialValue && !record ? "" : JSON.stringify(item));
   const dirty = JSON.stringify(item) !== savedSnapshot;
   const [tab, setTab] = useState<ProcurementSection>("main");
   const activeStage = workflowStage(tab);

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import "./App.css";
 import { Dialog } from "./components/Dialog";
 import { NetworkDiagnosticsPanel, NetworkOfflineNotice } from "./modules/settings/NetworkDiagnosticsPanel";
@@ -9,6 +9,7 @@ import { GlobalSearch } from "./modules/search/GlobalSearch";
 import { StatusCenter } from "./modules/status/StatusCenter";
 import { StatusIndicator } from "./modules/status/StatusIndicator";
 import { Proposals, type ProposalHandoff } from "./modules/proposals/Proposals";
+import type { IntelligenceHandoff } from "./modules/intelligence/workbenchTypes";
 import type { ProposalData } from "./modules/proposals/types";
 import { clearActivities } from "./lib/activity";
 import { setViewStateWorkspace } from "./hooks/useViewState";
@@ -46,6 +47,8 @@ import {
   WorkspaceAccessProvider,
 } from "./lib/workspaceAccess";
 
+const IntelligenceWorkbench = lazy(async () => ({ default: (await import("./modules/intelligence/IntelligenceWorkbench")).IntelligenceWorkbench }));
+
 type ToolId =
   | "dashboard"
   | "procurement"
@@ -56,6 +59,7 @@ type ToolId =
   | "staff"
   | "archive"
   | "proposals"
+  | "intelligence"
   | "status"
   | "settings"
   | "about";
@@ -63,6 +67,7 @@ type ToolId =
 const tools: Array<{ id: ToolId; label: string }> = [
   { id: "dashboard", label: "Главная" },
   { id: "procurement", label: "Закупки" },
+  { id: "intelligence", label: "Рабочее окно ИИ" },
   { id: "calculator", label: "Тендерный калькулятор" },
   { id: "proposals", label: "Коммерческие предложения" },
   { id: "scanner", label: "Сканирование документов" },
@@ -98,6 +103,7 @@ const toolTitles: Record<ToolId, [string, string]> = {
   ],
   staff: ["Кадры", "Люди, основания сотрудничества и подтверждающие документы"],
   proposals: ["Коммерческие предложения", "Состав, стоимость, условия и клиентские документы"],
+  intelligence: ["Рабочее окно ИИ", "Документы, анализ и подготовка карточек для всех разделов"],
   status: ["Центр состояния", "Рабочая папка, редактор, резервные копии и операции"],
   archive: ["Архив", "Восстановление и окончательное удаление записей"],
   settings: ["Настройки", "Рабочая папка, интерфейс и резервные копии"],
@@ -122,11 +128,12 @@ const helpText: Record<ToolId, string> = {
   archive:
     "Архивные расчёты, договоры и кадровые карточки можно восстановить. Окончательное удаление также удаляет историю и связанные файлы.",
   proposals: "Создавайте предложение по шагам. Данные сторон и цены сохраняются снимком; изменения справочника не меняют готовое КП. Внутренние заметки не включаются в клиентский документ.",
+  intelligence: "Добавьте материал и задачу, выберите подключение к модели. Проверьте ответ, отметьте нужные поля и откройте новую карточку в нужном разделе. Карточка сохраняется обычной кнопкой после проверки. Ключ подключения хранится только до закрытия программы.",
   status: "Центр состояния только читает сведения. Он не перехватывает редактора и не снимает блокировки. Состояние сетевой папки проверяется отдельно от наличия резервной копии.",
   settings:
     "Резервная копия включает базы и вложения. Перед восстановлением приложение автоматически создаёт страховочную копию текущих данных.",
   about:
-    "Все инструменты работают локально и не обмениваются бизнес-данными друг с другом.",
+    "Основные инструменты работают локально. Передача результатов между разделами выполняется по вашему выбору. ИИ получает только материал, который вы явно отправили выбранному подключению.",
 };
 
 function App() {
@@ -302,12 +309,14 @@ function App() {
   const [scannerOpened, setScannerOpened] = useState(activeTool === "scanner");
   const [calculatorOpened, setCalculatorOpened] = useState(activeTool === "calculator");
   const [proposalsOpened, setProposalsOpened] = useState(activeTool === "proposals");
+  const [intelligenceOpened, setIntelligenceOpened] = useState(activeTool === "intelligence");
+  const [intelligenceHandoff, setIntelligenceHandoff] = useState<IntelligenceHandoff | undefined>();
   const [proposalHandoff, setProposalHandoff] = useState<ProposalHandoff | undefined>();
   const [showHelp, setShowHelp] = useState(false);
   const [showSearch, setShowSearch] = useState(false);
   const [openRecord, setOpenRecord] = useState<{ tool: ToolId; id: string } | null>(null);
   const contentRef = useRef<HTMLDivElement>(null);
-  useEffect(() => { setOpenRecord(null); setShowSearch(false); setProposalHandoff(undefined); clearActivities(); setViewStateWorkspace(workspace?.root || ""); }, [workspace?.root]);
+  useEffect(() => { setOpenRecord(null); setShowSearch(false); setProposalHandoff(undefined); setIntelligenceHandoff(undefined); clearActivities(); setViewStateWorkspace(workspace?.root || ""); }, [workspace?.root]);
   useEffect(() => {
     const openSearch = (event: KeyboardEvent) => {
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k" && !document.querySelector('[role="dialog"]')) { event.preventDefault(); setShowSearch(true); }
@@ -321,6 +330,7 @@ function App() {
     if (tool === "scanner") setScannerOpened(true);
     if (tool === "calculator") setCalculatorOpened(true);
     if (tool === "proposals") setProposalsOpened(true);
+    if (tool === "intelligence") setIntelligenceOpened(true);
     setOpenRecord(recordId ? { tool, id: recordId } : null);
     setActiveTool(tool);
     localStorage.setItem("sbk-tools:last-tool", tool);
@@ -331,6 +341,13 @@ function App() {
   };
   const [title, subtitle] = toolTitles[activeTool];
   const createProposal = (data: ProposalData) => { setProposalHandoff({id:crypto.randomUUID(),data}); selectTool("proposals"); };
+  const intelligenceConsumed = () => setIntelligenceHandoff(undefined);
+  const transferIntelligence = (handoff: IntelligenceHandoff) => {
+    if (!workspace || handoff.workspaceRoot !== workspace.root || !workspace.editor || networkPaused) throw new Error("Для передачи данных подключите рабочую папку и войдите в режим редактора.");
+    if (handoff.destination === "proposals") setProposalHandoff({ id: handoff.id, data: handoff.data });
+    else setIntelligenceHandoff(handoff);
+    selectTool(handoff.destination);
+  };
 
   if (!installedFastStart && !workspace)
     return (
@@ -633,6 +650,13 @@ function App() {
           <div ref={contentRef} id="main-content" tabIndex={-1} className={`tool-content ${["contracts", "staff", "counterparties", "procurement"].includes(activeTool) ? "registry-content" : ""}`}>
             <NetworkOfflineNotice />
             <AdministrationNotice key={`notice-${workspace.root}`} message={workspace.administrationNotice} />
+            {intelligenceOpened && <div hidden={activeTool !== "intelligence"} key={`intelligence-${workspace.root}`}>
+              <ReadOnlyWorkspaceBoundary allowMutations>
+                <Suspense fallback={<p className="notice" role="status">Открываем рабочее окно ИИ…</p>}>
+                  <IntelligenceWorkbench active={activeTool === "intelligence"} workspaceRoot={workspace.root} onTransfer={transferIntelligence} />
+                </Suspense>
+              </ReadOnlyWorkspaceBoundary>
+            </div>}
             {scannerOpened && <div hidden={activeTool !== "scanner"} key={`scanner-${workspace.root}`}>
               <ReadOnlyWorkspaceBoundary allowMutations>
                 <Scanner active={activeTool === "scanner"} />
@@ -640,16 +664,16 @@ function App() {
             </div>}
             <ReadOnlyWorkspaceBoundary>
               {activeTool === "dashboard" && <div className="module-stack"><Dashboard onNavigate={selectTool} /><section className="dashboard-calendar" aria-label="Календарь тендеров"><h2>Календарь тендеров</h2><p className="help-text">Дважды щёлкните по дню, чтобы назначить закупку. С клавиатуры — Enter на выбранном дне.</p><TenderCalendar /></section></div>}
-              {activeTool === "procurement" && <ProcurementRegistry onCreateProposal={createProposal} openRecordId={openRecord?.tool === "procurement" ? openRecord.id : undefined} onRecordOpened={recordOpened} />}
+              {activeTool === "procurement" && <ProcurementRegistry key={`procurement-${workspace.root}`} onCreateProposal={createProposal} intelligenceHandoff={intelligenceHandoff?.destination === "procurement" ? intelligenceHandoff : undefined} onIntelligenceHandoffConsumed={intelligenceConsumed} openRecordId={openRecord?.tool === "procurement" ? openRecord.id : undefined} onRecordOpened={recordOpened} />}
               {calculatorOpened && <div hidden={activeTool !== "calculator"} key={`calculator-${workspace.root}`}><Calculator onCreateProposal={createProposal} active={activeTool === "calculator"} openRecordId={openRecord?.tool === "calculator" ? openRecord.id : undefined} onRecordOpened={recordOpened} /></div>}
               {proposalsOpened && <div hidden={activeTool !== "proposals"} key={`proposals-${workspace.root}`}><Proposals active={activeTool === "proposals"} handoff={proposalHandoff} onHandoffConsumed={() => setProposalHandoff(undefined)} openRecordId={openRecord?.tool === "proposals" ? openRecord.id : undefined} onRecordOpened={recordOpened} /></div>}
-              {activeTool === "contracts" && <ContractsRegistry openRecordId={openRecord?.tool === "contracts" ? openRecord.id : undefined} onRecordOpened={recordOpened} />}
-              {activeTool === "counterparties" && <CounterpartiesRegistry openRecordId={openRecord?.tool === "counterparties" ? openRecord.id : undefined} onRecordOpened={recordOpened} />}
-              {activeTool === "staff" && <StaffRegistry openRecordId={openRecord?.tool === "staff" ? openRecord.id : undefined} onRecordOpened={recordOpened} />}
+              {activeTool === "contracts" && <ContractsRegistry key={`contracts-${workspace.root}`} intelligenceHandoff={intelligenceHandoff?.destination === "contracts" ? intelligenceHandoff : undefined} onIntelligenceHandoffConsumed={intelligenceConsumed} openRecordId={openRecord?.tool === "contracts" ? openRecord.id : undefined} onRecordOpened={recordOpened} />}
+              {activeTool === "counterparties" && <CounterpartiesRegistry key={`counterparties-${workspace.root}`} intelligenceHandoff={intelligenceHandoff?.destination === "counterparties" ? intelligenceHandoff : undefined} onIntelligenceHandoffConsumed={intelligenceConsumed} openRecordId={openRecord?.tool === "counterparties" ? openRecord.id : undefined} onRecordOpened={recordOpened} />}
+              {activeTool === "staff" && <StaffRegistry key={`staff-${workspace.root}`} intelligenceHandoff={intelligenceHandoff?.destination === "staff" ? intelligenceHandoff : undefined} onIntelligenceHandoffConsumed={intelligenceConsumed} openRecordId={openRecord?.tool === "staff" ? openRecord.id : undefined} onRecordOpened={recordOpened} />}
               {activeTool === "archive" && <Archive />}
               {activeTool === "status" && <StatusCenter key={`status-${workspace.root}`} workspace={workspace} onSettings={() => selectTool("settings")} />}
               {activeTool === "settings" && (
-                <Settings collapsed={collapsed} onCollapsed={updateCollapsed} workspace={workspace} onWorkspaceChange={setWorkspace} />
+                <Settings collapsed={collapsed} onCollapsed={updateCollapsed} workspace={workspace} onWorkspaceChange={setWorkspace} onOpenIntelligence={() => selectTool("intelligence")} />
               )}
               {activeTool === "about" && <About />}
             </ReadOnlyWorkspaceBoundary>
@@ -666,7 +690,7 @@ function App() {
             <div className="dialog-body">
               <p>{helpText[activeTool]}</p>
               <p className="help-text">
-                Данные текущего инструмента не передаются в другие разделы.
+                Передача данных между разделами выполняется только по вашему выбору.
               </p>
             </div>
             <footer className="dialog-actions">

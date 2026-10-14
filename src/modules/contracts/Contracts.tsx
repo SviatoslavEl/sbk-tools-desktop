@@ -61,6 +61,7 @@ import { RegistryTableView } from "./RegistryTableView";
 import { ContractSelectionDocuments } from "./ContractSelectionDocuments";
 import { contractSelectionArchivePlan, contractSelectionDocumentGroups, pruneContractDocumentSelection } from "./selectionDocuments";
 import "./registry.css";
+import type { IntelligenceHandoff } from "../intelligence/workbenchTypes";
 
 const money = (value: number) =>
   new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 0 }).format(value) +
@@ -375,7 +376,7 @@ export function mergeContractImportUpdate(
   return next;
 }
 
-export function ContractsRegistry({ openRecordId, onRecordOpened }: { openRecordId?: string; onRecordOpened?: () => void } = {}) {
+export function ContractsRegistry({ openRecordId, onRecordOpened, intelligenceHandoff, onIntelligenceHandoffConsumed }: { openRecordId?: string; onRecordOpened?: () => void; intelligenceHandoff?: Extract<IntelligenceHandoff, { destination: "contracts" }>; onIntelligenceHandoffConsumed?: () => void } = {}) {
   const store = useRecords<ContractData>("contract-experience");
   const companyDirectory = useCompanyDirectory(store.records);
   const [search, setSearch] = useViewState("contracts.search", "");
@@ -386,10 +387,21 @@ export function ContractsRegistry({ openRecordId, onRecordOpened }: { openRecord
     StoredRecord<ContractData> | "new" | null
   >(null);
   const [viewingCard, setViewingCard] = useState(false);
+  const [intelligenceSeed, setIntelligenceSeed] = useState<{ id: string; data: ContractData } | null>(null);
+  const consumedIntelligence = useRef("");
   const setEditing = (record: StoredRecord<ContractData> | "new" | null) => {
+    setIntelligenceSeed(null);
     if (record !== null) setViewingCard(!companyDirectory.editor);
     setEditingRecord(record);
   };
+  useEffect(() => {
+    if (!intelligenceHandoff || consumedIntelligence.current === intelligenceHandoff.id || editing || companyDirectory.loading || !companyDirectory.editor) return;
+    consumedIntelligence.current = intelligenceHandoff.id;
+    setIntelligenceSeed({ id: intelligenceHandoff.id, data: structuredClone(intelligenceHandoff.data) });
+    setViewingCard(false);
+    setEditingRecord("new");
+    onIntelligenceHandoffConsumed?.();
+  }, [intelligenceHandoff, editing, companyDirectory.loading, companyDirectory.editor, onIntelligenceHandoffConsumed]);
   useEffect(() => {
     if (!openRecordId || store.loading || store.error || companyDirectory.loading || editing) return;
     const record = store.records.find((entry) => entry.id === openRecordId);
@@ -1297,8 +1309,10 @@ export function ContractsRegistry({ openRecordId, onRecordOpened }: { openRecord
       </div>
       {editing && viewingCard && editing !== "new" ? <ContractReadCard record={{ ...editing, payload: normalizeContractData(editing.payload) }} onClose={() => setEditing(null)} /> : editing && (
         <ContractEditor
+          key={intelligenceSeed?.id || (editing === "new" ? "new" : editing.id)}
           companies={companyDirectory.companies}
           record={editing === "new" ? undefined : editing}
+          initialValue={editing === "new" ? intelligenceSeed?.data : undefined}
           onClose={() => setEditing(null)}
           onSave={async (item, id) => {
             await companyDirectory.persistContractThenDirectory(item, id);
@@ -1925,6 +1939,7 @@ export function ContractsRegistry({ openRecordId, onRecordOpened }: { openRecord
           <ContractEditor
             companies={companyDirectory.companies}
             initialValue={importRows[importEditingIndex]}
+            importMode
             onClose={() => setImportEditingIndex(null)}
             onSave={async (item) => {
               const reviewedIndex = importEditingIndex;
@@ -1959,12 +1974,14 @@ export function ContractsRegistry({ openRecordId, onRecordOpened }: { openRecord
 export function ContractEditor({
   record,
   initialValue,
+  importMode = false,
   companies,
   onSave,
   onClose,
 }: {
   record?: StoredRecord<ContractData>;
   initialValue?: ContractData;
+  importMode?: boolean;
   companies: CompanyCard[];
   onSave: (item: ContractData, id?: string) => Promise<void>;
   onClose: () => void;
@@ -1978,7 +1995,7 @@ export function ContractEditor({
         ? normalizeContractData(structuredClone(initialValue))
         : emptyContract(),
   );
-  const [savedSnapshot, setSavedSnapshot] = useState(() => JSON.stringify(item));
+  const [savedSnapshot, setSavedSnapshot] = useState(() => initialValue && !record && !importMode ? "" : JSON.stringify(item));
   const [error, setError] = useState("");
   const [saving, setSaving] = useState(false);
   const saveInFlight = useRef(false);
@@ -2050,13 +2067,14 @@ export function ContractEditor({
       <header>
         <div>
           <h2>
-            {record || initialValue
+            {record || importMode
               ? item.number || "Дополнение импортируемого договора"
               : "Новый договор"}
           </h2>
           <p>
-            {initialValue
+            {importMode
               ? "Изменения применяются только к этой строке импорта"
+              : initialValue && !record ? "Черновик из окна ИИ · проверьте данные перед сохранением"
               : "Статусы хранятся независимо"}
           </p>
         </div>
@@ -2330,7 +2348,7 @@ export function ContractEditor({
           </label>
         </div>
         <div id="contract-section-documents" />
-        {!initialValue && (
+        {!importMode && (
           <ContractDocumentsEditor
             recordId={recordId}
             documents={item.documents}

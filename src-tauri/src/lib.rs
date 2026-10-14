@@ -40,6 +40,7 @@ mod database;
 mod diagnostics;
 mod diagnostics_commands;
 mod intelligence;
+mod intelligence_transport;
 mod network_diagnostics;
 #[cfg(test)]
 mod network_transition_regression_tests;
@@ -5540,6 +5541,9 @@ pub fn run() {
                     recover_workspace_editor_session,
                     intelligence_provider_status,
                     validate_intelligence_configuration,
+                    intelligence_transport::test_intelligence_connection,
+                    intelligence_transport::run_intelligence_analysis,
+                    intelligence_transport::cancel_intelligence_request,
                     analysis_job_list,
                     analysis_job_cancel,
                     set_workspace_location,
