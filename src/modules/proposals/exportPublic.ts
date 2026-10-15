@@ -9,12 +9,13 @@ function validDate(value: string): boolean {
   return Number.isFinite(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value;
 }
 export interface ProposalValidationOptions { today?: string; duplicateNumber?: boolean }
+const textLength = (value: string): number => Array.from(value).length;
 export function validateProposal(data: ProposalData, options: ProposalValidationOptions = {}): ProposalIssue[] {
   const issues: ProposalIssue[] = [];
   const issue = (field: string, step: ProposalIssue['step'], message: string, severity: ProposalIssue['severity'] = 'error', lineId?: string) => issues.push({ field, step, message, severity, ...(lineId ? { lineId } : {}) });
   for (const [field, value, label] of [['number', data.number, 'Номер'], ['title', data.title, 'Предмет'], ['issuer.name', data.issuer.name, 'Исполнитель'], ['recipient.name', data.recipient.name, 'Заказчик']] as const) {
     if (!value.trim()) issue(field, 1, `${label}: заполните обязательное поле`);
-    if (value.length > 500) issue(field, 1, `${label}: не более 500 символов`);
+    if (textLength(value) > 500) issue(field, 1, `${label}: не более 500 символов`);
   }
   if (!validDate(data.documentDate)) issue('documentDate', 1, 'Укажите корректную дату КП');
   if (!validDate(data.validUntil)) issue('validUntil', 3, 'Укажите корректный срок действия');
@@ -24,7 +25,7 @@ export function validateProposal(data: ProposalData, options: ProposalValidation
   for (const line of data.lines) {
     if (!line.title.trim()) issue('lines.title', 2, 'Укажите название позиции', 'error', line.id);
     if (!line.unit.trim()) issue('lines.unit', 2, 'Укажите единицу измерения', 'error', line.id);
-    if (line.title.length > 500 || line.description.length > 20000 || line.unit.length > 50) issue('lines.title', 2, 'Слишком длинная позиция: название до 500, описание до 20 000, единица до 50 символов', 'error', line.id);
+    if (textLength(line.title) > 500 || textLength(line.description) > 20000 || textLength(line.unit) > 50) issue('lines.title', 2, 'Слишком длинная позиция: название до 500, описание до 20 000, единица до 50 символов', 'error', line.id);
     try { priceProposalLine(line); } catch (error) { const e = error as ProposalPricingError; issue(e.field, 2, e.message, 'error', line.id); }
   }
   if (!issues.some((entry) => entry.step === 2 && entry.severity === 'error')) {
@@ -44,7 +45,7 @@ export function validateProposal(data: ProposalData, options: ProposalValidation
   }
   if (!/^#[0-9a-fA-F]{6}$/.test(data.template.accentColor)) issue('template.accentColor', 4, 'Выберите корректный цвет оформления');
   for (const [field, value] of [['deliveryTerms', data.deliveryTerms], ['paymentTerms', data.paymentTerms], ['introduction', data.introduction], ['conclusion', data.conclusion], ['template.footer', data.template.footer]] as const) {
-    if (value.length > 20000) issue(field, field.startsWith('template') ? 4 : 3, 'Не более 20 000 символов в текстовом блоке');
+    if (textLength(value) > 20000) issue(field, field.startsWith('template') ? 4 : 3, 'Не более 20 000 символов в текстовом блоке');
   }
   if (data.template.logo && (!['image/png', 'image/jpeg'].includes(data.template.logo.mimeType) || data.template.logo.sizeBytes > 5 * 1024 * 1024)) issue('template.logo', 4, 'Логотип: PNG или JPEG размером до 5 МБ');
   if (data.attachments.length > 100) issue('attachments', 3, 'Не более 100 приложений');

@@ -55,7 +55,7 @@ import {
 import { contractBalance, contractChecks } from "./validation";
 import { matchContract, type ContractSelectionCriteria } from "./selection";
 import { CompanyNameField, useCompanyDirectory } from "./CompanyDirectory";
-import type { CompanyCard } from "./companies";
+import { contractCompanySelectionErrors, normalizeCompanyName, resolveCompanyReference, type CompanyCard } from "./companies";
 import { ContractReadCard } from "./RegistryReadCard";
 import { RegistryTableView } from "./RegistryTableView";
 import { ContractSelectionDocuments } from "./ContractSelectionDocuments";
@@ -225,6 +225,7 @@ export function mapContracts(
   rows: string[][],
   mapping: Record<ImportField, number>,
   defaultLegalEntity = "",
+  defaultLegalEntityId = "",
 ): ContractData[] {
   const value = (row: string[], key: ImportField) =>
     mapping[key] >= 0 ? row[mapping[key]] || "" : "";
@@ -296,6 +297,7 @@ export function mapContracts(
         ...emptyContract(),
         performingLegalEntity:
           value(row, "performingLegalEntity") || defaultLegalEntity,
+        performingLegalEntityId: value(row, "performingLegalEntity") ? "" : defaultLegalEntity ? defaultLegalEntityId : "",
         number: contractNumber,
         date: isoDate(value(row, "date"), contractNumber),
         customer,
@@ -365,6 +367,8 @@ export function mergeContractImportUpdate(
   };
   copy("performingLegalEntity", "performingLegalEntity");
   copy("number", "number"); copy("date", "date"); copy("customer", "customer"); copy("subject", "subject");
+  if (mapping.performingLegalEntity >= 0) next.performingLegalEntityId = imported.performingLegalEntityId || (normalizeCompanyName(previous.performingLegalEntity) === normalizeCompanyName(imported.performingLegalEntity) ? previous.performingLegalEntityId : "");
+  if (mapping.customer >= 0) next.customerCompanyId = imported.customerCompanyId || (normalizeCompanyName(previous.customer) === normalizeCompanyName(imported.customer) ? previous.customerCompanyId : "");
   copy("industry", "industry"); copy("serviceType", "serviceType"); copy("standards", "standards"); copy("workScope", "workScope"); copy("contractRole", "contractRole");
   copy("amount", "amount"); copy("ourShare", "ourShareAmount"); copy("start", "startDate"); copy("end", "endDate");
   if (mapping.period >= 0) { next.startDate = imported.startDate; next.endDate = imported.endDate; }
@@ -429,6 +433,7 @@ export function ContractsRegistry({ openRecordId, onRecordOpened, intelligenceHa
   } | null>(null);
   const [importReport, setImportReport] = useState<string | null>(null);
   const [importLegalEntity, setImportLegalEntity] = useState("");
+  const [importLegalEntityId, setImportLegalEntityId] = useState("");
   const [selectionOpen, setSelectionOpen] = useState(false);
   const [selectionCriteria, setSelectionCriteria] =
     useState<ContractSelectionCriteria>({
@@ -841,7 +846,7 @@ export function ContractsRegistry({ openRecordId, onRecordOpened, intelligenceHa
         ),
       ]),
     ) as Record<ImportField, number>;
-    const parsed = mapContracts(rows, mapping, importLegalEntity);
+    const parsed = mapContracts(rows, mapping, importLegalEntity, importLegalEntityId);
     setImportSource({ headers, rows, mapping });
     setImportRows(parsed);
     setImportReviewIndex(null);
@@ -853,9 +858,10 @@ export function ContractsRegistry({ openRecordId, onRecordOpened, intelligenceHa
   const reparseContractImport = (
     mapping = importSource?.mapping,
     legalEntity = importLegalEntity,
+    legalEntityId = importLegalEntityId,
   ) => {
     if (!importSource || !mapping) return [];
-    return mapContracts(importSource.rows, mapping, legalEntity);
+    return mapContracts(importSource.rows, mapping, legalEntity, legalEntityId);
   };
 
   const updateContractImportRowPatch = (
@@ -892,6 +898,7 @@ export function ContractsRegistry({ openRecordId, onRecordOpened, intelligenceHa
             ? missingImportFields(item, requiredContractImportFields)
             : item.number.trim() ? [] : [{ label: "Номер договора" }]
           ).map((field) => `Не заполнено: ${field.label}`);
+          issues.push(...contractCompanySelectionErrors(item, companyDirectory.companies));
           const raw = importSource.rows[index] || [];
           const rawValue = (key: ImportField) =>
             importSource.mapping[key] >= 0
@@ -1705,21 +1712,19 @@ export function ContractsRegistry({ openRecordId, onRecordOpened, intelligenceHa
               wide
               label="Быстрый шаблон юрлица для пустых строк — необязательно"
               value={importLegalEntity}
-              companyId={
-                companyDirectory.companies.find(
-                  (company) => company.name === importLegalEntity,
-                )?.id || ""
-              }
+              companyId={importLegalEntityId}
               companies={companyDirectory.companies}
               role="ours"
-              onChange={(legalEntity) => {
+              onChange={(legalEntity, legalEntityId) => {
                 setImportLegalEntity(legalEntity);
+                setImportLegalEntityId(legalEntityId);
                 setImportRows(
                   applyImportReviewOverrides(
                     mapContracts(
                       importSource.rows,
                       importSource.mapping,
                       legalEntity,
+                      legalEntityId,
                     ),
                     importOverrides,
                   ),
@@ -1751,6 +1756,7 @@ export function ContractsRegistry({ openRecordId, onRecordOpened, intelligenceHa
                               importSource.rows,
                               mapping,
                               importLegalEntity,
+                              importLegalEntityId,
                             ),
                             importOverrides,
                           ),
@@ -1805,7 +1811,7 @@ export function ContractsRegistry({ openRecordId, onRecordOpened, intelligenceHa
                       ))}
                     </div>
                     <div className="form-grid">
-                      {missing.has("performingLegalEntity") && (
+                      {(missing.has("performingLegalEntity") || resolveCompanyReference(item.performingLegalEntityId, item.performingLegalEntity, companyDirectory.companies).ambiguous) && (
                         <CompanyNameField
                           wide
                           required
@@ -1837,7 +1843,7 @@ export function ContractsRegistry({ openRecordId, onRecordOpened, intelligenceHa
                           />
                         </label>
                       )}
-                      {missing.has("customer") && (
+                      {(missing.has("customer") || resolveCompanyReference(item.customerCompanyId, item.customer, companyDirectory.companies).ambiguous) && (
                         <CompanyNameField
                           wide
                           required
@@ -2041,6 +2047,8 @@ export function ContractEditor({
     const blocking = contractChecks(item).filter(
       (check) => check.severity === "error",
     );
+    const selectionErrors = contractCompanySelectionErrors(item, companies);
+    if (selectionErrors.length) { setError(selectionErrors.join(" ")); return; }
     if (blocking.length) {
       setError(blocking.map((check) => check.message).join(" "));
       return;
@@ -2055,6 +2063,7 @@ export function ContractEditor({
     } finally { saveInFlight.current = false; setSaving(false); }
   };
   const checks = contractChecks(item);
+  const companySelectionErrors = contractCompanySelectionErrors(item, companies);
   const balance = contractBalance(item);
   return (<>
     <DrawerBackdrop onClose={requestClose}>
@@ -2090,6 +2099,7 @@ export function ContractEditor({
       </header>
       <div className="drawer-body">
         {error && <div className="notice error" role="alert">{error}</div>}
+        {companySelectionErrors.length > 0 && <div className="notice warning" role="status">{companySelectionErrors.join(" ")}</div>}
         {!editorAccess.editor && <p className="notice warning" role="status">Редактирование недоступно. Введённые данные сохранены в открытой форме; не закрывайте её, если хотите продолжить после возврата доступа.</p>}
         <p className="registry-save-status" role="status">{saving ? "Сохраняем договор… Не закрывайте программу." : JSON.stringify(item) !== savedSnapshot ? "Есть несохранённые изменения" : "Карточка без несохранённых изменений"}{workspacePath && <><br />Рабочая папка: {workspacePath}</>}</p>
         <nav className="registry-section-nav" aria-label="Разделы договора">{[["main", "Основное"], ["execution", "Исполнение"], ["payment", "Оплата"], ["documents", "Документы"], ["contacts", "Контакты"]].map(([id, label]) => <button className="secondary small" key={id} type="button" onClick={(event) => event.currentTarget.closest(".drawer-body")?.querySelector(`#contract-section-${id}`)?.scrollIntoView({ block: "start", behavior: "smooth" })}>{label}</button>)}</nav>
@@ -2459,7 +2469,7 @@ export function ContractEditor({
         >
           Отмена
         </button>
-        <button className="primary" type="button" disabled={!editorAccess.editor || saving} onClick={() => void submit()}>
+        <button className="primary" type="button" disabled={!editorAccess.editor || saving || companySelectionErrors.length > 0} onClick={() => void submit()}>
           {saving ? "Сохраняем…" : "Сохранить договор"}
         </button>
       </footer>

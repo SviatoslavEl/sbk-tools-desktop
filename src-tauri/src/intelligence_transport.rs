@@ -706,6 +706,11 @@ async fn analyze_with_schema(
     let content = match profile.protocol {
         ConnectionProtocol::Ollama => {
             if json.get("done").and_then(Value::as_bool) != Some(true) { return Err("ИИ вернул незавершённый ответ. Повторите запрос с меньшим объёмом текста.".into()); }
+            // `done` only means that the stream ended, not that generation completed.
+            // Older Ollama versions may omit the reason; any supplied reason must be stop.
+            if json.get("done_reason").is_some_and(|reason| reason.as_str() != Some("stop")) {
+                return Err("ИИ остановил ответ до полного завершения. Сократите материалы или выберите другую модель; неполный результат не перенесён.".into());
+            }
             json.get("message").and_then(|message| message.get("content")).and_then(Value::as_str)
         }
         ConnectionProtocol::OpenaiCompatible => {
@@ -1054,6 +1059,46 @@ mod tests {
             assert!(!error.contains("private refusal text"));
             assert!(!error.contains("synthetic-session-key"));
         }
+    }
+
+    #[test]
+    fn ollama_finished_stream_with_non_stop_reason_never_becomes_success() {
+        for reason in [
+            json!("length"),
+            json!("load"),
+            json!("unload"),
+            json!("unknown"),
+            json!(7),
+            Value::Null,
+        ] {
+            let server = json_server(
+                200,
+                json!({"done":true,"done_reason":reason,"message":{"content":"{\"items\":[]}"}}),
+            );
+            let error = runtime()
+                .block_on(analyze(
+                    profile(&server.endpoint, ConnectionProtocol::Ollama),
+                    "Synthetic source".into(),
+                    key(),
+                ))
+                .err()
+                .unwrap();
+            assert!(error.contains("до полного завершения"));
+            assert!(!error.contains("synthetic-session-key"));
+        }
+        let server = json_server(
+            200,
+            json!({"done":true,"done_reason":"stop","message":{"content":"{\"items\":[]}"}}),
+        );
+        assert!(
+            runtime()
+                .block_on(analyze(
+                    profile(&server.endpoint, ConnectionProtocol::Ollama),
+                    "Synthetic source".into(),
+                    key()
+                ))
+                .is_ok()
+        );
     }
 
     #[test]

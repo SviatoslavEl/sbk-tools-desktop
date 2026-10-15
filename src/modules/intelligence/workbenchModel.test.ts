@@ -63,7 +63,7 @@ describe("AI workbench result boundary", () => {
 
   it.each([
     { name: "X", status: "Победа" }, { name: "X", nmc: { amount: 0 } },
-    { name: "X", requirements: [{ text: "unsafe" }] }, { name: "X", notes: "X".repeat(20_001) },
+    { name: "X", requirements: [{ text: "unsafe" }] }, { name: "X", notes: "X".repeat(100_001) },
     { name: "X", requirements: Array.from({ length: 101 }, () => "X") }, { name: "X", notes: "unsafe\u0000" },
   ])("editable mode retains structural and resource safety boundaries", (fields) => {
     expect(() => parseIntelligenceResult(JSON.stringify({ items: [rawItem("procurement", fields)] }), ["source-one"], { editableFields: true })).toThrow();
@@ -300,10 +300,12 @@ describe("request and field editing", () => {
     expect(all.properties.items.items.anyOf).toHaveLength(5);
   });
 
-  it.each(["staff", "contracts", "proposals", "counterparties"] as const)("uses a matching example for the scoped %s JSON request", (destination) => {
+  it.each(["staff", "contracts", "proposals", "counterparties"] as const)("uses only the scoped %s schema without placeholder examples", (destination) => {
     const prompt = buildIntelligencePrompt("Разбор", sources, [destination]);
     expect(prompt).toContain(`"destination":"${destination}"`);
-    expect(prompt).toContain(`"fields":{"${fieldDefinitions[destination][0].key}":`);
+    expect(prompt).toContain(`"key":"${fieldDefinitions[destination][0].key}"`);
+    expect(prompt).not.toContain('"title":"Краткое название"');
+    expect(prompt).not.toContain("Значение из источника");
     expect(prompt).not.toContain('"destination":"procurement"');
   });
 
@@ -321,5 +323,88 @@ describe("request and field editing", () => {
     expect(parseFieldInput(amount, "1500,50")).toBe(1_500.5);
     expect(parseFieldInput(amount, "0")).toBe(0);
     for (const input of ["", "-1", "1e3", "Infinity", "1,2,3"]) expect(() => parseFieldInput(amount, input)).toThrow();
+  });
+});
+
+describe("extended document QA regressions", () => {
+  it("aligns schema limits with field validation, including Unicode characters", () => {
+    const schema = buildIntelligenceResponseSchema(["procurement"]) as any;
+    const card = schema.properties.items.items;
+    expect(card.properties.title.maxLength).toBe(200);
+    expect(card.properties.fields.properties.notes.maxLength).toBe(20_000);
+    expect(card.properties.fields.properties.requirements.items.maxLength).toBe(2_000);
+    const unicode = parse({ items: [rawItem("procurement", { name: "X", notes: "😀".repeat(20_000) }, { title: "😀".repeat(200) })] });
+    expect(validateIntelligenceItem(unicode[0])).toEqual([]);
+  });
+
+  it("retains overlong bounded fields for correction instead of dropping every card", () => {
+    const raw = JSON.stringify({ items: [rawItem("procurement", { name: "Good" }), rawItem("procurement", { name: "Bad", notes: "X".repeat(20_001), requirements: ["X".repeat(2_001)] }, { title: "X".repeat(201) })] });
+    const parsed = parseIntelligenceResult(raw, ["source-one"], { editableFields: true });
+    expect(parsed).toHaveLength(2);
+    expect(validateIntelligenceItem(parsed[1])).toHaveLength(3);
+    expect(() => buildIntelligenceHandoff(parsed[1], sources, "workspace")).toThrow();
+    parsed[1].title = "Corrected"; parsed[1].selectedFields = ["name"];
+    expect(validateIntelligenceItem(parsed[1])).toEqual([]);
+    expect(() => parseIntelligenceResult(raw, ["source-one"])).toThrow();
+  });
+
+  it("validates evidence references structurally but only persists quotes present in the source", () => {
+    const document: IntelligenceSource = { ...sources[0], text: "НМЦ: 100 рублей", fragments: [{ id: "row-1", locator: "Строка 1", text: "НМЦ: 100 рублей" }], warnings: ["Неполное извлечение"] };
+    const parsed = parse({ items: [rawItem("procurement", { name: "Audit", nmc: 100 }, { evidence: [{ field: "nmc", sourceId: "source-one", fragmentId: "row-1", quote: "НМЦ: 100 рублей" }] })] });
+    expect(parsed[0].evidence?.[0].fragmentId).toBe("row-1");
+    expect(buildIntelligenceHandoff(parsed[0], [document], "workspace").provenance).toContain("Строка 1: НМЦ: 100 рублей");
+    expect(buildIntelligenceHandoff(parsed[0], [document], "workspace").provenance).toContain("Неполное извлечение");
+    parsed[0].evidence![0].quote = "Вымышленная цена";
+    expect(buildIntelligenceHandoff(parsed[0], [document], "workspace").provenance).not.toContain("Вымышленная цена");
+    parsed[0].evidence![0] = { field: "nmc", sourceId: "source-one", fragmentId: "empty-page", quote: "НМЦ: 100 рублей" };
+    expect(buildIntelligenceHandoff(parsed[0], [{ ...document, fragments: [...document.fragments!, { id: "empty-page", locator: "Пустая страница", text: "" }] }], "workspace").provenance).not.toContain("Пустая страница:");
+    for (const claim of [{ field: "save", sourceId: "source-one", quote: "X" }, { field: "nmc", sourceId: "foreign", quote: "X" }, { field: "nmc", sourceId: "source-one", quote: "X", path: "/private" }]) {
+      expect(() => parse({ items: [rawItem("procurement", { name: "X" }, { evidence: [claim] })] })).toThrow();
+    }
+  });
+
+  it("keeps selected source warnings and visibility in the prompt", () => {
+    const prompt = buildIntelligencePrompt("Analyze", [{ ...sources[0], text: "Historical", fragments: [{ id: "sheet-2-row-1", locator: "Sheet 2", text: "Historical", sheetId: "2", sheetState: "hidden", includedByUser: true }], warnings: ["Selected historical sheet"], coverage: { complete: false, requiresOcr: true } }], ["procurement"]);
+    expect(prompt).toContain('"sheetState":"hidden"'); expect(prompt).toContain('"id":"sheet-2-row-1"');
+    expect(prompt).toContain("Selected historical sheet"); expect(prompt).toContain('"requiresOcr":true');
+  });
+  it("retains fragment IDs and sparse table positions without duplicating the aggregate text", () => {
+    const prompt = buildIntelligencePrompt("Analyze", [{ ...sources[0], text: "Service\tQuantity\tPrice\n\t\t100", fragments: [{ id: "header", locator: "A1:C1", text: "Service\tQuantity\tPrice" }, { id: "row-2", locator: "A2:C2", text: "\t\t100" }] }], ["procurement"]);
+    expect(prompt).toContain('"id":"row-2"'); expect(prompt).toContain('"text":"\\t\\t100"');
+    expect(prompt.match(/Service/g)).toHaveLength(1);
+  });
+  it("never reintroduces unselected hidden sheet text through aggregate prompt or provenance", () => {
+    const source: IntelligenceSource = { ...sources[0], text: "Visible current 100\nHIDDEN-UNSELECTED 900", fragments: [
+      { id: "visible", locator: "Current A1", text: "Visible current 100", sheetId: "1", sheetState: "visible", includedByUser: false },
+      { id: "hidden", locator: "Historical A1", text: "HIDDEN-UNSELECTED 900", sheetId: "2", sheetState: "hidden", includedByUser: false },
+    ] };
+    const prompt = buildIntelligencePrompt("Analyze", [source], ["procurement"]);
+    expect(prompt).toContain('"id":"visible"'); expect(prompt).toContain("Visible current 100");
+    expect(prompt).not.toContain("HIDDEN-UNSELECTED");
+    const card = item("procurement", { name: "Audit", nmc: 900 });
+    for (const fragmentId of ["hidden", undefined]) {
+      card.evidence = [{ field: "nmc", sourceId: source.id, fragmentId, quote: "HIDDEN-UNSELECTED 900" }];
+      expect(buildIntelligenceHandoff(card, [source], "workspace").provenance).not.toContain("HIDDEN-UNSELECTED");
+    }
+  });
+
+  it("transfers two distinct proposal names and descriptions without amounts or quantities", () => {
+    const proposal = item("proposals", { title: "Servers", lines: ["Server A", "Server B"], lineDescriptions: ["CPU6334; components A", "CPU4310; components B"] });
+    const draft = buildIntelligenceHandoff(proposal, sources, "workspace");
+    if (draft.destination !== "proposals") throw new Error("Wrong direction");
+    expect(draft.data.lines.map((line) => [line.title, line.description])).toEqual([["Server A", "CPU6334; components A"], ["Server B", "CPU4310; components B"]]);
+    expect(draft.data.lines.map((line) => line.quantity)).toEqual(["", ""]);
+    proposal.fields.lineDescriptions = ["Only one"];
+    expect(validateIntelligenceItem(proposal)).toContain("Описания позиций должны соответствовать выбранным наименованиям в том же порядке и количестве.");
+    const field = fieldDefinitions.proposals.find((entry) => entry.key === "lineDescriptions")!;
+    expect(parseFieldInput(field, "\nDescription B")).toEqual(["", "Description B"]);
+  });
+  it("matches the short text caps of the receiving proposal editor", () => {
+    const schema = buildIntelligenceResponseSchema(["proposals"]) as any;
+    for (const field of ["title", "number", "issuerName", "recipientName"]) {
+      expect(schema.properties.items.items.properties.fields.properties[field].maxLength).toBe(500);
+      const parsed = parseIntelligenceResult(JSON.stringify({ items: [rawItem("proposals", { [field]: "X".repeat(501) })] }), ["source-one"], { editableFields: true });
+      expect(validateIntelligenceItem(parsed[0]).join(" ")).toContain("500");
+    }
   });
 });

@@ -70,11 +70,37 @@
 .iw-copy-date { padding: 6px 9px; font-size: 11px; white-space: normal; }
 .iw-response-metrics { display: flex; flex-wrap: wrap; gap: 5px 14px; margin-top: 16px; padding: 11px 12px; border: 1px solid var(--line); border-radius: 8px; color: var(--text-muted); font-size: 11px; }
 .iw-response-metrics strong { flex: 1 0 100%; color: var(--text-secondary); overflow-wrap: anywhere; }
+.iw-audit-progress { display: flex; align-items: center; gap: 9px; padding: 13px; border-radius: 9px; background: var(--surface-muted); color: var(--text-secondary); }
+.iw-cited-sources, .iw-evidence-findings, .iw-coverage { margin: 12px 0; padding: 12px; border: 1px solid var(--line); border-radius: 9px; min-width: 0; }
+.iw-cited-sources > summary, .iw-evidence-findings > summary, .iw-coverage > summary { cursor: pointer; font-weight: 550; color: var(--text-secondary); }
+.iw-cited-sources > label, .intelligence-workbench .iw-review-check, .iw-position-selection > label { display: flex; flex-direction: row; align-items: flex-start; gap: 8px; margin-top: 9px; font-weight: 400; }
+.iw-cited-sources input, .iw-review-check input, .iw-position-selection input { flex-shrink: 0; margin-top: 3px; }
+.iw-evidence-finding, .iw-coverage-row { margin-top: 12px; padding: 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-muted); min-width: 0; }
+.iw-evidence-finding.blocking, .iw-coverage-row.missing { border-color: #e7cf9b; background: var(--warning-soft); }
+.iw-evidence-finding p, .iw-coverage-row p, .iw-field-evidence p { margin: 5px 0; overflow-wrap: anywhere; }
+.iw-evidence-quotes { margin-top: 8px; font-size: 11px; }
+.iw-evidence-quotes > summary { cursor: pointer; color: var(--text-secondary); }
+.iw-evidence-quotes figure { margin: 10px 0; min-width: 0; }
+.iw-evidence-quotes figcaption { color: var(--text-muted); margin-bottom: 4px; overflow-wrap: anywhere; }
+.iw-evidence-quotes blockquote { margin: 0; padding: 9px 10px; white-space: pre-wrap; overflow-wrap: anywhere; border-left: 3px solid var(--line-strong); border-radius: 3px; background: var(--surface); max-height: 240px; overflow-y: auto; }
+.iw-field-evidence { padding-top: 10px; margin-top: 10px; border-top: 1px solid var(--line); font-size: 11px; color: var(--text-secondary); }
+.iw-field-evidence.confirmed > strong { color: var(--success); }
+.iw-field-evidence.conflict > strong, .iw-field-evidence.placeholder > strong, .iw-field-evidence.unverified > strong { color: var(--warning); }
+.iw-proposal-positions { margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--line); min-width: 0; }
+.iw-proposal-positions h4 { margin: 0; font-size: 14px; }
+.iw-position-selection { display: flex; flex-wrap: wrap; gap: 4px 18px; margin-bottom: 12px; }
+.iw-proposal-position, .iw-position-recovery { display: grid; gap: 12px; margin: 12px 0; padding: 14px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface-muted); min-width: 0; }
+.iw-proposal-position > header { display: flex; justify-content: space-between; gap: 8px; flex-wrap: wrap; align-items: center; }
+.iw-proposal-position > header > div { display: flex; gap: 5px; align-items: center; }
+.iw-proposal-position > header button { padding: 5px 8px; }
+.iw-position-recovery button, .iw-coverage-row button, .iw-proposal-positions > button { justify-self: start; white-space: normal; text-align: left; max-width: 100%; }
 .iw-validation { color: var(--warning); font-size: 12px; margin: 16px 0; }
 .iw-card-actions { margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--line); flex-wrap: wrap; }
 .iw-progress { display: flex; gap: 9px; flex-wrap: wrap; align-items: center; margin-top: 10px; color: var(--text-muted); }
 .iw-spinner { display: inline-block; width: 16px; height: 16px; border-radius: 50%; border: 2px solid var(--line); border-top-color: var(--primary); animation: iw-spin .8s linear infinite; }
 .iw-session-note { margin: 0; }
+.iw-sheets { margin-top: 10px; padding: 8px; border: 1px solid var(--line); border-radius: 8px; min-width: 0; }
+.iw-sheets > label { display: flex; flex-direction: row; align-items: center; gap: 8px; padding: 5px 0; overflow-wrap: anywhere; }
 .intelligence-workbench .notice { overflow-wrap: anywhere; }
 @keyframes iw-spin { to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) { .iw-spinner { animation: none; } }

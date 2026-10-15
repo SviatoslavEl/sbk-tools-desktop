@@ -45,7 +45,7 @@ jobs:
       - run: python -m pytest -q
         working-directory: scanner-worker
       - name: Verify safe extraction of the reusable installed worker
-        run: python -m pytest -q scripts/tests/test_extract_verified_installed_worker.py scripts/tests/test_installed_startup_contract.py scripts/tests/test_worker_package_data.py scripts/tests/test_benchmark_scanner.py
+        run: python -m pytest -q scripts/tests/test_extract_verified_installed_worker.py scripts/tests/test_installed_startup_contract.py scripts/tests/test_worker_package_data.py scripts/tests/test_benchmark_scanner.py scripts/tests/test_smoke_intelligence_extraction.py
       - run: python -m ruff check .
         working-directory: scanner-worker
       - name: Prepare sidecar placeholder for Tauri metadata checks
@@ -216,6 +216,7 @@ jobs:
           SCANDOCUMENT_RESOURCE_ROOT=src-tauri/runtime-resources "$WORKER" process --config scanner-worker/tests/fixtures/process-facsimile.json
           python scripts/smoke_preview_preparation.py --worker "$WORKER" --runtime src-tauri/runtime-resources --output-dir scanner-worker/tests/output/preview-preparation-sidecar
           python scripts/smoke_proposals.py --worker "$WORKER" --runtime src-tauri/runtime-resources --output-dir scanner-worker/tests/output/proposals-sidecar
+          python scripts/smoke_intelligence_extraction.py --worker "$WORKER" --runtime src-tauri/runtime-resources --report scanner-worker/tests/output/intelligence-extraction-sidecar/report.json
       - name: Generate trusted runtime manifest
         shell: bash
         run: |
@@ -266,6 +267,7 @@ jobs:
           SCANDOCUMENT_RESOURCE_ROOT="$RUNTIME" "$WORKER" process --config scanner-worker/tests/fixtures/process-docx.json
           python scripts/smoke_preview_preparation.py --worker "$WORKER" --runtime "$RUNTIME" --output-dir scanner-worker/tests/output/preview-preparation-final-app
           python scripts/smoke_proposals.py --worker "$WORKER" --runtime "$RUNTIME" --output-dir scanner-worker/tests/output/proposals-final-app
+          python scripts/smoke_intelligence_extraction.py --worker "$WORKER" --runtime "$RUNTIME" --report scanner-worker/tests/output/intelligence-extraction-final-app/report.json
           python scripts/verify_runtime_manifest.py --root "$RUNTIME" --worker "$WORKER"
           codesign --verify --deep --strict --verbose=2 "$APP"
       - name: Upload scanner preparation evidence
@@ -282,6 +284,7 @@ jobs:
             scanner-worker/tests/output/proposals-*/**/*.stderr.log
             scanner-worker/tests/output/proposals-*/**/proposal.*
             scanner-worker/tests/output/proposals-*/**/page-*.png
+            scanner-worker/tests/output/intelligence-extraction-*/**
           if-no-files-found: ignore
       - name: Sign, notarize and archive portable macOS app
         if: runner.os == 'macOS' && startsWith(github.ref, 'refs/tags/v') && steps.apple_credentials.outputs.available == 'true'
@@ -617,6 +620,7 @@ jobs:
           SCANDOCUMENT_RESOURCE_ROOT=src-tauri/runtime-resources "$worker" process --config scanner-worker/tests/fixtures/process-facsimile.json
           python scripts/smoke_preview_preparation.py --worker "$worker" --runtime src-tauri/runtime-resources --output-dir scanner-worker/tests/output/preview-preparation-sidecar
           python scripts/smoke_proposals.py --worker "$worker" --runtime src-tauri/runtime-resources --output-dir scanner-worker/tests/output/proposals-sidecar
+          python scripts/smoke_intelligence_extraction.py --worker "$worker" --runtime src-tauri/runtime-resources --report scanner-worker/tests/output/intelligence-extraction-sidecar/report.json
       - name: Generate and verify trusted runtime manifest
         shell: pwsh
         run: |
@@ -768,6 +772,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Installed page preparation or changed-source guard failed offline' }
           python scripts/smoke_proposals.py --worker $worker.FullName --runtime $runtime --output-dir scanner-worker/tests/output/proposals-installed
           if ($LASTEXITCODE -ne 0) { throw 'Installed proposal DOCX/PDF/preview/ZIP or privacy check failed offline' }
+          python scripts/smoke_intelligence_extraction.py --worker $worker.FullName --runtime $runtime --report scanner-worker/tests/output/intelligence-extraction-installed/report.json
+          if ($LASTEXITCODE -ne 0) { throw 'Installed intelligence extraction metadata or corruption guard failed offline' }
           python scripts/verify_runtime_manifest.py --root $runtime --worker $worker.FullName
           if ($LASTEXITCODE -ne 0) { throw 'Installed runtime changed during scanner preparation smoke' }
           Remove-Item Env:SCANDOCUMENT_RESOURCE_ROOT, Env:HTTP_PROXY, Env:HTTPS_PROXY
@@ -965,6 +971,7 @@ jobs:
             scanner-worker/tests/output/proposals-*/**/*.stderr.log
             scanner-worker/tests/output/proposals-*/**/proposal.*
             scanner-worker/tests/output/proposals-*/**/page-*.png
+            scanner-worker/tests/output/intelligence-extraction-*/**
           if-no-files-found: ignore
       - name: Sign and verify installed Windows package when configured
         if: startsWith(github.ref, 'refs/tags/v')

@@ -26,12 +26,14 @@ import {
   companyUsedAsPerformer,
   companyRelationshipLabel,
   companyInnFormatHint,
+  contractCompanySelectionErrors,
   emptyCompany,
   emptyCompanyDirectory,
   linkContractToDirectory,
   mergeCompaniesFromContracts,
   normalizeCompanyDirectory,
   normalizeCompanyName,
+  resolveCompanyReference,
   updateContractCompanyReference,
   validateCompany,
   validateCompanyInn,
@@ -75,7 +77,12 @@ export function useCompanyDirectory(_contracts: StoredRecord<ContractData>[]) {
     // A cached display is not a validation snapshot. Re-read before every
     // company cascade/import/save so unrelated fresh companies are preserved.
     const fresh = await readContractWorkspace<ContractData, CompanyDirectoryData>();
-    const ids = new Map(directory.companies.map((company) => [normalizeCompanyName(company.name), company.id]));
+    const nameCounts = new Map<string, number>();
+    for (const company of directory.companies) {
+      const name = normalizeCompanyName(company.name);
+      nameCounts.set(name, (nameCounts.get(name) || 0) + 1);
+    }
+    const ids = new Map(directory.companies.filter((company) => nameCounts.get(normalizeCompanyName(company.name)) === 1).map((company) => [normalizeCompanyName(company.name), company.id]));
     const migration = buildCompanyDirectoryMigration(fresh.directory || emptyCompanyDirectory(), fresh.records, ids);
     const errors = validateCompanyDirectory(migration.directory.companies);
     if (errors.length) throw new Error(`Справочник требует исправления: ${errors.join(" ")}`);
@@ -102,8 +109,8 @@ export function useCompanyDirectory(_contracts: StoredRecord<ContractData>[]) {
       };
       if (
         normalized.scope === "external" &&
-        (companyUsedAsPerformer(normalized, records) ||
-          (currentPrevious != null && companyUsedAsPerformer(currentPrevious, records)))
+        (companyUsedAsPerformer(normalized, records, fresh.directory.companies) ||
+          (currentPrevious != null && companyUsedAsPerformer(currentPrevious, records, fresh.directory.companies)))
       )
         throw new Error(
           "Компания используется как юрлицо-исполнитель и должна оставаться во внутренней группе.",
@@ -123,6 +130,7 @@ export function useCompanyDirectory(_contracts: StoredRecord<ContractData>[]) {
                 record.payload,
                 currentPrevious,
                 normalized,
+                fresh.directory.companies,
               ),
             }))
             .filter(({ update }) => update.changed)
@@ -142,6 +150,8 @@ export function useCompanyDirectory(_contracts: StoredRecord<ContractData>[]) {
   const persistContractThenDirectory = useCallback(
     async (item: ContractData, id?: string) => {
       const fresh = await prepareMutation();
+      const selectionErrors = contractCompanySelectionErrors(item, fresh.directory.companies);
+      if (selectionErrors.length) throw new Error(selectionErrors.join(" "));
       const merged = mergeCompaniesFromContracts(fresh.directory, [item]);
       const linked = linkContractToDirectory(item, merged.directory.companies);
       if (fresh.updates.length) await updateContractsAndCompanyDirectoryAtomic(fresh.updates, fresh.directory);
@@ -159,6 +169,8 @@ export function useCompanyDirectory(_contracts: StoredRecord<ContractData>[]) {
   const persistContractsThenDirectory = useCallback(
     async (items: ContractData[]) => {
       const fresh = await prepareMutation();
+      const selectionErrors = items.flatMap((item, index) => contractCompanySelectionErrors(item, fresh.directory.companies).map((error) => `Строка ${index + 1}: ${error}`));
+      if (selectionErrors.length) throw new Error(selectionErrors.join(" "));
       const merged = mergeCompaniesFromContracts(fresh.directory, items);
       const linked = items.map((item) =>
         linkContractToDirectory(item, merged.directory.companies),
@@ -179,6 +191,8 @@ export function useCompanyDirectory(_contracts: StoredRecord<ContractData>[]) {
 
   const persistContractUpdatesThenDirectory = useCallback(async (items: Array<{ id: string; payload: ContractData }>) => {
     const fresh = await prepareMutation();
+    const selectionErrors = items.flatMap((item, index) => contractCompanySelectionErrors(item.payload, fresh.directory.companies).map((error) => `Строка ${index + 1}: ${error}`));
+    if (selectionErrors.length) throw new Error(selectionErrors.join(" "));
     const merged = mergeCompaniesFromContracts(fresh.directory, items.map((item) => item.payload));
     const updates = items.map((item) => {
       const payload = linkContractToDirectory(item.payload, merged.directory.companies);
@@ -260,20 +274,19 @@ export function CompanyNameField({
   wide?: boolean;
   onChange: (name: string, id: string) => void;
 }) {
+  const resolution = resolveCompanyReference(companyId, value, companies);
   const available = companies
     .filter(
       (company) =>
         (!company.archived && company.scope === (role === "ours" ? "internal" : "external")) ||
-        company.id === companyId,
+        company.id === companyId ||
+        (resolution.ambiguous && resolution.matches.some((match) => match.id === company.id)),
     )
     .sort((a, b) => a.name.localeCompare(b.name, "ru"));
   const selectedValue =
     companyId && available.some((company) => company.id === companyId)
       ? companyId
-      : available.find(
-          (company) =>
-            normalizeCompanyName(company.name) === normalizeCompanyName(value),
-        )?.id || "__manual";
+      : resolution.ambiguous ? "" : available.some((company) => company.id === resolution.company?.id) ? resolution.company!.id : "__manual";
   const [manual, setManual] = useState(selectedValue === "__manual");
   useEffect(() => {
     setManual(selectedValue === "__manual");
@@ -284,6 +297,8 @@ export function CompanyNameField({
       {available.length > 0 && (
         <select
           aria-label={`${label}: выбор из справочника`}
+          aria-invalid={resolution.ambiguous}
+          required={required || resolution.ambiguous}
           value={manual ? "__manual" : selectedValue}
           onChange={(event) => {
             if (event.target.value === "__manual") {
@@ -301,11 +316,11 @@ export function CompanyNameField({
           }}
         >
           <option value="" disabled>
-            Выберите компанию
+            {resolution.ambiguous ? "Несколько юрлиц с этим названием — выберите по ИНН / ID" : "Выберите компанию"}
           </option>
           {available.map((company) => (
             <option key={company.id} value={company.id}>
-              {company.shortName || company.name}{company.archived ? " (в архиве — текущая связь)" : ""}
+              {company.shortName || company.name}{company.archived ? company.id === companyId ? " (в архиве — текущая связь)" : " (в архиве)" : ""} · ИНН {company.inn || "не указан"} · ID {company.id}
             </option>
           ))}
           <option value="__manual">+ Ввести новую компанию</option>
@@ -322,6 +337,7 @@ export function CompanyNameField({
           }
         />
       )}
+      {resolution.ambiguous && <span className="notice warning" role="alert">Для «{value}» найдено несколько юридических лиц. Название не определяет компанию: выберите точную карточку по ИНН / ID. До выбора договор нельзя сохранить.</span>}
     </label>
   );
 }

@@ -37,6 +37,17 @@ describe('proposal-pricing/1', () => {
   });
 });
 describe('public proposal boundary', () => {
+  it('uses Unicode character limits compatible with JSON Schema and the Python exporter', () => {
+    const proposal = fixture();
+    proposal.title = '😀'.repeat(500); proposal.issuer.name = '😀'.repeat(500);
+    proposal.lines[0].title = '😀'.repeat(500); proposal.lines[0].description = '😀'.repeat(20000);
+    proposal.lines[0].unit = '😀'.repeat(50); proposal.introduction = '😀'.repeat(20000);
+    expect(validateProposal(proposal).filter((entry) => entry.severity === 'error')).toEqual([]);
+    expect(buildProposalPublic(proposal).lines[0].description).toBe(proposal.lines[0].description);
+    proposal.title += '😀'; proposal.lines[0].description += '😀'; proposal.introduction += '😀';
+    const issues = validateProposal(proposal).filter((entry) => entry.severity === 'error');
+    expect(issues.map((entry) => entry.field)).toEqual(expect.arrayContaining(['title', 'lines.title', 'introduction']));
+  });
   it('exports no private source IDs, notes, paths, template IDs or extra properties', () => {
     const proposal = fixture();
     proposal.internalNote = 'SECRET_INTERNAL'; proposal.source = { tool: 'calculator', capturedAt: 'SECRET_CAPTURE', wasUnsaved: true, priceOrigin: 'SECRET_ORIGIN', recordId: 'SECRET_RECORD' };

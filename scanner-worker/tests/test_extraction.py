@@ -65,5 +65,12 @@ def test_xlsx_extraction_keeps_sheet_and_cell_range_and_reports_hidden_sheet(tmp
         archive.writestr("xl/sharedStrings.xml", """<sst xmlns='http://schemas.openxmlformats.org/spreadsheetml/2006/main'><si><t>Цена</t></si></sst>""")
         archive.writestr("xl/worksheets/sheet1.xml", """<worksheet xmlns='http://schemas.openxmlformats.org/spreadsheetml/2006/main'><sheetData><row r='1'><c r='A1' t='s'><v>0</v></c><c r='B1'><v>100</v></c></row></sheetData></worksheet>""")
     result = extract_document(path)
-    assert result["fragments"] == [{"id": "sheet-1", "locator": "Лист Расчёт, A1:B1", "sheet": "Расчёт", "cellRange": "A1:B1", "text": "Цена\t100"}]
+    assert result["fragments"] == []
+    assert result["extractedText"] == ""
+    assert result["sheets"] == [{"id": "1", "name": "Расчёт", "state": "hidden", "included": False}]
     assert "скрыт" in result["warnings"][0]
+    included = extract_document(path, include_hidden_sheets=True, selected_sheets=["1"])
+    assert included["fragments"][0]["text"] == "Цена\t100"
+    assert included["fragments"][0]["sheetState"] == "hidden"
+    assert included["fragments"][0]["includedByUser"] is True
+    assert included["fragments"][0]["cellRange"] == "A1:B1"

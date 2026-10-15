@@ -490,7 +490,8 @@ def main() -> int:
             return 0
         if args.command == "extract":
             validate_protocol(config)
-            emit(extract_document(Path(config["inputPath"])))
+            emit(extract_document(Path(config["inputPath"]), include_hidden_sheets=config.get("includeHiddenSheets", False),
+                                  selected_sheets=config.get("selectedSheets")))
             return 0
         if args.command == "preview":
             return preview(config)

@@ -220,17 +220,36 @@ type ContractSource = Pick<ContractData, "performingLegalEntity" | "customer"> &
 
 const contractPayload = (source: ContractSource) => "payload" in source ? source.payload : source;
 
+/** A name is not an identity: never choose one of several namesakes by order. */
+export function resolveCompanyReference(companyId: string, name: string, companies: readonly CompanyCard[]): { company?: CompanyCard; ambiguous: boolean; matches: CompanyCard[] } {
+  const linked = companyId ? companies.find((company) => company.id === companyId) : undefined;
+  if (linked) return { company: linked, ambiguous: false, matches: [linked] };
+  const normalized = normalizeCompanyName(name);
+  const matches = normalized ? companies.filter((company) => normalizeCompanyName(company.name) === normalized) : [];
+  return { company: matches.length === 1 ? matches[0] : undefined, ambiguous: matches.length > 1, matches };
+}
+
+export function contractCompanySelectionErrors(contract: ContractSource, companies: readonly CompanyCard[]): string[] {
+  const item = contractPayload(contract);
+  return [
+    ["Юрлицо-исполнитель", item.performingLegalEntityId || "", item.performingLegalEntity],
+    ["Заказчик", item.customerCompanyId || "", item.customer],
+  ].flatMap(([label, id, name]) => resolveCompanyReference(id, name, companies).ambiguous
+    ? [`${label}: для «${name}» найдено несколько юридических лиц. Выберите компанию из справочника по ИНН / ID перед сохранением.`]
+    : []);
+}
+
 export function companyUsedAsPerformer(
   company: Pick<CompanyCard, "id" | "name">,
   contracts: ContractSource[],
+  companies?: readonly CompanyCard[],
 ): boolean {
   const companyName = normalizeCompanyName(company.name);
   return contracts.some((source) => {
     const contract = contractPayload(source);
-    return (
-      contract.performingLegalEntityId === company.id ||
-      normalizeCompanyName(contract.performingLegalEntity) === companyName
-    );
+    if (contract.performingLegalEntityId) return contract.performingLegalEntityId === company.id;
+    if (companies) return resolveCompanyReference("", contract.performingLegalEntity, companies).company?.id === company.id;
+    return normalizeCompanyName(contract.performingLegalEntity) === companyName;
   });
 }
 
@@ -243,7 +262,13 @@ export function mergeCompaniesFromContracts(
 ): { directory: CompanyDirectoryData; changed: boolean } {
   const normalized = normalizeCompanyDirectory(directory);
   const companies = normalized.companies.map((company) => ({ ...company, affiliations: [...company.affiliations] }));
-  const byName = new Map(companies.map((company) => [normalizeCompanyName(company.name), company]));
+  const byName = new Map<string, CompanyCard[]>();
+  for (const company of companies) {
+    const key = normalizeCompanyName(company.name);
+    const matches = byName.get(key) || [];
+    matches.push(company);
+    byName.set(key, matches);
+  }
   let changed = JSON.stringify(normalized) !== JSON.stringify(directory);
 
   const include = (rawName: string, role: "ours" | "counterparty", contact = "", linkedId = "") => {
@@ -256,7 +281,9 @@ export function mergeCompaniesFromContracts(
       return;
     }
     const key = normalizeCompanyName(name);
-    const existing = byName.get(key);
+    const matches = byName.get(key) || [];
+    if (matches.length > 1) return;
+    const existing = matches[0];
     if (existing) {
       if (role === "ours" && existing.scope !== "internal") { existing.scope = "internal"; existing.updatedAt = now; changed = true; }
       if (role === "counterparty" && existing.source === "contracts" && !existing.contact.trim() && contact.trim()) { existing.contact = contact.trim(); existing.updatedAt = now; changed = true; }
@@ -270,7 +297,7 @@ export function mergeCompaniesFromContracts(
       contact: role === "counterparty" ? contact.trim() : "",
     };
     companies.push(company);
-    byName.set(key, company);
+    byName.set(key, [company]);
     changed = true;
   };
 
@@ -283,10 +310,8 @@ export function mergeCompaniesFromContracts(
 }
 
 export function linkContractToDirectory(contract: ContractData, companies: CompanyCard[]): ContractData {
-  const byName = new Map(companies.map((company) => [normalizeCompanyName(company.name), company]));
-  const byId = new Map(companies.map((company) => [company.id, company]));
-  const ours = byId.get(contract.performingLegalEntityId || "") || byName.get(normalizeCompanyName(contract.performingLegalEntity || ""));
-  const customer = byId.get(contract.customerCompanyId || "") || byName.get(normalizeCompanyName(contract.customer || ""));
+  const ours = resolveCompanyReference(contract.performingLegalEntityId || "", contract.performingLegalEntity || "", companies).company;
+  const customer = resolveCompanyReference(contract.customerCompanyId || "", contract.customer || "", companies).company;
   return {
     ...contract,
     performingLegalEntity: ours?.name || contract.performingLegalEntity,
@@ -315,10 +340,13 @@ export function buildCompanyDirectoryMigration(directory: CompanyDirectoryData, 
   return { directory: merged.directory, directoryChanged: merged.changed, updates };
 }
 
-export function updateContractCompanyReference(contract: ContractData, previous: CompanyCard, next: CompanyCard): { contract: ContractData; changed: boolean } {
+export function updateContractCompanyReference(contract: ContractData, previous: CompanyCard, next: CompanyCard, companies?: readonly CompanyCard[]): { contract: ContractData; changed: boolean } {
   const oldName = normalizeCompanyName(previous.name);
-  const isPerformer = contract.performingLegalEntityId === next.id || normalizeCompanyName(contract.performingLegalEntity) === oldName;
-  const isCustomer = contract.customerCompanyId === next.id || normalizeCompanyName(contract.customer) === oldName;
+  const matches = (id: string, name: string) => id ? id === next.id
+    : companies ? resolveCompanyReference("", name, companies).company?.id === previous.id
+    : normalizeCompanyName(name) === oldName;
+  const isPerformer = matches(contract.performingLegalEntityId, contract.performingLegalEntity);
+  const isCustomer = matches(contract.customerCompanyId, contract.customer);
   if (!isPerformer && !isCustomer) return { contract, changed: false };
   return {
     changed: true,

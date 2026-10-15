@@ -1,9 +1,50 @@
 import { describe, expect, it } from "vitest";
 import { emptyContract } from "./types";
-import { buildCompanyDirectoryMigration, companyRelationshipLabel, companyUsedAsPerformer, emptyCompany, emptyCompanyDirectory, linkContractToDirectory, mergeCompaniesFromContracts, normalizeCompanyDirectory, normalizeCompanyName, updateContractCompanyReference, validateCompany, validateCompanyDirectory } from "./companies";
+import { buildCompanyDirectoryMigration, companyRelationshipLabel, companyUsedAsPerformer, contractCompanySelectionErrors, emptyCompany, emptyCompanyDirectory, linkContractToDirectory, mergeCompaniesFromContracts, normalizeCompanyDirectory, normalizeCompanyName, resolveCompanyReference, updateContractCompanyReference, validateCompany, validateCompanyDirectory } from "./companies";
 import { companyDirectoryRefreshEvent, subscribeCompanyDirectoryRefresh } from "./CompanyDirectory";
 
 describe("справочник компаний", () => {
+  const namesakes = () => [
+    { ...emptyCompany("2026-10-14", "company-A"), name: "ООО «Альфа»", inn: "7736046991", source: "contracts" as const },
+    { ...emptyCompany("2026-10-14", "company-B"), name: "ООО «Альфа»", inn: "7721632827", source: "contracts" as const },
+  ];
+
+  it.each([false, true])("does not choose a namesake or alter its roles/contacts by directory order (reverse=%s)", (reverse) => {
+    const companies = reverse ? namesakes().reverse() : namesakes();
+    const original = structuredClone(companies);
+    const contract = { ...emptyContract(), performingLegalEntity: "ООО Альфа", customer: "ООО Альфа", contact: "Не выбирать случайного получателя" };
+    const merged = mergeCompaniesFromContracts({ schemaVersion: 3, companies }, [contract], () => "must-not-create");
+    expect(merged.changed).toBe(false);
+    expect(merged.directory.companies).toEqual(original);
+    expect(companies).toEqual(original);
+    expect(linkContractToDirectory(contract, merged.directory.companies)).toEqual(contract);
+    expect(contractCompanySelectionErrors(contract, companies)).toHaveLength(2);
+    expect(resolveCompanyReference("missing", "ООО Альфа", companies)).toMatchObject({ company: undefined, ambiguous: true });
+    const record = { id: "legacy", title: "Legacy", payload: contract, archived: false, createdAt: "", updatedAt: "" };
+    expect(buildCompanyDirectoryMigration({ schemaVersion: 3, companies }, [record]).updates).toEqual([]);
+  });
+
+  it.each([false, true])("keeps an exact valid ID among same-name companies (reverse=%s)", (reverse) => {
+    const companies = reverse ? namesakes().reverse() : namesakes();
+    const contract = { ...emptyContract(), customer: "Старый снимок названия", customerCompanyId: "company-B" };
+    expect(linkContractToDirectory(contract, companies)).toMatchObject({ customerCompanyId: "company-B", customer: "ООО «Альфа»" });
+    expect(contractCompanySelectionErrors(contract, companies)).toEqual([]);
+    expect(resolveCompanyReference("company-B", "ООО Альфа", companies).company?.inn).toBe("7721632827");
+  });
+
+  it("does not cascade namesake changes into a different ID or an ambiguous unlinked contract", () => {
+    const [a, b] = namesakes();
+    const next = { ...b, name: "ООО Бета" };
+    const other = { ...emptyContract(), customer: b.name, customerCompanyId: a.id };
+    expect(updateContractCompanyReference(other, b, next, [a, b])).toEqual({ changed: false, contract: other });
+    const unlinked = { ...emptyContract(), customer: b.name };
+    expect(updateContractCompanyReference(unlinked, b, next, [a, b])).toEqual({ changed: false, contract: unlinked });
+    const exact = { ...unlinked, customerCompanyId: b.id };
+    expect(updateContractCompanyReference(exact, b, next, [a, b])).toMatchObject({ changed: true, contract: { customer: "ООО Бета", customerCompanyId: b.id } });
+    expect(companyUsedAsPerformer(b, [{ ...emptyContract(), performingLegalEntity: b.name, performingLegalEntityId: a.id }], [a, b])).toBe(false);
+    expect(companyUsedAsPerformer(b, [{ ...emptyContract(), performingLegalEntity: b.name }], [a, b])).toBe(false);
+  });
+
   it("мигрирует уникальные компании из существующих договоров и объединяет роли", () => {
     const contracts = [
       { ...emptyContract(), performingLegalEntity: "ООО «СБК»", customer: "АО Заказчик", contact: "Иванов, +7 900 000-00-00" },
