@@ -207,7 +207,9 @@ def main() -> None:
         raise
     report["fixtureDirectory"] = str(directory)
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(json.dumps(report, ensure_ascii=False), flush=True)
+    # Windows CI may expose a legacy console encoding. ASCII JSON escapes are
+    # lossless; keep the evidence file above as readable UTF-8.
+    print(json.dumps(report, ensure_ascii=True), flush=True)
 
 
 if __name__ == "__main__":

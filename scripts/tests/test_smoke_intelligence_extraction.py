@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import subprocess
 import sys
@@ -86,6 +87,26 @@ def test_report_path_never_overwrites_existing_evidence(tmp_path: Path):
         smoke.main()
     assert report.read_text(encoding="utf-8") == "keep previous evidence"
     assert list(tmp_path.iterdir()) == [report]
+
+
+@pytest.mark.parametrize("console_encoding", ["cp1252", "ascii", "utf-8"])
+def test_cli_report_preserves_unicode_with_legacy_console_encoding(tmp_path: Path, console_encoding: str):
+    report = tmp_path / "Русская папка" / "report.json"
+    expected = {"status": "passed", "synthetic": True,
+                "sheets": [{"name": "Текущий QA"}], "warnings": ["Скрытые листы исключены."]}
+    console_bytes = io.BytesIO()
+    console = io.TextIOWrapper(console_bytes, encoding=console_encoding, errors="strict")
+    with patch("sys.argv", ["smoke", "--worker", "unit-test-sentinel", "--report", str(report)]), \
+            patch.object(smoke, "run_smoke", return_value=expected.copy()), patch("sys.stdout", console):
+        smoke.main()
+    console.flush()
+    raw_report = report.read_text(encoding="utf-8")
+    saved = json.loads(raw_report)
+    assert "Текущий QA" in raw_report and "Скрытые листы исключены." in raw_report
+    assert saved["sheets"] == expected["sheets"] and saved["warnings"] == expected["warnings"]
+    output = console_bytes.getvalue()
+    assert output.isascii() and json.loads(output.decode(console_encoding)) == saved
+    console.close()
 
 
 def test_optimized_python_rejects_cli_and_direct_smoke_before_worker_or_evidence_access(tmp_path: Path):
