@@ -15,15 +15,15 @@ describe("selected-source semantic evidence", () => {
   });
   it("checks the selected NMC against an explicit total and keeps the omitted workbook in coverage", () => {
     const card = item({ name: "Поставка оборудования" }, "procurement", { sourceIds: ["technical"] });
-    const audit = auditIntelligenceResult([card], [source("Поставка оборудования", { id: "technical" }), source("НМЦ договора, итого: 21 150 000,00 руб.", { id: "pricing", name: "Расчёт цены" })]);
+    const audit = auditIntelligenceResult([card], [source("Поставка оборудования", { id: "technical" }), source("НМЦ договора, итого: 18 240 000,00 руб.", { id: "pricing", name: "Расчёт цены" })]);
     expect(audit.coverage.find((entry) => entry.category === "price")?.status).toBe("missing"); expect(codes(audit)).toContain("missing-price");
     expect(audit.coverage.find((entry) => entry.category === "price")?.evidence.sourceId).toBe("pricing");
-    const fixed = item({ name: "Поставка оборудования", nmc: 21150000 }, "procurement", { sourceIds: ["technical", "pricing"] });
-    const fixedAudit = auditIntelligenceResult([fixed], [source("Поставка оборудования", { id: "technical" }), source("НМЦ договора, итого: 21 150 000,00 руб.", { id: "pricing" })]);
+    const fixed = item({ name: "Поставка оборудования", nmc: 18240000 }, "procurement", { sourceIds: ["technical", "pricing"] });
+    const fixedAudit = auditIntelligenceResult([fixed], [source("Поставка оборудования", { id: "technical" }), source("НМЦ договора, итого: 18 240 000,00 руб.", { id: "pricing" })]);
     expect(fieldStatus(fixedAudit, "nmc")?.status).toBe("confirmed"); expect(fixedAudit.coverage.find((entry) => entry.category === "price")?.status).toBe("covered");
   });
   it("does not confuse unit price with a total", () => {
-    const audit = auditIntelligenceResult([item({ nmc: 2115000 })], [source("НМЦ: цена за единицу 2 115 000,00 руб.\nНМЦ договора, итого: 21 150 000,00 руб.")]);
+    const audit = auditIntelligenceResult([item({ nmc: 1824000 })], [source("НМЦ: цена за единицу 1 824 000,00 руб.\nНМЦ договора, итого: 18 240 000,00 руб.")]);
     expect(fieldStatus(audit, "nmc")?.status).not.toBe("confirmed");
   });
   it("preserves individual certificate minimums rather than accepting a list of certificate names", () => {
@@ -258,11 +258,11 @@ describe("selected-source semantic evidence", () => {
     expect(fieldStatus(audit, "nmc")?.status).toBe("confirmed"); expect(audit.coverage.find((entry) => entry.category === "price")?.status).toBe("covered");
   });
   it("never retroactively claims a tax ID using the following price label", () => {
-    const text = "ИНН\n7704001959\nНачальная (максимальная) цена\nдоговора\n3895000";
-    const wrong = auditIntelligenceResult([item({ nmc: 7704001959 })], [source(text)]);
+    const text = "ИНН\n1234567890\nНачальная (максимальная) цена\nдоговора\n3746800";
+    const wrong = auditIntelligenceResult([item({ nmc: 1234567890 })], [source(text)]);
     expect(fieldStatus(wrong, "nmc")?.status).toBe("conflict");
-    expect(wrong.coverage.filter((check) => check.category === "price").map((check) => check.label)).toEqual(["Явная общая цена: 3895000"]);
-    const right = auditIntelligenceResult([item({ nmc: 3895000 })], [source(text)]);
+    expect(wrong.coverage.filter((check) => check.category === "price").map((check) => check.label)).toEqual(["Явная общая цена: 3746800"]);
+    const right = auditIntelligenceResult([item({ nmc: 3746800 })], [source(text)]);
     expect(fieldStatus(right, "nmc")?.status).toBe("confirmed");
   });
   it("does not convert an arbitrary proposal total into tender NMC or a missing-NMC obligation", () => {
@@ -439,5 +439,144 @@ describe("selected-source semantic evidence", () => {
   it("retains ordinary email indexing while requiring its explicitly labeled party", () => {
     const audit = auditIntelligenceResult([item({ contactEmail: "qa.supplier+1@example.test", recipientContact: "qa.buyer@example.test" }, "proposals")], [source("Поставщик: ООО QA\nEmail: qa.supplier+1@example.test\nЗаказчик: ООО Банк QA\nEmail: qa.buyer@example.test")]);
     expect(audit.fields.map((entry) => entry.status)).toEqual(["confirmed", "confirmed"]);
+  });
+  it("confirms a same-sheet Excel total only in its explicit ruble NMC column", () => {
+    const fragments = [
+      { id: "header", locator: "Лист QA, A3:P3", sheetId: "qa", sheetState: "visible" as const, includedByUser: false, text: "Наименование\tЦена за единицу, руб.\tН(М)Ц договора, с округлением цены за единицу (руб.)", cells: [{ reference: "A3", text: "Наименование", valueType: "text" }, { reference: "D3", text: "Цена за единицу, руб.", valueType: "text" }, { reference: "P3", text: "Н(М)Ц договора, с округлением цены за единицу (руб.)", valueType: "text" }] },
+      { id: "total", locator: "Лист QA, A7:P7", sheetId: "qa", sheetState: "visible" as const, includedByUser: false, text: "Итого\t431000\t876543.21", cells: [{ reference: "A7", text: "Итого", valueType: "text" }, { reference: "D7", text: "431000", rawValue: "431000", valueType: "number" }, { reference: "P7", text: "876543.21", rawValue: "876543.21", valueType: "number" }] },
+    ];
+    const correct = auditIntelligenceResult([item({ nmc: 876543.21 })], [source("", { fragments })]);
+    expect(fieldStatus(correct, "nmc")?.status).toBe("confirmed"); expect(codes(correct)).not.toContain("missing-price");
+    const wrong = auditIntelligenceResult([item({ nmc: 431000 })], [source("", { fragments })]);
+    expect(fieldStatus(wrong, "nmc")?.status).toBe("conflict");
+    const anotherSheet = auditIntelligenceResult([item({ nmc: 876543.21 })], [source("", { fragments: [fragments[0], { ...fragments[1], sheetId: "unrelated" }] })]);
+    expect(fieldStatus(anotherSheet, "nmc")?.status).not.toBe("confirmed");
+    const foreignHeader = { ...fragments[0], text: fragments[0].text.replace("(руб.)", "(USD)"), cells: fragments[0].cells.map((cell) => ({ ...cell, text: cell.text.replace("(руб.)", "(USD)") })) };
+    expect(fieldStatus(auditIntelligenceResult([item({ nmc: 876543.21 })], [source("", { fragments: [foreignHeader, fragments[1]] })]), "nmc")?.status).not.toBe("confirmed");
+    const hiddenHeader = { ...fragments[0], sheetState: "hidden" as const, includedByUser: false };
+    expect(fieldStatus(auditIntelligenceResult([item({ nmc: 876543.21 })], [source("", { fragments: [hiddenHeader, fragments[1]] })]), "nmc")?.status).not.toBe("confirmed");
+    const changedHeader = { ...foreignHeader, id: "changed-header", locator: "Лист QA, P4", cells: foreignHeader.cells.map((cell) => ({ ...cell, reference: cell.reference.replace("3", "4") })) };
+    expect(fieldStatus(auditIntelligenceResult([item({ nmc: 876543.21 })], [source("", { fragments: [fragments[0], changedHeader, fragments[1]] })]), "nmc")?.status).not.toBe("confirmed");
+    const missingHeader = { ...fragments[0], text: "НМЦ не указана, руб.", cells: [{ reference: "P3", text: "НМЦ не указана, руб.", valueType: "text" }] };
+    expect(fieldStatus(auditIntelligenceResult([item({ nmc: 876543.21 })], [source("", { fragments: [missingHeader, fragments[1]] })]), "nmc")?.status).not.toBe("confirmed");
+    const vat = { ...fragments[1], text: "Итого НДС\t876543.21", cells: [{ reference: "A7", text: "Итого НДС", valueType: "text" }, fragments[1].cells[2]] };
+    expect(fieldStatus(auditIntelligenceResult([item({ nmc: 876543.21 })], [source("", { fragments: [fragments[0], vat] })]), "nmc")?.status).not.toBe("confirmed");
+    const otherSource = auditIntelligenceResult([item({ nmc: 876543.21 }, "procurement", { sourceIds: ["total-only"] })], [source("", { fragments: [fragments[0]] }), source("", { id: "total-only", fragments: [fragments[1]] })]);
+    expect(fieldStatus(otherSource, "nmc")?.status).not.toBe("confirmed");
+  });
+  it.each(["Итого по разделу 1", "Всего по разделу 2", "Итого: подытог", "Итого, промежуточный итог", "Промежуточный итог"])("does not treat a subtotal as overall NMC or close its column heading: %s", (subtotal) => {
+    const fragments = [
+      { id: "header", locator: "Лист QA, P1", sheetId: "qa", sheetState: "visible" as const, text: "НМЦ, руб.", cells: [{ reference: "P1", text: "НМЦ, руб.", valueType: "text" }] },
+      { id: "subtotal", locator: "Лист QA, A9:P9", sheetId: "qa", sheetState: "visible" as const, text: `${subtotal}\t100`, cells: [{ reference: "A9", text: subtotal, valueType: "text" }, { reference: "P9", text: "100", rawValue: "100", valueType: "number" }] },
+      { id: "total", locator: "Лист QA, A10:P10", sheetId: "qa", sheetState: "visible" as const, text: "Всего\t200", cells: [{ reference: "A10", text: "Всего", valueType: "text" }, { reference: "P10", text: "200", rawValue: "200", valueType: "number" }] },
+    ];
+    const wrong = auditIntelligenceResult([item({ nmc: 100 })], [source("", { fragments })]);
+    expect(fieldStatus(wrong, "nmc")?.status).not.toBe("confirmed"); expect(getBlockingEvidenceFindings(wrong, "item-a").length).toBeGreaterThan(0);
+    const correct = auditIntelligenceResult([item({ nmc: 200 })], [source("", { fragments })]);
+    expect(fieldStatus(correct, "nmc")?.status).toBe("confirmed");
+    expect(correct.coverage.filter((check) => check.category === "price").map((check) => check.label)).toEqual(["Явная общая цена: 200"]);
+  });
+  it("assembles explicit NMC rubles and kopeks around bounded written-out words", () => {
+    const quote = "Начальная (максимальная) цена договора составляет: 876 543 (восемьсот семьдесят шесть тысяч пятьсот сорок три) руб., 21 коп., в том числе НДС";
+    const card = item({ nmc: 876543.21 }, "procurement", { evidence: [{ field: "nmc", sourceId: "source-a", quote }] });
+    const audit = auditIntelligenceResult([card], [source(quote)]);
+    expect(fieldStatus(audit, "nmc")?.status).toBe("confirmed"); expect(codes(audit)).not.toContain("evidence-does-not-support-value");
+    expect(audit.coverage.filter((check) => check.category === "price").map((check) => check.label)).toEqual(["Явная общая цена: 876543.21"]);
+    expect(fieldStatus(auditIntelligenceResult([item({ nmc: 876543 })], [source(quote)]), "nmc")?.status).toBe("conflict");
+    const short = "НМЦ: 876543 руб., 21 коп.";
+    expect(fieldStatus(auditIntelligenceResult([item({ nmc: 876543.21 })], [source(short)]), "nmc")?.status).toBe("confirmed");
+    expect(fieldStatus(auditIntelligenceResult([item({ nmc: 876543 })], [source(short)]), "nmc")?.status).toBe("conflict");
+    expect(fieldStatus(auditIntelligenceResult([item({ nmc: 876543 })], [source("НМЦ: 876543 руб., 121 коп.")]), "nmc")?.status).toBe("conflict");
+  });
+  it("canonicalizes a genuine date quote without treating a different event as evidence", () => {
+    const quote = "Поставка оборудования не позднее 11.04.2031 года.";
+    const card = item({ executionEndDate: "2031-04-11" }, "procurement", { evidence: [{ field: "executionEndDate", sourceId: "source-a", fragmentId: "delivery", quote }] });
+    const audit = auditIntelligenceResult([card], [source("", { fragments: [{ id: "delivery", locator: "Абзац QA", text: quote }] })]);
+    expect(fieldStatus(audit, "executionEndDate")?.status).toBe("confirmed"); expect(codes(audit)).not.toContain("evidence-does-not-support-value");
+    const otherEvent = auditIntelligenceResult([card], [source("", { fragments: [{ id: "delivery", locator: "Абзац QA", text: quote.replace("Поставка оборудования не позднее", "Подведение итогов:") }] })]);
+    expect(codes(otherEvent)).toContain("semantic-conflict"); expect(codes(otherEvent)).toContain("invalid-evidence-quote");
+  });
+  it.each(["7.", "8)", "9.2."])("does not require a document-list index to survive in business text: %s", (prefix) => {
+    const condition = "Декларация участника с приложением подтверждения за последние 30 дней.";
+    const correct = auditIntelligenceResult([item({ requirements: [condition] })], [source(`${prefix} ${condition}`)]);
+    expect(correct.coverage.find((check) => check.category === "document")?.status).toBe("covered"); expect(codes(correct)).not.toContain("missing-document");
+    const wrong = auditIntelligenceResult([item({ requirements: [condition.replace("30", "60")] })], [source(`${prefix} ${condition}`)]);
+    expect(codes(wrong)).toContain("missing-document");
+  });
+  it.each(["–", "—", "\t"])("recognizes explicit company roles with a normal separator: %s", (separator) => {
+    const text = `Поставщик ${separator} ООО Поставщик QA; Организатор ${separator} ООО Заказчик QA`;
+    const audit = auditIntelligenceResult([item({ issuerName: "ООО Поставщик QA", recipientName: "ООО Заказчик QA" }, "proposals")], [source(text)]);
+    expect(audit.fields.map((field) => field.status)).toEqual(["confirmed", "confirmed"]);
+    const wrong = auditIntelligenceResult([item({ recipientName: "ООО Поставщик QA" }, "proposals")], [source(text)]);
+    expect(fieldStatus(wrong, "recipientName")?.status).toBe("conflict");
+  });
+  it("carries an explicit source-wide timezone into the submission coverage label", () => {
+    const fragments = [{ id: "zone", locator: "Примечание QA", text: "Время в документе указано в часовом поясе MSK." }, { id: "deadline", locator: "Таблица QA", text: "Приём предложений до\t11.04.2031, 13:30" }];
+    const missing = auditIntelligenceResult([item({ submissionDeadline: "2031-04-11", notes: "Подача 13:30" })], [source("", { fragments })]);
+    expect(codes(missing)).toContain("missing-deadline-time");
+    expect(missing.coverage.find((check) => check.category === "deadline-time")?.label).toContain("MSK");
+    const fixed = auditIntelligenceResult([item({ submissionDeadline: "2031-04-11", notes: "Подача 13:30 МСК" })], [source("", { fragments })]);
+    expect(fixed.coverage.find((check) => check.category === "deadline-time")?.status).toBe("covered");
+    expect(missing.coverage.find((check) => check.category === "deadline-time")?.supportingEvidence?.[0].fragmentId).toBe("zone");
+  });
+  it("does not borrow a global timezone from another source or an excluded hidden fragment", () => {
+    const deadline = source("Срок подачи заявок: 11.04.2031 13:30", { id: "deadline" });
+    const card = item({ submissionDeadline: "2031-04-11", notes: "Подача 13:30" }, "procurement", { sourceIds: ["deadline"] });
+    const other = source("Время в документе указано в MSK.");
+    expect(auditIntelligenceResult([card], [deadline, other]).coverage.find((check) => check.category === "deadline-time")?.label).not.toContain("MSK");
+    const hidden = { id: "zone", locator: "История QA", sheetState: "hidden" as const, includedByUser: false, text: other.text };
+    const current = { id: "deadline", locator: "Текущий QA", text: deadline.text };
+    expect(auditIntelligenceResult([item(card.fields)], [source("", { fragments: [hidden, current] })]).coverage.find((check) => check.category === "deadline-time")?.label).not.toContain("MSK");
+  });
+  it("keeps conflicting common zones uncertain and lets only an explicit local zone override them", () => {
+    const prefix = "Время в документе указано в MSK.\nВремя в документе указано в UTC.\n";
+    const card = item({ submissionDeadline: "2031-04-11", notes: "Подача 13:30 MSK" });
+    const uncertain = auditIntelligenceResult([card], [source(`${prefix}Срок подачи заявок: 11.04.2031 13:30`)]);
+    expect(uncertain.coverage.find((check) => check.category === "deadline-time")?.status).toBe("uncertain"); expect(codes(uncertain)).toContain("missing-deadline-time");
+    const explicit = auditIntelligenceResult([card], [source(`${prefix}Срок подачи заявок: 11.04.2031 13:30 MSK`)]);
+    expect(explicit.coverage.find((check) => check.category === "deadline-time")?.status).toBe("covered");
+  });
+  it("accepts exact supporting excerpts inside a composed note but not unrelated evidence", () => {
+    const quote = "Срок подачи заявок: 11.04.2031 13:30 MSK";
+    const fields = { submissionDeadline: "2031-04-11", notes: `Моя заметка\nПодача: 2031-04-11 13:30 MSK — ${quote}` };
+    const card = item(fields, "procurement", { evidence: [{ field: "notes", sourceId: "source-a", quote }] });
+    expect(codes(auditIntelligenceResult([card], [source(quote)]))).not.toContain("evidence-does-not-support-value");
+    const wrong = { ...card, evidence: [{ field: "notes", sourceId: "source-a", quote: "Другой фрагмент" }] };
+    expect(codes(auditIntelligenceResult([wrong], [source(`${quote}\nДругой фрагмент`) ]))).toContain("evidence-does-not-support-value");
+  });
+  it("confirms a literal multiline proposal description within one selected fragment", () => {
+    const text = "Сервер QA-A\nCPU-A\nRAM-A\nDisk-A\nСервер QA-B\nCPU-B\nRAM-B";
+    const card = item({ lines: ["Сервер QA-A", "Сервер QA-B"], lineDescriptions: ["CPU-A\nRAM-A\nDisk-A", "CPU-B\nRAM-B"] }, "proposals", { evidence: [{ field: "lineDescriptions", sourceId: "source-a", quote: "CPU-A" }] });
+    const audit = auditIntelligenceResult([card], [source(text)]);
+    expect(fieldStatus(audit, "lineDescriptions")?.status).toBe("confirmed"); expect(getBlockingEvidenceFindings(audit, card)).toHaveLength(0);
+    const unknownSuffix = { ...card, fields: { ...card.fields, lineDescriptions: ["CPU-A\nRAM-A\nDisk-A\n99%", "CPU-B\nRAM-B"] } };
+    const unknownAudit = auditIntelligenceResult([unknownSuffix], [source(text)]);
+    expect(fieldStatus(unknownAudit, "lineDescriptions")?.status).toBe("unverified"); expect(getBlockingEvidenceFindings(unknownAudit, unknownSuffix).some((finding) => finding.field === "lineDescriptions")).toBe(true);
+    const split = source(text, { fragments: [{ id: "a", locator: "Страница A", text: "Сервер QA-A\nCPU-A" }, { id: "b", locator: "Страница B", text: "RAM-A\nDisk-A\nСервер QA-B\nCPU-B\nRAM-B" }] });
+    expect(fieldStatus(auditIntelligenceResult([card], [split]), "lineDescriptions")?.status).toBe("unverified");
+    const hidden = source(text, { fragments: [{ id: "hidden", locator: "История QA", sheetState: "hidden", includedByUser: false, text }] });
+    expect(fieldStatus(auditIntelligenceResult([card], [hidden]), "lineDescriptions")?.status).toBe("unverified");
+    const other = source(text, { id: "other" });
+    expect(fieldStatus(auditIntelligenceResult([card], [source("Нет описания"), other]), "lineDescriptions")?.status).toBe("unverified");
+  });
+  it.each(["notes", "paymentTerms"])("does not let an email hide unsupported suffixes in %s", (field) => {
+    const quote = "Наш контакт: qa@example.org";
+    const card = item({ [field]: "qa@example.org; 99%" }, field === "paymentTerms" ? "proposals" : "procurement", { evidence: [{ field, sourceId: "source-a", quote }] });
+    const audit = auditIntelligenceResult([card], [source(quote)]);
+    expect(fieldStatus(audit, field)?.status).toBe("unverified"); expect(codes(audit)).toContain("evidence-does-not-support-value");
+    if (field === "paymentTerms") expect(getBlockingEvidenceFindings(audit, card).length).toBeGreaterThan(0);
+  });
+  it("retains exact pure-email/list comparisons without accepting a longer email domain", () => {
+    const text = "Поставщик: ООО QA\nEmail: qa@example.org; second@example.org\nЗаказчик: ООО Покупатель QA\nEmail: buyer@example.org";
+    const correct = auditIntelligenceResult([item({ contactEmail: "qa@example.org; second@example.org" }, "proposals")], [source(text)]);
+    expect(fieldStatus(correct, "contactEmail")?.status).toBe("confirmed");
+    const wrong = auditIntelligenceResult([item({ contactEmail: "qa@example.org" }, "proposals")], [source("Поставщик: ООО QA\nEmail: qa@example.org.evil")]);
+    expect(fieldStatus(wrong, "contactEmail")?.status).toBe("unverified");
+    const otherRole = auditIntelligenceResult([item({ contactEmail: "buyer@example.org" }, "proposals")], [source(text)]);
+    expect(fieldStatus(otherRole, "contactEmail")?.status).toBe("conflict");
+  });
+  it("makes structural cell-budget exhaustion visible rather than reading unbounded metadata", () => {
+    const fragments = [{ id: "metadata", locator: "Лист QA", sheetId: "qa", text: "QA", cells: Array.from({ length: 20001 }, () => ({ reference: "A1", text: "", valueType: "empty" })) }];
+    expect(codes(auditIntelligenceResult([item({ name: "QA" })], [source("", { fragments })]))).toContain("audit-limit");
   });
 });

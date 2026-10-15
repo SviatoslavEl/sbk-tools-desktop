@@ -13,16 +13,17 @@ export interface CoverageCheck {
   id: string; category: "certificate" | "document" | "quantity" | "price" | "deadline-time" | "sku";
   status: "covered" | "missing" | "uncertain"; label: string; evidence: EvidenceExcerpt;
   itemIds: string[]; matchedItemIds: string[];
+  supportingEvidence?: EvidenceExcerpt[];
 }
 export interface IntelligenceEvidenceReport {
   fields: FieldEvidenceStatus[]; findings: EvidenceFinding[]; coverage: CoverageCheck[];
 }
 
 type Role = "supplier" | "customer" | "internal" | "unknown";
-type SourceUnit = EvidenceExcerpt & { text: string; normalizedText: string; normalizedSourceName: string; numbers: string[]; source: IntelligenceSource; sheetState?: IntelligenceFragment["sheetState"]; index: number; fragmentKey: number; context: string; precedingContext: string; role: Role };
-type UnitIndex = { tokens: Map<string, SourceUnit[]>; numbers: Map<string, SourceUnit[]>; phones: Map<string, SourceUnit[]>; sourceNames: Set<string>; limited: boolean };
+type SourceUnit = EvidenceExcerpt & { text: string; normalizedText: string; normalizedSourceName: string; numbers: string[]; source: IntelligenceSource; sheetState?: IntelligenceFragment["sheetState"]; index: number; fragmentKey: number; context: string; precedingContext: string; role: Role; nmcAmounts: string[]; nmcHeaders: EvidenceExcerpt[] };
+type UnitIndex = { tokens: Map<string, SourceUnit[]>; numbers: Map<string, SourceUnit[]>; phones: Map<string, SourceUnit[]>; sourceNames: Set<string>; literalFragments: Array<{ key: number; unit: SourceUnit; text: string }>; limited: boolean };
 type SourceFact = { category: CoverageCheck["category"]; label: string; unit: SourceUnit; anchors: string[]; numbers: string[]; token?: string; extra?: string[]; qualifiers?: string[]; uncertain?: boolean };
-type DateOccurrence = { iso: string; event: string; time?: string; timezone?: string; unit: SourceUnit; quote: string };
+type DateOccurrence = { iso: string; event: string; time?: string; timezone?: string; timezoneEvidence?: EvidenceExcerpt[]; timezoneAmbiguous?: boolean; unit: SourceUnit; quote: string };
 const maxUnits = 5000;
 const maxAuditCharacters = 2 * 1024 * 1024;
 const maxUnitCharacters = 20000;
@@ -37,7 +38,7 @@ const genericPlaceholders = /^(?:заказчик|покупатель|пост�
 const currency = /(?:руб(?:\.|лей|ля)?|₽|\bRUB\b)/iu;
 const foreignCurrency = /(?:\b(?:USD|EUR|CNY|KZT|BYN|JPY|GBP|CHF)\b|[$€¥₸£]|доллар[а-я]*|евро|юан[а-я]*|тенге|белорус[а-я\s]+рубл[а-я]*)/iu;
 const moneyContext = /(?:нмцк?|начальн[а-я\s]*(?:максимальн[а-я\s]*)?цен|максимальн[а-я\s]+(?:цен|стоимост)|итогов[а-я\s]+(?:цен|стоимост|сумм)|итого|всего|общая\s+(?:цена|стоимость|сумма)|(?:цена|стоимость|сумма)\s+(?:договора|контракта))/iu;
-const nmcLabel = /(?:нмцк?(?![а-я])|начальн[а-я\s]*максимальн[а-я\s]*цен[а-я]*|(?:предельн|максимальн)[а-я\s]+(?:цен|стоимост)[а-я\s]+(?:закупк|договора|контракта|лота))/iu;
+const nmcLabel = /(?:н\s*м\s*цк?(?![а-я])|начальн[а-я\s]*максимальн[а-я\s]*цен[а-я]*|(?:предельн|максимальн)[а-я\s]+(?:цен|стоимост)[а-я\s]+(?:закупк|договора|контракта|лота))/iu;
 const shareLabel = /(?:наша\s+доля|стоимость\s+нашей\s+(?:доли|части)|(?:стоимость|объ[её]м)\s+(?:наших\s+работ|работ\s+нашей\s+(?:компании|организации)))/iu;
 const unitPriceContext = /(?:цен[а-я]*\s+(?:за\s+)?(?:единиц|ед\.|шт)|за\s+од(?:ин|ну)|удельн|за единицу|единичн|unit\s+price)/iu;
 const certificatePattern = /(?<![a-z0-9])(?:OSCP|OSEP|BSCP|OSWE|OSWP|KLCP|eJPT|eCPPT|CISSP|CISA|CISM|CEH|(?:CompTIA\s+)?PenTest\+?|HTB\s+CPTS)(?![a-z0-9])/giu;
@@ -77,9 +78,12 @@ function emailTokens(value: string): string[] {
 }
 function digits(value: string): string { return value.replace(/\D/g, ""); }
 function numberTokens(value: string): string[] {
-  const matches = value.match(/\d+(?:[\s\u00a0\u202f]\d{3})*(?:[.,]\d+)?/gu) || [];
-  return matches.map((entry) => entry.replace(/[\s\u00a0\u202f]/g, "").replace(",", ".")).filter((entry) => Number.isFinite(Number(entry)));
+  // Tabs/newlines separate cells or rows, never decimal grouping positions.
+  const matches = value.match(/\d+(?:[ \u00a0\u202f]\d{3})*(?:[.,]\d+)?/gu) || [];
+  return matches.map((entry) => entry.replace(/[ \u00a0\u202f]/g, "").replace(",", ".")).filter((entry) => Number.isFinite(Number(entry)));
 }
+function withoutListIndex(value: string): string { return value.replace(/^\s*\d{1,3}(?:\.\d{1,3})*[.)]\s+(?=\S)/u, ""); }
+function businessNumbers(value: string): string[] { return numberTokens(withoutListIndex(value)); }
 function sameNumber(left: string, right: string): boolean { return Number(left) === Number(right); }
 function hasNumber(text: string, value: number): boolean { return numberTokens(text).some((entry) => Number(entry) === value); }
 function words(value: string): string[] {
@@ -90,21 +94,82 @@ function includesPhrase(text: string, value: string): boolean {
   const body = normalize(text), candidate = normalize(value);
   if (!candidate) return false;
   const emails = emailTokens(candidate);
-  if (emails?.length) return emails.every((email) => body.includes(email));
+  if (emails.length) {
+    const residue = emails.reduce((remaining, email) => remaining.split(email).join(""), candidate).replace(/[\s,;<>()[\]]/gu, "");
+    if (!residue) { const actual = new Set(emailTokens(body)); return emails.every((email) => actual.has(email)); }
+  }
   if (/^\+?[\d\s()-.]{9,}$/u.test(candidate)) {
     const expected = digits(candidate); return (text.match(/\+?\d[\d\s()-.]{7,}\d/gu) || []).some((phone) => digits(phone) === expected);
   }
   return candidate.length >= 3 && body.includes(candidate);
 }
+function canonicalQuoteDates(text: string): string[] {
+  return [...text.matchAll(/\b(?:(\d{4})-(\d{2})-(\d{2})|(\d{2})[./](\d{2})[./](\d{4}))\b/gu)].flatMap((match) => {
+    const iso = match[1] ? `${match[1]}-${match[2]}-${match[3]}` : `${match[6]}-${match[5]}-${match[4]}`;
+    const date = new Date(`${iso}T00:00:00Z`);
+    return Number.isFinite(date.getTime()) && date.toISOString().slice(0, 10) === iso ? [iso] : [];
+  });
+}
+function quoteSupportsValue(item: IntelligenceItem, field: string, quote: string): boolean {
+  const value = item.fields[field];
+  if (typeof value === "number") return hasNumber(quote, value) || field === "nmc" && splitRubleAmounts(quote, nmcLabel).some((amount) => Number(amount) === value);
+  return strings(value).some((entry) => includesPhrase(quote, entry)
+    // Literal quote existence, source selection and event/role checks are kept
+    // separate. Canonicalizing an actual date does not change its event.
+    || /(?:Date|Deadline)$|^(?:date|validUntil|availableFrom|availableTo)$/u.test(field) && /^\d{4}-\d{2}-\d{2}$/u.test(entry) && canonicalQuoteDates(quote).includes(entry)
+    // An exact excerpt can substantiate one part of a note or proposal
+    // description (whose full text is checked separately). This never applies
+    // to dates, companies, prices, contacts or requirements.
+    || (/^(?:notes|internalNote)$/u.test(field) || item.destination === "proposals" && field === "lineDescriptions") && Boolean(literalQuote(quote)) && literalQuote(entry).includes(literalQuote(quote)));
+}
 function lineRole(text: string): Role {
   if (/(?:наш|внутренн[а-я]*)\s+(?:ответственн|координатор|менеджер)|ответственн[а-я\s]+(?:за\s+)?нашу\s+заявк/iu.test(text)) return "internal";
-  if (/(?:^|[;\t])\s*(?:поставщик|исполнитель|продавец|отправитель)\s*[:—-]|(?:реквизиты|контакт|адрес)\s+(?:поставщика|исполнителя)/iu.test(text)) return "supplier";
-  if (/(?:^|[;\t])\s*(?:заказчик|покупатель|получатель|адресат|организатор)\s*[:—-]|(?:для\s+нужд|реквизиты|контакт|адрес)\s+(?:заказчика|покупателя|организатора)/iu.test(text)) return "customer";
+  if (/^(?:поставщик|исполнитель|продавец|отправитель)\s*$/iu.test(text.trim()) || /(?:^|[;\t])\s*(?:поставщик|исполнитель|продавец|отправитель)\s*(?:[:‐‑–—-]|\t)|(?:реквизиты|контакт|адрес)\s+(?:поставщика|исполнителя)/iu.test(text)) return "supplier";
+  if (/^(?:заказчик|покупатель|получатель|адресат|организатор)\s*$/iu.test(text.trim()) || /(?:^|[;\t])\s*(?:заказчик|покупатель|получатель|адресат|организатор)\s*(?:[:‐‑–—-]|\t)|(?:для\s+нужд|реквизиты|контакт|адрес)\s+(?:заказчика|покупателя|организатора)/iu.test(text)) return "customer";
   return "unknown";
+}
+interface NmcColumnHeader { row: number; excerpt: EvidenceExcerpt; }
+function structuredNmc(fragment: IntelligenceFragment, source: IntelligenceSource, headers: Map<string, NmcColumnHeader>, cellBudget: { count: number; characters: number; limited: boolean }): { amounts: string[]; headers: EvidenceExcerpt[] } {
+  const result = { amounts: [] as string[], headers: [] as EvidenceExcerpt[] };
+  const raw = (fragment as IntelligenceFragment & { cells?: unknown }).cells;
+  if (!fragment.sheetId || !Array.isArray(raw)) return result;
+  const fragmentText = literalQuote(fragment.text);
+  const cells: Array<{ column: string; row: number; text: string; number?: string }> = [];
+  for (const entry of raw) {
+    if (++cellBudget.count > 20000) { cellBudget.limited = true; break; }
+    if (!entry || typeof entry !== "object") continue;
+    const cell = entry as Record<string, unknown>, reference = typeof cell.reference === "string" ? /^([A-Z]{1,3})([1-9]\d{0,6})$/u.exec(cell.reference) : null;
+    if (!reference || Number(reference[2]) > 1048576 || typeof cell.text !== "string" || cell.text.length > maxUnitCharacters) continue;
+    cellBudget.characters += cell.text.length;
+    if (cellBudget.characters > maxAuditCharacters) { cellBudget.limited = true; break; }
+    if (!fragmentText.includes(literalQuote(cell.text))) continue;
+    const numeric = cell.valueType === "number" && /^\d+(?:[.,]\d+)?(?:e[+-]?\d+)?$/iu.test(cell.text.trim()) ? cell.text.trim().replace(",", ".") : undefined;
+    const number = numeric && Number.isFinite(Number(numeric)) && Number(numeric) >= 0 && Number(numeric) <= 1e12 && (cell.rawValue === undefined || typeof cell.rawValue === "string" && Number(cell.rawValue) === Number(numeric)) ? numeric : undefined;
+    cells.push({ column: reference[1], row: Number(reference[2]), text: cell.text, number });
+  }
+  // The heading belongs to a coordinate, not every number in its row or source.
+  for (const cell of cells) {
+    const primary = cell.text.split(/[,;:]/u)[0].replace(/[()]/gu, " ");
+    const key = `${fragment.sheetId}:${cell.column}`;
+    if (cell.number === undefined && (nmcLabel.test(primary) || moneyContext.test(primary) || unitPriceContext.test(primary) || foreignCurrency.test(cell.text))) headers.delete(key);
+    if (nmcLabel.test(primary) && currency.test(cell.text) && !unitPriceContext.test(primary) && !foreignCurrency.test(cell.text) && !/не\s+(?:указан[аоы]?|определ[её]н[аоы]?|извест[а-я]*)/iu.test(cell.text)) headers.set(key, { row: cell.row, excerpt: { sourceId: source.id, sourceName: source.name, fragmentId: fragment.id, locator: fragment.locator, quote: cell.text } });
+  }
+  if (!cells.some((cell) => /^(?:итого|всего)(?:\s|[,:‐‑–—-]|$)/iu.test(cell.text.trim()) && !/(?:подытог|subtotal|промежуточн|по\s+раздел)/iu.test(cell.text) && !/^(?:итого|всего)\s*[:,‐‑–—-]?\s*(?:сумма\s+)?ндс(?:[^\p{L}]|$)/iu.test(cell.text.trim()) && !unitPriceContext.test(cell.text) && !foreignCurrency.test(cell.text))) return result;
+  for (const cell of cells) {
+    const header = headers.get(`${fragment.sheetId}:${cell.column}`);
+    if (cell.number === undefined || !header || header.row >= cell.row) continue;
+    result.amounts.push(cell.number); result.headers.push(header.excerpt);
+    // A completed total closes this header association; a later unrelated table
+    // on the same sheet needs its own explicit heading.
+    headers.delete(`${fragment.sheetId}:${cell.column}`);
+  }
+  return result;
 }
 function createUnits(sources: readonly IntelligenceSource[]): { units: SourceUnit[]; limited: boolean } {
   const units: SourceUnit[] = []; let limited = false, characters = 0, fragmentKey = 0;
+  const cellBudget = { count: 0, characters: 0, limited: false };
   for (const source of sources) {
+    const nmcColumns = new Map<string, NmcColumnHeader>();
     const normalizedSourceName = normalize(source.name);
     // An explicit fragments array is authoritative: discarded sheets/pages must
     // never re-enter evidence through the source's aggregate text.
@@ -112,6 +177,7 @@ function createUnits(sources: readonly IntelligenceSource[]): { units: SourceUni
     for (const fragment of fragments) {
       if (!includedFragment(fragment)) continue;
       fragmentKey++;
+      const nmc = structuredNmc(fragment, source, nmcColumns, cellBudget);
       const rows = fragment.text.split(/\r?\n/u).map((line) => line.trim()).filter(Boolean);
       let role: Role = "unknown";
       for (let index = 0; index < rows.length; index++) {
@@ -121,24 +187,28 @@ function createUnits(sources: readonly IntelligenceSource[]): { units: SourceUni
         const context = rows.slice(Math.max(0, index - 1), Math.min(rows.length, index + 2)).map((line) => line.slice(0, maxUnitCharacters)).join("\n");
         const precedingContext = rows.slice(Math.max(0, index - 2), index).map((line) => line.slice(0, maxUnitCharacters)).join("\n");
         characters += text.length;
-        units.push({ sourceId: source.id, sourceName: source.name, fragmentId: fragment.id, locator: fragment.locator, quote: text, text, normalizedText: normalize(text), normalizedSourceName, numbers: numberTokens(text), source, sheetState: fragment.sheetState, index: units.length, fragmentKey, context, precedingContext, role });
+        const nmcAmounts = [...new Set([...(index === 0 ? nmc.amounts : []), ...splitRubleAmounts(text, nmcLabel)])];
+        units.push({ sourceId: source.id, sourceName: source.name, fragmentId: fragment.id, locator: fragment.locator, quote: text, text, normalizedText: normalize(text), normalizedSourceName, numbers: numberTokens(text), source, sheetState: fragment.sheetState, index: units.length, fragmentKey, context, precedingContext, role, nmcAmounts, nmcHeaders: index === 0 ? nmc.headers : [] });
         if (limited) break;
       }
       if (limited) break;
     }
     if (limited) break;
   }
-  return { units, limited };
+  return { units, limited: limited || cellBudget.limited };
 }
 function buildIndex(units: SourceUnit[]): UnitIndex {
-  const index: UnitIndex = { tokens: new Map(), numbers: new Map(), phones: new Map(), sourceNames: new Set(), limited: false };
+  const index: UnitIndex = { tokens: new Map(), numbers: new Map(), phones: new Map(), sourceNames: new Set(), literalFragments: [], limited: false };
+  const fragments = new Map<number, { unit: SourceUnit; rows: string[] }>();
   const add = (map: Map<string, SourceUnit[]>, token: string, unit: SourceUnit) => { const values = map.get(token) || []; values.push(unit); map.set(token, values); };
   for (const unit of units) {
+    const fragment = fragments.get(unit.fragmentKey) || { unit, rows: [] }; fragment.rows.push(unit.text); fragments.set(unit.fragmentKey, fragment);
     index.sourceNames.add(unit.normalizedSourceName);
     for (const token of new Set([...(unit.normalizedText.match(/[\p{L}\d+_-]{3,}/gu) || []), ...emailTokens(unit.normalizedText)])) add(index.tokens, token, unit);
-    for (const token of new Set(unit.numbers.map((value) => String(Number(value))))) add(index.numbers, token, unit);
+    for (const token of new Set([...unit.numbers, ...unit.nmcAmounts].map((value) => String(Number(value))))) add(index.numbers, token, unit);
     for (const phone of new Set((unit.text.match(/\+?\d[\d\s()-.]{7,}\d/gu) || []).map(digits))) add(index.phones, phone, unit);
   }
+  index.literalFragments = [...fragments].map(([key, { unit, rows }]) => ({ key, unit, text: literalQuote(rows.join("\n")) }));
   return index;
 }
 function candidatesFor(value: string | number, index: UnitIndex): SourceUnit[] {
@@ -239,8 +309,25 @@ function detectDateEvent(before: string, after: string, context: string): string
   }
   return "other";
 }
+function timezoneCodes(value: string): string[] {
+  return value.match(/(?<![\p{L}\d])(?:МСК|MSK|UTC(?:[+-]\d{1,2}(?::\d{2})?)?|GMT(?:[+-]\d{1,2})?|[+-]\d{2}:\d{2})(?![\p{L}\d:+-])/giu) || [];
+}
+function canonicalTimezone(value: string): string { return /^(?:мск|msk)$/iu.test(value) ? "MSK" : value.toUpperCase(); }
+function sourceTimezones(units: SourceUnit[]): Map<string, { zones: string[]; evidence: EvidenceExcerpt[] }> {
+  const sources = new Map<string, { zones: string[]; evidence: EvidenceExcerpt[] }>();
+  for (const unit of units) {
+    if (!/время/iu.test(unit.text) || !/(?:в\s+(?:(?:настоящем|данном|этом|вс[её]м)\s+)?документе|вс[её]\s+время|все\s+даты\s+и\s+время)/iu.test(unit.text) || /(?:^|\s)не\s+(?:в\s|указан|привед[её]н|задан)/iu.test(unit.text)) continue;
+    const zones = timezoneCodes(unit.text).map(canonicalTimezone); if (!zones.length) continue;
+    const previous = sources.get(unit.sourceId) || { zones: [], evidence: [] };
+    previous.zones = [...new Set([...previous.zones, ...zones])];
+    if (previous.evidence.length < 3) previous.evidence.push(excerpt(unit));
+    sources.set(unit.sourceId, previous);
+  }
+  return sources;
+}
 function dateOccurrences(units: SourceUnit[]): { dates: DateOccurrence[]; limited: boolean } {
   const occurrences: DateOccurrence[] = [];
+  const commonTimezones = sourceTimezones(units);
   for (const unit of units) {
     const regex = /\b(?:(\d{4})-(\d{2})-(\d{2})|(\d{2})[./](\d{2})[./](\d{4}))(?:[ T,]+(\d{1,2}:\d{2}(?::\d{2})?))?(?:\s*\(?\s*(МСК|MSK|UTC(?:[+-]\d{1,2}(?::\d{2})?)?|GMT(?:[+-]\d{1,2})?|[+-]\d{2}:\d{2})\)?)?/giu;
     const matches = unit.text.matchAll(regex); let previousEnd = 0, current = matches.next();
@@ -267,7 +354,8 @@ function dateOccurrences(units: SourceUnit[]): { dates: DateOccurrence[]; limite
         }
         event = detectDateEvent(preceding.join(" "), "", unit.context);
       }
-      occurrences.push({ iso, event, time: match[7], timezone: match[8], unit, quote: unit.text.slice(Math.max(0, start - 100), Math.min(unit.text.length, start + match[0].length + 100)) });
+      const common = !match[8] && match[7] ? commonTimezones.get(unit.sourceId) : undefined;
+      occurrences.push({ iso, event, time: match[7], timezone: match[8] || (common?.zones.length === 1 ? common.zones[0] : undefined), timezoneEvidence: common?.evidence, timezoneAmbiguous: Boolean(common && common.zones.length > 1), unit, quote: unit.text.slice(Math.max(0, start - 100), Math.min(unit.text.length, start + match[0].length + 100)) });
       previousEnd = end; current = next;
     }
   }
@@ -287,10 +375,25 @@ function overallAmounts(unit: SourceUnit): string[] {
   }
   return unit.numbers.length === 1 && /нмц|начальн[а-я\s]*(?:максимальн[а-я\s]*)?цен/iu.test(text) ? unit.numbers : [];
 }
+function splitRubleAmounts(text: string, label: RegExp): string[] {
+  if (foreignCurrency.test(text) || unitPriceContext.test(text) || /не\s+(?:указан[аоы]?|определ[её]н[аоы]?|извест[а-я]*)/iu.test(text)) return [];
+  const results: string[] = [];
+  for (const match of text.matchAll(/\b(\d+(?:[ \u00a0\u202f]\d{3})*)(?:\s*\([^()\n]{1,500}\))?\s*руб(?:\.|лей|ля)?\s*,?\s*(\d{1,2})\s*коп(?:\.|еек|ейки|ейка)?/giu)) {
+    const prefix = text.slice(0, match.index).split(/[;\t]/u).pop() || "";
+    const marker = label.exec(prefix.replace(/[()]/gu, " "));
+    if (!marker || /\d/u.test(prefix.replace(/[()]/gu, " ").slice(marker.index + marker[0].length))) continue;
+    const amount = `${match[1].replace(/\s/gu, "")}.${match[2].padStart(2, "0")}`;
+    if (Number(amount) <= 1e12) results.push(amount);
+  }
+  return results;
+}
 function labeledAmounts(unit: SourceUnit, label: RegExp, allowScalarContext = false): string[] {
   const text = unit.text.replace(/[()]/gu, " ");
   const missing = /не\s+(?:указан[аоы]?|определ[её]н[аоы]?|извест[а-я]*)/iu;
   if (foreignCurrency.test(text) || unitPriceContext.test(text) || label.test(text) && missing.test(text)) return [];
+  const split = splitRubleAmounts(unit.text, label);
+  if (split.length) return split;
+  if (/руб(?:\.|лей|ля)?[^;\t\n]{0,50}\d+\s*коп/iu.test(text)) return [];
   const matches = [...text.matchAll(/\d+(?:[ \u00a0\u202f]\d{3})*(?:[.,]\d+)?\s*(?:руб(?:\.|лей|ля)?|₽|\bRUB\b)/giu)];
   const amounts = matches.flatMap((match, index) => {
     const prefix = text.slice(index ? (matches[index - 1].index || 0) + matches[index - 1][0].length : 0, match.index).split(/[;\t]/u).pop() || "";
@@ -319,9 +422,22 @@ function fieldStatus(item: IntelligenceItem, field: string, value: IntelligenceF
   const values = strings(value), normalizedValues = values.map(normalize); const selectedRole = expectedRole(item.destination, field);
   if (values.some((entry) => placeholders.test(normalize(entry)) || genericPlaceholders.test(normalize(entry)))) return { itemId: item.id, field, status: "placeholder", message: "Это заглушка отсутствующих сведений, а не подтверждённый факт. Укажите фактическое значение или исключите поле.", evidence: [] };
   if ((field === "name" || field === "title") && normalizedValues.some((entry) => index.sourceNames.has(entry))) return { itemId: item.id, field, status: "placeholder", message: "Имя файла не подтверждает название закупки или карточки. Укажите название по содержанию.", evidence: [] };
+  if (item.destination === "proposals" && field === "lineDescriptions") {
+    const descriptions = values.filter((entry) => entry.trim());
+    const proofs = descriptions.map((description) => {
+      const literalDescription = literalQuote(description);
+      const candidates = candidatesFor(description, index), keys = new Set(candidates.map((unit) => unit.fragmentKey));
+      const hasTokens = /[\p{L}\d+_-]{3,}/u.test(normalize(description));
+      const fragments = keys.size ? index.literalFragments.filter((fragment) => keys.has(fragment.key)) : hasTokens ? [] : index.literalFragments;
+      if (fragments.length > maxCandidateUnits) index.limited = true;
+      return { description, match: fragments.slice(0, maxCandidateUnits).find((fragment) => fragment.text.includes(literalDescription)) };
+    });
+    const confirmed = proofs.every((proof) => proof.match);
+    return { itemId: item.id, field, status: confirmed ? "confirmed" : "unverified", message: confirmed ? "Каждое непустое описание дословно найдено в одном выбранном фрагменте. Это не подтверждает соответствие описания конкретной SKU или полноту комплектации." : "Полное дословное описание не найдено в одном выбранном фрагменте. Не объединяйте части разных страниц, листов или источников без проверки.", evidence: proofs.filter((proof) => proof.match).slice(0, 3).map((proof) => excerpt(proof.match!.unit, proof.description)) };
+  }
   const candidateUnits = [...new Set(values.flatMap((entry) => candidatesFor(typeof value === "number" ? value : entry, index)))];
   if (candidateUnits.length > maxCandidateUnits) index.limited = true;
-  const matches = candidateUnits.slice(0, maxCandidateUnits).filter((unit) => values.some((entry, position) => typeof value === "number" ? unit.numbers.some((number) => Number(number) === value) : matchesUnit(unit, entry, normalizedValues[position])));
+  const matches = candidateUnits.slice(0, maxCandidateUnits).filter((unit) => values.some((entry, position) => typeof value === "number" ? [...unit.numbers, ...(field === "nmc" ? unit.nmcAmounts : [])].some((number) => Number(number) === value) : matchesUnit(unit, entry, normalizedValues[position])));
   if (item.destination === "counterparties" && field === "name") {
     const names = explicitLegalNames(units), full = names.filter((entry) => entry.kind === "full"), correct = full.filter((entry) => normalizedValues.includes(entry.value));
     if (correct.length) return { itemId: item.id, field, status: "confirmed", message: "Название совпадает с явно указанным полным наименованием в источнике.", evidence: correct.slice(0, 3).map((entry) => excerpt(entry.unit)) };
@@ -340,8 +456,8 @@ function fieldStatus(item: IntelligenceItem, field: string, value: IntelligenceF
     return { itemId: item.id, field, status: platforms.length ? "confirmed" : "unverified", message: platforms.length ? "Название площадки найдено в контексте площадки или её адреса." : "Выбранные источники не подтверждают название торговой площадки.", evidence: platforms.slice(0, 3).map((unit) => excerpt(unit)) };
   }
   if (field === "nmc" || field === "amount" || field === "ourShareAmount") {
-    const contextual = matches.filter((unit) => (field === "nmc" ? labeledAmounts(unit, nmcLabel, true) : field === "ourShareAmount" ? labeledAmounts(unit, shareLabel) : overallAmounts(unit)).some((amount) => typeof value === "number" && sameNumber(amount, String(value))));
-    if (contextual.length && (typeof value !== "number" || value !== 0 || /(?:нмц|начальн[а-я\s]+цен)[^\n]{0,60}\b0(?:[.,]00)?\b/iu.test(contextual[0].text))) return { itemId: item.id, field, status: "confirmed", message: "Число найдено в контексте общей цены. Проверьте валюту и то, что это итог, а не цена единицы.", evidence: contextual.slice(0, 3).map((unit) => excerpt(unit)) };
+    const contextual = matches.filter((unit) => (field === "nmc" ? [...unit.nmcAmounts, ...labeledAmounts(unit, nmcLabel, true)] : field === "ourShareAmount" ? labeledAmounts(unit, shareLabel) : overallAmounts(unit)).some((amount) => typeof value === "number" && sameNumber(amount, String(value))));
+    if (contextual.length && (typeof value !== "number" || value !== 0 || /(?:нмц|начальн[а-я\s]+цен)[^\n]{0,60}\b0(?:[.,]00)?\b/iu.test(contextual[0].text))) return { itemId: item.id, field, status: "confirmed", message: "Число найдено в контексте общей цены. Проверьте валюту и то, что это итог, а не цена единицы.", evidence: contextual.slice(0, 3).flatMap((unit) => [excerpt(unit), ...(field === "nmc" ? unit.nmcHeaders : [])]).slice(0, 4) };
     return { itemId: item.id, field, status: matches.length ? "conflict" : "unverified", message: field === "ourShareAmount" ? "Общая цена договора не подтверждает нашу долю. Нужна явно указанная стоимость нашей доли / наших работ; процент нельзя подменять общей суммой." : "Цена не подтверждена как итог соответствующего договора / закупки. Цена строки, рыночная котировка или ноль в шаблоне не устанавливают НМЦ; для НМЦ требуется её явное обозначение.", evidence: matches.slice(0, 3).map((unit) => excerpt(unit)) };
   }
   if (expectedDateEvents[field] && typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/u.test(value)) {
@@ -407,15 +523,15 @@ function requirementFacts(units: SourceUnit[]): { facts: SourceFact[]; limited: 
       const certificate = certificates[index][0], segment = certificateSegment(unit.text, certificates, index);
       facts.push({ category: "certificate", label: segment.text, unit, anchors: [normalize(certificate)], numbers: segment.count ? [segment.count] : [], token: certificate, qualifiers: requirementQualifiers(segment.text), uncertain: segment.uncertain });
     }
-    const required = obligationPattern.test(unit.text) || /(?:документы\s+заявки|состав\s+заявки|перечень\s+документов)/iu.test(unit.context) || /^\d{1,3}[.)]\s+/u.test(unit.text) && documentPattern.test(unit.text);
+    const required = obligationPattern.test(unit.text) || /(?:документы\s+заявки|состав\s+заявки|перечень\s+документов)/iu.test(unit.context) || withoutListIndex(unit.text) !== unit.text && documentPattern.test(unit.text);
     if (required && documentPattern.test(unit.text) && !certificates.length && !placeholders.test(normalize(unit.text))) {
       const activity = /(?:подпункт(?:ами|ы|ов|ах)?|пункт(?:ами|ы|ов|ах)?|пп\.?|вид(?:ы|ов)\s+работ)\s*[:—-]?\s*([^.;\n]{1,100})/iu.exec(unit.text);
       const letters = activity ? [...activity[1].matchAll(/(?:^|[\s,\/«"'(])([а-я])(?=[\s,\/»"')]|$)/giu)].map((match) => match[1]).filter((letter) => !/^и$/iu.test(letter)) : [];
-      facts.push({ category: "document", label: unit.text, unit, anchors: words(unit.text).slice(0, 14), numbers: numberTokens(unit.text), extra: /фстэк|тзки/iu.test(unit.text) ? [...new Set(letters)] : [], qualifiers: requirementQualifiers(unit.text) });
+      facts.push({ category: "document", label: unit.text, unit, anchors: words(unit.text).slice(0, 14), numbers: businessNumbers(unit.text), extra: /фстэк|тзки/iu.test(unit.text) ? [...new Set(letters)] : [], qualifiers: requirementQualifiers(unit.text) });
     }
-    if ((obligationPattern.test(unit.text) || tableQuantity) && /\d/u.test(unit.text) && !ignoredNumericContext.test(unit.text) && !certificates.length && !documentPattern.test(unit.text) && !moneyContext.test(unit.text) && !/\b\d{2}[./]\d{2}[./]\d{4}|\b\d{4}-\d{2}-\d{2}/u.test(unit.text)) facts.push({ category: "quantity", label: unit.text, unit, anchors: words(unit.text).slice(0, 14), numbers: tableQuantity ? [columns[columns.length - 1].replace(",", ".")] : numberTokens(unit.text), qualifiers: requirementQualifiers(unit.text) });
+    if ((obligationPattern.test(unit.text) || tableQuantity) && /\d/u.test(unit.text) && !ignoredNumericContext.test(unit.text) && !certificates.length && !documentPattern.test(unit.text) && !moneyContext.test(unit.text) && !/\b\d{2}[./]\d{2}[./]\d{4}|\b\d{4}-\d{2}-\d{2}/u.test(unit.text)) facts.push({ category: "quantity", label: unit.text, unit, anchors: words(unit.text).slice(0, 14), numbers: tableQuantity ? [columns[columns.length - 1].replace(",", ".")] : businessNumbers(unit.text), qualifiers: requirementQualifiers(unit.text) });
     // An arbitrary supplier's "total" must not become a mandatory tender NMC.
-    for (const amount of labeledAmounts(unit, nmcLabel, true).filter((entry) => Number(entry) > 0)) { if (facts.length >= maxFacts) { limited = true; break; } facts.push({ category: "price", label: `Явная общая цена: ${amount}`, unit, anchors: [], numbers: [amount] }); }
+    for (const amount of [...new Set([...unit.nmcAmounts, ...labeledAmounts(unit, nmcLabel, true)])].filter((entry) => Number(entry) > 0)) { if (facts.length >= maxFacts) { limited = true; break; } facts.push({ category: "price", label: `Явная общая цена: ${Number(amount)}`, unit, anchors: [], numbers: [amount] }); }
   }
   const seen = new Set<string>();
   return { facts: facts.slice(0, maxFacts).filter((fact) => { const key = `${fact.category}:${fact.unit.sourceId}:${normalize(fact.label)}:${fact.token || ""}`; if (seen.has(key)) return false; seen.add(key); return true; }), limited: limited || facts.length > maxFacts };
@@ -438,7 +554,7 @@ function coversFact(text: string, fact: SourceFact): boolean {
   const tokens = words(text).map(stem), anchors = fact.anchors.map(stem);
   const lexical = anchors.length > 0 && anchors.filter((anchor) => tokens.some((token) => token === anchor || (anchor.length >= 5 && token.startsWith(anchor)))).length >= Math.max(1, Math.ceil(anchors.length * .6));
   const letterActivities = (fact.extra || []).every((letter) => new RegExp(`(?:^|[\\s,/«"'(])${letter}(?=[\\s,/»"')]|$)`, "iu").test(text));
-  return lexical && letterActivities && fact.numbers.every((number) => numberTokens(text).some((value) => sameNumber(value, number))) && conditionalPatterns.every((pattern) => !pattern.test(fact.unit.text) || pattern.test(text));
+  return lexical && letterActivities && fact.numbers.every((number) => businessNumbers(text).some((value) => sameNumber(value, number))) && conditionalPatterns.every((pattern) => !pattern.test(fact.unit.text) || pattern.test(text));
 }
 function targetItems(items: readonly IntelligenceItem[], destination: IntelligenceDestination, sourceId: string): IntelligenceItem[] {
   const candidates = items.filter((item) => item.destination === destination);
@@ -512,7 +628,7 @@ export function auditIntelligenceResult(items: readonly IntelligenceItem[], sour
       const candidates = source ? [...quoteGroups.values()].filter((group) => group.unit.sourceId === source.id && (!claim.fragmentId || group.unit.fragmentId === claim.fragmentId)) : [];
       const quote = literalQuote(claim.quote), quoted = candidates.filter((group) => quote && group.text.includes(quote)).map((group) => group.unit);
       if (!claim.quote.trim() || !quoted.length) report.findings.push(finding(item, "invalid-evidence-quote", "blocking", "Указанная моделью цитата или фрагмент не найдены среди выбранных материалов. Эта ссылка не подтверждает поле.", [], claim.field));
-      else if (!strings(item.fields[claim.field]).some((value) => includesPhrase(claim.quote, value) || (typeof item.fields[claim.field] === "number" && hasNumber(claim.quote, item.fields[claim.field] as number)))) report.findings.push(finding(item, "evidence-does-not-support-value", "blocking", "Цитата есть в источнике, но не содержит заявленное значение поля. Проверьте значение и ссылку.", quoted.slice(0, 2).map((unit) => excerpt(unit, claim.quote)), claim.field));
+      else if (!quoteSupportsValue(item, claim.field, claim.quote)) report.findings.push(finding(item, "evidence-does-not-support-value", "blocking", "Цитата есть в источнике, но не содержит заявленное значение поля. Проверьте значение и ссылку.", quoted.slice(0, 2).map((unit) => excerpt(unit, claim.quote)), claim.field));
     }
     for (const source of sources) {
       if (report.findings.length >= maxFindings) { limited = true; break; }
@@ -527,17 +643,17 @@ export function auditIntelligenceResult(items: readonly IntelligenceItem[], sour
     if (report.coverage.length >= maxCoverage || report.findings.length >= maxFindings) { limited = true; break; }
     const candidates = targetItems(items, "procurement", fact.unit.sourceId); if (!candidates.length) continue;
     const matched = candidates.filter((item) => fact.category === "price" ? item.selectedFields.includes("nmc") && typeof item.fields.nmc === "number" && Number(item.fields.nmc) === Number(fact.numbers[0]) : outputEntries(item, ["requirements", "licenses", "notes"]).some((entry) => coversFact(entry, fact)));
-    const check: CoverageCheck = { id: `coverage-${fingerprint({ source: fact.unit.sourceId, quote: fact.label, category: fact.category, token: fact.token })}`, category: fact.category, status: fact.uncertain ? "uncertain" : matched.length ? "covered" : "missing", label: fact.label, evidence: excerpt(fact.unit), itemIds: candidates.map((item) => item.id), matchedItemIds: matched.map((item) => item.id) };
+    const check: CoverageCheck = { id: `coverage-${fingerprint({ source: fact.unit.sourceId, quote: fact.label, category: fact.category, token: fact.token })}`, category: fact.category, status: fact.uncertain ? "uncertain" : matched.length ? "covered" : "missing", label: fact.label, evidence: excerpt(fact.unit), itemIds: candidates.map((item) => item.id), matchedItemIds: matched.map((item) => item.id), ...(fact.category === "price" && fact.unit.nmcHeaders.length ? { supportingEvidence: fact.unit.nmcHeaders } : {}) };
     report.coverage.push(check);
     if (!matched.length) for (const item of candidates) { if (report.findings.length >= maxFindings) { limited = true; break; } report.findings.push(finding(item, `missing-${fact.category}`, "blocking", fact.category === "price" ? "В выбранном источнике есть явная общая цена, но она не отражена в выбранной НМЦ. Проверьте итог и валюту." : "Обязательное условие из выбранного текста не найдено с его числами и оговорками в переносимых требованиях. Добавьте точное условие или подтвердите его неприменимость.", [check.evidence], fact.category === "price" && meaningful(item.fields.nmc) ? "nmc" : undefined)); }
   }
   for (const date of dates.filter((entry) => entry.event === "submission-end" && entry.time)) {
     if (report.coverage.length >= maxCoverage || report.findings.length >= maxFindings) { limited = true; break; }
     const candidates = targetItems(items, "procurement", date.unit.sourceId); if (!candidates.length) continue;
-    const matched = candidates.filter((item) => item.selectedFields.includes("submissionDeadline") && item.fields.submissionDeadline === date.iso && outputEntries(item, ["notes"]).some((note) => (note.match(/(?<!\d)\d{1,2}:\d{2}(?::\d{2})?(?![\d:])/gu) || []).some((time) => time === date.time) && (!date.timezone || (note.match(/(?<![\p{L}\d])(?:МСК|MSK|UTC(?:[+-]\d{1,2}(?::\d{2})?)?|GMT(?:[+-]\d{1,2})?|[+-]\d{2}:\d{2})(?![\p{L}\d:+-])/giu) || []).some((zone) => normalize(zone) === normalize(date.timezone!)))));
-    const check: CoverageCheck = { id: `coverage-${fingerprint({ source: date.unit.sourceId, date: date.iso, time: date.time, timezone: date.timezone })}`, category: "deadline-time", status: matched.length ? "covered" : "missing", label: `Подача: ${date.iso} ${date.time}${date.timezone ? ` ${date.timezone}` : ""}`, evidence: excerpt(date.unit, date.quote), itemIds: candidates.map((item) => item.id), matchedItemIds: matched.map((item) => item.id) };
+    const matched = candidates.filter((item) => !date.timezoneAmbiguous && item.selectedFields.includes("submissionDeadline") && item.fields.submissionDeadline === date.iso && outputEntries(item, ["notes"]).some((note) => (note.match(/(?<!\d)\d{1,2}:\d{2}(?::\d{2})?(?![\d:])/gu) || []).some((time) => time === date.time) && (!date.timezone || timezoneCodes(note).some((zone) => canonicalTimezone(zone) === canonicalTimezone(date.timezone!)))));
+    const check: CoverageCheck = { id: `coverage-${fingerprint({ source: date.unit.sourceId, date: date.iso, time: date.time, timezone: date.timezone, timezoneAmbiguous: date.timezoneAmbiguous })}`, category: "deadline-time", status: date.timezoneAmbiguous ? "uncertain" : matched.length ? "covered" : "missing", label: `Подача: ${date.iso} ${date.time}${date.timezone ? ` ${date.timezone}` : ""}${date.timezoneAmbiguous ? " — часовой пояс требует уточнения" : ""}`, evidence: excerpt(date.unit, date.quote), itemIds: candidates.map((item) => item.id), matchedItemIds: matched.map((item) => item.id), ...(date.timezoneEvidence?.length ? { supportingEvidence: date.timezoneEvidence } : {}) };
     report.coverage.push(check);
-    if (!matched.length) for (const item of candidates) { if (report.findings.length >= maxFindings) { limited = true; break; } report.findings.push(finding(item, "missing-deadline-time", "blocking", "Источник указывает время подачи и, возможно, часовой пояс. Одна дата не сохраняет это условие: добавьте время и указанный пояс в переносимые примечания.", [check.evidence])); }
+    if (!matched.length) for (const item of candidates) { if (report.findings.length >= maxFindings) { limited = true; break; } report.findings.push(finding(item, "missing-deadline-time", "blocking", date.timezoneAmbiguous ? "Источник содержит противоречивые общие часовые пояса. Уточните пояс срока подачи по документу; автоматический выбор не выполнен." : "Источник указывает время подачи и, возможно, часовой пояс. Одна дата не сохраняет это условие: добавьте время и указанный пояс в переносимые примечания.", [check.evidence, ...(check.supportingEvidence || [])])); }
   }
   const positions = skuFacts(units), sku = positions.facts; limited ||= positions.limited;
   for (const fact of sku) {

@@ -54,6 +54,25 @@ function loadProfiles(): ConnectionProfile[] {
 }
 function bytes(value: string) { return new TextEncoder().encode(value).byteLength; }
 function errorMessage(reason: unknown) { return reason instanceof Error ? reason.message : String(reason); }
+function coverageTextKey(value: string) {
+  // Only presentation changes are equivalent. Keep every business number,
+  // qualifier and unit; a list's leading "8." is not part of its condition.
+  return value.normalize("NFKC").trim().replace(/^(?:\d{1,3}(?:\.\d{1,3}){0,3}[.)]|[•▪●])\s+/u, "")
+    .toLocaleLowerCase("ru").replace(/ё/gu, "е").replace(/[–—]/gu, "-").replace(/\s+/gu, " ").replace(/[.;,]+$/u, "").trim();
+}
+function noteContainsCoverageText(note: string, quote: string) {
+  // Notes keep literal proof, unlike an equivalent requirements entry. Do not
+  // suppress a genuine quote merely because a manual paraphrase looks similar.
+  const haystack = note.replace(/\s+/gu, " ").trim(), needle = quote.replace(/\s+/gu, " ").trim();
+  if (!needle) return false;
+  let at = haystack.indexOf(needle);
+  while (at !== -1) {
+    const before = haystack[at - 1] || "", after = haystack[at + needle.length] || "";
+    if (!/[\p{L}\p{N}]/u.test(before) && !/[\p{L}\p{N}]/u.test(after)) return true;
+    at = haystack.indexOf(needle, at + 1);
+  }
+  return false;
+}
 
 export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer, onSettings }: {
   active?: boolean;
@@ -94,6 +113,7 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
   const auditItems = useMemo(() => { const next = items.filter((item) => !manualItemIds.includes(item.id)); const previous = previousAuditItems.current; if (next.length === previous.length && next.every((item, index) => item === previous[index])) return previous; previousAuditItems.current = next; return next; }, [items, manualItemIds]);
   const evidenceReady = Boolean(evidenceState && evidenceState.items === auditItems && evidenceState.sources === resultSources);
   const evidenceReport = evidenceReady && evidenceState ? evidenceState.report : emptyEvidenceReport();
+  const manualReviewCount = items.reduce((total, item) => total + new Set(reviewedFindings[item.id] || []).size, 0);
   const evidenceCurrent = useRef({ evidenceState, auditItems, resultSources, reviewedFindings, manualItemIds });
   evidenceCurrent.current = { evidenceState, auditItems, resultSources, reviewedFindings, manualItemIds };
   const [openedItems, setOpenedItems] = useState<string[]>([]);
@@ -324,15 +344,39 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
   const retryAudit = () => { evidenceCurrent.current = { ...evidenceCurrent.current, evidenceState: null }; setEvidenceState(null); setAuditAttempt((previous) => previous + 1); };
   const evidenceQuotes = (quotes: EvidenceExcerpt[]) => quotes.length ? <details className="iw-evidence-quotes"><summary>Цитаты и расположение ({quotes.length})</summary>{quotes.map((quote, index) => <figure key={`${quote.sourceId}:${quote.fragmentId || ""}:${index}`}><figcaption>{quote.sourceName} · {quote.locator}</figcaption><blockquote>{quote.quote}</blockquote></figure>)}</details> : <p className="help-text">Подтверждающая цитата в выбранных источниках не найдена.</p>;
   const addCoverageText = (item: IntelligenceItem, check: CoverageCheck) => {
+    // A retained callback may run twice or after a manual edit. Never rebuild
+    // the field from the older card captured by that callback.
+    const current = itemsRef.current.find((entry) => entry.id === item.id); if (!current) return;
     const quote = check.evidence.quote.trim(); if (!quote) return;
     const field = check.category === "deadline-time" ? "notes" : "requirements";
-    if (field === "requirements" && Array.from(quote).length > 2000) { setError("Условие длиннее 2000 символов. Разделите его на отдельные точные пункты в поле требований."); return; }
-    const previous = item.fields[field];
-    const next: IntelligenceFieldValue = field === "notes" ? [typeof previous === "string" ? previous : "", quote].filter(Boolean).join("\n") : [...new Set([...(Array.isArray(previous) ? previous : []), quote])];
+    const previous = current.fields[field];
+    if (previous !== undefined && (field === "notes" ? typeof previous !== "string" : !Array.isArray(previous))) { setError("Сначала исправьте формат поля, в которое добавляется условие. Исходное значение сохранено."); return; }
+    const excerpts = [check.evidence, ...(check.supportingEvidence || [])].filter((entry) => entry.quote.trim());
+    let next: IntelligenceFieldValue;
+    let added = false;
+    if (field === "notes") {
+      let note = typeof previous === "string" ? previous : "";
+      const append = (value: string) => { note = [note, value].filter(Boolean).join("\n"); added = true; };
+      if (!noteContainsCoverageText(note, quote)) append(check.label.trim() ? `${check.label.trim()} — ${quote}` : quote);
+      else if (check.status === "uncertain" && check.label.trim() && !noteContainsCoverageText(note, check.label)) append(check.label.trim());
+      // A source-wide MSK declaration is a separate genuine quote. Keep it in
+      // the note as well as in provenance; do not invent a zone from locale.
+      for (const supporting of excerpts.slice(1)) if (!noteContainsCoverageText(note, supporting.quote)) append(supporting.quote.trim());
+      next = note;
+    } else {
+      const requirements = Array.isArray(previous) ? previous : [];
+      const present = requirements.some((entry) => coverageTextKey(entry) === coverageTextKey(quote));
+      if (!present && Array.from(quote).length > 2000) { setError("Условие длиннее 2000 символов. Разделите его на отдельные точные пункты в поле требований."); return; }
+      next = present ? requirements : [...requirements, quote]; added = !present;
+    }
     if (typeof next === "string" && Array.from(next).length > 20000) { setError("Примечания превышают 20 000 символов. Добавьте нужный фрагмент вручную."); return; }
     if (Array.isArray(next) && next.length > 100) { setError("В карточке допускается не более 100 требований."); return; }
-    editItem(item.id, { fields: { ...item.fields, [field]: next }, selectedFields: [...new Set([...item.selectedFields, field])], sourceIds: [...new Set([...item.sourceIds, check.evidence.sourceId])], evidence: [...(item.evidence || []).filter((entry) => !(entry.field === field && entry.sourceId === check.evidence.sourceId && entry.quote === quote)), { field, sourceId: check.evidence.sourceId, fragmentId: check.evidence.fragmentId, quote }] });
-    setNotice("Точный текст добавлен из выбранного источника. Проверьте его применимость; локальная проверка запущена заново.");
+    const evidence = [...(current.evidence || [])];
+    for (const entry of excerpts) if (!evidence.some((claim) => claim.field === field && claim.sourceId === entry.sourceId && claim.fragmentId === entry.fragmentId && claim.quote === entry.quote.trim())) evidence.push({ field, sourceId: entry.sourceId, fragmentId: entry.fragmentId, quote: entry.quote.trim() });
+    const sourceIds = [...new Set([...current.sourceIds, ...excerpts.map((entry) => entry.sourceId)])];
+    const changed = added || !current.selectedFields.includes(field) || sourceIds.length !== current.sourceIds.length || evidence.length !== (current.evidence || []).length;
+    if (changed) editItem(current.id, { fields: { ...current.fields, [field]: next }, selectedFields: [...new Set([...current.selectedFields, field])], sourceIds, evidence });
+    setNotice(added ? "Точный текст и подтверждающий контекст добавлены из выбранного источника. Проверьте применимость; локальная проверка запущена заново." : "Эквивалентное условие уже есть — повторная строка не добавлена. Связь с источником проверена.");
   };
   const proposalPositions = (item: IntelligenceItem, itemIndex: number) => {
     const titles = Array.isArray(item.fields.lines) ? item.fields.lines : [];
@@ -381,6 +425,7 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
     {error && <div className="notice error" role="alert">{error}</div>}{notice && <div className="notice success" role="status">{notice}</div>}{emptyWarning && <div className="notice warning" role="status">{emptyWarning}</div>}
     <div className="iw-workspace-grid">
       <section className="surface iw-sources"><div className="iw-section-heading"><span className="iw-step">1</span><div><h3>Источники</h3><p>В модель отправятся только отмеченные тексты.</p></div></div>
+        {manualReviewCount > 0 && <div className="notice warning" role="status" aria-label="Предупреждение о сбросе подтверждений источников">Ручных подтверждений: {manualReviewCount}. Изменение состава, выбора, листов или текста источников сбросит их все. Перед переносом потребуется повторная сверка; автоматически подтверждения не восстанавливаются.</div>}
         <button type="button" className="secondary iw-add-document" disabled={extracting || network.phase !== "connected"} onClick={() => void addDocument()}><ToolIcon name="folder" />{extracting ? "Извлекаем текст…" : "Добавить PDF, DOCX или XLSX"}</button>
         {extracting && <div className="iw-progress" role="status"><span className="iw-spinner" aria-hidden="true" />Читаем документ. Это может занять время.<button type="button" className="secondary" onClick={() => { extractionEpoch.current++; extractionPending.current = null; setExtracting(false); setNotice("Чтение отменено для этой задачи. Поздний результат не будет добавлен."); }}>Отмена</button></div>}
         <div className="iw-text-source"><label>Название источника<input id="iw-source-name" value={sourceName} maxLength={200} placeholder="Например: Техническое задание" onChange={(event) => setSourceName(event.target.value)} /></label><label>Текст<textarea id="iw-source-text" rows={5} maxLength={maxTextBytes} value={sourceText} placeholder="Вставьте текст документа, письма или заметки" onChange={(event) => { if (bytes(event.target.value) > maxTextBytes) setError("Текст одного источника не должен превышать 2 МБ."); else setSourceText(event.target.value); }} /></label><button type="button" className="secondary" disabled={!sourceText.trim() || sources.length >= maxSources} onClick={addTextSource}>Добавить текст</button></div>
@@ -413,14 +458,15 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
         const manual = manualItemIds.includes(item.id);
         const unreviewed = manual ? [] : getBlockingEvidenceFindings(evidenceReport, item, reviewedFindings[item.id] || []);
         const cardFindings = evidenceReport.findings.filter((finding) => finding.itemId === item.id && (!finding.field || item.selectedFields.includes(finding.field)));
+        const manuallyReviewed = cardFindings.filter((finding) => finding.severity === "blocking" && (reviewedFindings[item.id] || []).includes(finding.id)).length;
         const coverage = evidenceReport.coverage.filter((check) => check.itemIds.includes(item.id));
         return <details className="iw-card" key={item.id} open={items.length === 1}>
           <summary><span className="iw-card-index">{index + 1}</span><span><strong>{item.title || destinationLabels[item.destination]}</strong><small>{destinationLabels[item.destination]} · полей: {item.selectedFields.length}{openedItems.includes(item.id) ? " · черновик открыт" : ""}</small></span></summary>
           <div className="iw-card-body"><label>Название результата<input aria-label={`Название результата ${index + 1}`} value={item.title} maxLength={200} onChange={(event) => editItem(item.id, { title: event.target.value })} /></label><p className="help-text">Источники: {sourceNames.join(", ") || "Не указаны"}</p>
-          <details className="iw-cited-sources"><summary>Выбрать источники этой карточки</summary><p className="help-text">Связывайте карточку только с документами, к которым относятся её сведения. Проверка поля использует эти источники; перечень обязательных условий учитывает весь выбранный комплект.</p>{resultSources.length ? resultSources.map((source) => <label key={source.id}><input type="checkbox" aria-label={`Источник ${source.name} для результата ${index + 1}`} checked={item.sourceIds.includes(source.id)} onChange={(event) => editItem(item.id, { sourceIds: event.target.checked ? [...new Set([...item.sourceIds, source.id])] : item.sourceIds.filter((id) => id !== source.id) })} />{source.name}</label>) : <p className="help-text">Исходные документы для этой карточки не заданы.</p>}</details>
+          <details className="iw-cited-sources"><summary>Выбрать источники этой карточки</summary><p className="help-text">Связывайте карточку только с документами, к которым относятся её сведения. Проверка поля использует эти источники; перечень обязательных условий учитывает весь выбранный комплект.</p>{manuallyReviewed > 0 && <p className="notice warning" role="status" aria-label={`Предупреждение о сбросе подтверждений результата ${index + 1}`}>Изменение источников этой карточки сбросит ручные подтверждения: {manuallyReviewed}. Потребуется повторная сверка.</p>}{resultSources.length ? resultSources.map((source) => <label key={source.id}><input type="checkbox" aria-label={`Источник ${source.name} для результата ${index + 1}`} checked={item.sourceIds.includes(source.id)} onChange={(event) => editItem(item.id, { sourceIds: event.target.checked ? [...new Set([...item.sourceIds, source.id])] : item.sourceIds.filter((id) => id !== source.id) })} />{source.name}</label>) : <p className="help-text">Исходные документы для этой карточки не заданы.</p>}</details>
           {manual && <p className="help-text">Ручная карточка: сведения вводите и проверяете самостоятельно. Автоматические выводы ИИ сюда не подставляются.</p>}
-          {!manual && cardFindings.length > 0 && <details className="iw-evidence-findings" open={unreviewed.length > 0}><summary>Проверка результата: {unreviewed.length} замечаний требуют решения</summary>{cardFindings.map((finding) => <div className={`iw-evidence-finding ${finding.severity}`} key={finding.id}><strong>{finding.severity === "blocking" ? "Требует решения" : "Обратите внимание"}</strong><p>{finding.message}</p>{evidenceQuotes(finding.evidence)}{finding.severity === "blocking" && <label className="iw-review-check"><input type="checkbox" aria-label={`Проверено замечание ${finding.id} результата ${index + 1}`} checked={(reviewedFindings[item.id] || []).includes(finding.id)} onChange={(event) => reviewFinding(item.id, finding.id, event.target.checked)} />Я проверил(а) это замечание по источнику и подтверждаю перенос текущих выбранных значений / неприменимость пропущенного условия.</label>}</div>)}</details>}
-          {!manual && coverage.length > 0 && <details className="iw-coverage" open={coverage.some((check) => check.status !== "covered")}><summary>Сопоставление обязательных условий: {coverage.filter((check) => check.status === "covered").length} из {coverage.length} найдено</summary>{coverage.map((check) => <div className={`iw-coverage-row ${check.status}`} key={check.id}><strong>{check.status === "covered" ? "Найдено" : check.status === "missing" ? "Не найдено в переносимых данных" : "Нужна проверка"}</strong><p>{check.label}</p>{evidenceQuotes([check.evidence])}{check.status !== "covered" && ["certificate", "document", "quantity", "deadline-time"].includes(check.category) && <button type="button" className="secondary" onClick={() => addCoverageText(item, check)}>{check.category === "deadline-time" ? "Добавить время в примечания" : "Добавить точное условие в требования"}</button>}</div>)}</details>}
+          {!manual && cardFindings.length > 0 && <details className="iw-evidence-findings" open={unreviewed.length > 0}><summary>Проверка результата: нерешённых — {unreviewed.length} · подтверждено вручную — {manuallyReviewed}</summary>{cardFindings.map((finding) => <div className={`iw-evidence-finding ${finding.severity}`} key={finding.id}><strong>{finding.severity === "blocking" ? (reviewedFindings[item.id] || []).includes(finding.id) ? "Перенос подтверждён вручную" : "Требует решения" : "Обратите внимание"}</strong><p>{finding.message}</p>{evidenceQuotes(finding.evidence)}{finding.severity === "blocking" && <label className="iw-review-check"><input type="checkbox" aria-label={`Проверено замечание ${finding.id} результата ${index + 1}`} checked={(reviewedFindings[item.id] || []).includes(finding.id)} onChange={(event) => reviewFinding(item.id, finding.id, event.target.checked)} />Я проверил(а) это замечание по источнику и подтверждаю перенос текущих выбранных значений / неприменимость пропущенного условия.</label>}</div>)}</details>}
+          {!manual && coverage.length > 0 && <details className="iw-coverage" open={coverage.some((check) => check.status !== "covered")}><summary>Сопоставление обязательных условий: {coverage.filter((check) => check.status === "covered").length} из {coverage.length} найдено</summary>{coverage.map((check) => <div className={`iw-coverage-row ${check.status}`} key={check.id}><strong>{check.status === "covered" ? "Найдено" : check.status === "missing" ? "Не найдено в переносимых данных" : "Нужна проверка"}</strong><p>{check.label}</p>{evidenceQuotes([check.evidence, ...(check.supportingEvidence || [])])}{check.status !== "covered" && ["certificate", "document", "quantity", "deadline-time"].includes(check.category) && <button type="button" className="secondary" onClick={() => addCoverageText(item, check)}>{check.category === "deadline-time" ? "Добавить время в примечания" : "Добавить точное условие в требования"}</button>}</div>)}</details>}
           <div className="iw-field-grid">{fieldDefinitions[item.destination].filter((field) => item.destination !== "proposals" || !["lines", "lineDescriptions"].includes(field.key)).map((field) => {
             const value = item.fields[field.key]; const enabled = item.selectedFields.includes(field.key);
             const setValue = (next: IntelligenceFieldValue) => editItem(item.id, { fields: { ...item.fields, [field.key]: next }, selectedFields: [...new Set([...item.selectedFields, field.key])] });

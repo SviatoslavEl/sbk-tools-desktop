@@ -2,12 +2,12 @@ param([string]$Target = 'x86_64-pc-windows-msvc')
 $ErrorActionPreference = 'Stop'
 # Reuse only the identical worker from a successful installed-build job.
 # Never launch the downloaded installer, application, or bundled extractor.
-$sourceRun = '36847897394'
-$sourceJob = '110323434296'
-$sourceCommit = '35aa57143193c3aaef9b606478607d537622681a'
-$sourceRunNumber = 76
-$sourceArtifact = '11157815132'
-$sourceArtifactDigest = 'sha256:9d1c51dc76edfdbb0b6226f77ab92c06ff1249fdf01370f8b037f7aa2781b5b9'
+$sourceRun = '38712841121'
+$sourceJob = '116349664129'
+$sourceCommit = '8170a402ad96f1785eedf185faf83a01fbcffb9b'
+$sourceRunNumber = 81
+$sourceArtifact = '11965130313'
+$sourceArtifactDigest = 'sha256:1deb6bf8eaec684be9e3bc3c3985802c1dbf2aaeb3a7388fa66fa35715165000'
 $repo = 'SviatoslavEl/sbk-tools-desktop'
 $artifactName = 'SBK-Tools-Windows-x64-Installed'
 $download = $null

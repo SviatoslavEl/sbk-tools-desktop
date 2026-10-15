@@ -257,6 +257,41 @@ describe("unified intelligence workflow", () => {
     expect(text()).toContain("Карточка изменилась"); expect(runtime.workspace).not.toHaveBeenCalled();
     expect(nodes().filter((node) => /^Проверено замечание /.test(node.props["aria-label"] || "")).every((node) => !node.props.checked)).toBe(true);
   });
+  it("distinguishes a manually confirmed risk without hiding its warning or changing its yellow risk class", async () => {
+    await addText(); await paste();
+    const checks = nodes().filter((node) => /^Проверено замечание /.test(node.props["aria-label"] || ""));
+    const label = checks[0].props["aria-label"]!;
+    const findingRow = () => nodes().find((node) => node.props.className?.split(" ").includes("iw-evidence-finding") && nodes(node).some((child) => child.props["aria-label"] === label))!;
+    const originalMessage = text(nodes(findingRow()).find((node) => node.type === "p")!.props.children);
+    expect(text(findingRow())).toContain("Требует решения");
+    await toggle(label, true);
+    expect(text(findingRow())).toContain("Перенос подтверждён вручную"); expect(text(findingRow())).toContain(originalMessage); expect(findingRow().props.className).toContain("blocking");
+    const summary = nodes().find((node) => node.type === "summary" && text(node.props.children).startsWith("Проверка результата:"))!;
+    expect(text(summary)).toContain(`нерешённых — ${checks.length - 1}`); expect(text(summary)).toContain("подтверждено вручную — 1");
+    await toggle(label, false); expect(text(findingRow())).toContain("Требует решения"); expect(findingRow().props.className).toContain("blocking");
+    expect(button("Открыть черновик: Закупки").props.disabled).toBe(true);
+  });
+  it("warns with the reset count before source edits and never restores cleared acknowledgements automatically", async () => {
+    await addText(); await paste(); const count = nodes().filter((node) => /^Проверено замечание /.test(node.props["aria-label"] || "")).length;
+    await reviewVisibleFindings(); const captured = button("Открыть черновик: Закупки").props.onClick!;
+    const warning = labeled("Предупреждение о сбросе подтверждений источников");
+    expect(text(warning)).toContain(`Ручных подтверждений: ${count}`); expect(text(warning)).toContain("потребуется повторная сверка"); expect(warning.props.className).toContain("warning");
+    expect(nodes().indexOf(warning)).toBeLessThan(nodes().indexOf(labeled("Текст источника ТЗ")));
+    await toggle("Отправить источник ТЗ", false); captured(); await flush(); expect(runtime.workspace).not.toHaveBeenCalled(); expect(transfer).not.toHaveBeenCalled();
+    await toggle("Отправить источник ТЗ", true);
+    expect(nodes().filter((node) => /^Проверено замечание /.test(node.props["aria-label"] || "")).every((node) => !node.props.checked)).toBe(true);
+    expect(nodes().some((node) => node.props["aria-label"] === "Предупреждение о сбросе подтверждений источников")).toBe(false);
+    expect(button("Открыть черновик: Закупки").props.disabled).toBe(true);
+  });
+  it("shows a card-specific reset warning before changing its cited sources", async () => {
+    await addText(); await paste(); await reviewVisibleFindings();
+    const count = nodes().filter((node) => /^Проверено замечание /.test(node.props["aria-label"] || "") && node.props.checked).length;
+    expect(text(labeled("Предупреждение о сбросе подтверждений результата 1"))).toContain(`ручные подтверждения: ${count}`);
+    await toggle("Источник ТЗ для результата 1", false);
+    expect(nodes().filter((node) => /^Проверено замечание /.test(node.props["aria-label"] || "")).every((node) => !node.props.checked)).toBe(true);
+    expect(nodes().some((node) => node.props["aria-label"] === "Предупреждение о сбросе подтверждений результата 1")).toBe(false);
+    expect(button("Открыть черновик: Закупки").props.disabled).toBe(true); expect(runtime.workspace).not.toHaveBeenCalled();
+  });
   it("shows worker progress and failure, retries, and ignores terminated worker replies", async () => {
     const workers: Array<{ request?: EvidenceAuditRequest; onmessage?: (event: { data: EvidenceAuditReply }) => void; onerror?: () => void; terminated: boolean }> = [];
     class WorkerStub {
@@ -291,6 +326,79 @@ describe("unified intelligence workflow", () => {
     expect(field("notes").props.value).toBe(""); expect(button("Открыть черновик: Закупки").props.disabled).toBe(true);
     await click("Добавить время в примечания"); expect(field("notes").props.value).toContain("16:00 МСК"); expect(text()).toContain("Сопоставление обязательных условий: 1 из 1 найдено");
     expect(button("Открыть черновик: Закупки").props.disabled).toBe(false);
+  });
+  it("keeps a source-wide MSK declaration and both quote locators when adding deadline time", async () => {
+    const zone = "Время в настоящем документе указано в MSK.";
+    const deadline = "Приём предложений до 21.10.2026, 16:00.";
+    runtime.invoke.mockResolvedValueOnce({ fileName: "Извещение QA.docx", sha256: "a".repeat(64), extractedText: `Закупка QA\n${zone}\n${deadline}`,
+      fragments: [{ id: "intro", locator: "Абзац 1", text: `Закупка QA\n${zone}` }, { id: "deadline", locator: "Абзац 8", text: deadline }], warnings: [] });
+    await click("Добавить PDF, DOCX или XLSX"); await paste([{ destination: "procurement", title: "Закупка QA", fields: { name: "Закупка QA", submissionDeadline: "2026-10-21" } }]);
+    expect(field("notes").props.value).toBe(""); expect(text()).toContain("Абзац 1"); expect(text()).toContain("Абзац 8");
+    const add = button("Добавить время в примечания").props.onClick!; add(); add(); await flush();
+    const note = String(field("notes").props.value); expect(note).toContain("16:00 MSK"); expect(note).toContain(zone); expect(note).toContain(deadline);
+    expect(note.split(zone)).toHaveLength(2); expect(note.split(deadline)).toHaveLength(2);
+    expect(text()).toContain("Сопоставление обязательных условий: 1 из 1 найдено"); expect(text()).not.toContain("Цитата есть в источнике, но не содержит");
+    expect(button("Открыть черновик: Закупки").props.disabled).toBe(false); await click("Открыть черновик: Закупки");
+    const handoff = transfer.mock.calls[0][0]; if (handoff.destination === "procurement") { expect(handoff.data.notes.startsWith(`${note}\n\n`)).toBe(true); expect(handoff.provenance).toContain("Абзац 1"); expect(handoff.provenance).toContain("Абзац 8"); }
+  });
+  it("adds only the missing inherited zone when the original deadline quote is already in notes", async () => {
+    const zone = "Все даты и время в документе указаны в MSK.";
+    const deadline = "Срок подачи заявок: 21.10.2026 16:00.";
+    await addText("Сроки QA", `Закупка QA\n${zone}\n${deadline}`);
+    await paste([{ destination: "procurement", title: "Закупка QA", fields: { name: "Закупка QA", submissionDeadline: "2026-10-21", notes: deadline } }]);
+    await click("Добавить время в примечания");
+    const note = String(field("notes").props.value); expect(note).toBe(`${deadline}\n${zone}`); expect(note.split(deadline)).toHaveLength(2);
+    expect(text()).toContain("Сопоставление обязательных условий: 1 из 1 найдено");
+  });
+  it("keeps a manual paraphrase while adding the literal proof required by its evidence claim", async () => {
+    const zone = "Время в настоящем документе указано в MSK.";
+    const deadline = "Срок подачи заявок: 21.10.2026 16:00.";
+    const manual = "срок подачи заявок: 21.10.2026 16:00";
+    await addText("Сроки QA", `Закупка QA\n${zone}\n${deadline}`);
+    await paste([{ destination: "procurement", title: "Закупка QA", fields: { name: "Закупка QA", submissionDeadline: "2026-10-21", notes: manual } }]);
+    await click("Добавить время в примечания");
+    expect(String(field("notes").props.value).startsWith(`${manual}\n`)).toBe(true); expect(field("notes").props.value).toContain(deadline); expect(field("notes").props.value).toContain(zone);
+    expect(text()).not.toContain("Цитата есть в источнике, но не содержит"); expect(button("Открыть черновик: Закупки").props.disabled).toBe(false);
+  });
+  it("does not borrow MSK from another selected document", async () => {
+    await addText("Пояс другого документа", "Время в настоящем документе указано в MSK.");
+    await addText("Сроки без пояса", "Закупка QA\nСрок подачи заявок: 21.10.2026 16:00.");
+    await paste([{ destination: "procurement", title: "Закупка QA", fields: { name: "Закупка QA", submissionDeadline: "2026-10-21" }, sourceIds: [sourceId("Сроки без пояса")] }]);
+    await click("Добавить время в примечания");
+    expect(field("notes").props.value).toContain("16:00"); expect(field("notes").props.value).not.toMatch(/MSK|МСК|UTC/u);
+  });
+  it("does not choose a timezone between conflicting declarations in one source", async () => {
+    const deadline = "Срок подачи заявок: 21.10.2026 16:00.";
+    await addText("Противоречивые сроки", `Закупка QA\nВремя в настоящем документе указано в MSK.\nВремя в настоящем документе указано в UTC.\n${deadline}`);
+    await paste([{ destination: "procurement", title: "Закупка QA", fields: { name: "Закупка QA", submissionDeadline: "2026-10-21", notes: deadline } }]);
+    await click("Добавить время в примечания");
+    const note = String(field("notes").props.value);
+    expect(note).toContain(deadline); expect(note).toContain("Время в настоящем документе указано в MSK."); expect(note).toContain("Время в настоящем документе указано в UTC.");
+    const label = note.split("\n").find((line) => line.startsWith("Подача:")); expect(label).toContain("часовой пояс требует уточнения"); expect(label).not.toMatch(/MSK|МСК|UTC/u);
+    expect(text()).toContain("Нужна проверка"); expect(button("Открыть черновик: Закупки").props.disabled).toBe(true);
+  });
+  it("does not duplicate a numbered condition or overwrite later manual requirements through a retained action", async () => {
+    const existing = "КНД 1120101 об отсутствии налоговой задолженности";
+    await addText("Документы QA", `Закупка QA\n8. ${existing}.`);
+    await paste([{ destination: "procurement", title: "Закупка QA", fields: { name: "Закупка QA", requirements: [] } }]);
+    const add = button("Добавить точное условие в требования").props.onClick!;
+    field("requirements").props.onChange!({ target: { value: `${existing}\nРучное условие: срок 14 рабочих дней`, checked: false } }); await flush();
+    add(); add(); await flush();
+    expect(field("requirements").props.value).toBe(`${existing}\nРучное условие: срок 14 рабочих дней`);
+    expect(text()).toContain("Эквивалентное условие уже есть"); expect(String(field("requirements").props.value).match(/1120101/gu)).toHaveLength(1);
+    expect(runtime.workspace).not.toHaveBeenCalled(); expect(transfer).not.toHaveBeenCalled();
+  });
+  it("preserves different business counts rather than deduplicating their common certificate name", async () => {
+    await addText("Сертификаты QA", "Закупка QA\n1. OSCP — не менее 5 специалистов.\n2. OSCP — не менее 7 специалистов.");
+    await paste([{ destination: "procurement", title: "Закупка QA", fields: { name: "Закупка QA", requirements: ["OSCP — не менее 5 специалистов"] } }]);
+    await click("Добавить точное условие в требования");
+    expect(String(field("requirements").props.value).split("\n")).toHaveLength(2);
+    expect(field("requirements").props.value).toContain("не менее 5"); expect(field("requirements").props.value).toContain("не менее 7");
+  });
+  it("keeps an invalid original note instead of discarding it when adding source context", async () => {
+    await addText("Сроки QA", "Закупка QA\nСрок подачи заявок: 21.10.2026 16:00 МСК");
+    await paste([{ destination: "procurement", title: "Закупка QA", fields: { name: "Закупка QA", notes: 42 } }]);
+    await click("Добавить время в примечания"); expect(field("notes").props.value).toBe("42"); expect(text()).toContain("Исходное значение сохранено");
   });
   it("links price facts to the selected pricing source instead of borrowing unrelated document values", async () => {
     await addText("Техническое задание", "Поставка оборудования"); const technicalId = sourceId("Техническое задание");
