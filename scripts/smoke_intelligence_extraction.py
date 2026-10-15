@@ -81,7 +81,7 @@ def write_workbook(path: Path, *, missing_hidden: bool = False, bad_shared: bool
         archive.writestr("xl/workbook.xml", f'<workbook xmlns="{SHEET}" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Текущий QA" sheetId="1" state="visible" r:id="r1"/><sheet name="История QA" sheetId="2" state="hidden" r:id="r2"/></sheets></workbook>')
         archive.writestr("xl/_rels/workbook.xml.rels", '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="r1" Target="worksheets/sheet1.xml"/><Relationship Id="r2" Target="worksheets/sheet2.xml"/></Relationships>')
         archive.writestr("xl/styles.xml", f'<styleSheet xmlns="{SHEET}"><cellXfs><xf numFmtId="0"/><xf numFmtId="14"/><xf numFmtId="9"/></cellXfs></styleSheet>')
-        cells = ('<c r="C9" s="1"><v>46316</v></c><c r="D9" s="2"><v>0.2</v></c><c r="P9"><v>3493894.95</v></c>'
+        cells = ('<c r="C9" s="1"><v>46316</v></c><c r="D9" s="2"><v>0.2</v></c><c r="P9"><v>876543.21</v></c>'
                  if not bad_shared else '<c r="A9" t="s"><v>99</v></c>')
         archive.writestr("xl/worksheets/sheet1.xml", f'<worksheet xmlns="{SHEET}"><sheetData><row r="9">{cells}</row></sheetData></worksheet>')
         archive.writestr("xl/sharedStrings.xml", f'<sst xmlns="{SHEET}"><si><t>SYNTHETIC QA SHARED</t></si></sst>')
@@ -164,7 +164,7 @@ def run_smoke(worker: Path, directory: Path, runtime: Path | None = None) -> dic
     cells = fragment["cells"]
     assert [cell["reference"] for cell in cells] == ["C9", "D9", "P9"]
     assert [cell["valueType"] for cell in cells] == ["date", "percentage", "number"]
-    assert cells[2]["text"] == "3493894.95" and cells[2]["rawValue"] == "3493894.95"
+    assert cells[2]["text"] == "876543.21" and cells[2]["rawValue"] == "876543.21"
     assert all(type(cell["hasFormula"]) is bool for cell in cells)
     hidden = run("xlsx-hidden-explicit", files["xlsx"], includeHiddenSheets=True, selectedSheets=["2"])
     assert [sheet["included"] for sheet in hidden["sheets"]] == [False, True]
