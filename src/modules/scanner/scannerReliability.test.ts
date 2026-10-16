@@ -8,8 +8,13 @@ describe("scanner reliability wiring", () => {
     expect(source).toContain("await openDocumentPath(path)");
     expect(source).toContain("else if (documents.length === 1) void openDocumentPath(documents[0])");
     const open = source.slice(source.indexOf("const openDocumentPath ="), source.indexOf("const chooseBatch ="));
-    expect(open.match(/if \(dirty && !window.confirm/g)).toHaveLength(2);
-    expect(open.indexOf("if (dirty && !window.confirm")).toBeLessThan(open.indexOf('setInputPath(path)'));
+    const replacementGuard = "if (dirty && !replacementConfirmed && !window.confirm";
+    expect(open).toContain(replacementGuard);
+    expect(open).toContain("if (dirty && !window.confirm");
+    expect(open.indexOf(replacementGuard)).toBeLessThan(open.indexOf('setInputPath(path)'));
+    expect(source).toContain("replacementConfirmed = false");
+    expect(source.match(/openDocumentPath\(request\.inputPath, false, true\)/g)).toHaveLength(1);
+    expect(source).toContain("Загрузить документ из окна ИИ для OCR?");
   });
   it("retries the failed operation and never silently reruns completed batch rows", () => {
     expect(source).toContain('setRetryOperation("save")');
@@ -17,6 +22,11 @@ describe("scanner reliability wiring", () => {
     expect(source).toContain('entry.status === "done" || batchCancelled.current');
     expect(source).toContain('outputPolicy: "no-clobber"');
     expect(source).toContain('scanner_plan_outputs');
+  });
+  it("does not attempt a failure-journal write in document or split viewer mode", () => {
+    const document = source.slice(source.indexOf("const processDocument ="), source.indexOf("const cancel ="));
+    expect(document).toContain('if (workspaceAccess.editor) await templates.save(`Ошибка разделения');
+    expect(document).toContain('if (workspaceAccess.editor) await templates.save(`Ошибка ${');
   });
   it("renders final preview separately without burning effects into the editable canvas", () => {
     expect(source).toContain('finalPreview: true, expectedSourceFingerprint: sourceSession.sourceFingerprint');

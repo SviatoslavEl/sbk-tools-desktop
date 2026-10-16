@@ -292,6 +292,88 @@ describe("unified intelligence workflow", () => {
     expect(nodes().some((node) => node.props["aria-label"] === "Предупреждение о сбросе подтверждений результата 1")).toBe(false);
     expect(button("Открыть черновик: Закупки").props.disabled).toBe(true); expect(runtime.workspace).not.toHaveBeenCalled();
   });
+  it("preserves immutable result decisions when unrelated material and future task settings change", async () => {
+    await addText(); await paste(); await reviewVisibleFindings();
+    const decisions = () => nodes().filter((node) => /^Проверено замечание /.test(node.props["aria-label"] || ""));
+    const count = decisions().length; expect(count).toBeGreaterThan(0);
+    await addText("Независимая заметка", "Материал для другой задачи");
+    expect(decisions().filter((node) => node.props.checked)).toHaveLength(count);
+    await toggle("Отправить источник Независимая заметка", false);
+    await editLabeled("Текст источника Независимая заметка", "Изменение независимой заметки");
+    await edit("iw-instruction", "Другая задача для будущего анализа");
+    await click("Кадры");
+    expect(decisions().filter((node) => node.props.checked)).toHaveLength(count);
+    expect(button("Открыть черновик: Закупки").props.disabled).toBe(false);
+    await click("Открыть черновик: Закупки");
+    expect(transfer).toHaveBeenCalledTimes(1);
+    expect(transfer.mock.calls[0][0].provenance).not.toContain("Независимая заметка");
+  });
+  it("revokes decisions immediately for a real evidence text edit and never restores them by undoing it", async () => {
+    await addText(); await paste(); await reviewVisibleFindings();
+    const captured = button("Открыть черновик: Закупки").props.onClick!;
+    const original = String(labeled("Текст источника ТЗ").props.value);
+    labeled("Текст источника ТЗ").props.onChange!({ target: { value: "Реально изменённый исходник", checked: false } });
+    captured(); await flush();
+    expect(runtime.workspace).not.toHaveBeenCalled(); expect(transfer).not.toHaveBeenCalled();
+    await editLabeled("Текст источника ТЗ", original);
+    expect(nodes().filter((node) => /^Проверено замечание /.test(node.props["aria-label"] || "")).every((node) => !node.props.checked)).toBe(true);
+  });
+  it("does not clear decisions for a no-op text update", async () => {
+    await addText(); await paste(); await reviewVisibleFindings();
+    await editLabeled("Текст источника ТЗ", String(labeled("Текст источника ТЗ").props.value));
+    expect(button("Открыть черновик: Закупки").props.disabled).toBe(false);
+  });
+  it("replaces an earlier green success with the failed file import and names that file", async () => {
+    await addText("Сохранённый материал", "Полезная заметка");
+    expect(text()).toContain("Текст добавлен");
+    runtime.invoke.mockResolvedValueOnce({ fileName: "Скан без текста.pdf", extractedText: "", sha256: "a", fragments: [], warnings: [] });
+    await click("Добавить PDF, DOCX или XLSX");
+    expect(text()).toContain("Скан без текста.pdf"); expect(text()).toContain("в документе не найден текст");
+    expect(text()).not.toContain("Текст добавлен"); expect(text()).toContain("Сохранённый материал");
+    expect(nodes().some((node) => node.props.className === "notice success")).toBe(false);
+  });
+  it("returns OCR text to the same task once, retaining its old material without inference or storage writes", async () => {
+    const recognize = vi.fn(); const consumed = vi.fn();
+    render({ ...props, onRecognizeFile: recognize, onOcrReturnConsumed: consumed }); await flush();
+    await addText("Заметка до OCR", "Оставить в задаче");
+    runtime.invoke.mockResolvedValueOnce({ fileName: "Скан.pdf", extractedText: "", sha256: "a", fragments: [], warnings: [] });
+    await click("Добавить PDF, DOCX или XLSX"); await click("Распознать этот файл");
+    const request = recognize.mock.calls[0][0]; expect(request.inputPath).toBe("/qa/source.pdf");
+    runtime.invoke.mockResolvedValueOnce({ fileName: "Скан-ocr.pdf", extractedText: "Распознанный текст", sha256: "b".repeat(64), fragments: [{ id: "p1", locator: "Страница 1", text: "Распознанный текст" }], warnings: ["Проверьте полноту текстового слоя."] });
+    render({ ...props, active: true, ocrReturn: { id: request.id, outputPath: "/qa/source-ocr.pdf", sha256: "b".repeat(64) } }); await flush();
+    expect(runtime.invoke).toHaveBeenCalledTimes(2); expect(runtime.invoke.mock.calls[1][1].config.inputPath).toBe("/qa/source-ocr.pdf");
+    expect(consumed).toHaveBeenCalledTimes(1); expect(text()).toContain("Заметка до OCR"); expect(text()).toContain("Скан-ocr.pdf"); expect(text()).toContain("Проверьте полноту");
+    expect(runtime.analyze).not.toHaveBeenCalled(); expect(runtime.workspace).not.toHaveBeenCalled(); expect(transfer).not.toHaveBeenCalled();
+    render(); await flush(); expect(runtime.invoke).toHaveBeenCalledTimes(2);
+  });
+  it("ignores late OCR results after a new task and ignores foreign request ids", async () => {
+    const recognize = vi.fn(); const consumed = vi.fn(); render({ ...props, onRecognizeFile: recognize, onOcrReturnConsumed: consumed }); await flush();
+    runtime.invoke.mockResolvedValueOnce({ fileName: "Скан.pdf", extractedText: "", fragments: [], warnings: [] });
+    await click("Добавить PDF, DOCX или XLSX"); await click("Распознать этот файл");
+    const request = recognize.mock.calls[0][0];
+    render({ ...props, ocrReturn: { id: "unrelated-request", outputPath: "/qa/unrelated.pdf", sha256: "b".repeat(64) } }); await flush(); expect(runtime.invoke).toHaveBeenCalledTimes(1);
+    await click("Новая задача");
+    render({ ...props, ocrReturn: { id: request.id, outputPath: "/qa/old-ocr.pdf", sha256: "b".repeat(64) } }); await flush();
+    expect(runtime.invoke).toHaveBeenCalledTimes(1); expect(text()).not.toContain("old-ocr");
+  });
+  it("does not read OCR output while file IO is paused", async () => {
+    const recognize = vi.fn(); render({ ...props, onRecognizeFile: recognize }); await flush();
+    runtime.invoke.mockResolvedValueOnce({ fileName: "Скан.pdf", extractedText: "", fragments: [], warnings: [] });
+    await click("Добавить PDF, DOCX или XLSX"); await click("Распознать этот файл");
+    runtime.phase = "disconnected";
+    render({ ...props, ocrReturn: { id: recognize.mock.calls[0][0].id, outputPath: "/qa/output.pdf", sha256: "b".repeat(64) } }); await flush();
+    expect(runtime.invoke).toHaveBeenCalledTimes(1); expect(runtime.analyze).not.toHaveBeenCalled();
+  });
+  it("rejects an OCR file replaced between the scanner return and the extraction snapshot", async () => {
+    const recognize = vi.fn(); render({ ...props, onRecognizeFile: recognize }); await flush();
+    await addText("Неприкосновенный материал", "Предыдущая заметка");
+    runtime.invoke.mockResolvedValueOnce({ fileName: "Скан.pdf", extractedText: "", fragments: [], warnings: [] });
+    await click("Добавить PDF, DOCX или XLSX"); await click("Распознать этот файл");
+    runtime.invoke.mockResolvedValueOnce({ fileName: "Подменённый.pdf", extractedText: "Чужой текст не должен добавиться", sha256: "c".repeat(64), fragments: [], warnings: [] });
+    render({ ...props, ocrReturn: { id: recognize.mock.calls[0][0].id, outputPath: "/qa/output.pdf", sha256: "b".repeat(64) } }); await flush();
+    expect(text()).toContain("Результат OCR изменился"); expect(text()).toContain("Неприкосновенный материал");
+    expect(text()).not.toContain("Подменённый.pdf"); expect(runtime.analyze).not.toHaveBeenCalled();
+  });
   it("shows worker progress and failure, retries, and ignores terminated worker replies", async () => {
     const workers: Array<{ request?: EvidenceAuditRequest; onmessage?: (event: { data: EvidenceAuditReply }) => void; onerror?: () => void; terminated: boolean }> = [];
     class WorkerStub {

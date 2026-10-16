@@ -53,6 +53,17 @@ import { snapshotDifferences, snapshotFieldLabels, snapshotValue } from "./snaps
 import type { ProposalData } from "../proposals/types";
 import { ProcurementProposalSource } from "../proposals/ProcurementProposalSource";
 
+type RequiredProcurementField = "name" | "customer" | "subject";
+
+function blocksProcurementSave(item: ProcurementData, warning: string) {
+  return warning.startsWith("Не заполнены") ||
+    (warning.startsWith("НМЦ") && !(item.status === "Черновик" && item.nmc === 0)) ||
+    warning.startsWith("Срок вопросов") ||
+    warning.startsWith("Ставка НДС") ||
+    warning.startsWith("Некорректно") ||
+    warning.includes("превышает 100");
+}
+
 function snapshot(
   sourceModule: SnapshotLink["sourceModule"],
   record: StoredRecord<unknown>,
@@ -330,6 +341,12 @@ export function ProcurementEditor({
   const activeStage = workflowStage(tab);
   const expertSection = stage2Section(tab);
   const [error, setError] = useState("");
+  const [validationAttempted, setValidationAttempted] = useState(false);
+  const [focusRequest, setFocusRequest] = useState(0);
+  const focusField = useRef<RequiredProcurementField | null>(null);
+  const requiredFieldRefs = useRef<Record<RequiredProcurementField, HTMLInputElement | HTMLTextAreaElement | null>>({ name: null, customer: null, subject: null });
+  const validationSummaryRef = useRef<HTMLDivElement | null>(null);
+  const fieldId = useRef(crypto.randomUUID()).current;
   const [saving, setSaving] = useState(false);
   const saveInFlight = useRef(false);
   const readOnlyRef = useRef(readOnly);
@@ -342,6 +359,27 @@ export function ProcurementEditor({
   const [reduction, setReduction] = useState(1);
   const [rebidPreset, setRebidPreset] = useState<RebidPreset>("comfort");
   const warnings = procurementWarnings(item);
+  const requiredErrors: Record<RequiredProcurementField, string> = {
+    name: item.name.trim() ? "" : "Укажите название закупки.",
+    customer: item.customer.trim() ? "" : "Укажите заказчика.",
+    subject: item.subject.trim() ? "" : "Укажите предмет закупки.",
+  };
+  const fieldErrors = validationAttempted ? requiredErrors : { name: "", customer: "", subject: "" };
+  const blockingWarnings = [
+    ...Object.values(requiredErrors).filter(Boolean),
+    ...warnings.filter((warning) => blocksProcurementSave(item, warning) && !warning.startsWith("Не заполнены")),
+  ];
+  const recommendations = warnings.filter((warning) => !blocksProcurementSave(item, warning)).map((warning) =>
+    warning.startsWith("НМЦ не указана.")
+      ? "НМЦ не указана. Для решения об участии и расчётов нужна цена; в черновике её можно заполнить позже."
+      : warning,
+  );
+  useEffect(() => {
+    if (!focusRequest || readOnlyRef.current || saveInFlight.current) return;
+    const target = focusField.current ? requiredFieldRefs.current[focusField.current] : validationSummaryRef.current;
+    target?.focus();
+    target?.scrollIntoView({ block: "nearest" });
+  }, [focusRequest]);
   const protectedClose = () => { if (!saveInFlight.current) onClose(); };
   const { requestClose: checkClose, confirmation: discardConfirmation } = useUnsavedChanges(dirty, protectedClose);
   const requestClose = () => { if (!saveInFlight.current) checkClose(); };
@@ -364,17 +402,13 @@ export function ProcurementEditor({
   };
   const save = async () => {
     if (readOnlyRef.current || saveInFlight.current) return;
-    const blocking = procurementWarnings(item).filter(
-      (warning) =>
-        warning.startsWith("Не заполнены") ||
-        (warning.startsWith("НМЦ") && !(item.status === "Черновик" && item.nmc === 0)) ||
-        warning.startsWith("Срок вопросов") ||
-        warning.startsWith("Ставка НДС") ||
-        warning.startsWith("Некорректно") ||
-        warning.includes("превышает 100"),
-    );
-    if (blocking.length) {
-      setError("Исправьте отмеченные замечания перед сохранением.");
+    setValidationAttempted(true);
+    if (blockingWarnings.length) {
+      setError("");
+      setSavedMessage("");
+      focusField.current = (["name", "customer", "subject"] as const).find((key) => requiredErrors[key]) || null;
+      if (focusField.current) setTab("main");
+      setFocusRequest((current) => current + 1);
       return;
     }
     saveInFlight.current = true;
@@ -529,11 +563,16 @@ export function ProcurementEditor({
         {readOnly && <p className="notice">Режим просмотра: карточка и выгрузка доступны, изменения запрещены.</p>}
         {error && <div className="notice error" role="alert">{error}</div>}
         {savedMessage && <div className="notice success" role="status">{savedMessage}</div>}
-        {warnings.length > 0 && (
-          <div className="notice warning">
-            {warnings.map((warning) => (
-              <span key={warning}>{warning}</span>
-            ))}
+        {validationAttempted && blockingWarnings.length > 0 && (
+          <div className="notice error procurement-validation-summary" role="alert" aria-label="Ошибки сохранения закупки" tabIndex={-1} ref={validationSummaryRef}>
+            <strong>Нужно исправить перед сохранением</strong>
+            <ul>{blockingWarnings.map((warning) => <li key={warning}>{warning}</li>)}</ul>
+          </div>
+        )}
+        {recommendations.length > 0 && (
+          <div className="notice warning procurement-recommendations" role="note" aria-label="Рекомендации по закупке">
+            <strong>Рекомендации · не блокируют сохранение</strong>
+            <ul>{recommendations.map((warning) => <li key={warning}>{warning}</li>)}</ul>
           </div>
         )}
         <fieldset className="procurement-fields" disabled={saving || (readOnly && tab !== "exports" && tab !== "s2:documents")}>
@@ -541,27 +580,45 @@ export function ProcurementEditor({
           <>
             <h3>Карточка</h3>
             <div className="form-grid">
-              <label className="wide">
+              <label className={`wide${fieldErrors.name ? " procurement-field-invalid" : ""}`}>
                 Название *
                 <input
+                  id={`${fieldId}-name`}
+                  ref={(element) => { requiredFieldRefs.current.name = element; }}
+                  aria-required="true"
+                  aria-invalid={Boolean(fieldErrors.name)}
+                  aria-describedby={fieldErrors.name ? `${fieldId}-name-error` : undefined}
                   value={item.name}
                   onChange={(event) => update("name", event.target.value)}
                 />
+                {fieldErrors.name && <small id={`${fieldId}-name-error`} className="field-error procurement-field-error">{fieldErrors.name}</small>}
               </label>
-              <label className="wide">
+              <label className={`wide${fieldErrors.customer ? " procurement-field-invalid" : ""}`}>
                 Заказчик *
                 <input
+                  id={`${fieldId}-customer`}
+                  ref={(element) => { requiredFieldRefs.current.customer = element; }}
+                  aria-required="true"
+                  aria-invalid={Boolean(fieldErrors.customer)}
+                  aria-describedby={fieldErrors.customer ? `${fieldId}-customer-error` : undefined}
                   value={item.customer}
                   onChange={(event) => update("customer", event.target.value)}
                 />
+                {fieldErrors.customer && <small id={`${fieldId}-customer-error`} className="field-error procurement-field-error">{fieldErrors.customer}</small>}
               </label>
-              <label className="wide">
+              <label className={`wide${fieldErrors.subject ? " procurement-field-invalid" : ""}`}>
                 Предмет *
                 <textarea
+                  id={`${fieldId}-subject`}
+                  ref={(element) => { requiredFieldRefs.current.subject = element; }}
+                  aria-required="true"
+                  aria-invalid={Boolean(fieldErrors.subject)}
+                  aria-describedby={fieldErrors.subject ? `${fieldId}-subject-error` : undefined}
                   rows={3}
                   value={item.subject}
                   onChange={(event) => update("subject", event.target.value)}
                 />
+                {fieldErrors.subject && <small id={`${fieldId}-subject-error`} className="field-error procurement-field-error">{fieldErrors.subject}</small>}
               </label>
               <label>
                 НМЦ

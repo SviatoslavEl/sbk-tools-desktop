@@ -23,7 +23,7 @@ type Role = "supplier" | "customer" | "internal" | "unknown";
 type SourceUnit = EvidenceExcerpt & { text: string; normalizedText: string; normalizedSourceName: string; numbers: string[]; source: IntelligenceSource; sheetState?: IntelligenceFragment["sheetState"]; index: number; fragmentKey: number; context: string; precedingContext: string; role: Role; nmcAmounts: string[]; nmcHeaders: EvidenceExcerpt[] };
 type UnitIndex = { tokens: Map<string, SourceUnit[]>; numbers: Map<string, SourceUnit[]>; phones: Map<string, SourceUnit[]>; sourceNames: Set<string>; literalFragments: Array<{ key: number; unit: SourceUnit; text: string }>; limited: boolean };
 type SourceFact = { category: CoverageCheck["category"]; label: string; unit: SourceUnit; anchors: string[]; numbers: string[]; token?: string; extra?: string[]; qualifiers?: string[]; uncertain?: boolean };
-type DateOccurrence = { iso: string; event: string; time?: string; timezone?: string; timezoneEvidence?: EvidenceExcerpt[]; timezoneAmbiguous?: boolean; unit: SourceUnit; quote: string };
+type DateOccurrence = { iso: string; event: string; time?: string; timezone?: string; timezoneEvidence?: EvidenceExcerpt[]; timezoneAmbiguous?: boolean; lowerBound?: boolean; unit: SourceUnit; quote: string };
 const maxUnits = 5000;
 const maxAuditCharacters = 2 * 1024 * 1024;
 const maxUnitCharacters = 20000;
@@ -286,15 +286,21 @@ const expectedDateEvents: Record<string, string[]> = {
   executionStartDate: ["execution-start"], executionEndDate: ["execution-end"], startDate: ["execution-start"], endDate: ["execution-end"],
   date: ["contract-date"], documentDate: ["proposal-date"], validUntil: ["valid-until"],
 };
-function detectDateEvent(before: string, after: string, context: string): string {
-  if (/поставк|выполнени[а-я\s]+работ/iu.test(context)) {
-    if (/не\s+ранее\s*$/iu.test(before)) return "execution-start";
-    if (/не\s+позднее\s*$/iu.test(before)) return "execution-end";
-  }
+const lowerExecutionBound = /(?:не\s+ранее|не\s+может\s+быть\s+(?:осуществлен[а-я]*|выполнен[а-я]*|начат[а-я]*)\s+ранее)\s*$/iu;
+const upperExecutionBound = /не\s+позднее\s*$/iu;
+// A sentence or table-row boundary ends an event. Dots inside calendar dates
+// are not boundaries; a delivery in the next sentence cannot label a results date.
+function temporalClauses(value: string): string[] { return value.split(/[;!?\n]|\.(?=\s|$)/u); }
+function detectDateEvent(before: string, after: string): string {
   let last = -1; let event = "other";
   for (const [name, pattern] of dateEvents) {
     pattern.lastIndex = 0;
     for (const match of before.matchAll(pattern)) { if ((match.index ?? -1) >= last) { last = match.index ?? -1; event = name; } }
+  }
+  const delivery = [...before.matchAll(/поставк[а-я]*|выполнени[а-я\s]+работ/giu)].pop();
+  if (delivery && (delivery.index ?? -1) >= last) {
+    if (lowerExecutionBound.test(before)) return "execution-start";
+    if (upperExecutionBound.test(before)) return "execution-end";
   }
   if (event !== "other") return event;
   let first = Infinity;
@@ -302,24 +308,51 @@ function detectDateEvent(before: string, after: string, context: string): string
     pattern.lastIndex = 0;
     for (const match of after.matchAll(pattern)) if ((match.index ?? Infinity) < first) { first = match.index ?? Infinity; event = name; }
   }
-  if (event !== "other") return event;
-  if (/поставк|выполнени[а-я\s]+работ/iu.test(context)) {
-    if (/не\s+ранее\s*$/iu.test(before)) return "execution-start";
-    if (/не\s+позднее\s*$/iu.test(before)) return "execution-end";
-  }
-  return "other";
+  return event;
 }
 function timezoneCodes(value: string): string[] {
   return value.match(/(?<![\p{L}\d])(?:МСК|MSK|UTC(?:[+-]\d{1,2}(?::\d{2})?)?|GMT(?:[+-]\d{1,2})?|[+-]\d{2}:\d{2})(?![\p{L}\d:+-])/giu) || [];
 }
-function canonicalTimezone(value: string): string { return /^(?:мск|msk)$/iu.test(value) ? "MSK" : value.toUpperCase(); }
+function canonicalTimezone(value: string): string {
+  if (/^(?:мск|msk)$/iu.test(value)) return "MSK";
+  const match = /^(?:(?:UTC|GMT))?([+-])(\d{1,2})(?::(\d{2}))?$/iu.exec(value);
+  if (match) {
+    const minutes = (Number(match[2]) * 60 + Number(match[3] || 0)) * (match[1] === "-" ? -1 : 1);
+    if (minutes === 180) return "MSK";
+    if (!minutes) return "UTC";
+    return `UTC${minutes < 0 ? "-" : "+"}${Math.floor(Math.abs(minutes) / 60)}:${String(Math.abs(minutes) % 60).padStart(2, "0")}`;
+  }
+  return /^(?:UTC|GMT)$/iu.test(value) ? "UTC" : value.toUpperCase();
+}
+function adjacentTimezones(value: string): string[] {
+  const zones: string[] = []; let rest = value;
+  // Only a zone immediately attached to this time (and optional equivalent
+  // aliases) belongs to the event. A later revision's zone is not a fallback.
+  for (let index = 0; index < 4; index++) {
+    const match = /^\s*(?:[,/]\s*|(?:и|или)\s+)?\(?\s*(МСК|MSK|UTC(?:[+-]\d{1,2}(?::\d{2})?)?|GMT(?:[+-]\d{1,2})?|[+-]\d{2}:\d{2})(?![\p{L}\d:+-])\)?/iu.exec(rest);
+    if (!match) break;
+    zones.push(canonicalTimezone(match[1])); rest = rest.slice(match[0].length);
+  }
+  return [...new Set(zones)];
+}
+function globalTimezoneDeclarations(value: string): Array<{ quote: string; zones: string[] }> {
+  return temporalClauses(value).flatMap((quote) => {
+    const text = normalize(quote);
+    const document = "(?:в\\s+(?:(?:настоящем|данном|этом|всем)\\s+)?документе)";
+    const subject = new RegExp(`^(?:${document}\\s+)?(?:время\\s+${document}|все\\s+даты\\s+и\\s+время(?:\\s+${document})?|все\\s+время(?:\\s+${document})?)(?=\\s+(?:указан[оы]|приведен[оы]|задан[оы]|по|в\\s))`, "u");
+    if (!subject.test(text) || /(?:^|\s)не\s+(?:в\s|указан|приведен|задан)/u.test(text)) return [];
+    const zones = [...new Set(timezoneCodes(quote).map(canonicalTimezone))];
+    return zones.length ? [{ quote: quote.trim(), zones }] : [];
+  });
+}
 function sourceTimezones(units: SourceUnit[]): Map<string, { zones: string[]; evidence: EvidenceExcerpt[] }> {
   const sources = new Map<string, { zones: string[]; evidence: EvidenceExcerpt[] }>();
   for (const unit of units) {
-    if (!/время/iu.test(unit.text) || !/(?:в\s+(?:(?:настоящем|данном|этом|вс[её]м)\s+)?документе|вс[её]\s+время|все\s+даты\s+и\s+время)/iu.test(unit.text) || /(?:^|\s)не\s+(?:в\s|указан|привед[её]н|задан)/iu.test(unit.text)) continue;
-    const zones = timezoneCodes(unit.text).map(canonicalTimezone); if (!zones.length) continue;
+    const declarations = globalTimezoneDeclarations(unit.text); if (!declarations.length) continue;
     const previous = sources.get(unit.sourceId) || { zones: [], evidence: [] };
-    previous.zones = [...new Set([...previous.zones, ...zones])];
+    previous.zones = [...new Set([...previous.zones, ...declarations.flatMap((declaration) => declaration.zones)])];
+    // Canonicalize only the comparison. Provenance keeps the complete literal
+    // row (including punctuation), so copying it never fabricates a quotation.
     if (previous.evidence.length < 3) previous.evidence.push(excerpt(unit));
     sources.set(unit.sourceId, previous);
   }
@@ -328,8 +361,10 @@ function sourceTimezones(units: SourceUnit[]): Map<string, { zones: string[]; ev
 function dateOccurrences(units: SourceUnit[]): { dates: DateOccurrence[]; limited: boolean } {
   const occurrences: DateOccurrence[] = [];
   const commonTimezones = sourceTimezones(units);
+  const proposalHeadings = new Map<number, number>();
+  for (const unit of units) if (/^коммерческое\s+предложение(?:\s*№\s*[\p{L}\d/._-]+)?\s*$/iu.test(unit.text)) proposalHeadings.set(unit.fragmentKey, Math.min(proposalHeadings.get(unit.fragmentKey) ?? Infinity, unit.index));
   for (const unit of units) {
-    const regex = /\b(?:(\d{4})-(\d{2})-(\d{2})|(\d{2})[./](\d{2})[./](\d{4}))(?:[ T,]+(\d{1,2}:\d{2}(?::\d{2})?))?(?:\s*\(?\s*(МСК|MSK|UTC(?:[+-]\d{1,2}(?::\d{2})?)?|GMT(?:[+-]\d{1,2})?|[+-]\d{2}:\d{2})\)?)?/giu;
+    const regex = /\b(?:(\d{4})-(\d{2})-(\d{2})|(\d{2})[./](\d{2})[./](\d{4}))(?:[ T,]+(\d{1,2}:\d{2}(?::\d{2})?))?/giu;
     const matches = unit.text.matchAll(regex); let previousEnd = 0, current = matches.next();
     while (!current.done) {
       if (occurrences.length >= maxDateOccurrences) return { dates: occurrences, limited: true };
@@ -338,10 +373,16 @@ function dateOccurrences(units: SourceUnit[]): { dates: DateOccurrence[]; limite
       const iso = match[1] ? `${match[1]}-${match[2]}-${match[3]}` : `${match[6]}-${match[5]}-${match[4]}`;
       const end = start + match[0].length;
       const beforeRaw = unit.text.slice(Math.max(previousEnd, start - 150), start), afterRaw = unit.text.slice(end, Math.min(next.done ? unit.text.length : next.value.index ?? unit.text.length, end + 100));
-      const beforeClauses = beforeRaw.split(/;/u), before = beforeClauses[beforeClauses.length - 1] || "", after = afterRaw.split(/[;\t]/u)[0];
+      const beforeClauses = temporalClauses(beforeRaw); let before = beforeClauses[beforeClauses.length - 1] || "";
+      const after = temporalClauses(afterRaw)[0].split("\t")[0];
       const date = new Date(`${iso}T00:00:00Z`), parts = match[7]?.split(":").map(Number);
       const valid = Number.isFinite(date.getTime()) && date.toISOString().slice(0, 10) === iso && (!parts || parts[0] <= 23 && parts[1] <= 59 && (parts[2] === undefined || parts[2] <= 59));
-      let event = valid ? detectDateEvent(before, after, unit.context) : "other";
+      let event = valid ? detectDateEvent(before, after) : "other";
+      const prior = occurrences[occurrences.length - 1];
+      if (valid && event === "other" && prior?.unit === unit && /^execution-(?:start|end)$/u.test(prior.event) && beforeClauses.length === 1) {
+        if (lowerExecutionBound.test(before)) event = "execution-start";
+        if (upperExecutionBound.test(before)) event = "execution-end";
+      }
       // PDF text often wraps a label across two rows before its scalar value.
       // Never inherit across a locator or another dated row: unresolved layouts
       // remain unverified instead of borrowing a nearby event from another field.
@@ -352,15 +393,44 @@ function dateOccurrences(units: SourceUnit[]): { dates: DateOccurrence[]; limite
           if (previous.fragmentKey !== unit.fragmentKey || /\d{2}[./]\d{2}[./]\d{4}|\d{4}-\d{2}-\d{2}/u.test(previous.text)) break;
           preceding.unshift(previous.text);
         }
-        event = detectDateEvent(preceding.join(" "), "", unit.context);
+        before = preceding.join(" ");
+        event = detectDateEvent(before, "");
       }
-      const common = !match[8] && match[7] ? commonTimezones.get(unit.sourceId) : undefined;
-      occurrences.push({ iso, event, time: match[7], timezone: match[8] || (common?.zones.length === 1 ? common.zones[0] : undefined), timezoneEvidence: common?.evidence, timezoneAmbiguous: Boolean(common && common.zones.length > 1), unit, quote: unit.text.slice(Math.max(0, start - 100), Math.min(unit.text.length, start + match[0].length + 100)) });
+      if (valid && event === "other" && /^\s*дата\s*[:—-]\s*$/iu.test(before) && (proposalHeadings.get(unit.fragmentKey) ?? Infinity) < unit.index) {
+        const previous = units[unit.index - 1];
+        const previousEvent = previous?.fragmentKey === unit.fragmentKey ? detectDateEvent(previous.text, "") : "other";
+        if (previousEvent === "other" || previousEvent === "proposal-date") event = "proposal-date";
+      }
+      const inlineZones = match[7] ? adjacentTimezones(afterRaw) : [];
+      const common = !inlineZones.length && match[7] ? commonTimezones.get(unit.sourceId) : undefined;
+      const zones = inlineZones.length ? inlineZones : common?.zones || [];
+      occurrences.push({ iso, event, time: match[7], timezone: zones.length === 1 ? zones[0] : undefined, timezoneEvidence: common?.evidence, timezoneAmbiguous: zones.length > 1, lowerBound: event === "execution-start" && lowerExecutionBound.test(before), unit, quote: unit.text.slice(Math.max(0, start - 100), Math.min(unit.text.length, start + match[0].length + 100)) });
       previousEnd = end; current = next;
     }
   }
   return { dates: occurrences, limited: false };
 }
+type NoteTimeOccurrence = { iso?: string; event: string; time: string; zones: string[] };
+function submissionNoteTimes(note: string): NoteTimeOccurrence[] {
+  const records: NoteTimeOccurrence[] = [];
+  const common = [...new Set(globalTimezoneDeclarations(note).flatMap((declaration) => declaration.zones))];
+  for (const clause of temporalClauses(note)) {
+    const matches = [...clause.matchAll(/(?<![\d:+-])\d{1,2}:\d{2}(?::\d{2})?(?![\d:])/gu)]; let previousEnd = 0;
+    for (const match of matches) {
+      if (records.length >= maxDateOccurrences) return records;
+      const start = match.index ?? 0, end = start + match[0].length;
+      const before = clause.slice(previousEnd, start), after = clause.slice(end);
+      let event = detectDateEvent(before, "");
+      if (event === "other" && /(?:^|[^\p{L}])(?:подача|время\s+подачи)(?!\p{L})/iu.test(before)) event = "submission-end";
+      const dates = canonicalQuoteDates(before), hasDate = /\d{4}-\d{2}-\d{2}|\d{2}[./]\d{2}[./]\d{4}/u.test(before);
+      const inline = adjacentTimezones(after);
+      records.push({ event, time: match[0], iso: hasDate ? dates[dates.length - 1] || "invalid" : undefined, zones: inline.length ? inline : common });
+      previousEnd = end;
+    }
+  }
+  return records;
+}
+function sameTime(left: string, right: string): boolean { return [...left.split(":"), "0"].slice(0, 3).map(Number).join(":") === [...right.split(":"), "0"].slice(0, 3).map(Number).join(":"); }
 function roleMessage(role: Role): string { return role === "supplier" ? "поставщика / исполнителя" : role === "customer" ? "заказчика / организатора" : "внутреннего ответственного"; }
 
 function overallAmounts(unit: SourceUnit): string[] {
@@ -463,7 +533,7 @@ function fieldStatus(item: IntelligenceItem, field: string, value: IntelligenceF
   if (expectedDateEvents[field] && typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/u.test(value)) {
     const sameDates = dates.filter((entry) => entry.iso === value);
     const correct = sameDates.filter((entry) => expectedDateEvents[field].includes(entry.event));
-    return { itemId: item.id, field, status: correct.length ? "confirmed" : sameDates.length ? "conflict" : "unverified", message: correct.length ? "Дата найдена рядом с обозначением соответствующего события." : sameDates.length ? "Такая дата есть в источнике, но относится к другому событию или событие не подтверждено. Не подменяйте подачу поставкой, публикацию редакцией или работы подведением итогов." : "В выбранных источниках нет явной даты этого события. Относительная длительность не является календарной датой.", evidence: (correct.length ? correct : sameDates).slice(0, 3).map((entry) => excerpt(entry.unit, entry.quote)) };
+    return { itemId: item.id, field, status: correct.length ? "confirmed" : sameDates.length ? "conflict" : "unverified", message: correct.length ? correct.every((entry) => entry.lowerBound) ? "Указана нижняя допустимая граница поставки / работ (не ранее), а не обещание фактического начала в этот день." : "Дата найдена рядом с обозначением соответствующего события." : sameDates.length ? "Такая дата есть в источнике, но относится к другому событию или событие не подтверждено. Не подменяйте подачу поставкой, публикацию редакцией или работы подведением итогов." : "В выбранных источниках нет явной даты этого события. Относительная длительность не является календарной датой.", evidence: (correct.length ? correct : sameDates).slice(0, 3).map((entry) => excerpt(entry.unit, entry.quote)) };
   }
   if (selectedRole !== "unknown") {
     const role = (unit: SourceUnit) => entityRole(unit, values.find((entry) => matchesUnit(unit, entry)));
@@ -525,7 +595,7 @@ function requirementFacts(units: SourceUnit[]): { facts: SourceFact[]; limited: 
     }
     const required = obligationPattern.test(unit.text) || /(?:документы\s+заявки|состав\s+заявки|перечень\s+документов)/iu.test(unit.context) || withoutListIndex(unit.text) !== unit.text && documentPattern.test(unit.text);
     if (required && documentPattern.test(unit.text) && !certificates.length && !placeholders.test(normalize(unit.text))) {
-      const activity = /(?:подпункт(?:ами|ы|ов|ах)?|пункт(?:ами|ы|ов|ах)?|пп\.?|вид(?:ы|ов)\s+работ)\s*[:—-]?\s*([^.;\n]{1,100})/iu.exec(unit.text);
+      const activity = /(?:(?:подпункт|пункт)(?:ами|ам|ы|ов|ах|у|ом|е|а)?(?!\p{L})|пп\.?|вид(?:ы|ов)\s+работ)\s*[:—-]?\s*([^.;\n]{1,100})/iu.exec(unit.text);
       const letters = activity ? [...activity[1].matchAll(/(?:^|[\s,\/«"'(])([а-я])(?=[\s,\/»"')]|$)/giu)].map((match) => match[1]).filter((letter) => !/^и$/iu.test(letter)) : [];
       facts.push({ category: "document", label: unit.text, unit, anchors: words(unit.text).slice(0, 14), numbers: businessNumbers(unit.text), extra: /фстэк|тзки/iu.test(unit.text) ? [...new Set(letters)] : [], qualifiers: requirementQualifiers(unit.text) });
     }
@@ -647,13 +717,17 @@ export function auditIntelligenceResult(items: readonly IntelligenceItem[], sour
     report.coverage.push(check);
     if (!matched.length) for (const item of candidates) { if (report.findings.length >= maxFindings) { limited = true; break; } report.findings.push(finding(item, `missing-${fact.category}`, "blocking", fact.category === "price" ? "В выбранном источнике есть явная общая цена, но она не отражена в выбранной НМЦ. Проверьте итог и валюту." : "Обязательное условие из выбранного текста не найдено с его числами и оговорками в переносимых требованиях. Добавьте точное условие или подтвердите его неприменимость.", [check.evidence], fact.category === "price" && meaningful(item.fields.nmc) ? "nmc" : undefined)); }
   }
+  const noteTimes = new Map<string, NoteTimeOccurrence[]>();
   for (const date of dates.filter((entry) => entry.event === "submission-end" && entry.time)) {
     if (report.coverage.length >= maxCoverage || report.findings.length >= maxFindings) { limited = true; break; }
     const candidates = targetItems(items, "procurement", date.unit.sourceId); if (!candidates.length) continue;
-    const matched = candidates.filter((item) => !date.timezoneAmbiguous && item.selectedFields.includes("submissionDeadline") && item.fields.submissionDeadline === date.iso && outputEntries(item, ["notes"]).some((note) => (note.match(/(?<!\d)\d{1,2}:\d{2}(?::\d{2})?(?![\d:])/gu) || []).some((time) => time === date.time) && (!date.timezone || timezoneCodes(note).some((zone) => canonicalTimezone(zone) === canonicalTimezone(date.timezone!)))));
+    const matched = candidates.filter((item) => !date.timezoneAmbiguous && item.selectedFields.includes("submissionDeadline") && item.fields.submissionDeadline === date.iso && outputEntries(item, ["notes"]).some((note) => {
+      let records = noteTimes.get(note); if (!records) { records = submissionNoteTimes(note); noteTimes.set(note, records); }
+      return records.some((record) => record.event === "submission-end" && (!record.iso || record.iso === date.iso) && sameTime(record.time, date.time!) && record.zones.length <= 1 && (!date.timezone || record.zones.includes(canonicalTimezone(date.timezone))));
+    }));
     const check: CoverageCheck = { id: `coverage-${fingerprint({ source: date.unit.sourceId, date: date.iso, time: date.time, timezone: date.timezone, timezoneAmbiguous: date.timezoneAmbiguous })}`, category: "deadline-time", status: date.timezoneAmbiguous ? "uncertain" : matched.length ? "covered" : "missing", label: `Подача: ${date.iso} ${date.time}${date.timezone ? ` ${date.timezone}` : ""}${date.timezoneAmbiguous ? " — часовой пояс требует уточнения" : ""}`, evidence: excerpt(date.unit, date.quote), itemIds: candidates.map((item) => item.id), matchedItemIds: matched.map((item) => item.id), ...(date.timezoneEvidence?.length ? { supportingEvidence: date.timezoneEvidence } : {}) };
     report.coverage.push(check);
-    if (!matched.length) for (const item of candidates) { if (report.findings.length >= maxFindings) { limited = true; break; } report.findings.push(finding(item, "missing-deadline-time", "blocking", date.timezoneAmbiguous ? "Источник содержит противоречивые общие часовые пояса. Уточните пояс срока подачи по документу; автоматический выбор не выполнен." : "Источник указывает время подачи и, возможно, часовой пояс. Одна дата не сохраняет это условие: добавьте время и указанный пояс в переносимые примечания.", [check.evidence, ...(check.supportingEvidence || [])])); }
+    if (!matched.length) for (const item of candidates) { if (report.findings.length >= maxFindings) { limited = true; break; } report.findings.push(finding(item, "missing-deadline-time", "blocking", date.timezoneAmbiguous ? "Источник содержит противоречивые указания часового пояса. Уточните пояс срока подачи по документу; автоматический выбор не выполнен." : "Источник указывает время подачи и, возможно, часовой пояс. Одна дата не сохраняет это условие: добавьте время и указанный пояс в переносимые примечания.", [check.evidence, ...(check.supportingEvidence || [])])); }
   }
   const positions = skuFacts(units), sku = positions.facts; limited ||= positions.limited;
   for (const fact of sku) {

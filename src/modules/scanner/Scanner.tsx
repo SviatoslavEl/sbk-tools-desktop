@@ -1,4 +1,4 @@
-import { invoke as tauriInvoke } from "../../lib/networkDiagnostics";
+import { invoke as tauriInvoke, networkAccessIsPaused, useNetworkAccess } from "../../lib/networkDiagnostics";
 import { trackedOperation } from "../../lib/activity";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
@@ -43,6 +43,7 @@ import { ScannerEditHistory, scannerSettingsKey, SCANNER_DRAFT_KEY, encodeScanne
 import { annotationColor, DEFAULT_ANNOTATION_COLORS, isColoredAnnotationKind, updateAnnotationColor } from "./annotationColors";
 import { ScannerSizeSummary, positiveFileBytes, totalScannerOutputBytes, type ScannerResultSize } from "./ScannerSizeSummary";
 import { belongsToScannerResult, useScannerOperationUi, type ScannerProgress, type ScannerWorkspaceMode } from "./scannerOperationState";
+import { IntelligenceOcrBridge, isIntelligenceOcrSha256, type IntelligenceOcrRequest, type IntelligenceOcrReturn } from "./intelligenceOcrBridge";
 import {
   facsimileHeight,
   drawnRect,
@@ -158,7 +159,29 @@ export function ScannerResultActionNotice({ failure, onDismiss }: { failure: Sca
   </div>;
 }
 
-export function Scanner({ active = true }: { active?: boolean }) {
+export function Scanner({ active = true, intelligenceOcrRequest, onIntelligenceOcrReady }: { active?: boolean; intelligenceOcrRequest?: IntelligenceOcrRequest; onIntelligenceOcrReady?: (result: IntelligenceOcrReturn) => void }) {
+  const network = useNetworkAccess();
+  const intelligenceOcrBridge = useRef(new IntelligenceOcrBridge());
+  const intelligenceOcrRequestRef = useRef(intelligenceOcrRequest);
+  intelligenceOcrRequestRef.current = intelligenceOcrRequest;
+  const [ocrLoadConfirmation, setOcrLoadConfirmation] = useState<IntelligenceOcrRequest | null>(null);
+  const [intelligenceOcrOpening, setIntelligenceOcrOpening] = useState(false);
+  const [intelligenceOcrReturning, setIntelligenceOcrReturning] = useState(false);
+  const intelligenceOcrBusy = useRef(false);
+  const [intelligenceOcrError, setIntelligenceOcrError] = useState("");
+  const [, refreshIntelligenceOcr] = useState(0);
+  const intelligenceOcrMounted = useRef(true);
+  useEffect(() => {
+    intelligenceOcrMounted.current = true;
+    return () => { intelligenceOcrMounted.current = false; intelligenceOcrBridge.current.invalidate(); };
+  }, []);
+  useEffect(() => {
+    intelligenceOcrBridge.current.invalidate();
+    setOcrLoadConfirmation(null); setIntelligenceOcrError(""); refreshIntelligenceOcr((value) => value + 1);
+  }, [intelligenceOcrRequest?.id, intelligenceOcrRequest?.inputPath]);
+  useEffect(() => {
+    if (network.phase !== "connected") { intelligenceOcrBridge.current.invalidate(); refreshIntelligenceOcr((value) => value + 1); }
+  }, [network.phase]);
   const [fileDragActive, setFileDragActive] = useState(false);
   const [pendingDroppedPaths, setPendingDroppedPaths] = useState<string[]>([]);
   const dropHandler = useRef<(paths: string[]) => void>(() => undefined);
@@ -318,9 +341,21 @@ export function Scanner({ active = true }: { active?: boolean }) {
     revision: (path) => invoke<string>("scanner_source_revision", { path }),
   }, setPreparation);
   useEffect(() => () => previewSession.current?.clear(), []);
+  const intelligenceOcrSettingsKey = scannerSettingsKey(editSnapshot);
+  const intelligenceOcrPreviousSettings = useRef(intelligenceOcrSettingsKey);
+  if (intelligenceOcrPreviousSettings.current !== intelligenceOcrSettingsKey) {
+    intelligenceOcrBridge.current.clearResult();
+    intelligenceOcrPreviousSettings.current = intelligenceOcrSettingsKey;
+  }
+  const intelligenceOcrUi = useRef({ inputPath, workspaceMode, resultKind, resultPath, settingsKey: intelligenceOcrSettingsKey, ocrEnabled });
+  intelligenceOcrUi.current = { inputPath, workspaceMode, resultKind, resultPath, settingsKey: intelligenceOcrSettingsKey, ocrEnabled };
+  const currentIntelligenceOcrSource = () => ({ inputPath: intelligenceOcrUi.current.inputPath, sourceGeneration: previewSession.current!.sourceGeneration, sourceFingerprint: previewSession.current!.sourceFingerprint });
+  const intelligenceOcrBound = intelligenceOcrBridge.current.isBound(intelligenceOcrRequest, currentIntelligenceOcrSource());
+  const intelligenceOcrCandidate = intelligenceOcrBridge.current.candidate(intelligenceOcrRequest, currentIntelligenceOcrSource(), intelligenceOcrUi.current);
   useEffect(() => { previewSession.current?.confirmDisplayed(previewUrl); }, [previewUrl]);
   useEffect(() => {
     if (preparation.state === "changed") {
+      intelligenceOcrBridge.current.invalidate();
       setReadyPreviewKey(""); setPreviewUrl(""); setOriginalUrl(""); setLoadedPreviewUrl("");
       setError(SOURCE_CHANGED_MESSAGE, "document");
     }
@@ -487,9 +522,10 @@ export function Scanner({ active = true }: { active?: boolean }) {
     if (!path) return;
     await openDocumentPath(path);
   };
-  const openDocumentPath = async (path: string, preserveRecoveryDraft = false) => {
+  const openDocumentPath = async (path: string, preserveRecoveryDraft = false, replacementConfirmed = false) => {
     if (activeJobRef.current || mergeInspecting) { setError("Дождитесь завершения текущей обработки, затем замените файл."); return; }
-    if (dirty && !window.confirm("В документе есть несохранённые изменения. Открыть другой файл и сбросить их? Исходный файл не изменится.")) return false;
+    if (dirty && !replacementConfirmed && !window.confirm("В документе есть несохранённые изменения. Открыть другой файл и сбросить их? Исходный файл не изменится.")) return false;
+    intelligenceOcrBridge.current.invalidate();
     historyDocument.current = ""; setFinalPreview(null);
     splitPlan.current = null; setSplitOutcomes([]); setTemplateError(""); setTemplateNotice("");
     if (!preserveRecoveryDraft) discardDraft(); else setDraftEnabled(false);
@@ -506,6 +542,7 @@ export function Scanner({ active = true }: { active?: boolean }) {
   const clearDocument = () => {
     if (activeJobRef.current || mergeInspecting) return;
     if (dirty && !window.confirm("Сбросить несохранённые изменения документа? Исходный файл не изменится.")) return;
+    intelligenceOcrBridge.current.invalidate();
     historyDocument.current = ""; setFinalPreview(null); discardDraft();
     splitPlan.current = null; setTemplateError(""); setTemplateNotice("");
     if (finalPreviewJob.current) void invoke("scanner_cancel", { jobId: finalPreviewJob.current }).catch(() => undefined);
@@ -518,6 +555,37 @@ export function Scanner({ active = true }: { active?: boolean }) {
     setAnnotations([]); setRedactions([]); setSplitOutcomes([]);
     editHistory.current.reset({ ...editSnapshot, pageOrder: [], facsimile: null, savedFacsimiles: [], editingFacsimileId: "", activeFacsimilePage: null, annotations: [], redactions: [] });
     setPreparation({ state: "idle", prepared: 0, total: 0 });
+  };
+  const loadIntelligenceOcr = async (request: IntelligenceOcrRequest) => {
+    if (intelligenceOcrBusy.current || activeJobRef.current || mergeInspecting || documentSaveGate.current.busy || mergeSaveGate.current.busy) return;
+    if (request.id !== intelligenceOcrRequestRef.current?.id || request.inputPath !== intelligenceOcrRequestRef.current.inputPath) return;
+    if (networkAccessIsPaused()) { setIntelligenceOcrError("Доступ к файлам приостановлен. Возобновите связь с рабочей папкой перед OCR."); return; }
+    intelligenceOcrBusy.current = true; setIntelligenceOcrOpening(true); setIntelligenceOcrError("");
+    try {
+      const loaded = await openDocumentPath(request.inputPath, false, true);
+      if (!intelligenceOcrMounted.current || networkAccessIsPaused() || request.id !== intelligenceOcrRequestRef.current?.id || request.inputPath !== intelligenceOcrRequestRef.current.inputPath) return;
+      if (!loaded || !intelligenceOcrBridge.current.bind(request, { inputPath: request.inputPath, sourceGeneration: previewSession.current!.sourceGeneration, sourceFingerprint: loaded.sourceFingerprint })) {
+        setIntelligenceOcrError("Не удалось подтвердить версию документа. Повторите загрузку из запроса ИИ."); return;
+      }
+      setOcrEnabled(true); setOcrLoadConfirmation(null);
+    } catch (reason) { if (intelligenceOcrMounted.current && request.id === intelligenceOcrRequestRef.current?.id) setIntelligenceOcrError(`Не удалось загрузить файл для OCR: ${String(reason)}`); }
+    finally { intelligenceOcrBusy.current = false; if (intelligenceOcrMounted.current) { setIntelligenceOcrOpening(false); refreshIntelligenceOcr((value) => value + 1); } }
+  };
+  const returnIntelligenceOcr = async () => {
+    if (intelligenceOcrBusy.current || activeJobRef.current || !onIntelligenceOcrReady || networkAccessIsPaused()) return;
+    const candidate = intelligenceOcrBridge.current.candidate(intelligenceOcrRequestRef.current, currentIntelligenceOcrSource(), intelligenceOcrUi.current);
+    if (!candidate || candidate.id !== intelligenceOcrCandidate?.id || candidate.outputPath !== intelligenceOcrCandidate.outputPath || candidate.outputRevision !== intelligenceOcrCandidate.outputRevision || candidate.sha256 !== intelligenceOcrCandidate.sha256) return;
+    intelligenceOcrBusy.current = true; setIntelligenceOcrReturning(true); setIntelligenceOcrError("");
+    try {
+      if (!await previewSession.current!.verifySource()) throw new Error("Исходный документ изменился. Повторите OCR актуального файла.");
+      if (await invoke<string>("scanner_source_revision", { path: candidate.outputPath }) !== candidate.outputRevision) throw new Error("Сохранённый PDF изменился или был заменён. Сохраните новый результат OCR.");
+      if (!intelligenceOcrMounted.current || networkAccessIsPaused()) return;
+      const current = intelligenceOcrBridge.current.candidate(intelligenceOcrRequestRef.current, currentIntelligenceOcrSource(), intelligenceOcrUi.current);
+      if (!current || current.id !== candidate.id || current.outputPath !== candidate.outputPath || current.sha256 !== candidate.sha256 || activeJobRef.current) return;
+      onIntelligenceOcrReady({ id: current.id, outputPath: current.outputPath, sha256: current.sha256 });
+      intelligenceOcrBridge.current.consume(intelligenceOcrRequestRef.current, currentIntelligenceOcrSource(), intelligenceOcrUi.current);
+    } catch (reason) { if (intelligenceOcrMounted.current && candidate.id === intelligenceOcrRequestRef.current?.id) { intelligenceOcrBridge.current.clearResult(); setIntelligenceOcrError(`Результат не передан в ИИ. ${String(reason)}`); } }
+    finally { intelligenceOcrBusy.current = false; if (intelligenceOcrMounted.current) { setIntelligenceOcrReturning(false); refreshIntelligenceOcr((value) => value + 1); } }
   };
   const chooseBatch = async () => {
     const paths = await chooseOpenPaths("Выберите PDF и DOCX для пакета", ["pdf", "docx"]);
@@ -638,6 +706,7 @@ export function Scanner({ active = true }: { active?: boolean }) {
     finally { setBatchPlanning(false); }
   };
   const processBatch = async () => {
+    intelligenceOcrBridge.current.clearResult();
     if (!batchPlan.length || activeJobRef.current) return;
     setWorkspaceMode("document"); batchCancelled.current = false; setRetryOperation("batch");
     const startedAt = Date.now(); setError("", "document"); setWarnings([], "document"); setResultPath("", "document"); setResultKind("", "document");
@@ -663,6 +732,7 @@ export function Scanner({ active = true }: { active?: boolean }) {
   };
 
   const processMerge = async () => {
+    intelligenceOcrBridge.current.clearResult();
     if (mergePaths.length < 2 || !mergePageOrder.length || activeJobRef.current || mergeInspecting) return;
     await mergeSaveGate.current.run(async () => {
     setMergeSaving(true);
@@ -876,6 +946,7 @@ export function Scanner({ active = true }: { active?: boolean }) {
     const sourceSession = previewSession.current!;
     const sourceGeneration = sourceSession.sourceGeneration;
     const expectedSourceFingerprint = sourceSession.sourceFingerprint;
+    const intelligenceOcrTicket = intelligenceOcrBridge.current.startSave(intelligenceOcrRequestRef.current, { inputPath, sourceGeneration, sourceFingerprint: expectedSourceFingerprint });
     const splitKey = scannerSettingsKey({ inputPath, expectedSourceFingerprint, settings: editSnapshot });
     const continuation = outputPageMode === "blocks" ? resumableSplitPlan(splitPlan.current, splitKey) : null;
     const saveStillCurrent = () => previewSession.current === sourceSession && sourceSession.sourceGeneration === sourceGeneration && !activeJobRef.current;
@@ -935,7 +1006,7 @@ export function Scanner({ active = true }: { active?: boolean }) {
       } catch (reason) {
         setError(String(reason)); setProgress(null);
         if (splitPlan.current?.key === splitKey && splitPlan.current.outcomes.some((entry) => entry.status === "done")) { setResultPath(outputDirectory); setResultKind("split"); setSavedResultSize(null); }
-        await templates.save(`Ошибка разделения ${new Date().toLocaleString("ru-RU")}`, { kind: "processing-journal", inputType: inputPath.toLowerCase().endsWith(".docx") ? "DOCX" : "PDF", pageCount: completedPages, preset, ocr: ocrEnabled, status: "failed", durationMs: Date.now() - startedAt }).catch(() => undefined);
+        if (workspaceAccess.editor) await templates.save(`Ошибка разделения ${new Date().toLocaleString("ru-RU")}`, { kind: "processing-journal", inputType: inputPath.toLowerCase().endsWith(".docx") ? "DOCX" : "PDF", pageCount: completedPages, preset, ocr: ocrEnabled, status: "failed", durationMs: Date.now() - startedAt }).catch(() => undefined);
       } finally { setActiveJob(""); activeJobRef.current = ""; }
       return;
     }
@@ -950,10 +1021,24 @@ export function Scanner({ active = true }: { active?: boolean }) {
       editHistory.current.markSaved(editSnapshot); refreshHistory((value) => value + 1);
       setSavedResultSize({ inputPath, resultPath: response.outputPath || outputPath, kind: "single", originalBytes: positiveFileBytes(response.originalBytes) ?? originalBytes, outputBytes: positiveFileBytes(response.outputBytes), fileCount: 1 });
       setProgress({ stage: "Готово", currentPage: finalPageOrder.length, totalPages: finalPageOrder.length, percent: 100 });
+      if (intelligenceOcrTicket && ocrEnabled && intelligenceOcrRequestRef.current?.id === intelligenceOcrTicket.id) {
+        const outputSha256 = response.outputSha256;
+        if (!response.ocrText?.trim()) setIntelligenceOcrError("PDF сохранён, но OCR не вернул текст. Проверьте языки и качество распознавания перед возвратом в ИИ.");
+        else if (!isIntelligenceOcrSha256(outputSha256)) setIntelligenceOcrError("PDF сохранён, но обработчик не вернул корректный SHA-256 результата. Возврат в ИИ недоступен: повторите сохранение PDF с OCR.");
+        else if (outputPageMode === "all" && finalPageOrder.length === pageCount && finalPageOrder.every((page, index) => page === index)) {
+          try {
+            const outputRevision = await invoke<string>("scanner_source_revision", { path: response.outputPath || outputPath });
+            if (intelligenceOcrMounted.current && !networkAccessIsPaused()) intelligenceOcrBridge.current.completeSave(intelligenceOcrTicket, intelligenceOcrRequestRef.current, currentIntelligenceOcrSource(), {
+              workspaceMode: "document", kind: "single", outputPageMode, pageCount, pageOrder: finalPageOrder,
+              ocrEnabled, settingsKey: scannerSettingsKey(editSnapshot), outputPath: response.outputPath || outputPath, outputSha256, outputRevision, ocrText: response.ocrText,
+            });
+          } catch (reason) { if (intelligenceOcrMounted.current && intelligenceOcrTicket.id === intelligenceOcrRequestRef.current?.id) setIntelligenceOcrError(`PDF сохранён, но его версию не удалось проверить для возврата в ИИ. ${String(reason)}`); }
+        }
+      }
       const logicalFacsimileCount = savedFacsimiles.length + (facsimile && !editingFacsimileId ? 1 : 0);
       const appliedOperations = [`Пресет: ${preset}`, `${dpi} dpi`, `Качество ${quality}%`, `Сжатие: ${compressionMode}`, ...(ocrEnabled ? [`OCR ${ocrLanguages}`] : []), ...(pdfaEnabled ? ["PDF/A-2b"] : []), ...(savedWorkerFacsimiles.length || workerFacsimiles.length ? [`Факсимиле: ${logicalFacsimileCount}`] : []), ...(redactions.length ? [`Скрытие областей: ${redactions.length}`] : []), ...(annotations.length ? [`Инструменты: ${annotations.length}`] : []), ...(pageOrder.some((value, index) => value !== index) ? ["Изменён порядок страниц"] : []), ...(finalPageOrder.length !== pageOrder.length ? ["Выбран диапазон итоговых страниц"] : []), ...(Object.values(pageRotations).some(Boolean) ? ["Поворот страниц"] : [])];
       if (workspaceAccess.editor) await templates.save(`Обработка ${new Date().toLocaleString("ru-RU")}`, { kind: "processing-journal", inputType: inputPath.toLowerCase().endsWith(".docx") ? "DOCX" : "PDF", pageCount: finalPageOrder.length, preset, ocr: ocrEnabled, status: "completed", durationMs: Date.now() - startedAt, outputSha256: response.outputSha256, appliedOperations }).catch(() => undefined);
-    } catch (reason) { setError(String(reason)); setProgress(null); await templates.save(`Ошибка ${new Date().toLocaleString("ru-RU")}`, { kind: "processing-journal", inputType: inputPath.toLowerCase().endsWith(".docx") ? "DOCX" : "PDF", pageCount: finalPageOrder.length, preset, ocr: ocrEnabled, status: "failed", durationMs: Date.now() - startedAt }).catch(() => undefined); }
+    } catch (reason) { setError(String(reason)); setProgress(null); if (workspaceAccess.editor) await templates.save(`Ошибка ${new Date().toLocaleString("ru-RU")}`, { kind: "processing-journal", inputType: inputPath.toLowerCase().endsWith(".docx") ? "DOCX" : "PDF", pageCount: finalPageOrder.length, preset, ocr: ocrEnabled, status: "failed", durationMs: Date.now() - startedAt }).catch(() => undefined); }
     finally { setActiveJob(""); activeJobRef.current = ""; }
     } catch (reason) { setError(`Не удалось начать сохранение: ${String(reason)}`); }
     });
@@ -1157,10 +1242,12 @@ export function Scanner({ active = true }: { active?: boolean }) {
     if (!(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== "z" || (event.target instanceof HTMLElement && event.target.closest("input,textarea,[contenteditable=true]"))) return;
     event.preventDefault(); undoEdits(event.shiftKey);
   }}>
+    {ocrLoadConfirmation && <Dialog title="Загрузить документ из окна ИИ для OCR?" onClose={() => { if (!intelligenceOcrBusy.current) setOcrLoadConfirmation(null); }} closeDisabled={intelligenceOcrOpening} width="560px"><div className="dialog-body"><p><strong>{ocrLoadConfirmation.inputPath.split(/[\\/]/).pop()}</strong></p><p>Текущий документ и его несохранённые настройки в сканере будут заменены. Уже сохранённые PDF и исходные файлы не изменятся. Список объединения останется доступен.</p><p>Будет включён поиск текста OCR. Проверьте язык и все страницы, затем сохраните новый полный PDF. Возврат в ИИ выполняется отдельной кнопкой.</p>{intelligenceOcrError && <p className="notice error" role="alert">{intelligenceOcrError}</p>}</div><footer className="dialog-actions"><button className="secondary" type="button" disabled={intelligenceOcrOpening} onClick={() => setOcrLoadConfirmation(null)}>Отмена</button><button className="primary" type="button" disabled={intelligenceOcrOpening} onClick={() => void loadIntelligenceOcr(ocrLoadConfirmation)}>{intelligenceOcrOpening ? "Загружаем документ…" : "Загрузить и включить OCR"}</button></footer></Dialog>}
     {finalPreview && <Dialog title={`Итоговый просмотр · страница ${finalPreview.page + 1}`} width="min(1100px, 94vw)" onClose={() => setFinalPreview(null)}><div className="dialog-body scanner-final-preview"><p>{finalPreview.key === scannerSettingsKey(editSnapshot) ? "Изображение рассчитано обработчиком итогового PDF с текущими эффектами, факсимиле и JPEG-сжатием. Для экрана уменьшено до 1400 пикселей. OCR-слой и метаданные здесь не проверяются." : "Настройки изменились. Закройте просмотр и рассчитайте его заново."}{outputPageMode === "blocks" ? " При нескольких блоках показан первый блок, содержащий эту страницу; бюджет сжатия других блоков может отличаться." : ""}</p><img src={finalPreview.url} alt={`Итоговый вид страницы ${finalPreview.page + 1}`} /></div><footer className="dialog-actions"><button className="primary" type="button" onClick={() => setFinalPreview(null)}>Вернуться к редактированию</button></footer></Dialog>}
     {fileDragActive && <div className="scanner-file-drop-overlay" role="status"><strong>Отпустите PDF или DOCX здесь</strong><span>{workspaceMode === "merge" ? "Документы добавятся к объединению" : "Один документ откроется в сканере; для нескольких можно выбрать объединение или пакетную обработку"}</span></div>}
     {pendingDroppedPaths.length > 1 && <Dialog title="Добавить перетащенные документы" onClose={() => setPendingDroppedPaths([])} width="560px"><div className="dialog-body"><p>Файлов: {pendingDroppedPaths.length}. Объединить страницы в один PDF или обработать каждый документ отдельно?</p></div><footer className="dialog-actions"><button className="secondary" type="button" onClick={() => { setBatchPaths(pendingDroppedPaths); setBatchPlan([]); setPendingDroppedPaths([]); setError(""); }}>Обработать отдельно</button><button className="primary" type="button" onClick={() => { const paths = pendingDroppedPaths; setPendingDroppedPaths([]); void addMergePaths(paths); }}>Объединить</button></footer></Dialog>}
     <section className="surface scanner-controls" inert={!!activeJob || finalPreviewing}><div className="surface-title"><h2>Настройки</h2></div><div className="surface-body scanner-control-stack">
+      {intelligenceOcrRequest && <div className="notice warning" aria-label="Распознавание документа для ИИ"><strong>Документ из окна ИИ: {intelligenceOcrRequest.inputPath.split(/[\\/]/).pop()}</strong>{intelligenceOcrBound ? <p>OCR {ocrEnabled ? "включён" : "выключен"}. Сохраните полный PDF без диапазона или перестановки страниц. Распознавание не гарантирует полноту: проверьте текст перед анализом.</p> : <><p>Загрузите именно этот файл для OCR. Текущие настройки не заменяются без подтверждения.</p><button className="secondary small" type="button" disabled={!!activeJob || mergeInspecting || intelligenceOcrOpening || network.phase !== "connected"} onClick={() => { setIntelligenceOcrError(""); setOcrLoadConfirmation({ ...intelligenceOcrRequest }); }}>Загрузить для OCR</button></>}{intelligenceOcrError && !ocrLoadConfirmation && <p className="notice error" role="alert">{intelligenceOcrError}</p>}</div>}
       <button className="primary full-width" type="button" disabled={!!activeJob || mergeInspecting} onClick={() => void chooseDocument()}>{inputPath ? "Заменить файл" : "Выбрать PDF или DOCX"}</button>
       <button className="secondary full-width" type="button" disabled={!!activeJob || batchPlanning} onClick={() => void chooseBatch()}>Пакетная обработка</button>{batchPaths.length > 0 && <div className="notice success"><span>Выбрано файлов: {batchPaths.length}</span><button className="primary small" type="button" disabled={!!activeJob || batchPlanning} onClick={() => void prepareBatch()}>{batchPlanning ? "Проверяем имена…" : "Выбрать папку и проверить имена"}</button></div>}{documentName && <p className="selected-file">▧ {documentName}</p>}
       {batchPlan.length > 0 && <details open className="scanner-output-plan"><summary>Результаты пакета · готово {batchPlan.filter((entry) => entry.status === "done").length} из {batchPlan.length}</summary><p>Существующие файлы не заменяются. Совпадающие имена получают номер. Окончательная проверка выполняется при сохранении.</p><ol>{batchPlan.map((entry, index) => <li key={`${entry.inputPath}-${index}`}><span>{entry.inputPath.split(/[\\/]/).pop()} → <strong>{entry.outputPath.split(/[\\/]/).pop()}</strong></span><small>{({ planned: "Ожидает", working: "Обрабатывается…", done: "Готово", error: "Не сохранён" })[entry.status]}{entry.error ? `: ${entry.error}` : ""}</small></li>)}</ol><button className="primary small" type="button" disabled={!!activeJob || batchPlan.every((entry) => entry.status === "done")} onClick={() => void processBatch()}>Сохранить неготовые файлы</button></details>}
@@ -1266,6 +1353,7 @@ export function Scanner({ active = true }: { active?: boolean }) {
       </div>
       {resultPath ? resultKind === "batch" || resultKind === "split" ? <div className="ready-panel"><div><strong>✓ {resultKind === "split" ? splitOutcomes.every((entry) => entry.status === "done") ? "Блоки PDF готовы" : "Сохранена часть блоков" : batchPlan.every((entry) => entry.status === "done") ? "Пакет готов" : "Сохранена часть пакета"}</strong><span>{resultPath}</span></div><button className="primary" type="button" onClick={() => void openGeneratedPath(resultPath, "папку")}>Открыть папку</button><button className="secondary" type="button" onClick={() => { if (resultKind === "batch") setBatchPaths([]); setResultPath(""); setResultKind(""); setProgress(null); }}>{resultKind === "split" ? "Изменить блоки" : "Другой пакет"}</button></div> : <div className="ready-panel"><div><strong>✓ PDF готов</strong><span>{resultPath}</span></div><button className="secondary" type="button" onClick={() => void openGeneratedPath(resultPath, "PDF")}>Открыть PDF</button><button className="secondary" type="button" onClick={() => void revealGeneratedFile(resultPath)}>Открыть папку</button><button className="primary" disabled={!documentReady || !!activeJob || !!facsimileSelection.error || !!outputPageSelection.error || !!outputBlockSelection.error} type="button" onClick={() => void processDocument()}>Сохранить ещё одну версию</button><button className="secondary" type="button" disabled={!!activeJob || mergeInspecting} onClick={clearDocument}>Другой файл</button></div> : <div className="actionbar"><span>{facsimileSelection.error || outputPageSelection.error || outputBlockSelection.error || (facsimile ? "Факсимиле перемещается и поворачивается мгновенно, без повторной загрузки документа" : outputPageMode === "blocks" ? "Настройте блоки и сохраните несколько PDF" : "Выберите пресет и сохраните новый PDF")}</span><button className="primary" disabled={!documentReady || !!activeJob || !!facsimileSelection.error || !!outputPageSelection.error || !!outputBlockSelection.error} type="button" onClick={() => void processDocument()}>{outputPageMode === "blocks" ? "Сохранить блоки PDF" : "Сохранить PDF"}</button></div>}
       </>}
+      {intelligenceOcrCandidate && onIntelligenceOcrReady && <div className="notice" aria-label="Готовый результат OCR для ИИ"><span>Полный PDF с текстом OCR сохранён. В окне ИИ он добавится в текущую задачу; автоматическая отправка модели не выполняется.</span><button className="secondary" type="button" disabled={!!activeJob || intelligenceOcrReturning || network.phase !== "connected"} onClick={() => void returnIntelligenceOcr()}>{intelligenceOcrReturning ? "Проверяем сохранённый PDF…" : "Вернуть распознанный текст в ИИ"}</button></div>}
       {resultActionError && belongsToScannerResult(resultActionError, workspaceMode, resultPath) && <ScannerResultActionNotice failure={resultActionError} onDismiss={() => { resultActionGeneration.current += 1; setResultActionError(null); }} />}
     </section>
   </div>;

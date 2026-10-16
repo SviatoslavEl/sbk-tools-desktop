@@ -102,6 +102,9 @@ class StreamingPdfWriter:
         self._seed = seed
         self._pdfa = pdfa
         self._finished = False
+        # A list (including an empty one) records an OCR attempt. This marker
+        # never certifies that every word, image or page was recognised.
+        self._ocr_attempted = False
 
     def _write_object(self, object_id: int, payload: bytes) -> None:
         self._offsets[object_id] = self._stream.tell()
@@ -165,6 +168,8 @@ class StreamingPdfWriter:
         image_size: tuple[int, int],
         words=None,
     ) -> None:
+        if words is not None:
+            self._ocr_attempted = True
         image_id, content_id, page_id = self._next_id, self._next_id + 1, self._next_id + 2
         self._next_id += 3
         image_name = f"Im{len(self._page_ids) + 1}"
@@ -262,7 +267,8 @@ class StreamingPdfWriter:
             self._write_object(
                 self._INFO_ID,
                 f"<< /Producer (ScanDocument) /Title <{self._utf16_hex(self._title)}> "
-                f"/ScanDocumentSeed ({self._seed}) >>".encode("ascii"),
+                f"/ScanDocumentSeed ({self._seed}) "
+                f"{'/ScanDocumentOCR (attempted-v1) ' if self._ocr_attempted else ''}>>".encode("ascii"),
             )
             kids = " ".join(f"{page_id} 0 R" for page_id in self._page_ids)
             self._write_object(

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "../../lib/networkDiagnostics";
-import { Dialog } from "../../components/Dialog";
+import { ConfirmDialog, Dialog } from "../../components/Dialog";
 import { VersionHistory } from "../../components/VersionHistory";
 import { useRecords } from "../../hooks/useRecords";
 import { useViewState } from "../../hooks/useViewState";
@@ -16,6 +16,7 @@ import { ProposalContactFields, ProposalLinesEditor, ProposalPartyFields } from 
 import type { ProposalData, ProposalIssue, ProposalRenderFormat, ProposalRenderResult, ProposalStatus, ProposalTemplateData } from "./types";
 import "./proposals.css";
 type ProposalRecord = ProposalData | ProposalTemplateData;
+type ArchivingProposal = Pick<StoredRecord<ProposalData>, "id" | "payload" | "archived">;
 interface Session {
     id?: string;
     writeId: string;
@@ -88,9 +89,13 @@ export function Proposals({ active = true, openRecordId, onRecordOpened, handoff
     const [companies, setCompanies] = useState<CompanyCard[]>([]);
     const [directoryError, setDirectoryError] = useState("");
     const [pendingTarget, setPendingTarget] = useState<Target | null>(null);
+    const [archiving, setArchiving] = useState<ArchivingProposal | null>(null);
     const [busy, setBusy] = useState("");
     const [error, setError] = useState("");
     const [notice, setNotice] = useState("");
+    // An archive may have been restored in another tool while this view stayed
+    // mounted. Do not present an old action receipt as its current state.
+    useEffect(() => { if (active) setNotice(""); }, [active]);
     const [draftStatus, setDraftStatus] = useState("");
     const [preview, setPreview] = useState<{
         fingerprint: string;
@@ -113,6 +118,7 @@ export function Proposals({ active = true, openRecordId, onRecordOpened, handoff
     latest.current = session;
     const accessRef = useRef(access.editor);
     accessRef.current = access.editor;
+    useEffect(() => { if (!access.editor) setArchiving(null); }, [access.editor]);
     const data = session?.data;
     const dirty = Boolean(session && snapshot(session.data) !== session.savedJson);
     const immutable = session?.persistedStatus !== "draft";
@@ -278,6 +284,35 @@ export function Proposals({ active = true, openRecordId, onRecordOpened, handoff
         setPendingTarget(target);
     else
         void run("Открываем…", () => performTarget(target)); };
+    const requestArchive = (record: ArchivingProposal) => {
+        if (operation.current || !accessRef.current || record.archived) return;
+        const current = latest.current;
+        if (current?.id === record.id && snapshot(current.data) !== current.savedJson) {
+            setError("Сначала сохраните изменения КП или вернитесь к списку без сохранения. Архивация не должна отбрасывать незавершённую правку.");
+            return;
+        }
+        setError("");
+        setArchiving(record);
+    };
+    const archiveProposal = async () => {
+        if (!archiving || operation.current) return;
+        const record = archiving;
+        const done = await run("Переносим КП в архив…", async () => {
+            if (!accessRef.current) throw new Error("Для архивации КП требуется действующий режим редактора.");
+            await draftQueue.current.catch(() => undefined);
+            if (!accessRef.current) throw new Error("Режим редактора недоступен. КП не перенесено в архив.");
+            const current = latest.current;
+            if (current?.id === record.id && snapshot(current.data) !== current.savedJson)
+                throw new Error("Сначала сохраните изменения КП или вернитесь к списку без сохранения.");
+            // Archive only the persisted record. Its payload, attachments,
+            // versions and any saved draft remain available for restoration.
+            await store.archive(record.id);
+            if (latest.current?.id === record.id) install(null);
+            setArchiving(null);
+            setNotice(`КП «${record.payload.number} · редакция ${record.payload.revision}» перенесено в архив. Восстановление доступно в разделе «Архив» → «Коммерческие предложения».`);
+        });
+        if (!done) throw new Error("Архивация КП не подтверждена. Проверьте сообщение об ошибке и повторите попытку.");
+    };
     useEffect(() => {
         if (!handoff || seenHandoff.current === handoff.id || operation.current)
             return;
@@ -440,7 +475,7 @@ export function Proposals({ active = true, openRecordId, onRecordOpened, handoff
     <div className="proposal-toolbar"><small>Предложений: {proposals.length} · шаблонов: {templates.length}</small><button className="primary" type="button" disabled={Boolean(busy)} onClick={() => requestTarget({ kind: "new" })}>{access.editor ? "Новое КП" : "Новое локальное КП"}</button></div>
     {store.error && <div className="notice error" role="alert">Не удалось прочитать КП: {store.error}<button type="button" onClick={() => void store.reload()}>Повторить</button></div>}
     {error && <div className="notice error" role="alert">{error}</div>}{notice && <div className="notice" role="status">{notice}</div>}
-    {!session ? <><label className="proposal-search">Поиск по номеру, предмету или заказчику<input aria-label="Поиск КП" value={search} onChange={(event) => setSearch(event.target.value)}/></label>{store.loading ? <p role="status">Загружаем предложения…</p> : <div className="proposal-registry">{filtered.map((entry) => <button className="proposal-record" key={entry.id} type="button" onClick={() => requestTarget({ kind: "record", record: entry })}><strong>{entry.payload.number} · редакция {entry.payload.revision}</strong><span>{entry.payload.title || "Без предмета"}</span><small>{entry.payload.recipient.name || "Заказчик не указан"} · {statuses[entry.payload.status]}</small></button>)}{!filtered.length && <p className="empty-inline">{search ? "КП по этому запросу не найдены." : "Коммерческих предложений пока нет. Начните с нового КП или перенесите цену из калькулятора."}</p>}</div>}</> : <>
+    {!session ? <><label className="proposal-search">Поиск по номеру, предмету или заказчику<input aria-label="Поиск КП" value={search} onChange={(event) => setSearch(event.target.value)}/></label>{store.loading ? <p role="status">Загружаем предложения…</p> : <div className="proposal-registry">{filtered.map((entry) => <article className="proposal-record-card" key={entry.id}><button className="proposal-record" type="button" disabled={Boolean(busy)} onClick={() => requestTarget({ kind: "record", record: entry })}><strong>{entry.payload.number} · редакция {entry.payload.revision}</strong><span>{entry.payload.title || "Без предмета"}</span><small>{entry.payload.recipient.name || "Заказчик не указан"} · {statuses[entry.payload.status]}</small></button>{access.editor && <div className="proposal-record-actions"><button type="button" className="secondary small" disabled={Boolean(busy)} aria-label={`Архивировать КП ${entry.payload.number} · редакция ${entry.payload.revision}`} onClick={() => requestArchive(entry)}>Архивировать</button></div>}</article>)}{!filtered.length && <p className="empty-inline">{search ? "КП по этому запросу не найдены." : "Коммерческих предложений пока нет. Начните с нового КП или перенесите цену из калькулятора."}</p>}</div>}</> : <>
       <div className="proposal-context">
         <div><strong>{data!.number} · редакция {data!.revision}</strong><span>{session.local ? "Локальная копия · не сохраняется в общую базу" : immutable ? "Сохранённая редакция защищена от изменения" : draftStatus || (dirty ? "Изменения не сохранены в карточку" : "Карточка сохранена")}</span></div>
         <div className="button-row">
@@ -448,8 +483,10 @@ export function Proposals({ active = true, openRecordId, onRecordOpened, handoff
           <button type="button" className="secondary small" disabled={Boolean(busy)} onClick={() => requestTarget({ kind: "close" })}>К списку</button>
           <button type="button" className="secondary small" disabled={Boolean(busy)} onClick={() => requestTarget({ kind: "seed", data: cloneProposal(data!), local: !access.editor })}>{access.editor ? "Создать копию" : "Локальная копия"}</button>
           {immutable && access.editor && <button type="button" className="secondary small" disabled={Boolean(busy)} onClick={revision}>Новая редакция</button>}
+          {session.id && !session.local && access.editor && <button type="button" className="secondary small" disabled={Boolean(busy) || dirty} title={dirty ? "Сначала сохраните изменения КП или вернитесь к списку без сохранения" : "Перенести сохранённую редакцию в архив с возможностью восстановления"} onClick={() => requestArchive({ id: session.id!, payload: data!, archived: false })}>Архивировать</button>}
         </div>
       </div>
+      {session.id && !session.local && access.editor && dirty && <p className="help-text">Для архивации сначала сохраните изменения КП или вернитесь к списку без сохранения. Черновик не будет удалён при архивации.</p>}
       {!access.editor && !session.local && <p className="notice">Просмотр и экспорт доступны. Для изменения без записи в общую папку создайте локальную копию.</p>}
       {!access.editor && session.local && <p className="help-text">Данные находятся только в памяти окна. Новые вложения и общие шаблоны недоступны; экспорт использует уже прикреплённые файлы.</p>}
       {data!.source && <p className="help-text">Источник: {data!.source.tool === "calculator" ? "калькулятор" : "закупка"} · {data!.source.priceOrigin}{data!.source.wasUnsaved ? " · несохранённый снимок" : ""}. Себестоимость и внутренние заметки не переносились.</p>}
@@ -482,6 +519,7 @@ export function Proposals({ active = true, openRecordId, onRecordOpened, handoff
       </div>
       <footer className="proposal-footer"><div>{pricing ? <><strong>Итого: {formatMoneyMinor(pricing.totals.grossMinor)}</strong><small>Без налога: {formatMoneyMinor(pricing.totals.netMinor)} · НДС: {formatMoneyMinor(pricing.totals.vatMinor)}</small>{pricing.totals.byTax.length > 1 && <small>{pricing.totals.byTax.map((group) => `${taxLabel(group.tax)}: ${formatMoneyMinor(group.vatMinor)}`).join(" · ")}</small>}</> : <span>Заполните корректные количества и цены для расчёта итога.</span>}</div><div className="button-row">{busy && <span role="status">{busy}</span>}{jobId.current && <button type="button" className="secondary" onClick={() => void cancelRender()}>Отменить создание</button>}<button className="secondary" type="button" disabled={step === 0} onClick={() => setStep((value) => value - 1)}>Назад</button>{step < 4 && <button className="secondary" type="button" onClick={() => setStep((value) => value + 1)}>Далее</button>}{!session.local && !immutable && <><label>Статус<select aria-label="Статус КП" disabled={fieldsDisabled} value={data!.status} onChange={(event) => update("status", event.target.value as ProposalStatus)}>{Object.entries(statuses).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label><button className="primary" type="button" disabled={Boolean(busy) || !access.editor || !dirty || (data!.status !== "draft" && (issues.some((issue) => issue.severity === "error") || zeroNeedsConsent))} onClick={() => void run("Сохраняем КП…", saveCurrent)}>Сохранить КП</button></>}</div></footer>
     </>}
+    {archiving && <ConfirmDialog title="Архивировать КП?" message={`Перенести КП «${archiving.payload.number} · редакция ${archiving.payload.revision} · ${archiving.payload.title || "Без предмета"}» в архив? Оно исчезнет из рабочего списка. Данные, история и вложения сохранятся; восстановить КП можно в разделе «Архив» → «Коммерческие предложения». Другие редакции этого КП не изменятся.`} confirmLabel="Перенести в архив" onClose={() => { if (!operation.current) setArchiving(null); }} onConfirm={archiveProposal} />}
     {pendingTarget && <Dialog title="Есть несохранённые изменения КП" onClose={() => { if (!busy)
         setPendingTarget(null); }} closeDisabled={Boolean(busy)} width="540px"><div className="dialog-body"><p>Сохраните текущую карточку или явно замените её. При замене несохранённые изменения и их черновик будут отброшены.</p>{session?.local && <p>Локальная копия не записывается в общую папку. При необходимости сначала экспортируйте документ.</p>}</div><footer className="dialog-actions"><button type="button" className="secondary" disabled={Boolean(busy)} onClick={() => setPendingTarget(null)}>Отмена</button><button type="button" className="secondary" disabled={Boolean(busy)} onClick={() => void resolveTarget(false)}>Заменить без сохранения</button>{access.editor && !session?.local && !immutable && <button type="button" className="primary" disabled={Boolean(busy)} onClick={() => void resolveTarget(true)}>Сохранить и продолжить</button>}</footer></Dialog>}
     {templateName !== null && <Dialog title="Сохранить оформление как шаблон" onClose={() => { if (!busy)

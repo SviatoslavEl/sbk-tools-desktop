@@ -5,6 +5,10 @@
 .procurement-fields { display: block; border: 0; padding: 0; margin: 0; min-width: 0; }
 .procurement-fields:disabled { opacity: 1; }
 .procurement-fields:disabled :is(input, textarea, select) { opacity: 1; color: var(--text, #233345); -webkit-text-fill-color: currentColor; }
+.procurement-field-invalid :is(input, textarea) { border-color: var(--danger, #b33232); box-shadow: 0 0 0 1px var(--danger, #b33232); }
+.procurement-field-error { display: block; color: var(--danger, #b33232); font-size: 12px; line-height: 1.45; white-space: normal; overflow-wrap: anywhere; }
+.procurement-validation-summary ul, .procurement-recommendations ul { margin: 6px 0 0; padding-left: 20px; }
+.procurement-validation-summary:focus { outline: 2px solid var(--danger, #b33232); outline-offset: 2px; }
 .procurement-drawer .snapshot-list small { overflow-wrap: anywhere; }
 .procurement-snapshot-comparison { margin: 8px 0; }
 .procurement-snapshot-comparison summary { cursor: pointer; font-size: 12px; }

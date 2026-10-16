@@ -20,6 +20,7 @@ import { Calculator } from "./modules/calculator/Calculator";
 import { ContractsRegistry } from "./modules/contracts/Contracts";
 import { CounterpartiesRegistry } from "./modules/contracts/Counterparties";
 import { Scanner } from "./modules/scanner/Scanner";
+import { IntelligenceOcrRouter, type IntelligenceOcrRequest, type IntelligenceOcrReturn } from "./modules/scanner/intelligenceOcrBridge";
 import { About, Settings } from "./modules/settings/Settings";
 import { StaffRegistry } from "./modules/staff/Staff";
 import { Dashboard } from "./modules/dashboard/Dashboard";
@@ -311,6 +312,13 @@ function App() {
   const [proposalsOpened, setProposalsOpened] = useState(activeTool === "proposals");
   const [intelligenceOpened, setIntelligenceOpened] = useState(activeTool === "intelligence");
   const [intelligenceHandoff, setIntelligenceHandoff] = useState<IntelligenceHandoff | undefined>();
+  const intelligenceOcrRouter = useRef(new IntelligenceOcrRouter());
+  const intelligenceOcrRoot = useRef(workspace?.root || "");
+  intelligenceOcrRoot.current = workspace?.root || "";
+  intelligenceOcrRouter.current.updateContext(intelligenceOcrRoot.current, networkPaused);
+  const [, refreshIntelligenceOcr] = useState(0);
+  const intelligenceOcrRequest = intelligenceOcrRouter.current.request;
+  const intelligenceOcrReturn = intelligenceOcrRouter.current.result;
   const [proposalHandoff, setProposalHandoff] = useState<ProposalHandoff | undefined>();
   const [showHelp, setShowHelp] = useState(false);
   const [showSearch, setShowSearch] = useState(false);
@@ -347,6 +355,25 @@ function App() {
     if (handoff.destination === "proposals") setProposalHandoff({ id: handoff.id, data: handoff.data });
     else setIntelligenceHandoff(handoff);
     selectTool(handoff.destination);
+  };
+  const recognizeIntelligenceFile = (request: IntelligenceOcrRequest) => {
+    if (intelligenceOcrRoot.current !== workspace?.root) throw new Error("Рабочая папка изменилась. Повторите запрос OCR в окне ИИ.");
+    intelligenceOcrRouter.current.updateContext(intelligenceOcrRoot.current, networkAccessIsPaused());
+    intelligenceOcrRouter.current.begin(request);
+    refreshIntelligenceOcr((value) => value + 1);
+    selectTool("scanner");
+  };
+  const returnIntelligenceOcr = (result: IntelligenceOcrReturn) => {
+    if (intelligenceOcrRoot.current !== workspace?.root) throw new Error("Рабочая папка изменилась. Повторите запрос OCR в окне ИИ.");
+    intelligenceOcrRouter.current.updateContext(intelligenceOcrRoot.current, networkAccessIsPaused());
+    intelligenceOcrRouter.current.finish(result);
+    refreshIntelligenceOcr((value) => value + 1);
+    selectTool("intelligence");
+  };
+  const consumeIntelligenceOcr = () => {
+    if (!intelligenceOcrReturn || intelligenceOcrRoot.current !== workspace?.root || intelligenceOcrRouter.current.result?.id !== intelligenceOcrReturn.id) return;
+    intelligenceOcrRouter.current.consume();
+    refreshIntelligenceOcr((value) => value + 1);
   };
 
   if (!installedFastStart && !workspace)
@@ -653,13 +680,13 @@ function App() {
             {intelligenceOpened && <div hidden={activeTool !== "intelligence"} key={`intelligence-${workspace.root}`}>
               <ReadOnlyWorkspaceBoundary allowMutations>
                 <Suspense fallback={<p className="notice" role="status">Открываем рабочее окно ИИ…</p>}>
-                  <IntelligenceWorkbench active={activeTool === "intelligence"} workspaceRoot={workspace.root} onTransfer={transferIntelligence} />
+                  <IntelligenceWorkbench active={activeTool === "intelligence"} workspaceRoot={workspace.root} onTransfer={transferIntelligence} onRecognizeFile={recognizeIntelligenceFile} ocrReturn={intelligenceOcrReturn} onOcrReturnConsumed={consumeIntelligenceOcr} />
                 </Suspense>
               </ReadOnlyWorkspaceBoundary>
             </div>}
             {scannerOpened && <div hidden={activeTool !== "scanner"} key={`scanner-${workspace.root}`}>
               <ReadOnlyWorkspaceBoundary allowMutations>
-                <Scanner active={activeTool === "scanner"} />
+                <Scanner active={activeTool === "scanner"} intelligenceOcrRequest={intelligenceOcrRequest} onIntelligenceOcrReady={returnIntelligenceOcr} />
               </ReadOnlyWorkspaceBoundary>
             </div>}
             <ReadOnlyWorkspaceBoundary>

@@ -115,14 +115,26 @@ def _coverage(complete=True, *, no_text=None, images=None) -> dict:
             "pagesWithoutText": no_text or [], "pagesWithImages": images or []}
 
 
+def _pdf_metadata_value(document, key: str) -> str:
+    # Metadata is only a provenance hint, never evidence of OCR completeness.
+    # Probe its size before using the helper, which otherwise allocates a buffer
+    # of arbitrary size supplied by the PDF.
+    size = pdfium_raw.FPDF_GetMetaText(document, key.encode("ascii") + b"\0", None, 0)
+    return document.get_metadata_value(key).strip() if 2 <= size <= 512 else ""
+
+
 def _pdf(path: Path) -> tuple[str, list[dict], list[str], dict]:
     document = pdfium.PdfDocument(path)
     fragments = _Fragments()
     no_text: list[int] = []
     image_pages: list[int] = []
+    scanner_producer = False
+    scanner_ocr_attempted = False
     try:
         if len(document) > MAX_PAGES:
             raise ValueError("PDF содержит слишком много страниц.")
+        scanner_producer = _pdf_metadata_value(document, "Producer") == "ScanDocument"
+        scanner_ocr_attempted = scanner_producer and _pdf_metadata_value(document, "ScanDocumentOCR") == "attempted-v1"
         for index in range(len(document)):
             page = document[index]
             text_page = page.get_textpage()
@@ -143,13 +155,24 @@ def _pdf(path: Path) -> tuple[str, list[dict], list[str], dict]:
     finally:
         document.close()
     warnings: list[str] = []
+    if scanner_ocr_attempted:
+        warnings.append("По метаданным PDF ранее выполнялось OCR сканером приложения; это отметка обработки, а не подтверждение полноты распознавания.")
+    elif scanner_producer and len(no_text) < len(fragments):
+        warnings.append("По метаданным PDF создан сканером приложения. Найден текстовый слой; наличие прежнего OCR по этим метаданным не подтверждено.")
     if no_text:
         if len(no_text) == len(fragments):
-            warnings.append("В PDF нет текстового слоя. Для поиска сначала выполните OCR в модуле сканирования.")
+            warnings.append("В PDF нет текстового слоя. " + (
+                "Проверьте качество скана и языки распознавания; при необходимости выполните OCR повторно."
+                if scanner_ocr_attempted else "Для поиска сначала выполните OCR в модуле сканирования."))
         else:
-            warnings.append(f"Текст извлечён не со всех страниц PDF. Без текстового слоя: {', '.join(map(str, no_text))}. Выполните OCR или исключите эти страницы.")
+            warnings.append(f"Текст извлечён не со всех страниц PDF. Без текстового слоя: {', '.join(map(str, no_text))}. " + (
+                "Проверьте эти страницы; при необходимости выполните OCR повторно только для этих страниц."
+                if scanner_ocr_attempted else "Выполните OCR или исключите эти страницы."))
     if image_pages:
-        warnings.append(f"PDF содержит изображения на страницах: {', '.join(map(str, image_pages))}. Текст внутри изображений и растровых шапок не распознавался; извлечение может быть неполным. Проверьте документ или выполните OCR.")
+        warnings.append(f"PDF содержит изображения на страницах: {', '.join(map(str, image_pages))}. " + (
+            "Найден текстовый слой; полнота текста внутри изображений и растровых шапок не подтверждена. Проверьте извлечённый текст по страницам и при пропусках выполните OCR для нужных страниц."
+            if len(no_text) < len(fragments) else
+            "Текст внутри изображений и растровых шапок сейчас недоступен для извлечения; полнота документа не подтверждена."))
     return "application/pdf", fragments, warnings, _coverage(not no_text and not image_pages, no_text=no_text, images=image_pages)
 
 

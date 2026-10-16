@@ -2,6 +2,8 @@ import { isValidElement, type ReactElement, type ReactNode } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Proposals } from './Proposals';
 import { VersionHistory } from '../../components/VersionHistory';
+import { ConfirmDialog } from '../../components/Dialog';
+import { Archive } from '../archive/Archive';
 import { createProposal } from './defaults';
 import { buildProposalPublic, proposalExportAssets } from './exportPublic';
 import type { ProposalData, ProposalRenderResult, ProposalTemplateData } from './types';
@@ -10,8 +12,9 @@ import type { StoredRecord } from '../../lib/storage';
 // Real component callbacks/effects with persistent hook slots. DOM layout and
 // child components are covered separately; storage and native rendering are boundaries.
 const runtime = vi.hoisted(() => ({ cursor: 0, changed: false, slots: [] as Array<{ value?: unknown; deps?: readonly unknown[]; cleanup?: () => void }>, effects: [] as Array<() => void>, editor: true,
-  store: { records: [] as StoredRecord<ProposalData | ProposalTemplateData>[], loading: false, error: null as string | null, save: vi.fn(), reload: vi.fn() },
+  store: { records: [] as StoredRecord<ProposalData | ProposalTemplateData>[], loading: false, error: null as string | null, save: vi.fn(), reload: vi.fn(), archive: vi.fn() },
   readDraft: vi.fn(), saveDraft: vi.fn(), clearDraft: vi.fn(), copyAttachment: vi.fn(), getWorkspace: vi.fn(), chooseSave: vi.fn(), chooseOpen: vi.fn(), invoke: vi.fn(),
+  listRecords: vi.fn(), archiveRecord: vi.fn(), archiveRecords: vi.fn(), deleteRecord: vi.fn(), deleteRecords: vi.fn(),
 }));
 vi.mock('react', async (original) => {
   const same = (left?: readonly unknown[], right?: readonly unknown[]) => left !== undefined && right !== undefined && left.length === right.length && left.every((value, index) => Object.is(value, right[index]));
@@ -25,16 +28,17 @@ vi.mock('react', async (original) => {
 });
 vi.mock('../../hooks/useRecords', () => ({ useRecords: () => runtime.store }));
 vi.mock('../../lib/workspaceAccess', () => ({ useWorkspaceAccess: () => ({ editor: runtime.editor, message: 'Тестовый доступ' }) }));
-vi.mock('../../lib/storage', () => ({ readDraft: runtime.readDraft, saveDraft: runtime.saveDraft, clearDraft: runtime.clearDraft, copyAttachment: runtime.copyAttachment, getWorkspaceInfo: runtime.getWorkspace }));
+vi.mock('../../lib/storage', () => ({ readDraft: runtime.readDraft, saveDraft: runtime.saveDraft, clearDraft: runtime.clearDraft, copyAttachment: runtime.copyAttachment, getWorkspaceInfo: runtime.getWorkspace, listRecords: runtime.listRecords, archiveRecord: runtime.archiveRecord, archiveRecords: runtime.archiveRecords, deleteRecord: runtime.deleteRecord, deleteRecords: runtime.deleteRecords }));
 vi.mock('../../lib/files', () => ({ chooseSavePath: runtime.chooseSave, chooseOpenPath: runtime.chooseOpen }));
 vi.mock('@tauri-apps/api/core', () => ({ invoke: runtime.invoke, convertFileSrc: (path: string) => `asset://${path}` }));
 vi.mock('@tauri-apps/plugin-opener', () => ({ openPath: vi.fn().mockResolvedValue(undefined) }));
 
 type ComponentProps = Parameters<typeof Proposals>[0];
-type NodeProps = { children?: ReactNode; onClick?: () => unknown; onChange?: (event: { target: { value: string; checked?: boolean } }) => unknown; onRestore?: (value: unknown) => Promise<void>; value?: unknown; disabled?: boolean; id?: string; title?: string; type?: string; 'aria-label'?: string; src?: string; alt?: string };
+type NodeProps = { children?: ReactNode; onClick?: () => unknown; onChange?: (event: { target: { value: string; checked?: boolean } }) => unknown; onRestore?: (value: unknown) => Promise<void>; onConfirm?: () => Promise<void>; onClose?: () => void; message?: string; value?: unknown; disabled?: boolean; id?: string; title?: string; type?: string; 'aria-label'?: string; src?: string; alt?: string };
 let tree: ReactNode;
 let props: ComponentProps;
-function render(next = props) { props = next; runtime.cursor = 0; runtime.changed = false; tree = Proposals(props); for (const effect of runtime.effects.splice(0)) effect(); }
+let renderOverride: (() => ReactNode) | undefined;
+function render(next = props) { props = next; runtime.cursor = 0; runtime.changed = false; tree = renderOverride ? renderOverride() : Proposals(props); for (const effect of runtime.effects.splice(0)) effect(); }
 async function flush() { for (let turn = 0; turn < 30; turn += 1) { await Promise.resolve(); if (runtime.changed) render(); } }
 function nodes(node: ReactNode = tree): ReactElement<NodeProps>[] { if (Array.isArray(node)) return node.flatMap((child) => nodes(child ?? null)); if (!isValidElement<NodeProps>(node)) return []; return [node, ...nodes(node.props.children ?? null)]; }
 function text(node: ReactNode = tree): string { if (Array.isArray(node)) return node.map((child) => text(child ?? null)).join(''); if (isValidElement<NodeProps>(node)) return text(node.props.children ?? null); return typeof node === 'string' || typeof node === 'number' ? String(node) : ''; }
@@ -52,18 +56,20 @@ const record = (id: string, data: ProposalData): StoredRecord<ProposalData> => (
 const result: ProposalRenderResult = { outputPath: '/tmp/proposal.pdf', outputBytes: 1234, sha256: 'a'.repeat(64), pageCount: 1, previewPages: ['/tmp/proposal-page-1.png'] };
 async function seed(data = proposal()) { render({ handoff: { id: `handoff-${data.familyId}`, data } }); await flush(); }
 const renderCalls = () => runtime.invoke.mock.calls.filter(([command]) => command === 'proposal_render');
+const archiveConfirmation = () => nodes().find((node) => node.type === ConfirmDialog && node.props.title === 'Архивировать КП?');
 
 beforeEach(() => {
   vi.useFakeTimers(); vi.setSystemTime(new Date('2026-09-18T12:00:00Z'));
-  runtime.cursor = 0; runtime.changed = false; runtime.slots = []; runtime.effects = []; runtime.editor = true; props = {};
+  runtime.cursor = 0; runtime.changed = false; runtime.slots = []; runtime.effects = []; runtime.editor = true; props = {}; renderOverride = undefined;
   runtime.store.records = []; runtime.store.loading = false; runtime.store.error = null;
-  for (const mock of [runtime.store.save, runtime.store.reload, runtime.readDraft, runtime.saveDraft, runtime.clearDraft, runtime.copyAttachment, runtime.getWorkspace, runtime.chooseSave, runtime.chooseOpen, runtime.invoke]) mock.mockReset();
+  for (const mock of [runtime.store.save, runtime.store.reload, runtime.store.archive, runtime.readDraft, runtime.saveDraft, runtime.clearDraft, runtime.copyAttachment, runtime.getWorkspace, runtime.chooseSave, runtime.chooseOpen, runtime.invoke, runtime.listRecords, runtime.archiveRecord, runtime.archiveRecords, runtime.deleteRecord, runtime.deleteRecords]) mock.mockReset();
   runtime.readDraft.mockResolvedValue(null); runtime.saveDraft.mockResolvedValue(undefined); runtime.clearDraft.mockResolvedValue(undefined);
   runtime.chooseSave.mockResolvedValue('/tmp/proposal.docx'); runtime.chooseOpen.mockResolvedValue(null);
   runtime.getWorkspace.mockResolvedValue({ root: '/tmp/qa-workspace', editor: true });
   runtime.copyAttachment.mockImplementation(async (path: string, _module: string, owner: string) => ({ relativePath: `attachment-staging/commercial-proposals/${owner}/${path.split('/').pop()}`, fileName: path.split('/').pop()!, sizeBytes: 100, sha256: 'a'.repeat(64), mimeType: path.endsWith('.png') ? 'image/png' : 'application/pdf' }));
   runtime.invoke.mockImplementation(async (command: string) => command === 'proposal_render' ? result : command === 'read_binary_file' ? 'data:image/png;base64,TEST-PREVIEW' : undefined);
   runtime.store.save.mockImplementation(async (_title: string, data: ProposalData, id?: string) => record(id || 'created-record', data));
+  runtime.store.archive.mockResolvedValue(undefined); runtime.listRecords.mockResolvedValue([]); runtime.archiveRecord.mockResolvedValue(undefined);
   vi.stubGlobal('window', { __TAURI_INTERNALS__: {}, addEventListener: vi.fn(), removeEventListener: vi.fn() });
 });
 afterEach(() => { runtime.slots.forEach((slot) => slot.cleanup?.()); vi.clearAllTimers(); vi.useRealTimers(); vi.unstubAllGlobals(); });
@@ -335,5 +341,132 @@ describe('proposal attachment ownership and durable draft identity', () => {
     expect(template.logo?.relativePath).toBe(`attachment-staging/commercial-proposals/${template.id}/logo.png`);
     expect(runtime.store.save.mock.calls[0][2]).toBe(template.id);
     await click('Сохранить КП'); expect(runtime.store.save.mock.calls[1][2]).toBe(proposalWriteId); expect(runtime.store.save.mock.calls[1][1].template.logo.relativePath).toBe(proposalLogoPath);
+  });
+});
+
+describe('proposal archive workflow', () => {
+  it('offers separate archive and open actions in the list, and cancellation never changes a record', async () => {
+    const data = proposal(); data.revision = 3;
+    runtime.store.records = [record('saved-proposal', data)]; render(); await flush();
+    const archive = button('Архивировать');
+    expect(archive.props['aria-label']).toBe(`Архивировать КП ${data.number} · редакция 3`);
+    expect(nodes().filter((node) => node.type === 'button').every((node) => nodes(node.props.children).every((child) => child.type !== 'button'))).toBe(true);
+    await click('Архивировать');
+    expect(archiveConfirmation()?.props.message).toContain('Другие редакции этого КП не изменятся');
+    expect(archiveConfirmation()?.props.message).toContain('«Архив» → «Коммерческие предложения»');
+    expect(runtime.store.archive).not.toHaveBeenCalled();
+    archiveConfirmation()!.props.onClose!(); await flush();
+    expect(archiveConfirmation()).toBeUndefined(); expect(text()).toContain(data.title);
+    expect(runtime.store.archive).not.toHaveBeenCalled(); expect(runtime.store.save).not.toHaveBeenCalled(); expect(runtime.clearDraft).not.toHaveBeenCalled();
+  });
+
+  it('archives only the confirmed list record and keeps sibling revisions unchanged', async () => {
+    const data = proposal(); const sibling = { ...structuredClone(data), revision: 2 };
+    const original = record('one', data), other = record('two', sibling);
+    runtime.store.records = [original, other];
+    runtime.store.archive.mockImplementation(async (id: string) => { runtime.store.records = runtime.store.records.filter((entry) => entry.id !== id); });
+    render(); await flush(); await click('Архивировать'); await archiveConfirmation()!.props.onConfirm!(); await flush();
+    expect(runtime.store.archive).toHaveBeenCalledExactlyOnceWith('one'); expect(runtime.store.records).toEqual([other]);
+    expect(other).toEqual(record('two', sibling)); expect(original.payload).toEqual(data);
+    expect(text()).toContain('перенесено в архив'); expect(archiveConfirmation()).toBeUndefined();
+    expect(runtime.store.save).not.toHaveBeenCalled(); expect(runtime.saveDraft).not.toHaveBeenCalled(); expect(runtime.clearDraft).not.toHaveBeenCalled();
+  });
+
+  it.each(['draft', 'ready', 'sent', 'accepted', 'rejected'] as const)('can archive the persisted %s revision from its view without changing its payload', async (status) => {
+    const data = proposal(); data.status = status;
+    runtime.store.records = [record('saved', data)]; render({ openRecordId: 'saved' }); await flush();
+    expect(button('Архивировать').props.disabled).toBe(false);
+    await click('Архивировать'); await archiveConfirmation()!.props.onConfirm!(); await flush();
+    expect(runtime.store.archive).toHaveBeenCalledExactlyOnceWith('saved'); expect(archiveConfirmation()).toBeUndefined();
+    expect(nodes().some((node) => node.type === 'input' && node.props.id === 'proposal-title')).toBe(false);
+    expect(runtime.store.records[0].payload).toEqual(data); expect(runtime.store.save).not.toHaveBeenCalled(); expect(runtime.clearDraft).not.toHaveBeenCalled();
+  });
+
+  it('does not offer archiving for viewers, new proposals or local copies', async () => {
+    await seed(); expect(nodes().some((node) => node.type === 'button' && text(node) === 'Архивировать')).toBe(false);
+    runtime.editor = false; render(); await flush();
+    expect(nodes().some((node) => node.type === 'button' && text(node) === 'Архивировать')).toBe(false);
+    expect(runtime.store.archive).not.toHaveBeenCalled();
+  });
+
+  it('does not expose a list archive action to viewers', async () => {
+    runtime.editor = false; runtime.store.records = [record('saved', proposal())]; render(); await flush();
+    expect(text()).toContain('Тестовое предложение');
+    expect(nodes().some((node) => node.type === 'button' && text(node) === 'Архивировать')).toBe(false);
+    expect(runtime.store.archive).not.toHaveBeenCalled();
+  });
+
+  it('requires resolving unsaved edits before archive and protects them even from an older click handler', async () => {
+    runtime.store.records = [record('saved', proposal())]; render({ openRecordId: 'saved' }); await flush();
+    const earlierArchive = button('Архивировать').props.onClick!;
+    await edit('proposal-title', 'Правка, которую нельзя потерять');
+    expect(button('Архивировать').props.disabled).toBe(true); expect(text()).toContain('Для архивации сначала сохраните изменения');
+    earlierArchive(); await flush();
+    expect(archiveConfirmation()).toBeUndefined(); expect(input('proposal-title').props.value).toBe('Правка, которую нельзя потерять');
+    expect(runtime.store.archive).not.toHaveBeenCalled(); expect(runtime.clearDraft).not.toHaveBeenCalled(); expect(runtime.store.save).not.toHaveBeenCalled();
+  });
+
+  it('rechecks unsaved fields at confirmation rather than archiving a changed view', async () => {
+    runtime.store.records = [record('saved', proposal())]; render({ openRecordId: 'saved' }); await flush(); await click('Архивировать');
+    const confirm = archiveConfirmation()!.props.onConfirm!;
+    await edit('proposal-title', 'Поздняя правка');
+    await expect(confirm()).rejects.toThrow('Архивация КП не подтверждена'); await flush();
+    expect(runtime.store.archive).not.toHaveBeenCalled(); expect(input('proposal-title').props.value).toBe('Поздняя правка'); expect(runtime.clearDraft).not.toHaveBeenCalled();
+  });
+
+  it('rechecks editor access for both old archive clicks and old confirmation callbacks', async () => {
+    runtime.store.records = [record('saved', proposal())]; render({ openRecordId: 'saved' }); await flush();
+    const oldArchive = button('Архивировать').props.onClick!;
+    await click('Архивировать'); const confirm = archiveConfirmation()!.props.onConfirm!;
+    runtime.editor = false; render(); await flush();
+    expect(archiveConfirmation()).toBeUndefined(); oldArchive(); await flush(); expect(archiveConfirmation()).toBeUndefined();
+    await expect(confirm()).rejects.toThrow('Архивация КП не подтверждена'); await flush();
+    expect(runtime.store.archive).not.toHaveBeenCalled(); expect(runtime.clearDraft).not.toHaveBeenCalled(); expect(input('proposal-title').props.value).toBe('Тестовое предложение');
+  });
+
+  it('serializes archive attempts, keeps confirmation and view on failure, and permits retry', async () => {
+    const pending = deferred<void>(); runtime.store.archive.mockReturnValueOnce(pending.promise).mockResolvedValueOnce(undefined);
+    runtime.store.records = [record('saved', proposal())]; render({ openRecordId: 'saved' }); await flush(); await click('Архивировать');
+    const confirmation = archiveConfirmation()!;
+    const first = confirmation.props.onConfirm!().catch((reason: Error) => reason);
+    await confirmation.props.onConfirm!(); await flush();
+    expect(runtime.store.archive).toHaveBeenCalledOnce(); confirmation.props.onClose!(); await flush(); expect(archiveConfirmation()).toBeDefined();
+    pending.reject(new Error('Сетевая папка недоступна'));
+    expect(await first).toMatchObject({ message: 'Архивация КП не подтверждена. Проверьте сообщение об ошибке и повторите попытку.' }); await flush();
+    expect(archiveConfirmation()).toBeDefined(); expect(text()).toContain('Сетевая папка недоступна'); expect(input('proposal-title').props.value).toBe('Тестовое предложение');
+    expect(runtime.clearDraft).not.toHaveBeenCalled(); await archiveConfirmation()!.props.onConfirm!(); await flush();
+    expect(runtime.store.archive).toHaveBeenCalledTimes(2); expect(archiveConfirmation()).toBeUndefined(); expect(text()).toContain('перенесено в архив');
+  });
+
+  it('round-trips a proposal through the existing central archive restore action without changing its data', async () => {
+    const data = proposal(); const source = record('round-trip', data);
+    let archived: StoredRecord<ProposalData> | null = null;
+    runtime.store.records = [source];
+    runtime.store.archive.mockImplementation(async (id: string) => { archived = { ...source, archived: true }; runtime.store.records = runtime.store.records.filter((entry) => entry.id !== id); });
+    runtime.listRecords.mockImplementation(async (module: string) => module === 'commercial-proposals' && archived ? [archived] : []);
+    runtime.archiveRecord.mockImplementation(async (_module: string, id: string, flag: boolean) => {
+      if (archived?.id === id) { archived = { ...archived, archived: flag }; runtime.store.records = [archived]; }
+    });
+    render(); await flush(); await click('Архивировать'); await archiveConfirmation()!.props.onConfirm!(); await flush();
+    expect(runtime.store.records).toEqual([]);
+    for (const slot of runtime.slots) slot.cleanup?.(); runtime.slots = []; runtime.effects = []; props = {}; renderOverride = Archive;
+    render(); await flush();
+    expect(runtime.listRecords).toHaveBeenCalledWith('commercial-proposals', true); expect(text()).toContain(data.title);
+    await click('Восстановить');
+    expect(runtime.archiveRecord).toHaveBeenCalledExactlyOnceWith('commercial-proposals', source.id, false);
+    expect(runtime.store.records[0].payload).toEqual(data); expect(runtime.store.records[0].archived).toBe(false);
+    for (const slot of runtime.slots) slot.cleanup?.(); runtime.slots = []; runtime.effects = []; renderOverride = undefined;
+    render(); await flush(); expect(text()).toContain(data.title);
+    expect(runtime.deleteRecord).not.toHaveBeenCalled(); expect(runtime.deleteRecords).not.toHaveBeenCalled(); expect(runtime.store.save).not.toHaveBeenCalled(); expect(runtime.clearDraft).not.toHaveBeenCalled();
+  });
+  it('clears an old archive success on return after another tool restores the same record', async () => {
+    const source = record('restored-while-hidden', proposal()); runtime.store.records = [source];
+    runtime.store.archive.mockImplementation(async () => { runtime.store.records = []; });
+    render({ active: true }); await flush(); await click('Архивировать'); await archiveConfirmation()!.props.onConfirm!(); await flush();
+    expect(text()).toContain('перенесено в архив');
+    render({ active: false }); await flush(); runtime.store.records = [source];
+    render({ active: true }); await flush();
+    expect(text()).toContain(source.payload.title); expect(text()).not.toContain('перенесено в архив');
+    expect(runtime.store.save).not.toHaveBeenCalled(); expect(runtime.store.archive).toHaveBeenCalledTimes(1);
   });
 });

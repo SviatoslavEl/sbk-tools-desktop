@@ -41,7 +41,9 @@ vi.mock("react", async (original) => {
 vi.mock("../../hooks/useRecords", () => ({ useRecords: () => ({ records: [], loading: false, error: null }) }));
 
 type Props = {
-  children?: ReactNode; disabled?: boolean; value?: string; className?: string;
+  children?: ReactNode; disabled?: boolean; value?: string; className?: string; id?: string; role?: string;
+  "aria-label"?: string; "aria-invalid"?: boolean; "aria-required"?: string; "aria-describedby"?: string;
+  ref?: ((element: unknown) => void) | { current: unknown };
   onClick?: () => unknown; onChange?: (event: { target: { value: string } }) => void;
   onConfirm?: () => unknown; onClose?: () => void;
 };
@@ -50,12 +52,27 @@ let props: EditorProps;
 let tree: ReactNode;
 let target: EventTarget;
 const saved = vi.fn(), closed = vi.fn();
-function render() { runtime.cursor = 0; runtime.changed = false; tree = ProcurementEditor(props); for (const effect of runtime.effects.splice(0)) effect(); }
+const hostElements = new Map<string, { focus: ReturnType<typeof vi.fn>; scrollIntoView: ReturnType<typeof vi.fn> }>();
+function render() {
+  runtime.cursor = 0; runtime.changed = false; tree = ProcurementEditor(props);
+  for (const node of nodes()) {
+    const key = node.props.id || node.props["aria-label"];
+    if (!node.props.ref || !key) continue;
+    if (!hostElements.has(key)) hostElements.set(key, { focus: vi.fn(), scrollIntoView: vi.fn() });
+    if (typeof node.props.ref === "function") node.props.ref(hostElements.get(key));
+    else node.props.ref.current = hostElements.get(key);
+  }
+  for (const effect of runtime.effects.splice(0)) effect();
+}
 async function flush() { for (let i = 0; i < 24; i += 1) { await Promise.resolve(); if (runtime.changed) render(); } }
 function nodes(node: ReactNode = tree): ReactElement<Props>[] { if (Array.isArray(node)) return node.flatMap((child) => nodes(child ?? null)); if (!isValidElement<Props>(node)) return []; return [node, ...nodes(node.props.children ?? null)]; }
 function text(node: ReactNode = tree): string { if (Array.isArray(node)) return node.map((child) => text(child ?? null)).join(""); if (isValidElement<Props>(node)) return text(node.props.children ?? null); return typeof node === "string" || typeof node === "number" ? String(node) : ""; }
 function button(label: string) { const result = nodes().find((node) => node.type === "button" && text(node) === label); if (!result) throw new Error(`Button missing: ${label}`); return result; }
-function nameInput() { const label = nodes().find((node) => node.type === "label" && text(node).startsWith("Название *"))!; return nodes(label).find((node) => node.type === "input")!; }
+function fieldInput(labelText: string) { const label = nodes().find((node) => node.type === "label" && text(node).startsWith(labelText))!; return nodes(label).find((node) => node.type === "input" || node.type === "textarea")!; }
+function nameInput() { return fieldInput("Название *"); }
+function fieldHost(label: string) { return hostElements.get(fieldInput(label).props.id!)!; }
+function validationSummary() { return nodes().find((node) => node.props["aria-label"] === "Ошибки сохранения закупки"); }
+function recommendations() { return nodes().find((node) => node.props["aria-label"] === "Рекомендации по закупке"); }
 function stage() { return nodes().find((node) => node.type === Stage2Workspace) as unknown as ReactElement<{ item: ProcurementData; onChange: (next: ProcurementData) => void }>; }
 function confirm() { return nodes().find((node) => node.type === ConfirmDialog); }
 function escape() { const event = new Event("keydown", { cancelable: true }); Object.defineProperty(event, "key", { value: "Escape" }); target.dispatchEvent(event); return event; }
@@ -64,6 +81,7 @@ const link: SnapshotLink = { id: "snapshot", sourceModule: "calculator", sourceI
 
 beforeEach(() => {
   runtime.cursor = 0; runtime.changed = false; runtime.slots = []; runtime.effects = [];
+  hostElements.clear();
   saved.mockReset().mockResolvedValue(undefined); closed.mockReset();
   const record: StoredRecord<ProcurementData> = { id: "procurement", title: "Закупка", archived: false, createdAt: "2026-09-17T10:00:00Z", updatedAt: "2026-09-17T10:00:00Z", payload: { ...emptyProcurement(), name: "Закупка", customer: "Заказчик", subject: "Работы", nmc: 100, calculations: [structuredClone(link)] } };
   props = { record, onSave: saved, onClose: closed, readOnly: false };
@@ -78,7 +96,8 @@ describe("procurement save and close lifecycle", () => {
     render(); await flush();
     const nmcLabel = nodes().find((node) => node.type === "label" && text(node).trim() === "НМЦ")!;
     expect(nodes(nmcLabel).find((node) => node.type === "input")!.props.value).toBe("");
-    expect(text()).toContain("Черновик можно сохранить");
+    expect(text(recommendations())).toContain("в черновике её можно заполнить позже");
+    expect(text(recommendations())).toContain("не блокируют сохранение");
     button("Сохранить закупку").props.onClick!(); await flush();
     expect(saved).toHaveBeenCalledOnce();
     expect(saved.mock.calls[0][0]).toMatchObject({ status: "Черновик", nmc: 0, notes: "НМЦ в источнике не указана" });
@@ -87,7 +106,8 @@ describe("procurement save and close lifecycle", () => {
   it.each([[-1, "Черновик"], [Number.NaN, "Черновик"], [0, "Подготовка"], [0, "Подана"]] as const)("does not waive invalid/required NMC for %s and %s", async (nmc, status) => {
     props = { initialValue: { ...emptyProcurement(), name: "Закупка", customer: "Заказчик", subject: "Аудит", nmc, status }, onSave: saved, onClose: closed };
     render(); await flush(); button("Сохранить закупку").props.onClick!(); await flush();
-    expect(saved).not.toHaveBeenCalled(); expect(text()).toContain("Исправьте отмеченные");
+    expect(saved).not.toHaveBeenCalled(); expect(validationSummary()).toBeDefined();
+    expect(text(validationSummary())).toContain("НМЦ должна быть больше нуля");
   });
   it("opens an intelligence result as an unsaved new card and saves only on the normal action", async () => {
     const seed = { ...emptyProcurement(), name: "Закупка из ИИ", customer: "Заказчик", subject: "Услуги", nmc: 250_000, notes: "Источник: тестовый документ" };
@@ -196,5 +216,98 @@ describe("procurement save and close lifecycle", () => {
     expect(stage().props.item.notes).toBe("");
     expect(stage().props.item.calculations).toEqual([link]);
     expect(text()).toContain("Режим просмотра");
+  });
+});
+
+describe("procurement required-field feedback", () => {
+  beforeEach(() => {
+    props = { initialValue: emptyProcurement(), onSave: saved, onClose: closed };
+  });
+
+  it("marks each missing required field after Save and separates errors from optional NMC advice", async () => {
+    render(); await flush();
+    expect(nameInput().props["aria-invalid"]).toBe(false);
+    expect(validationSummary()).toBeUndefined();
+    expect(fieldHost("Название *").focus).not.toHaveBeenCalled();
+    button("Сохранить закупку").props.onClick!(); await flush();
+    for (const [label, message] of [["Название *", "Укажите название закупки."], ["Заказчик *", "Укажите заказчика."], ["Предмет *", "Укажите предмет закупки."]]) {
+      const input = fieldInput(label);
+      expect(input.props["aria-required"]).toBe("true");
+      expect(input.props["aria-invalid"]).toBe(true);
+      const hint = nodes().find((node) => node.props.id === input.props["aria-describedby"]);
+      expect(text(hint)).toBe(message);
+      expect(hint?.props.className).toContain("procurement-field-error");
+    }
+    expect(validationSummary()?.props.role).toBe("alert");
+    expect(text(validationSummary())).toContain("Укажите название закупки.");
+    expect(text(validationSummary())).not.toContain("НМЦ");
+    expect(text(recommendations())).toContain("НМЦ не указана");
+    expect(text(recommendations())).not.toContain("Укажите название");
+    expect(text()).not.toContain("Черновик можно сохранить");
+    expect(fieldHost("Название *").focus).toHaveBeenCalledOnce();
+    expect(fieldHost("Название *").scrollIntoView).toHaveBeenCalledWith({ block: "nearest" });
+    expect(saved).not.toHaveBeenCalled();
+  });
+
+  it.each(["name", "customer", "subject"] as const)("focuses the first missing %s field, including whitespace-only input", async (missing) => {
+    const labels = { name: "Название *", customer: "Заказчик *", subject: "Предмет *" };
+    props = { ...props, initialValue: { ...emptyProcurement(), name: "Закупка", customer: "Заказчик", subject: "Услуги", [missing]: " \n\t " } };
+    render(); await flush(); button("Сохранить закупку").props.onClick!(); await flush();
+    expect(fieldInput(labels[missing]).props["aria-invalid"]).toBe(true);
+    expect(fieldHost(labels[missing]).focus).toHaveBeenCalledOnce();
+    for (const key of ["name", "customer", "subject"] as const) {
+      if (key !== missing) {
+        expect(fieldInput(labels[key]).props["aria-invalid"]).toBe(false);
+        expect(fieldHost(labels[key]).focus).not.toHaveBeenCalled();
+      }
+    }
+    expect(saved).not.toHaveBeenCalled();
+  });
+
+  it("returns from another workflow stage before focusing the required card field", async () => {
+    render(); await flush(); button("3 Цена").props.onClick!(); await flush();
+    expect(nodes().some((node) => node.props.id?.endsWith("-name"))).toBe(false);
+    button("Сохранить закупку").props.onClick!(); await flush();
+    expect(nameInput()).toBeDefined();
+    expect(fieldHost("Название *").focus).toHaveBeenCalledOnce();
+    expect(saved).not.toHaveBeenCalled();
+  });
+
+  it("clears corrected field hints without stealing focus and permits a normal unknown-NMC draft save", async () => {
+    render(); await flush(); button("Сохранить закупку").props.onClick!(); await flush();
+    nameInput().props.onChange!({ target: { value: "Новая закупка" } }); await flush();
+    expect(nameInput().props["aria-invalid"]).toBe(false);
+    expect(nameInput().props["aria-describedby"]).toBeUndefined();
+    expect(nodes().filter((node) => node.props.className?.includes("procurement-field-error"))).toHaveLength(2);
+    expect(fieldHost("Заказчик *").focus).not.toHaveBeenCalled();
+    button("Сохранить закупку").props.onClick!(); await flush();
+    expect(fieldHost("Заказчик *").focus).toHaveBeenCalledOnce();
+    fieldInput("Заказчик *").props.onChange!({ target: { value: "Заказчик" } }); await flush();
+    fieldInput("Предмет *").props.onChange!({ target: { value: "Услуги" } }); await flush();
+    expect(validationSummary()).toBeUndefined();
+    expect(fieldInput("НМЦ").props["aria-required"]).toBeUndefined();
+    button("Сохранить закупку").props.onClick!(); await flush();
+    expect(saved).toHaveBeenCalledOnce();
+    expect(saved.mock.calls[0][0]).toMatchObject({ name: "Новая закупка", customer: "Заказчик", subject: "Услуги", status: "Черновик", nmc: 0 });
+    expect(text()).toContain("Закупка сохранена в рабочей папке");
+  });
+
+  it("keeps existing non-required validation blocking and focuses its error summary", async () => {
+    props = { ...props, initialValue: { ...emptyProcurement(), name: "Закупка", customer: "Заказчик", subject: "Услуги", nmc: -1 } };
+    render(); await flush(); button("Сохранить закупку").props.onClick!(); await flush();
+    expect(text(validationSummary())).toContain("НМЦ должна быть больше нуля");
+    expect(recommendations()).toBeUndefined();
+    expect(hostElements.get("Ошибки сохранения закупки")?.focus).toHaveBeenCalledOnce();
+    expect(nameInput().props["aria-invalid"]).toBe(false);
+    expect(saved).not.toHaveBeenCalled();
+  });
+
+  it("does not focus or expose editor validation when a stale Save callback loses editing rights", async () => {
+    render(); await flush(); const save = button("Сохранить закупку").props.onClick!;
+    props = { ...props, readOnly: true }; render(); await flush(); save(); await flush();
+    expect(validationSummary()).toBeUndefined();
+    expect(nameInput().props["aria-invalid"]).toBe(false);
+    expect(fieldHost("Название *").focus).not.toHaveBeenCalled();
+    expect(saved).not.toHaveBeenCalled();
   });
 });

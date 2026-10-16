@@ -74,11 +74,14 @@ function noteContainsCoverageText(note: string, quote: string) {
   return false;
 }
 
-export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer, onSettings }: {
+export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer, onSettings, onRecognizeFile, ocrReturn, onOcrReturnConsumed }: {
   active?: boolean;
   workspaceRoot: string;
   onTransfer: (handoff: IntelligenceHandoff) => void;
   onSettings?: () => void;
+  onRecognizeFile?: (request: { id: string; inputPath: string }) => void;
+  ocrReturn?: { id: string; outputPath: string; sha256: string };
+  onOcrReturnConsumed?: () => void;
 }) {
   const access = useWorkspaceAccess();
   const network = useNetworkAccess();
@@ -120,8 +123,15 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
   const [resultStale, setResultStale] = useState(false);
   const [running, setRunning] = useState(false);
   const [transferring, setTransferring] = useState<string | null>(null);
-  const [error, setError] = useState("");
-  const [notice, setNotice] = useState("");
+  const [error, setErrorState] = useState("");
+  const [notice, setNoticeState] = useState("");
+  // Feedback always describes the latest completed action, never a stale green
+  // success alongside a later failure (including failures in async imports).
+  const setError = (message: string) => { setErrorState(message); if (message) setNoticeState(""); };
+  const setNotice = (message: string) => { setNoticeState(message); if (message) setErrorState(""); };
+  const [scanWithoutText, setScanWithoutText] = useState<{ inputPath: string; name: string } | null>(null);
+  const pendingOcr = useRef<{ id: string; workspaceRoot: string } | null>(null);
+  const consumedOcrReturn = useRef<string | null>(null);
   const [confirm, setConfirm] = useState<{ title: string; message: string; label?: string; run: () => void } | null>(null);
   const mounted = useRef(true);
   const epoch = useRef(0);
@@ -149,7 +159,20 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
     if (request) void cancelIntelligenceRequest(request.id).catch(() => undefined);
     setRunning(false);
   };
-  const invalidateTask = () => { cancelPending(); evidenceCurrent.current = { ...evidenceCurrent.current, reviewedFindings: {} }; setReviewedFindings({}); if (items.length || rawResponse) setResultStale(true); setEmptyWarning(""); setError(""); };
+  const invalidateTask = (changedSourceId?: string) => {
+    cancelPending();
+    // Results own immutable evidence snapshots. New independent material and
+    // connection/task settings cannot alter those snapshots. A mutation of an
+    // existing snapshot source still revokes decisions immediately, even for a
+    // retained transfer callback. Coverage considers the complete snapshot, not
+    // only each card's cited field sources, so all its cards may be affected.
+    if (changedSourceId && evidenceCurrent.current.resultSources.some((source) => source.id === changedSourceId)) {
+      evidenceCurrent.current = { ...evidenceCurrent.current, reviewedFindings: {} };
+      setReviewedFindings({});
+    }
+    if (itemsRef.current.length || rawResponse) setResultStale(true);
+    setEmptyWarning(""); setError(""); setNotice("");
+  };
   useEffect(() => {
     mounted.current = true;
     return () => { mounted.current = false; epoch.current++; extractionEpoch.current++; connectionEpoch.current++; const request = pending.current; pending.current = null; if (request) void cancelIntelligenceRequest(request.id).catch(() => undefined); };
@@ -216,24 +239,52 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
   const editSourceText = (id: string, text: string) => {
     if (bytes(text) > maxTextBytes) { setError("Текст одного источника не должен превышать 2 МБ."); return; }
     if (sourcesRef.current.reduce((total, entry) => total + (entry.id === id ? bytes(text) : bytes(entry.text)), 0) > maxSessionSourceBytes) { setError("Тексты в окне ИИ не должны превышать 4 МБ."); return; }
-    invalidateTask(); updateSources((previous) => previous.map((entry) => entry.id === id ? { ...entry, text, sha256: undefined, fragments: undefined, filePath: undefined, sheets: undefined, coverage: undefined } : entry));
+    if (sourcesRef.current.find((entry) => entry.id === id)?.text === text) return;
+    invalidateTask(id); updateSources((previous) => previous.map((entry) => entry.id === id ? { ...entry, text, sha256: undefined, fragments: undefined, filePath: undefined, sheets: undefined, coverage: undefined } : entry));
+  };
+  const readDocument = async (path: string, token: number, expectedSha256?: string) => {
+    const result = await invoke<ExtractionResult>("scanner_run", { jobId: crypto.randomUUID(), operation: "extract", config: { protocolVersion: 2, inputPath: path } });
+    if (token !== extractionEpoch.current || !mounted.current || networkAccessIsPaused()) return;
+    if (expectedSha256 !== undefined && result.sha256?.toLowerCase() !== expectedSha256.toLowerCase()) throw new Error("Результат OCR изменился после сохранения. Текст не добавлен: вернитесь в сканер и сохраните новый результат.");
+    if (!result.extractedText.trim() && !result.sheets?.length) {
+      const name = result.fileName || path.split(/[\\/]/).pop() || "Документ";
+      setScanWithoutText(/\.pdf$/iu.test(path) ? { inputPath: path, name } : null);
+      throw new Error(`«${name}»: в документе не найден текст. Для скана сначала выполните распознавание в сканере.`);
+    }
+    if (bytes(result.extractedText) > maxTextBytes) throw new Error("Извлечённый текст превышает 2 МБ. Добавьте нужные фрагменты как текст.");
+    appendSource({ id: crypto.randomUUID(), name: result.fileName, text: result.extractedText, sha256: result.sha256, fragments: result.fragments, filePath: path, sheets: result.sheets, coverage: result.coverage, selected: true, warnings: result.warnings || [] });
+    invalidateTask(); setScanWithoutText(null);
+    setNotice(`Документ «${result.fileName}» прочитан. Его текст остаётся в этой задаче до явной отправки.`);
   };
   const addDocument = async () => {
     if (extractionPending.current !== null || networkAccessIsPaused()) return;
     if (sourcesRef.current.length >= maxSources) { setError("В одной задаче можно добавить не более 100 источников."); return; }
-    const token = ++extractionEpoch.current; extractionPending.current = token; setExtracting(true); setError("");
+    const token = ++extractionEpoch.current; extractionPending.current = token; setExtracting(true); setError(""); setNotice(""); setScanWithoutText(null);
     try {
       const path = await chooseOpenPath("Источник для ИИ — PDF, DOCX или XLSX", ["pdf", "docx", "xlsx"]);
       if (!path || token !== extractionEpoch.current || !mounted.current || networkAccessIsPaused()) return;
-      const result = await invoke<ExtractionResult>("scanner_run", { jobId: crypto.randomUUID(), operation: "extract", config: { protocolVersion: 2, inputPath: path } });
-      if (token !== extractionEpoch.current || !mounted.current || networkAccessIsPaused()) return;
-      if (!result.extractedText.trim() && !result.sheets?.length) throw new Error("В документе не найден текст. Для скана сначала выполните распознавание в сканере.");
-      if (bytes(result.extractedText) > maxTextBytes) throw new Error("Извлечённый текст превышает 2 МБ. Добавьте нужные фрагменты как текст.");
-      appendSource({ id: crypto.randomUUID(), name: result.fileName, text: result.extractedText, sha256: result.sha256, fragments: result.fragments, filePath: path, sheets: result.sheets, coverage: result.coverage, selected: true, warnings: result.warnings || [] }); invalidateTask();
-      setNotice("Документ прочитан. Его текст остаётся в этом окне до явной отправки.");
+      await readDocument(path, token);
     } catch (reason) { if (mounted.current && token === extractionEpoch.current) setError(errorMessage(reason)); }
     finally { if (extractionPending.current === token) extractionPending.current = null; if (mounted.current && token === extractionEpoch.current) setExtracting(false); }
   };
+  useEffect(() => {
+    if (!ocrReturn || extractionPending.current !== null || network.phase !== "connected") return;
+    if (consumedOcrReturn.current === ocrReturn.id) return;
+    const expected = pendingOcr.current;
+    consumedOcrReturn.current = ocrReturn.id;
+    if (!expected || expected.id !== ocrReturn.id || expected.workspaceRoot !== workspaceRoot) { onOcrReturnConsumed?.(); return; }
+    pendingOcr.current = null;
+    if (!/^[a-f0-9]{64}$/iu.test(ocrReturn.sha256 || "")) { setError("Не удалось подтвердить сохранённый результат OCR. Вернитесь в сканер и повторите сохранение."); onOcrReturnConsumed?.(); return; }
+    const token = ++extractionEpoch.current; extractionPending.current = token;
+    setExtracting(true); setError(""); setNotice(""); setScanWithoutText(null);
+    onOcrReturnConsumed?.();
+    void readDocument(ocrReturn.outputPath, token, ocrReturn.sha256).catch((reason: unknown) => {
+      if (mounted.current && token === extractionEpoch.current) setError(errorMessage(reason));
+    }).finally(() => {
+      if (extractionPending.current === token) extractionPending.current = null;
+      if (mounted.current && token === extractionEpoch.current) setExtracting(false);
+    });
+  }, [ocrReturn, network.phase, workspaceRoot, extracting]);
   const selectSheet = async (sourceId: string, sheetId: string, included: boolean) => {
     if (extractionPending.current !== null || networkAccessIsPaused()) return;
     const original = sourcesRef.current.find((source) => source.id === sourceId);
@@ -241,13 +292,13 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
     const selectedSheets = original.sheets.filter((sheet) => sheet.id === sheetId ? included : sheet.included).map((sheet) => sheet.id);
     const includeHiddenSheets = original.sheets.some((sheet) => selectedSheets.includes(sheet.id) && sheet.state !== "visible");
     const path = original.filePath;
-    const token = ++extractionEpoch.current; extractionPending.current = token; setExtracting(true); setError(""); invalidateTask();
+    const token = ++extractionEpoch.current; extractionPending.current = token; setExtracting(true); setError(""); setNotice(""); invalidateTask(sourceId);
     try {
       const result = await invoke<ExtractionResult>("scanner_run", { jobId: crypto.randomUUID(), operation: "extract", config: { protocolVersion: 2, inputPath: path, selectedSheets, includeHiddenSheets } });
       if (token !== extractionEpoch.current || !mounted.current || networkAccessIsPaused() || sourcesRef.current.find((source) => source.id === sourceId)?.filePath !== path) return;
       if (bytes(result.extractedText) > maxTextBytes || sourcesRef.current.reduce((total, source) => total + (source.id === sourceId ? bytes(result.extractedText) : bytes(source.text)), 0) > maxSessionSourceBytes) throw new Error("Тексты выбранных листов превышают допустимый объём. Выберите меньше листов.");
       updateSources((previous) => previous.map((source) => source.id === sourceId ? { ...source, text: result.extractedText, sha256: result.sha256, fragments: result.fragments, sheets: result.sheets, coverage: result.coverage, warnings: result.warnings || [] } : source));
-      invalidateTask();
+      invalidateTask(sourceId);
       setNotice(result.sha256 !== original.sha256 ? "Файл изменился: перечитан новый цельный снимок документа. Проверьте текст и повторите анализ." : "Обновлён текст выбранных листов. Скрытые листы используются только по вашему выбору.");
     } catch (reason) { if (mounted.current && token === extractionEpoch.current) setError(errorMessage(reason)); }
     finally { if (extractionPending.current === token) extractionPending.current = null; if (mounted.current && token === extractionEpoch.current) setExtracting(false); }
@@ -328,6 +379,7 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
     finally { transferPending.current = false; if (mounted.current) setTransferring(null); }
   };
   const reset = () => {
+    pendingOcr.current = null; setScanWithoutText(null);
     cancelPending(); extractionEpoch.current++; extractionPending.current = null; setExtracting(false); updateSources(() => []); setSourceName(""); setSourceText(""); setRawResponse(""); setItems([]); setResultSources([]); setManualItemIds([]); setReviewedFindings({}); setOpenedItems([]); setResultStale(false); setEmptyWarning(""); setResponseDetails(null); setError(""); setNotice(""); setConfirm(null);
   };
   const requestReset = () => {
@@ -423,14 +475,15 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
       </div>}
     </section>
     {error && <div className="notice error" role="alert">{error}</div>}{notice && <div className="notice success" role="status">{notice}</div>}{emptyWarning && <div className="notice warning" role="status">{emptyWarning}</div>}
+    {scanWithoutText && <div className="notice warning" role="status"><strong>{scanWithoutText.name}</strong><p>Откройте именно этот файл в сканере, включите OCR и сохраните полный PDF. Затем верните результат в эту задачу: уже добавленные материалы останутся, отправка модели не начнётся автоматически.</p>{onRecognizeFile && <button type="button" className="secondary" disabled={extracting || network.phase !== "connected"} onClick={() => { if (networkAccessIsPaused() || extractionPending.current !== null) return; const request = { id: crypto.randomUUID(), inputPath: scanWithoutText.inputPath }; pendingOcr.current = { id: request.id, workspaceRoot }; try { onRecognizeFile(request); } catch (reason) { pendingOcr.current = null; setError(errorMessage(reason)); } }}>Распознать этот файл</button>}</div>}
     <div className="iw-workspace-grid">
       <section className="surface iw-sources"><div className="iw-section-heading"><span className="iw-step">1</span><div><h3>Источники</h3><p>В модель отправятся только отмеченные тексты.</p></div></div>
-        {manualReviewCount > 0 && <div className="notice warning" role="status" aria-label="Предупреждение о сбросе подтверждений источников">Ручных подтверждений: {manualReviewCount}. Изменение состава, выбора, листов или текста источников сбросит их все. Перед переносом потребуется повторная сверка; автоматически подтверждения не восстанавливаются.</div>}
+        {manualReviewCount > 0 && <div className="notice warning" role="status" aria-label="Предупреждение о сбросе подтверждений источников">Ручных подтверждений: {manualReviewCount}. Добавление независимого материала сохраняет решения прежнего результата. Изменение выбора, листов или текста источника из его снимка сбросит связанные подтверждения: потребуется повторная сверка; автоматически подтверждения не восстанавливаются.</div>}
         <button type="button" className="secondary iw-add-document" disabled={extracting || network.phase !== "connected"} onClick={() => void addDocument()}><ToolIcon name="folder" />{extracting ? "Извлекаем текст…" : "Добавить PDF, DOCX или XLSX"}</button>
         {extracting && <div className="iw-progress" role="status"><span className="iw-spinner" aria-hidden="true" />Читаем документ. Это может занять время.<button type="button" className="secondary" onClick={() => { extractionEpoch.current++; extractionPending.current = null; setExtracting(false); setNotice("Чтение отменено для этой задачи. Поздний результат не будет добавлен."); }}>Отмена</button></div>}
         <div className="iw-text-source"><label>Название источника<input id="iw-source-name" value={sourceName} maxLength={200} placeholder="Например: Техническое задание" onChange={(event) => setSourceName(event.target.value)} /></label><label>Текст<textarea id="iw-source-text" rows={5} maxLength={maxTextBytes} value={sourceText} placeholder="Вставьте текст документа, письма или заметки" onChange={(event) => { if (bytes(event.target.value) > maxTextBytes) setError("Текст одного источника не должен превышать 2 МБ."); else setSourceText(event.target.value); }} /></label><button type="button" className="secondary" disabled={!sourceText.trim() || sources.length >= maxSources} onClick={addTextSource}>Добавить текст</button></div>
         {sources.length ? <ul className="iw-source-list">{sources.map((source) => <li key={source.id}>
-          <div className="iw-source-line"><label><input type="checkbox" checked={source.selected} aria-label={`Отправить источник ${source.name}`} onChange={(event) => { invalidateTask(); updateSources((previous) => previous.map((entry) => entry.id === source.id ? { ...entry, selected: event.target.checked } : entry)); }} /><strong>{source.name}</strong></label><button type="button" className="icon-button" aria-label={`Удалить источник ${source.name}`} title="Удалить источник" onClick={() => setConfirm({ title: "Удалить источник?", message: `Текст «${source.name}» будет убран из текущей задачи. Подготовленные ранее карточки сохранят свои ссылки на исходный снимок.`, run: () => { invalidateTask(); updateSources((previous) => previous.filter((entry) => entry.id !== source.id)); setConfirm(null); } })}>×</button></div>
+          <div className="iw-source-line"><label><input type="checkbox" checked={source.selected} aria-label={`Отправить источник ${source.name}`} onChange={(event) => { invalidateTask(source.id); updateSources((previous) => previous.map((entry) => entry.id === source.id ? { ...entry, selected: event.target.checked } : entry)); }} /><strong>{source.name}</strong></label><button type="button" className="icon-button" aria-label={`Удалить источник ${source.name}`} title="Удалить источник" onClick={() => setConfirm({ title: "Удалить источник?", message: `Текст «${source.name}» будет убран из текущей задачи. Подготовленные ранее карточки сохранят свои ссылки на исходный снимок.`, run: () => { invalidateTask(source.id); updateSources((previous) => previous.filter((entry) => entry.id !== source.id)); setConfirm(null); } })}>×</button></div>
           <small>{source.text.length.toLocaleString("ru")} символов{source.fragments?.length ? ` · ${source.fragments.length} фрагментов` : ""}</small>
           {source.sheets?.length ? <details className="iw-sheets" open><summary>Листы документа ({source.sheets.filter((sheet) => sheet.included).length} выбрано)</summary><p className="help-text">По умолчанию используются только видимые листы. Скрытые листы могут содержать историю другой закупки; выбирайте их явно. При изменении выбора файл перечитывается целиком.</p>{source.sheets.map((sheet) => <label key={sheet.id}><input type="checkbox" aria-label={`Лист ${sheet.name} источника ${source.name}`} checked={sheet.included} disabled={extracting || network.phase !== "connected" || !source.filePath} onChange={(event) => void selectSheet(source.id, sheet.id, event.target.checked)} />{sheet.name}{sheet.state !== "visible" ? " · скрытый" : ""}</label>)}</details> : null}
           {!source.text.trim() && <p className="iw-source-warning">Нет выбранного непустого текста. Выберите листы: пустой источник в модель не отправляется.</p>}
