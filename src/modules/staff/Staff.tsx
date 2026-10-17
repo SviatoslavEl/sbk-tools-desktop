@@ -70,7 +70,9 @@ import { StaffSelectionDocuments } from "./StaffSelectionDocuments";
 import { pruneStaffDocumentSelection, selectedStaffAttachmentPaths } from "./documentSelection";
 import { staffEmailHint, validateStaffEmail } from "./emailValidation";
 import { StaffReadCard } from "./StaffReadCard";
-import { RegistryTableView } from "../contracts/RegistryTableView";
+import { StaffOptionalDateField } from "./StaffOptionalDateField";
+import { RegistryTableView, useRegistryColumns, type RegistryColumn } from "../contracts/RegistryTableView";
+import { RegistryCellText, RegistryScrollHint } from "../contracts/RegistryOverviewCells";
 import "../contracts/registry.css";
 import {
   applyStaffImportOverrides,
@@ -140,7 +142,12 @@ const requiredStaffImportFields: ImportRequiredField<StaffData>[] = [
   },
 ];
 
+const registryColumns: RegistryColumn[] = [
+  { key: "name", label: "ФИО", compact: true }, { key: "legalEntity", label: "Юрлицо", compact: false }, { key: "department", label: "Отдел", compact: false }, { key: "position", label: "Должность", compact: true }, { key: "basis", label: "Основание", compact: true }, { key: "status", label: "Статус", compact: false }, { key: "qualification", label: "Квалификация", compact: false }, { key: "document", label: "Документы", compact: false }, { key: "readiness", label: "Полнота карточки", compact: true },
+];
+
 export function StaffRegistry({ openRecordId, onRecordOpened, intelligenceHandoff, onIntelligenceHandoffConsumed }: { openRecordId?: string; onRecordOpened?: () => void; intelligenceHandoff?: Extract<IntelligenceHandoff, { destination: "staff" }>; onIntelligenceHandoffConsumed?: () => void } = {}) {
+  const tableColumns = useRegistryColumns("staff", registryColumns);
   const workspaceAccess = useWorkspaceAccess();
   const readOnly = !workspaceAccess.editor;
   const store = useRecords<StaffData>("staff");
@@ -900,12 +907,11 @@ export function StaffRegistry({ openRecordId, onRecordOpened, intelligenceHandof
           <button className="secondary" type="button" disabled={store.loading} onClick={() => void store.reload()}>Повторить чтение</button>
         </div>
       )}
-      <div className="surface table-surface">
-        <RegistryTableView name="staff" count={filtered.length} cacheNotice={store.cacheNotice} columns={[
-          { key: "name", label: "ФИО", compact: true }, { key: "legalEntity", label: "Юрлицо", compact: false }, { key: "department", label: "Отдел", compact: false }, { key: "position", label: "Должность", compact: true }, { key: "basis", label: "Основание", compact: true }, { key: "status", label: "Статус", compact: false }, { key: "qualification", label: "Квалификация", compact: false }, { key: "document", label: "Документы", compact: true }, { key: "readiness", label: "Полнота карточки", compact: true },
-        ]} />
-        <div className="table-scroll">
-          <table className="registry-staff-table registry-compact-table">
+      <div className="surface table-surface registry-overview-surface">
+        <RegistryTableView count={filtered.length} cacheNotice={store.cacheNotice} columns={registryColumns} selected={tableColumns.selected} onChange={tableColumns.update} />
+        <RegistryScrollHint id="staff-scroll-hint" />
+        <div className="table-scroll registry-overview-scroll" role="region" aria-label="Кадровый реестр" aria-describedby="staff-scroll-hint" tabIndex={0}>
+          <table className="registry-staff-table registry-compact-table registry-overview-table">
             <thead>
               <tr>
                 <th className="selection-cell"><input type="checkbox" aria-label="Выбрать все найденные кадровые карточки" checked={filtered.length > 0 && filtered.every((record) => selectedRegistryStaff.has(record.id))} ref={(input) => { if (input) input.indeterminate = filtered.some((record) => selectedRegistryStaff.has(record.id)) && !filtered.every((record) => selectedRegistryStaff.has(record.id)); }} onChange={(event) => { const checked = event.target.checked; setSelectedRegistryStaff((current) => { const next = new Set(current); filtered.forEach((record) => checked ? next.add(record.id) : next.delete(record.id)); return next; }); }} /></th>
@@ -913,8 +919,8 @@ export function StaffRegistry({ openRecordId, onRecordOpened, intelligenceHandof
                   "name", "ФИО"], ["legalEntity", "Юрлицо"], ["department", "Отдел"],
                   ["position", "Должность / роль"], ["basis", "Основание"], ["status", "Статус"],
                   ["qualification", "Квалификация"], ["document", "Самый срочный документ"], ["readiness", "Полнота карточки"],
-                ] as Array<[StaffSortKey, string]>).map(([column, label]) => <SortableHeader key={column} label={label} column={column} active={sort.key === column} direction={sort.direction} onSort={(key) => setSort((current) => toggleSort(current, key))} />)}
-                <th />
+                ] as Array<[StaffSortKey, string]>).filter(([column]) => tableColumns.visible(column)).map(([column, label]) => <SortableHeader key={column} label={label} column={column} active={sort.key === column} direction={sort.direction} onSort={(key) => setSort((current) => toggleSort(current, key))} />)}
+                <th className="registry-row-actions" scope="col">Действия</th>
               </tr>
             </thead>
             <tbody>
@@ -934,7 +940,7 @@ export function StaffRegistry({ openRecordId, onRecordOpened, intelligenceHandof
                   <Fragment key={record.id}>
                     {sort.key === "department" && department !== previousDepartment && (
                       <tr className="department-group-row">
-                        <td colSpan={11}>{department}</td>
+                        <td colSpan={tableColumns.selected.length + 2}>{department}</td>
                       </tr>
                     )}
                     <tr
@@ -959,12 +965,12 @@ export function StaffRegistry({ openRecordId, onRecordOpened, intelligenceHandof
                           </button>
                         )}
                       </td>
-                      <td>{assignment.legalEntity || "Не указано"}</td>
-                      <td>
-                        <strong>{department}</strong>
-                      </td>
-                      <td>{assignment.position || item.role}</td>
-                      <td>
+                      {tableColumns.visible("legalEntity") && <td><RegistryCellText text={assignment.legalEntity || "Не указано"} /></td>}
+                      {tableColumns.visible("department") && <td>
+                        <RegistryCellText text={department} />
+                      </td>}
+                      {tableColumns.visible("position") && <td><RegistryCellText text={assignment.position || item.role} /></td>}
+                      {tableColumns.visible("basis") && <td>
                         <span className={`status ${staffBasisTone(assignment.engagementType)}`}>
                           {assignment.engagementType}
                           {assignment.engagementType === "Иное" &&
@@ -972,14 +978,12 @@ export function StaffRegistry({ openRecordId, onRecordOpened, intelligenceHandof
                             ? `: ${assignment.engagementOther}`
                             : ""}
                         </span>
-                      </td>
-                      <td>{assignment.status}</td>
-                      <td>
-                        {item.primarySpecialization ||
-                          item.qualification ||
-                          "—"}
-                      </td>
-                      <td>
+                      </td>}
+                      {tableColumns.visible("status") && <td>{assignment.status}</td>}
+                      {tableColumns.visible("qualification") && <td>
+                        <RegistryCellText text={item.primarySpecialization || item.qualification || "—"} />
+                      </td>}
+                      {tableColumns.visible("document") && <td>
                         {urgent ? (
                           <span
                             className={`status ${urgent.category === "expired" ? "danger" : "warning"}`}
@@ -991,8 +995,8 @@ export function StaffRegistry({ openRecordId, onRecordOpened, intelligenceHandof
                         ) : (
                           "—"
                         )}
-                      </td>
-                      <td>
+                      </td>}
+                      {tableColumns.visible("readiness") && <td>
                         <span
                           className={`status ${requirements.ready ? "success" : "warning"}`}
                           title={
@@ -1005,28 +1009,26 @@ export function StaffRegistry({ openRecordId, onRecordOpened, intelligenceHandof
                           {requirements.ready ? "заполнено" : "неполно"}
                         </span>
                         <small title={attachmentSummary.title}>{attachmentSummary.label}</small>
-                      </td>
-                      <td>
-                        {!readOnly && (
-                          <div className="row-actions">
+                      </td>}
+                      <td className="registry-row-actions">
+                        <div className="row-actions">
                             <button
                               className="secondary small"
                               type="button"
-                              aria-label={`Редактировать сотрудника ${item.fullName}`}
+                              aria-label={`${readOnly ? "Открыть" : "Редактировать"} сотрудника ${item.fullName}`}
                               onClick={() => setEditing(record)}
                             >
-                              Редактировать
+                              Открыть
                             </button>
-                            <button
+                            {!readOnly && <button
                               className="icon-button danger"
                               type="button"
                               aria-label={`Архивировать ${item.fullName}`}
                               onClick={() => setArchiving(record)}
                             >
                               ×
-                            </button>
+                            </button>}
                           </div>
-                        )}
                         <VersionHistory module="staff" id={record.id} title={record.title} payload={record.payload} />
                       </td>
                     </tr>
@@ -1899,6 +1901,12 @@ export function StaffEditor({
       return;
     }
     const assignments = staffAssignments(item);
+    if (assignments.some((entry) => entry.engagementType === "Не указано")) {
+      setError("Выберите подтверждённое основание сотрудничества для каждого места работы. Значение «Не указано» не заменяется трудовым договором автоматически.");
+      setAssignmentValidationAttempt((current) => current + 1);
+      setTab("work");
+      return;
+    }
     if (
       !assignments.length ||
       assignments.some(
@@ -2174,6 +2182,7 @@ export function StaffEditor({
             categories={["education"]}
             recordId={recordId}
             documents={item.documents}
+            disabled={saving || !editorAccess.editor}
             onChange={(documents) => update("documents", documents)}
           />
         )}
@@ -2183,6 +2192,7 @@ export function StaffEditor({
             categories={["certificate", "permit"]}
             recordId={recordId}
             documents={item.documents}
+            disabled={saving || !editorAccess.editor}
             onChange={(documents) => update("documents", documents)}
           />
         )}
@@ -2192,6 +2202,7 @@ export function StaffEditor({
             categories={["contract"]}
             recordId={recordId}
             documents={item.documents}
+            disabled={saving || !editorAccess.editor}
             onChange={(documents) => update("documents", documents)}
           />
         )}
@@ -2437,7 +2448,7 @@ function OrganizationalAssignmentsEditor({
           title={assignment.position.trim() || assignment.legalEntity.trim() || "Новое назначение"}
           summary={[assignment.legalEntity, assignment.department, assignment.isPrimary ? "Основное" : "Дополнительное"].filter(Boolean).join(" · ")}
           defaultExpanded={!assignment.legalEntity.trim() || !assignment.department.trim() || !assignment.position.trim()}
-          revealKey={!assignment.legalEntity.trim() || !assignment.department.trim() || !assignment.position.trim() || (assignment.engagementType === "Иное" && !assignment.engagementOther.trim()) ? validationAttempt : 0}
+          revealKey={!assignment.legalEntity.trim() || !assignment.department.trim() || !assignment.position.trim() || assignment.engagementType === "Не указано" || (assignment.engagementType === "Иное" && !assignment.engagementOther.trim()) ? validationAttempt : 0}
         >
           <div className="document-card-header">
             <label className="checkbox-row">
@@ -2589,12 +2600,14 @@ function DocumentsEditor({
   recordId,
   documents,
   onChange,
+  disabled = false,
 }: {
   title: string;
   categories: StaffDocument["category"][];
   recordId: string;
   documents: StaffDocument[];
   onChange: (items: StaffDocument[]) => void;
+  disabled?: boolean;
 }) {
   const visible = documents.filter((item) =>
     categories.includes(item.category),
@@ -2729,27 +2742,33 @@ function DocumentsEditor({
                 }
               />
             </label>
-            <label>
-              Дата выдачи
-              <input
-                type="date"
-                value={doc.issuedDate}
-                onChange={(event) =>
-                  update(doc.id, { issuedDate: event.target.value })
-                }
+            <StaffOptionalDateField
+              label="Дата выдачи"
+              value={doc.issuedDate}
+              disabled={disabled}
+              onChange={(value) => update(doc.id, { issuedDate: value })}
+            />
+            {doc.category === "certificate" && <>
+              <StaffOptionalDateField
+                label="Дата экзамена"
+                value={doc.examDate || ""}
+                disabled={disabled}
+                onChange={(value) => update(doc.id, { examDate: value })}
               />
-            </label>
-            <label>
-              Срок действия
-              <input
-                type="date"
-                disabled={doc.unlimited}
-                value={doc.expiresDate}
-                onChange={(event) =>
-                  update(doc.id, { expiresDate: event.target.value })
-                }
-              />
-            </label>
+              <label>
+                Статус в исходном реестре
+                <select aria-label="Статус в исходном реестре" value={doc.reportedValidity || ""} onChange={(event) => update(doc.id, { reportedValidity: event.target.value as StaffDocument["reportedValidity"] })}>
+                  <option value="">Не указан</option><option value="Да">Да</option><option value="Нет">Нет</option>
+                </select>
+                <small>Историческая отметка реестра, не подтверждение действия сегодня.</small>
+              </label>
+            </>}
+            <StaffOptionalDateField
+              label="Срок действия"
+              value={doc.expiresDate}
+              disabled={disabled || doc.unlimited}
+              onChange={(value) => update(doc.id, { expiresDate: value })}
+            />
             <label className="checkbox-row">
               <input
                 type="checkbox"

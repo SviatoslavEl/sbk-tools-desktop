@@ -102,7 +102,11 @@ export function buildFacsimilePlacements(
     { ...facsimile, ...geometry },
     selection.application === "all" && groups.size === 1
       ? { application: "all", pages: [] }
-      : { application: groupPages.length === 1 ? "current" : "explicitPages", pages: groupPages },
+      // A single-page group from an all/range selection still owns that
+      // selection's region and random rotation. "current" is a user mode, not
+      // a group-size optimization: buildFacsimilePlacement deliberately clears
+      // its hidden region, which must not happen after per-page edits.
+      : { application: selection.application === "current" ? "current" : "explicitPages", pages: groupPages },
   ));
 }
 
@@ -171,12 +175,65 @@ export function facsimileAppliesTo(placement: FacsimilePlacementPayload, pageInd
   return placement.application === "all" || placement.pages.includes(pageIndex);
 }
 
-export function facsimileOverlayStyle(placement: FacsimilePlacementPayload) {
+export interface FacsimilePreviewMetrics {
+  /** Actual page width / height, including the current page's rotation. */
+  pageAspect: number;
+  /** EXIF-corrected source image width / height. */
+  imageAspect: number;
+}
+const knownPreviewDimensions = (metrics: FacsimilePreviewMetrics) => Number.isFinite(metrics.pageAspect) && metrics.pageAspect > 0
+  && Number.isFinite(metrics.imageAspect) && metrics.imageAspect > 0;
+
+/** Derived display geometry only; never pass it back as the requested width.
+ * Mirrors the compositor's two fits and its expanded-bitmap anchor/clamp in
+ * continuous page coordinates (raster rounding may differ by a pixel).
+ * Call positionFacsimileInRegion first, using the original requested size, so
+ * deterministic random placement is identical to the worker's per-page plan. */
+export function facsimilePreviewGeometry(placement: FacsimilePlacementPayload, metrics: FacsimilePreviewMetrics) {
+  const knownDimensions = knownPreviewDimensions(metrics);
+  const pageAspect = knownDimensions ? metrics.pageAspect : 1;
+  const imageAspect = knownDimensions ? metrics.imageAspect : 1;
+  const requested = { x: placement.x, y: placement.y, width: placement.width,
+    height: placement.width * pageAspect / imageAspect, rotation: placement.rotation };
+  if (!placement.region || !knownDimensions) return requested;
+  const [rx, ry, rw, rh] = placement.region;
+  if (![rx, ry, rw, rh, placement.x, placement.y, placement.width, placement.rotation].every(Number.isFinite) || rw <= 0 || rh <= 0) return requested;
+  const clamp = (value: number, minimum: number, maximum: number) => Math.max(minimum, Math.min(maximum, value));
+  // Work in physical page units: page height is 1 and width is pageAspect.
+  let width = pageAspect * clamp(placement.width, 0.02, 0.95), height = width / imageAspect;
+  const regionWidth = pageAspect * rw, regionHeight = rh;
+  const firstScale = Math.min(1, regionWidth / width, regionHeight / height);
+  width *= firstScale; height *= firstScale;
+  const angle = placement.rotation * Math.PI / 180;
+  const cosine = Math.abs(Math.cos(angle)), sine = Math.abs(Math.sin(angle));
+  let rotatedWidth = width * cosine + height * sine, rotatedHeight = width * sine + height * cosine;
+  // Pillow expands around the old centre before fitting that rotated bitmap.
+  // Its top-left anchor does not get re-centred after the second resize.
+  let left = pageAspect * clamp(placement.x, 0, 1) + (width - rotatedWidth) / 2;
+  let top = clamp(placement.y, 0, 1) + (height - rotatedHeight) / 2;
+  const secondScale = Math.min(1, regionWidth / rotatedWidth, regionHeight / rotatedHeight);
+  width *= secondScale; height *= secondScale;
+  rotatedWidth *= secondScale; rotatedHeight *= secondScale;
+  left = clamp(left, pageAspect * rx, pageAspect * (rx + rw) - rotatedWidth);
+  top = clamp(top, ry, ry + rh - rotatedHeight);
+  // Convert the fitted rotated bitmap anchor back to CSS's unrotated box;
+  // transform-origin:center then produces the same final ink bounds.
+  return { x: (left + (rotatedWidth - width) / 2) / pageAspect,
+    y: top + (rotatedHeight - height) / 2, width: width / pageAspect, height, rotation: placement.rotation };
+}
+
+export function facsimileOverlayStyle(placement: FacsimilePlacementPayload, metrics?: FacsimilePreviewMetrics) {
+  const derived = metrics ? facsimilePreviewGeometry(placement, metrics) : undefined;
+  const displayed = derived || placement;
   return {
-    left: `${placement.x * 100}%`,
-    top: `${placement.y * 100}%`,
-    width: `${placement.width * 100}%`,
-    transform: `rotate(${placement.rotation}deg)`,
+    left: `${displayed.x * 100}%`,
+    top: `${displayed.y * 100}%`,
+    width: `${displayed.width * 100}%`,
+    // The legacy 10px overlay minimum must not move the rotation centre or ink
+    // when a narrow region fits a signature below 10 displayed pixels high.
+    ...(derived && metrics && placement.region && knownPreviewDimensions(metrics)
+      ? { height: `${derived.height * 100}%`, minHeight: 0 } : {}),
+    transform: `rotate(${displayed.rotation}deg)`,
     transformOrigin: "center center",
   } as const;
 }

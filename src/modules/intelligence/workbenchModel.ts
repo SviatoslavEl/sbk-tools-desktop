@@ -4,6 +4,8 @@ import { emptyProcurement, emptyQuestion, emptyRequirement } from "../procuremen
 import { createProposal, createProposalLine } from "../proposals/defaults";
 import { cooperationBases, emptyStaff, emptyStaffDocument } from "../staff/types";
 import { parseUniqueJson } from "./uniqueJson";
+import { staffCertificateHandoffDocuments } from "./staffCertificateHandoff";
+import { evidenceSourceIssue, sourceListIssue, sourceReferenceMessage } from "./responseRecovery";
 import type {
   IntelligenceDestination, IntelligenceFieldDefinition, IntelligenceFieldValue,
   IntelligenceEvidence, IntelligenceHandoff, IntelligenceItem, IntelligenceSource,
@@ -132,6 +134,26 @@ function selectedDestinations(destinations?: readonly IntelligenceDestination[])
   return selected;
 }
 
+function extractionFieldDescription(destination: IntelligenceDestination, key: string, label: string): string {
+  const common: Record<string, string> = {
+    responsible: "Только явно назначенный наш внутренний ответственный; контакт заказчика или поставщика не подходит.",
+    platform: "Только явно названная электронная торговая площадка; банк, заказчик, номер ЕИС и подпись пустого флажка не подходят.",
+    publishedDate: "Только событие публикации закупки, не дата редакции, расчёта НМЦ или документа.",
+    submissionDeadline: "Только дата окончания подачи предложений; время и пояс того же срока обязательно сохранить в notes.",
+    questionDeadline: "Только дата окончания приёма вопросов, не подача или дата документа.",
+    nmc: "Явный итог начальной максимальной цены всей закупки, включая выбранный расчёт НМЦ; не строка товара, штраф, компенсация или нулевая заглушка.",
+    requirements: "Отдельно каждое обязательное условие из всех источников: числа специалистов и сертификаты, подпункты лицензий, документы заявки, количества, сроки реакции, оговорки и исключения. Не заменять требования вопросами.",
+    scope: "internal только при прямом указании принадлежности к нашей группе; роли покупателя, поставщика и наличие реквизитов этого не доказывают.",
+  };
+  const specific: Partial<Record<IntelligenceDestination, Record<string, string>>> = {
+    procurement: { name: "Содержательное краткое название по конкретному предмету; не «Закупка», имя файла или заглушка заказчика.", licenses: "Только явно указанные лицензии и лицензионные виды деятельности, например ФСТЭК, ФСБ, ТЗКИ, с полными подпунктами и оговорками. Доверенности, декларации, сертификаты и прочие документы заявки сами по себе не являются лицензиями: сохраняй их в requirements, не в licenses.", notes: "Полностью сохранить время и часовой пояс подачи, относительные сроки и важные оговорки, которым нет отдельного поля." },
+    contracts: { number: "Только заполненный номер после явного обозначения договора; название «Договор поставки», пустой шаблон, номер закона или приложения не подходят.", amount: "Общая цена договора, не штраф, лимит ответственности или компенсация. Неизвестная сумма — null, не 0.", performingLegalEntity: "Исполнитель / поставщик именно этого договора, не покупатель и не предполагаемая наша компания.", contractRole: "Не выбирать генподрядчика по умолчанию. Только прямо указанная роль нашей стороны." },
+    counterparties: { name: "Полное юридическое наименование конкретной компании; сокращённое наименование сохранить отдельно в shortName.", ogrn: "Только явно указанный ОГРН / ОГРНИП этой компании. Нельзя достраивать номер по шаблону.", address: "Адрес именно этой компании, включая продолжения строки; не адрес соседней стороны." },
+    proposals: { number: "Только явно обозначенный номер КП / коммерческого предложения или его исходящий номер. Модель оборудования, артикул, номер договора, доверенности или строки таблицы не являются номером КП.", issuerName: "Поставщик / исполнитель, направляющий КП. Не превращать его в заказчика или адресата.", recipientName: "Покупатель / заказчик, которому адресовано КП, а не автор бланка.", recipientAddress: "Только адрес заказчика; адрес поставщика в шапке сюда не переносить.", validUntil: "Календарная дата только при явном указании. Относительные дни сохранить в условиях, не вычислять без основания.", deliveryTerms: "Полные сроки, гарантия и оговорки, включая срок действия предложения и условия валютного курса, если в источнике они есть.", paymentTerms: "Все этапы: аванс, окончательный платёж, проценты, сроки и события, от которых они отсчитываются, включая альтернативы приёмки или отказа. Один аванс не заменяет остальные этапы." },
+  };
+  return `${label}. ${specific[destination]?.[key] || common[key] || ""} Неизвестно — null.`;
+}
+
 /** Nullable required fields work with strict APIs; null means unknown, never zero. */
 export function buildIntelligenceResponseSchema(destinations?: readonly IntelligenceDestination[]): Record<string, unknown> {
   const variants = selectedDestinations(destinations).map((destination) => {
@@ -139,7 +161,7 @@ export function buildIntelligenceResponseSchema(destinations?: readonly Intellig
     const wireDefinitions = destination === "proposals" ? definitions.filter((field) => !["lines", "lineDescriptions"].includes(field.key)) : definitions;
     const properties = Object.fromEntries(wireDefinitions.map((field) => [field.key, {
       type: [field.kind === "number" ? "number" : field.kind === "list" ? "array" : "string", "null"],
-      description: `${field.label}. Неизвестно — null.`,
+      description: extractionFieldDescription(destination, field.key, field.label),
       ...(field.kind === "list" ? { items: { type: "string", minLength: field.key === "lineDescriptions" ? 0 : 1, maxLength: listEntryLimit(field.key) }, maxItems: MAX_LIST_ITEMS } : {}),
       ...(field.kind !== "list" && field.kind !== "number" ? { maxLength: field.maxLength || MAX_TEXT_LENGTH } : {}),
       ...(field.kind === "number" ? { minimum: 0, maximum: field.key === "experienceYears" ? 100 : 1_000_000_000_000 } : {}),
@@ -149,11 +171,11 @@ export function buildIntelligenceResponseSchema(destinations?: readonly Intellig
     return {
       type: "object", additionalProperties: false, required: ["destination", "title", "fields", "sourceIds", "evidence", ...(destination === "proposals" ? ["positions"] : [])],
       properties: {
-        destination: { type: "string", enum: [destination] }, title: { type: "string", minLength: 1, maxLength: 200 },
+        destination: { type: "string", enum: [destination] }, title: { type: "string", minLength: 1, maxLength: 200, description: "Краткое понятное название по содержанию карточки. Не имя файла, не общее слово «Закупка» / «Договор» и не случайные символы; марки и модели сохранять как в источнике." },
         fields: { type: "object", properties, required: wireDefinitions.map((field) => field.key), additionalProperties: false },
         ...(destination === "proposals" ? { positions: {
           type: ["array", "null"], maxItems: MAX_LIST_ITEMS,
-          description: "Одна SKU/комплектация — один объект с полным описанием. Не отдельные строки компонентов.",
+          description: "Одна SKU/комплектация или предлагаемая услуга — один объект с полным описанием. Не отдельные строки компонентов; шапки таблиц и финансовые итоги не являются товарами или услугами.",
           items: { type: "object", additionalProperties: false, required: ["name", "description"], properties: {
             name: { type: "string", minLength: 1, maxLength: 200, description: "Короткое наименование с моделью и артикулом/SKU, если они явно указаны. Разные комплектации не объединять." },
             description: { type: "string", maxLength: MAX_TEXT_LENGTH },
@@ -261,16 +283,22 @@ export function parseIntelligenceResult(raw: string, sourceIds: readonly string[
     }
     if (typeof value.title !== "string" || stringLength(value.title) > (options.editableFields ? MAX_TEXT_LENGTH : 200) || /[\u0000-\u0008\u000b\u000c\u000e-\u001f]/.test(value.title)) throw new Error(`${context}: недопустимое название карточки.`);
     const ids = value.sourceIds === undefined ? [...sourceIds] : value.sourceIds;
-    if (!Array.isArray(ids) || ids.length > MAX_SOURCE_IDS || ids.some((id) => !validSourceId(id) || !sourceIds.includes(id)) || unique(ids).length !== ids.length) throw new Error(`${context}: указаны неизвестные или повторяющиеся источники.`);
+    if (!Array.isArray(ids) || ids.length > MAX_SOURCE_IDS || ids.some((id) => !validSourceId(id) || !sourceIds.includes(id)) || unique(ids).length !== ids.length) {
+      const issue = sourceListIssue(ids, sourceIds, `items[${index}].sourceIds`);
+      throw new Error(`${context}: ${issue ? sourceReferenceMessage(issue) : "неверный список источников."}`);
+    }
     const evidence: IntelligenceEvidence[] | undefined = value.evidence === undefined ? undefined : (() => {
       if (!Array.isArray(value.evidence) || value.evidence.length > MAX_EVIDENCE_ITEMS) throw new Error(`${context}: недопустимый список подтверждений.`);
-      return value.evidence.map((claim) => {
+      return value.evidence.map((claim, claimIndex) => {
         if (!objectValue(claim)) throw new Error(`${context}: подтверждение должно быть объектом.`);
         strictKeys(claim, ["field", "sourceId", "fragmentId", "quote"], `${context}: подтверждение`);
         if (typeof claim.field !== "string" || !fieldDefinitions[value.destination as IntelligenceDestination].some((field) => field.key === claim.field)
           || !validSourceId(claim.sourceId) || !ids.includes(claim.sourceId)
           || (claim.fragmentId !== undefined && claim.fragmentId !== null && !validSourceId(claim.fragmentId))
-          || typeof claim.quote !== "string" || !claim.quote.trim() || stringLength(claim.quote) > 2_000 || /[\u0000-\u0008\u000b\u000c\u000e-\u001f]/.test(claim.quote)) throw new Error(`${context}: неверное поле, источник или цитата подтверждения.`);
+          || typeof claim.quote !== "string" || !claim.quote.trim() || stringLength(claim.quote) > 2_000 || /[\u0000-\u0008\u000b\u000c\u000e-\u001f]/.test(claim.quote)) {
+          const issue = evidenceSourceIssue(claim.sourceId, sourceIds, ids, `items[${index}].evidence[${claimIndex}].sourceId`);
+          throw new Error(`${context}: ${issue ? sourceReferenceMessage(issue) : "неверное поле, источник или цитата подтверждения."}`);
+        }
         return { field: claim.field, sourceId: claim.sourceId, ...(typeof claim.fragmentId === "string" ? { fragmentId: claim.fragmentId } : {}), quote: claim.quote };
       });
     })();
@@ -308,16 +336,16 @@ export function buildIntelligencePrompt(instruction: string, sources: readonly I
   if (sources.length > MAX_SOURCE_IDS || sources.some((source) => !validSourceId(source.id)) || unique(sources.map((source) => source.id)).length !== sources.length) throw new Error("Неверный список источников.");
   const selected = selectedDestinations(destinations);
   const sourcePayload = sources.map((source) => {
-    const fragments = source.fragments?.filter((fragment) => (fragment.sheetState !== "hidden" && fragment.sheetState !== "veryHidden") || fragment.includedByUser === true).map(({ id, locator, text, sheetId, sheetState, includedByUser }) => ({ id, locator, text, ...(sheetId ? { sheetId, sheetState, includedByUser } : {}) }));
-    const excludedHidden = fragments?.length !== source.fragments?.length;
-    const complete = fragments?.length && fragments.map((fragment) => fragment.text).filter((text) => text.trim()).join("\n").trim() === source.text.trim();
-    return { id: source.id, name: source.name, sha256: source.sha256, warnings: source.warnings || [], coverage: source.coverage, ...(complete || excludedHidden ? { fragments } : { text: source.text }) };
+    const fragments = source.fragments?.filter((fragment) => (fragment.sheetState !== "hidden" && fragment.sheetState !== "veryHidden") || fragment.includedByUser === true).map(({ id, locator, text, pdfGrid, sheetId, sheetState, includedByUser }) => ({ id, locator, text, ...(pdfGrid ? { pdfGrid } : {}), ...(sheetId ? { sheetId, sheetState, includedByUser } : {}) }));
+    // The selected fragments are authoritative, including an explicit empty
+    // selection. Never restore aggregate text that local fact checks excluded.
+    return { id: source.id, name: source.name, sha256: source.sha256, warnings: source.warnings || [], coverage: source.coverage, ...(fragments !== undefined ? { fragments } : { text: source.text }) };
   });
   const materials = JSON.stringify(sourcePayload);
   if (new TextEncoder().encode(materials).byteLength > MAX_SOURCE_PAYLOAD_BYTES) throw new Error("Исходные тексты превышают 1 МБ. Разделите материалы на несколько задач.");
   const schema = selected.map((destination) => ({
     destination, label: destinationLabels[destination as IntelligenceDestination],
-    fields: fieldDefinitions[destination].filter((field) => destination !== "proposals" || !["lines", "lineDescriptions"].includes(field.key)).map((field) => ({ key: field.key, description: field.label, type: field.kind === "number" ? "number" : field.kind === "list" ? "string[]" : "string", ...(field.maxLength ? { maxLength: field.maxLength } : {}), ...(field.kind === "list" ? { maxEntryLength: listEntryLimit(field.key) } : {}), ...(field.options ? { allowedValues: field.options } : {}), ...(field.kind === "date" ? { format: "YYYY-MM-DD" } : {}) })),
+    fields: fieldDefinitions[destination].filter((field) => destination !== "proposals" || !["lines", "lineDescriptions"].includes(field.key)).map((field) => ({ key: field.key, description: extractionFieldDescription(destination, field.key, field.label), type: field.kind === "number" ? "number" : field.kind === "list" ? "string[]" : "string", ...(field.maxLength ? { maxLength: field.maxLength } : {}), ...(field.kind === "list" ? { maxEntryLength: listEntryLimit(field.key) } : {}), ...(field.options ? { allowedValues: field.options } : {}), ...(field.kind === "date" ? { format: "YYYY-MM-DD" } : {}) })),
     ...(destination === "proposals" ? { positions: { type: "array|null", maxItems: MAX_LIST_ITEMS, items: { name: "string, 1–200 символов; модель и артикул/SKU из источника", description: "string, до 20000 символов; полный многострочный состав этой SKU" } } } : {}),
   }));
   const prompt = [
@@ -331,7 +359,8 @@ export function buildIntelligencePrompt(instruction: string, sources: readonly I
     "Не смешивай разные стороны и документы разных закупок. Адрес, банк, реквизиты и контакты исполнителя не относятся к заказчику; неизвестные сведения заказчика — null. responsible — наш внутренний ответственный, не контакт организатора, поставщика или заказчика: без явного назначения оставь null. Полное юридическое название отличается от короткого. title/name выбирай по предмету карточки, не по имени файла. Предупреждения sources и coverage означают ограничения извлечения; не выдавай такой источник за полный. Скрытые листы — явно выбранные дополнительные материалы, возможная история; не подменяй ими текущую закупку.",
     "Для всех дат строго различай событие: публикация, подача, вопросы, рассмотрение/подведение итогов, поставка/работы, дата документа, срок действия. Дата поставки не является сроком подачи; дата подведения итогов не является началом/окончанием работ. Относительные сроки (например, 14 календарных дней) без исходной даты не превращай в календарную дату; сохрани текст в примечании/условиях. Для сроков со временем полностью сохрани время и часовой пояс в notes/internalNote.",
     ...(selected.includes("procurement") ? ["Для закупки: НМЦ указывай только если прямо названа начальная максимальная цена или предел стоимости всей закупки. Нулевые цены строк спецификации не являются НМЦ. Если НМЦ неизвестна, пропусти nmc или верни null. Дата редакции извещения не является датой публикации: publishedDate только при явном указании публикации. Срок подачи — дата YYYY-MM-DD; время и часовой пояс сохрани полностью в notes. Предмет — конкретная услуга или товар из источника, не слово «Закупка». Каждое квалификационное условие, сертификат, количество специалистов, период опыта и требуемый документ сохрани отдельной строкой requirements без сокращения или объединения разных условий."] : []),
-    ...(selected.includes("proposals") ? ["Для КП верни positions рядом с fields: массив объектов {name,description}, а не два независимых списка. Каждая SKU/модель/различная комплектация — ровно один объект с коротким name до 200 символов. В name сохрани явно указанные модель И артикул/SKU: одинаковое название модели не заменяет разные артикулы. Если артикула нет, не придумывай его. Все процессоры, память, диски, RAID, питание и остальные строки состава этой SKU объедини переносами строки внутри её description (до 20000 символов; пустая строка допустима). Две SKU должны дать два объекта независимо от числа компонентов. Не создавай отдельную позицию на каждый компонент и не смешивай разные комплектации. Если позиции неизвестны — positions:null. fields.lines и fields.lineDescriptions не возвращай; evidence для названий использует field=lines, для состава field=lineDescriptions. Цены, количества, налоги и полномочия в positions не добавляй: их пользователь заполняет отдельно. Не меняй роли исполнителя и адресата по шапке документа."] : []),
+    ...(selected.includes("contracts") ? ["Для опыта по договорам: каждая строка с отдельным договором — отдельная карточка, даже если таблица одна или заказчик скрыт. Цитаты остальных договоров в evidence первой карточки не заменяют отдельные карточки. Сверь число явно перечисленных договоров и число карточек. Неизвестные реквизиты каждой строки оставь null; не переноси дату заявки, соседнюю сумму или конфиденциального заказчика в другую строку. Месяц без дня не превращай в полную дату."] : []),
+    ...(selected.includes("proposals") ? ["Для КП верни positions рядом с fields: массив объектов {name,description}, а не два независимых списка. Каждая SKU/модель/различная комплектация — ровно один объект с коротким name до 200 символов. В name сохрани явно указанные модель И артикул/SKU: одинаковое название модели не заменяет разные артикулы. Если артикула нет, не придумывай его. Все процессоры, память, диски, RAID, питание и остальные строки состава этой SKU объедини переносами строки внутри её description (до 20000 символов; пустая строка допустима). Две SKU должны дать два объекта независимо от числа компонентов. Не создавай отдельную позицию на каждый компонент и не смешивай разные комплектации. Шапка таблицы, промежуточный итог, НДС и общая сумма не являются позициями КП. Предлагаемую услугу бери из предмета документа, а не выдумывай из итоговой суммы. Если позиции неизвестны — positions:null. fields.lines и fields.lineDescriptions не возвращай; evidence для названий использует field=lines, для состава field=lineDescriptions. Цены, количества, налоги и полномочия в positions не добавляй: их пользователь заполняет отдельно. Сохрани ВСЕ этапы оплаты в paymentTerms, включая аванс, окончательный расчёт, доли, сроки и события приёмки/отказа; аванс не заменяет оставшуюся оплату. Не меняй роли исполнителя и адресата по шапке документа."] : []),
     "sourceIds может содержать только идентификаторы приложенных источников. До составления карточки проверь ВСЕ выбранные источники и каждый обязательный пункт: количества, модели, комплектующие, гарантии, опыт, сертификаты с минимальным числом специалистов, лицензии с подпунктами, документы заявки, сроки оплаты и исключения. Явный итог НМЦ в расчёте используй для той же закупки, а не только текст ТЗ. Требования и вопросы останутся неподтверждёнными, сертификаты и образование — описаниями без прикреплённых файлов.",
     `Схема допустимых полей: ${JSON.stringify(schema)}`,
     `Задача пользователя: ${JSON.stringify(instruction)}`,
@@ -399,10 +428,9 @@ export function buildIntelligenceHandoff(item: IntelligenceItem, sources: readon
       return { ...base, destination: "contracts", data };
     }
     case "staff": {
-      const data = assignFields(emptyStaff(), selected, fieldDefinitions.staff.filter((field) => field.key !== "certificates" && field.key !== "education").map((field) => field.key));
-      for (const key of ["certificates", "education"] as const) {
-        data.documents.push(...((selected[key] as string[] | undefined) || []).map((name) => ({ ...emptyStaffDocument(key === "certificates" ? "certificate" : "education"), name, comment: provenance })));
-      }
+      const data = assignFields({ ...emptyStaff(), basis: "Не указано" as const }, selected, fieldDefinitions.staff.filter((field) => field.key !== "certificates" && field.key !== "education").map((field) => field.key));
+      data.documents.push(...staffCertificateHandoffDocuments(item, sources, provenance));
+      data.documents.push(...((selected.education as string[] | undefined) || []).map((name) => ({ ...emptyStaffDocument("education"), name, comment: provenance })));
       data.notes = appendProvenance(data.notes, provenance);
       return { ...base, destination: "staff", data };
     }

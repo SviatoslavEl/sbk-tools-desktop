@@ -1,6 +1,6 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
-import { ScannerSizeSummary, scannerSizeSummary, totalScannerOutputBytes, type ScannerResultSize } from "./ScannerSizeSummary";
+import { ScannerSizeSummary, formatScannerBytes, scannerSizeSummary, totalScannerOutputBytes, type ScannerResultSize } from "./ScannerSizeSummary";
 
 const split: ScannerResultSize = {
   inputPath: "/qa/source.pdf", resultPath: "/qa/blocks", kind: "split",
@@ -12,6 +12,16 @@ const props = {
 };
 
 describe("saved scanner output sizes", () => {
+  it("shows small nonzero files in bytes/KB, never rounded to zero MB", () => {
+    expect(formatScannerBytes(1, "unknown")).toBe("1 Б");
+    expect(formatScannerBytes(1024, "unknown")).toBe("1 КБ");
+    expect(formatScannerBytes(17000, "unknown")).toBe("16,6 КБ");
+    expect(formatScannerBytes(1024 * 1024, "unknown")).toBe("1 МБ");
+    expect(formatScannerBytes(null, "считается")).toBe("считается");
+    const html = renderToStaticMarkup(<ScannerSizeSummary {...props} resultPath="" resultKind="" originalBytes={17000} estimatedOutputBytes={11000} />);
+    expect(html).toContain("Исходный размер: 16,6 КБ");
+    expect(html).toContain("≈ 10,7 КБ"); expect(html).not.toContain("0.0 МБ");
+  });
   it("compares the sum of every saved block, not the old 30% preview estimate", () => {
     const summary = scannerSizeSummary(props);
     expect(summary.outputBytes).toBe(1400);

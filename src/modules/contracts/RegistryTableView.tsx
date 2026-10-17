@@ -7,7 +7,7 @@ export function normalizeRegistryColumns(value: unknown, columns: RegistryColumn
   return [...new Set([columns[0].key, ...selected])];
 }
 
-export function RegistryTableView({ name, columns, count, cacheNotice = "" }: { name: "contracts" | "staff"; columns: RegistryColumn[]; count: number; cacheNotice?: string }) {
+export function useRegistryColumns(name: "contracts" | "staff", columns: RegistryColumn[]) {
   const storageKey = `sbk-registry-columns-${name}-v1`;
   const [selected, setSelected] = useState(() => {
     try { return normalizeRegistryColumns(JSON.parse(localStorage.getItem(storageKey) || "null"), columns); }
@@ -18,13 +18,15 @@ export function RegistryTableView({ name, columns, count, cacheNotice = "" }: { 
     setSelected(next);
     try { localStorage.setItem(storageKey, JSON.stringify(next)); } catch { /* In-memory choice still works when local storage is unavailable. */ }
   };
-  const hidden = columns.flatMap((column, index) => selected.includes(column.key) ? [] : [index + 2]);
+  return { selected, update, visible: (key: string) => selected.includes(key) };
+}
+
+export function RegistryTableView({ columns, selected, onChange, count, cacheNotice = "" }: { columns: RegistryColumn[]; selected: string[]; onChange: (keys: string[]) => void; count: number; cacheNotice?: string }) {
   return <div className="registry-display-options" data-workspace-viewer-allowed>
     <strong role="status">Найдено: {count}</strong>
     {cacheNotice && <small role="status" title={cacheNotice}>{cacheNotice}</small>}
-    <button className="secondary small" type="button" onClick={() => update(columns.filter((column) => column.compact).map((column) => column.key))}>Кратко</button>
-    <button className="secondary small" type="button" onClick={() => update(columns.map((column) => column.key))}>Подробно</button>
-    <details><summary>Столбцы ({selected.length})</summary><div className="column-options">{columns.map((column, index) => <label className="checkbox-row" key={column.key}><input type="checkbox" disabled={index === 0} checked={selected.includes(column.key)} onChange={(event) => update(event.target.checked ? [...selected, column.key] : selected.filter((key) => key !== column.key))} />{column.label}</label>)}</div></details>
-    <style>{hidden.map((index) => `.registry-${name}-table > thead > tr > :nth-child(${index}), .registry-${name}-table > tbody > tr:not(.department-group-row) > :nth-child(${index}) { display: none; }`).join("\n")}</style>
+    <button className="secondary small" type="button" onClick={() => onChange(columns.filter((column) => column.compact).map((column) => column.key))}>Кратко</button>
+    <button className="secondary small" type="button" onClick={() => onChange(columns.map((column) => column.key))}>Подробно</button>
+    <details><summary>Столбцы ({selected.length})</summary><div className="column-options">{columns.map((column, index) => <label className="checkbox-row" key={column.key}><input type="checkbox" disabled={index === 0} checked={selected.includes(column.key)} onChange={(event) => onChange(event.target.checked ? [...selected, column.key] : selected.filter((key) => key !== column.key))} />{column.label}</label>)}</div></details>
   </div>;
 }

@@ -815,9 +815,7 @@ input[type="checkbox"]:disabled, input[type="radio"]:disabled { cursor: not-allo
 }
 
 @media (prefers-reduced-motion: no-preference) {
-  .dialog, .detail-drawer { animation: appear .14s ease-out; }
   .primary, .secondary, .icon-button, .help-button, .collapse-button, .tool-nav button, .settings-nav button, .workspace-access-chip, .sidebar-workspace, .dashboard-stat, .dashboard-shortcut { transition: background-color .12s ease, border-color .12s ease, color .12s ease, box-shadow .12s ease; }
-  @keyframes appear { from { opacity: 0; transform: translateY(5px); } }
 }
 .startup-screen { height: 100vh; min-height: 0; overflow: auto; display: grid; place-items: center; padding: 32px; background: radial-gradient(ellipse at 50% 20%, #e8edff, var(--canvas) 65%); }
 .startup-card { width: min(540px, 100%); padding: 32px; border: 1px solid var(--line); border-radius: 18px; background: var(--surface); box-shadow: var(--shadow-overlay); display: grid; gap: 18px; }
@@ -869,8 +867,12 @@ input[type="checkbox"]:disabled, input[type="radio"]:disabled { cursor: not-allo
 .network-offline-notice button { flex-shrink: 0; }
 .dialog-backdrop > .network-offline-notice, .drawer-backdrop > .network-offline-notice { position: fixed; z-index: 2; bottom: 12px; left: 12px; width: min(520px, calc(100vw - 24px)); margin: 0; box-shadow: var(--shadow); }
 .network-diagnostics-button { font-size: 11px; }
-.network-overlay-access { position: fixed; z-index: 2; bottom: 12px; left: 12px; }
-.network-overlay-access button { padding: 7px 10px; font-size: 11px; background: var(--surface); box-shadow: var(--shadow); }
+.modal-network-controls { min-width: 0; flex: 0 1 auto; }
+.modal-network-controls .network-overlay-access { position: static; }
+.modal-network-controls .network-overlay-access button { padding: 6px 9px; font-size: 11px; background: var(--surface); white-space: normal; }
+.dialog-header:has(> .modal-network-controls), .detail-drawer > header:has(> .modal-network-controls) { flex-wrap: wrap; }
+.modal-network-controls:has(.network-offline-notice) { flex: 1 0 100%; }
+.modal-network-controls .network-offline-notice { width: 100%; margin: 0; box-shadow: none; }
 .startup-diagnostics { margin-top: 16px; text-align: left; }
 .startup-diagnostics summary { cursor: pointer; color: var(--text-muted); font-size: 12px; }
 @media (max-width: 1000px) { .topbar-actions { flex-wrap: wrap; gap: 6px; } .network-diagnostics-button { padding: 6px 8px; } }

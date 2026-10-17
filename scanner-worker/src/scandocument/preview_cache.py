@@ -51,7 +51,7 @@ def source_fingerprint(source: Path) -> str:
 
 def raster_key(source: Path, page: int, dpi: int) -> str:
     return hashlib.sha256(
-        f"raster-v2\0{source_fingerprint(source)}\0{page}\0{dpi}".encode()
+        f"raster-v3-visible-forms\0{source_fingerprint(source)}\0{page}\0{dpi}".encode()
     ).hexdigest()
 
 

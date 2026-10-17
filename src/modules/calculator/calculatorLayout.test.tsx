@@ -28,6 +28,15 @@ function declarations(selector: string, container?: string) {
 }
 
 describe("calculator layout on small desktop windows", () => {
+  it("puts a compact live result before inputs and discloses secondary record operations", () => {
+    const html = renderToStaticMarkup(<Calculator />);
+    const resultStart = html.indexOf('aria-label="Текущий итог расчёта"');
+    expect(resultStart).toBeGreaterThan(0);
+    expect(resultStart).toBeLessThan(html.indexOf('class="input-column"'));
+    expect(html).toContain('<details class="calculator-record-actions"><summary>Действия с расчётом</summary>');
+    expect(html).toContain('Цена с НДС'); expect(html).toContain('Прибыль'); expect(html).toContain('Маржа');
+    expect(html).not.toContain('Один расчёт — переключение без потери данных');
+  });
   it("keeps all expert sections and actions present in the responsive container", () => {
     const html = renderToStaticMarkup(<Calculator />);
     expect(html).toContain('class="module-stack calculator-module calculator-session calculator-expert"');

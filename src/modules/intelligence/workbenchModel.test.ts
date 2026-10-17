@@ -274,9 +274,13 @@ describe("request and field editing", () => {
     expect(prompt).toContain("Абзац 2");
   });
 
-  it("uses the current full text rather than obsolete or incomplete fragments", () => {
+  it("treats explicit fragments as authoritative, including an empty selection, just like local fact checks", () => {
     const prompt = buildIntelligencePrompt("Разбор", [{ ...sources[0], text: "CURRENT-FULL-TEXT", fragments: [{ locator: "Old locator", text: "STALE-FRAGMENT" }] }]);
-    expect(prompt).toContain("CURRENT-FULL-TEXT"); expect(prompt).not.toContain("STALE-FRAGMENT");
+    expect(prompt).not.toContain("CURRENT-FULL-TEXT"); expect(prompt).toContain("STALE-FRAGMENT");
+    const empty = buildIntelligencePrompt("Разбор", [{ ...sources[0], text: "EXCLUDED-AGGREGATE-TEXT", fragments: [] }]);
+    expect(empty).not.toContain("EXCLUDED-AGGREGATE-TEXT"); expect(empty).toContain('"fragments":[]');
+    const manuallyEdited = buildIntelligencePrompt("Разбор", [{ ...sources[0], text: "MANUALLY-EDITED-TEXT", fragments: undefined }]);
+    expect(manuallyEdited).toContain("MANUALLY-EDITED-TEXT");
   });
 
   it("restricts instructions to explicit directions without interpreting user wording", () => {
@@ -302,6 +306,22 @@ describe("request and field editing", () => {
     expect(JSON.stringify(schema)).not.toContain("fullName");
     const all = buildIntelligenceResponseSchema() as { properties: { items: { items: { anyOf: unknown[] } } } };
     expect(all.properties.items.items.anyOf).toHaveLength(5);
+  });
+  it("keeps field-level meaning next to the schema used by small scoped models", () => {
+    const procurementSchema = JSON.stringify(buildIntelligenceResponseSchema(["procurement"]));
+    expect(procurementSchema).toContain("Явный итог");
+    expect(procurementSchema).toContain("включая выбранный расчёт НМЦ");
+    expect(procurementSchema).toContain("числа специалистов и сертификаты");
+    expect(procurementSchema).toContain("не дата редакции");
+    expect(procurementSchema).toContain("не случайные символы");
+    const proposalPrompt = buildIntelligencePrompt("Разбор", sources, ["proposals"]);
+    expect(proposalPrompt).toContain("Не превращать его в заказчика или адресата");
+    expect(proposalPrompt).toContain("условия валютного курса");
+    expect(proposalPrompt).toContain("В name сохрани явно указанные модель И артикул/SKU");
+    const contractSchema = JSON.stringify(buildIntelligenceResponseSchema(["contracts"]));
+    expect(contractSchema).toContain("Не выбирать генподрядчика по умолчанию");
+    expect(contractSchema).toContain("Неизвестная сумма — null, не 0");
+    expect(JSON.stringify(buildIntelligenceResponseSchema(["counterparties"]))).toContain("Нельзя достраивать номер по шаблону");
   });
 
   it.each(["staff", "contracts", "proposals", "counterparties"] as const)("uses only the scoped %s schema without placeholder examples", (destination) => {

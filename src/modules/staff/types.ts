@@ -1,4 +1,4 @@
-export const cooperationBases = ["Трудовой договор", "Штат", "Внешнее совместительство", "Внутреннее совместительство", "ГПХ", "ИП", "Самозанятый", "Подрядная организация", "Привлечённый специалист", "Иное"] as const;
+export const cooperationBases = ["Трудовой договор", "Штат", "Внешнее совместительство", "Внутреннее совместительство", "ГПХ", "ИП", "Самозанятый", "Подрядная организация", "Привлечённый специалист", "Иное", "Не указано"] as const;
 export const workStatuses = ["Работает", "Временно не работает", "Сотрудничество завершено", "Кандидат", "Не указано"] as const;
 
 export interface OrganizationalAssignment {
@@ -24,6 +24,10 @@ export interface StaffDocument {
   seriesNumber: string;
   issuer: string;
   issuedDate: string;
+  /** An examination date from the source register is not an issue date. */
+  examDate?: string;
+  /** Literal historical register status, not validity as of today. */
+  reportedValidity?: "" | "Да" | "Нет";
   expiresDate: string;
   unlimited: boolean;
   relativePath?: string;
@@ -67,7 +71,7 @@ export interface StaffData {
 }
 
 export const emptyStaffDocument = (category: StaffDocument["category"] = "certificate"): StaffDocument => ({
-  id: crypto.randomUUID(), category, type: "", name: "", seriesNumber: "", issuer: "", issuedDate: "", expiresDate: "", unlimited: false, comment: "",
+  id: crypto.randomUUID(), category, type: "", name: "", seriesNumber: "", issuer: "", issuedDate: "", examDate: "", reportedValidity: "", expiresDate: "", unlimited: false, comment: "",
 });
 
 export const emptyOrganizationalAssignment = (): OrganizationalAssignment => ({

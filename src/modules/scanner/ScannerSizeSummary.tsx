@@ -40,9 +40,16 @@ export function scannerSizeSummary(props: ScannerSizeSummaryProps) {
   return { completed, originalBytes, outputBytes, savingsPercent, fileCount: matching?.fileCount };
 }
 
+export function formatScannerBytes(bytes: number | null, missing: string) {
+  if (positiveFileBytes(bytes) === null) return missing;
+  const divisor = bytes! >= 1024 * 1024 ? 1024 * 1024 : bytes! >= 1024 ? 1024 : 1;
+  const unit = divisor === 1 ? "Б" : divisor === 1024 ? "КБ" : "МБ";
+  return `${new Intl.NumberFormat("ru-RU", { maximumFractionDigits: divisor === 1 ? 0 : 1 }).format(bytes! / divisor)} ${unit}`;
+}
+
 export function ScannerSizeSummary(props: ScannerSizeSummaryProps) {
   const summary = scannerSizeSummary(props);
-  const size = (bytes: number | null, missing: string) => bytes ? `${(bytes / 1024 / 1024).toFixed(1)} МБ` : missing;
+  const size = formatScannerBytes;
   const label = !summary.completed ? "Оценка результата" : props.resultKind === "split"
     ? `Общий размер сохранённых блоков${summary.fileCount ? ` (${summary.fileCount} PDF)` : ""}`
     : "Размер сохранённого PDF";

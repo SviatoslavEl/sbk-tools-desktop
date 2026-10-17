@@ -13,6 +13,7 @@ import { BUILTIN_TEMPLATES, cloneProposal, createProposal, emptyContact, nextPro
 import { buildProposalPublic, proposalExportAssets, safeProposalFileName, validateProposal } from "./exportPublic";
 import { formatMoneyMinor, priceProposal, taxLabel } from "./pricing";
 import { ProposalContactFields, ProposalLinesEditor, ProposalPartyFields } from "./ProposalFields";
+import { hasPendingProposalDraftPersistence, queueProposalDraftMutation, settleProposalDraftPersistence } from "./proposalDraftPersistence";
 import type { ProposalData, ProposalIssue, ProposalRenderFormat, ProposalRenderResult, ProposalStatus, ProposalTemplateData } from "./types";
 import "./proposals.css";
 type ProposalRecord = ProposalData | ProposalTemplateData;
@@ -54,11 +55,12 @@ const checkedDraft = (stored: ProposalDraft | null) => {
     if (!/^[A-Za-z0-9_-]{1,128}$/u.test(recordId)) throw new Error("Некорректный идентификатор черновика. Запись остановлена.");
     return { data: value, recordId };
 };
-async function restageAsset(asset: AttachmentInfo, recordId: string): Promise<AttachmentInfo> {
+async function restageAsset(asset: AttachmentInfo, recordId: string, expectedRoot?: string): Promise<AttachmentInfo> {
     if (!asset.relativePath.startsWith("attachment-staging/")) return asset;
     const path = asset.relativePath;
     if (!/^attachment-staging\/commercial-proposals\/[A-Za-z0-9_-]+\//u.test(path) || path.split(/[\\/]/u).some((part) => part === ".." || part === ".")) throw new Error("Некорректный путь временного вложения.");
     const workspace = await getWorkspaceInfo();
+    if (expectedRoot !== undefined && workspace.root !== expectedRoot) throw new Error("Рабочая папка изменилась. Повторите получение КП из текущего источника.");
     const copied = await copyAttachment(`${workspace.root.replace(/[\\/]$/u, "")}/${path}`, "commercial-proposals", recordId);
     if (copied.sha256.toLowerCase() !== asset.sha256.toLowerCase()) throw new Error("Временное вложение изменилось. Прикрепите исходный файл повторно; карточка не изменена.");
     return copied;
@@ -89,6 +91,7 @@ export function Proposals({ active = true, openRecordId, onRecordOpened, handoff
     const [companies, setCompanies] = useState<CompanyCard[]>([]);
     const [directoryError, setDirectoryError] = useState("");
     const [pendingTarget, setPendingTarget] = useState<Target | null>(null);
+    const [failedHandoff, setFailedHandoff] = useState<string | null>(null);
     const [archiving, setArchiving] = useState<ArchivingProposal | null>(null);
     const [busy, setBusy] = useState("");
     const [error, setError] = useState("");
@@ -97,6 +100,7 @@ export function Proposals({ active = true, openRecordId, onRecordOpened, handoff
     // mounted. Do not present an old action receipt as its current state.
     useEffect(() => { if (active) setNotice(""); }, [active]);
     const [draftStatus, setDraftStatus] = useState("");
+    const [savedStatus, setSavedStatus] = useState("");
     const [preview, setPreview] = useState<{
         fingerprint: string;
         result: ProposalRenderResult;
@@ -112,12 +116,41 @@ export function Proposals({ active = true, openRecordId, onRecordOpened, handoff
     const mounted = useRef(true);
     const draftTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
     const draftQueue = useRef<Promise<unknown>>(Promise.resolve());
+    const draftOwnerRoot = useRef<string | null>(null);
+    const draftOwnerRequest = useRef<Promise<string> | null>(null);
+    const previousDraftSession = useRef<Session | null>(null);
     const seenHandoff = useRef<string | undefined>(undefined);
+    const handoffContext = useRef({ handoff, active });
+    handoffContext.current = { handoff, active };
     const seenRecord = useRef<string | undefined>(undefined);
     const latest = useRef(session);
     latest.current = session;
     const accessRef = useRef(access.editor);
     accessRef.current = access.editor;
+    const ownerRoot = (knownRoot?: string): Promise<string> => {
+        if (knownRoot !== undefined && draftOwnerRoot.current === null) draftOwnerRoot.current = knownRoot;
+        if (knownRoot !== undefined && draftOwnerRoot.current !== knownRoot) return Promise.reject(new Error("Рабочая папка изменилась. Повторите открытие КП."));
+        if (draftOwnerRoot.current !== null) return Promise.resolve(draftOwnerRoot.current);
+        if (!draftOwnerRequest.current) {
+            const request = getWorkspaceInfo().then((workspace) => {
+                if (draftOwnerRoot.current !== null && draftOwnerRoot.current !== workspace.root) throw new Error("Рабочая папка изменилась. Повторите открытие КП.");
+                draftOwnerRoot.current = workspace.root; return workspace.root;
+            });
+            draftOwnerRequest.current = request;
+            void request.catch(() => { if (draftOwnerRequest.current === request) draftOwnerRequest.current = null; });
+        }
+        return draftOwnerRequest.current;
+    };
+    const clearOwnedDraft = async (root: string, key: string) => {
+        const fresh = await getWorkspaceInfo();
+        if (!accessRef.current || !fresh.editor || fresh.root !== root) throw new Error("Рабочая папка или доступ изменились; старый черновик не очищен. Повторите действие в исходной рабочей папке с правами редактора.");
+        await clearDraft("commercial-proposals", key);
+    };
+    const readProposalDraft = async (key: string) => {
+        const root = await ownerRoot();
+        await settleProposalDraftPersistence(root, key, () => clearOwnedDraft(root, key));
+        return readDraft<ProposalDraft>("commercial-proposals", key);
+    };
     useEffect(() => { if (!access.editor) setArchiving(null); }, [access.editor]);
     const data = session?.data;
     const dirty = Boolean(session && snapshot(session.data) !== session.savedJson);
@@ -170,7 +203,7 @@ export function Proposals({ active = true, openRecordId, onRecordOpened, handoff
         return () => { alive = false; };
     }, [preview?.result.outputPath, previewPage]);
     useEffect(() => {
-        const unload = (event: BeforeUnloadEvent) => { if (latest.current && snapshot(latest.current.data) !== latest.current.savedJson) {
+        const unload = (event: BeforeUnloadEvent) => { const current = latest.current, root = draftOwnerRoot.current; if (current && (snapshot(current.data) !== current.savedJson || (!current.local && root !== null && hasPendingProposalDraftPersistence(root, current.draftKey)))) {
             event.preventDefault();
             event.returnValue = "";
         } };
@@ -181,7 +214,7 @@ export function Proposals({ active = true, openRecordId, onRecordOpened, handoff
         if (!access.editor || openRecordId || handoff) return;
         let alive = true;
         const initialGeneration = generation.current;
-        void readDraft<ProposalDraft>("commercial-proposals", "proposal:new").then((stored) => {
+        void readProposalDraft("proposal:new").then((stored) => {
             const draft = checkedDraft(stored);
             if (draft && alive && generation.current === initialGeneration && !latest.current && !operation.current) {
                 install({ data: draft.data, writeId: draft.recordId, savedJson: "", local: false, draftKey: "proposal:new", persistedStatus: "draft" });
@@ -193,7 +226,9 @@ export function Proposals({ active = true, openRecordId, onRecordOpened, handoff
     const stopDraftTimer = () => { if (draftTimer.current)
         clearTimeout(draftTimer.current); draftTimer.current = null; };
     const queueDraft = (current: Session) => {
-        const task = draftQueue.current.catch(() => undefined).then(() => {
+        const root = draftOwnerRoot.current;
+        if (root === null) return Promise.reject(new Error("Рабочая папка черновика ещё не определена. Повторите открытие КП."));
+        const task = queueProposalDraftMutation(root, current.draftKey, "write", () => {
             if (!mounted.current || !accessRef.current || current.local)
                 throw new Error("Режим редактора недоступен; данные остаются в форме.");
             return saveDraft("commercial-proposals", { kind: "proposal-draft", schemaVersion: 1, recordId: current.id || current.writeId, data: current.data }, current.draftKey);
@@ -201,9 +236,32 @@ export function Proposals({ active = true, openRecordId, onRecordOpened, handoff
         draftQueue.current = task;
         return task;
     };
+    const queueDraftCleanup = (current: Session) => {
+        const root = draftOwnerRoot.current;
+        if (root === null) return Promise.reject(new Error("Рабочая папка черновика ещё не определена. Повторите открытие КП."));
+        const task = queueProposalDraftMutation(root, current.draftKey, "cleanup", () => clearOwnedDraft(root, current.draftKey));
+        draftQueue.current = task;
+        return task;
+    };
+    const settleCurrentDraft = async () => {
+        await draftQueue.current.catch(() => undefined);
+        const current = latest.current, root = draftOwnerRoot.current;
+        if (current && !current.local && root !== null) await settleProposalDraftPersistence(root, current.draftKey, () => clearOwnedDraft(root, current.draftKey));
+    };
     useEffect(() => {
-        if (!session || !dirty || session.local || immutable || !access.editor || busy)
+        const previous = previousDraftSession.current;
+        previousDraftSession.current = session;
+        if (!session || session.local || immutable || !access.editor || busy)
             return;
+        if (!dirty) {
+            if (previous?.draftKey === session.draftKey && snapshot(previous.data) !== previous.savedJson) {
+                const ownGeneration = generation.current;
+                const stillClean = () => mounted.current && generation.current === ownGeneration && latest.current?.draftKey === session.draftKey && snapshot(latest.current.data) === latest.current.savedJson;
+                setSavedStatus("Возвращены сохранённые данные · очищаем временный черновик…");
+                void queueDraftCleanup(session).then(() => { if (stillClean()) { setDraftStatus(""); setSavedStatus("Карточка сохранена"); } }).catch((reason) => { if (stillClean()) setSavedStatus(`Сохранённые данные восстановлены, но старый черновик не очищен: ${message(reason)}`); });
+            }
+            return;
+        }
         let alive = true;
         setDraftStatus("Несохранённые изменения…");
         const timer = setTimeout(() => { draftTimer.current = null; void queueDraft(session).then(() => { if (alive)
@@ -236,15 +294,17 @@ export function Proposals({ active = true, openRecordId, onRecordOpened, handoff
                 setBusy("");
         }
     };
-    const install = (next: Session | null) => { generation.current += 1; setSession(next); setStep(0); setPreview(null); setAllowZero(false); setDraftStatus(""); };
-    const performTarget = async (target: Target) => {
+    const install = (next: Session | null) => { generation.current += 1; setSession(next); setStep(0); setPreview(null); setAllowZero(false); setDraftStatus(""); setSavedStatus(""); };
+    const performTarget = async (target: Target, guard?: { check: () => Promise<void>; root: string }) => {
         if (target.kind === "close") {
             install(null);
             return;
         }
         if (target.kind === "seed") {
+            if (access.editor && !target.local) await ownerRoot(guard?.root);
             if (!latest.current && access.editor && !target.local) {
-                const existing = checkedDraft(await readDraft<ProposalDraft>("commercial-proposals", "proposal:new"));
+                const existing = checkedDraft(await readProposalDraft("proposal:new"));
+                await guard?.check();
                 if (existing) {
                     install({ data: existing.data, writeId: existing.recordId, savedJson: "", local: false, draftKey: "proposal:new", persistedStatus: "draft" });
                     setPendingTarget(target);
@@ -255,9 +315,10 @@ export function Proposals({ active = true, openRecordId, onRecordOpened, handoff
             const writeId = crypto.randomUUID();
             const local = target.local ?? !access.editor;
             if (!local) {
-                value.attachments = await Promise.all(value.attachments.map((file) => restageAsset(file, writeId)));
-                if (value.template.logo) value.template.logo = await restageAsset(value.template.logo, writeId);
+                value.attachments = await Promise.all(value.attachments.map((file) => restageAsset(file, writeId, guard?.root)));
+                if (value.template.logo) value.template.logo = await restageAsset(value.template.logo, writeId, guard?.root);
             }
+            await guard?.check();
             install({ data: value, writeId, savedJson: "", local, draftKey: "proposal:new", persistedStatus: "draft" });
             return;
         }
@@ -267,14 +328,15 @@ export function Proposals({ active = true, openRecordId, onRecordOpened, handoff
                 install({ data: value, writeId: crypto.randomUUID(), savedJson: "", local: true, draftKey: "local", persistedStatus: "draft" });
                 return;
             }
-            const draft = checkedDraft(await readDraft<ProposalDraft>("commercial-proposals", "proposal:new"));
+            const draft = checkedDraft(await readProposalDraft("proposal:new"));
             install({ data: draft?.data || createProposal(), writeId: draft?.recordId || crypto.randomUUID(), savedJson: "", local: false, draftKey: "proposal:new", persistedStatus: "draft" });
             if (draft)
                 setNotice("Восстановлен незавершённый черновик нового КП.");
             return;
         }
         const record = target.record;
-        const draft = access.editor && record.payload.status === "draft" ? checkedDraft(await readDraft<ProposalDraft>("commercial-proposals", `proposal:${record.id}`)) : null;
+        await ownerRoot(guard?.root);
+        const draft = access.editor && record.payload.status === "draft" ? checkedDraft(await readProposalDraft(`proposal:${record.id}`)) : null;
         install({ id: record.id, writeId: record.id, data: structuredClone(draft?.data || record.payload), savedJson: snapshot(record.payload), local: false, draftKey: `proposal:${record.id}`, persistedStatus: record.payload.status });
         if (draft)
             setNotice("Открыта карточка с ранее сохранённым черновиком изменений.");
@@ -283,7 +345,7 @@ export function Proposals({ active = true, openRecordId, onRecordOpened, handoff
         return; if (dirty)
         setPendingTarget(target);
     else
-        void run("Открываем…", () => performTarget(target)); };
+        void run("Открываем…", async () => { await settleCurrentDraft(); await performTarget(target); }); };
     const requestArchive = (record: ArchivingProposal) => {
         if (operation.current || !accessRef.current || record.archived) return;
         const current = latest.current;
@@ -299,7 +361,7 @@ export function Proposals({ active = true, openRecordId, onRecordOpened, handoff
         const record = archiving;
         const done = await run("Переносим КП в архив…", async () => {
             if (!accessRef.current) throw new Error("Для архивации КП требуется действующий режим редактора.");
-            await draftQueue.current.catch(() => undefined);
+            await settleCurrentDraft();
             if (!accessRef.current) throw new Error("Режим редактора недоступен. КП не перенесено в архив.");
             const current = latest.current;
             if (current?.id === record.id && snapshot(current.data) !== current.savedJson)
@@ -313,13 +375,43 @@ export function Proposals({ active = true, openRecordId, onRecordOpened, handoff
         });
         if (!done) throw new Error("Архивация КП не подтверждена. Проверьте сообщение об ошибке и повторите попытку.");
     };
-    useEffect(() => {
-        if (!handoff || seenHandoff.current === handoff.id || operation.current)
+    const receiveHandoff = async (incoming: ProposalHandoff) => {
+        if (operation.current || !mounted.current || !handoffContext.current.active || handoffContext.current.handoff !== incoming) return;
+        // Admission is remembered even after a failure. Retrying is explicit,
+        // never a loop caused by the busy-state effect rerendering.
+        seenHandoff.current = incoming.id;
+        setFailedHandoff(null);
+        const target: Target = { kind: "seed", data: structuredClone(incoming.data) };
+        const currentGeneration = generation.current;
+        const current = () => mounted.current && handoffContext.current.active && handoffContext.current.handoff === incoming && generation.current === currentGeneration;
+        if (dirty) {
+            // The seed is now held by the repeatable replacement dialog, not
+            // lost with the sender's transient handoff prop.
+            setPendingTarget(target);
+            onHandoffConsumed?.();
             return;
-        seenHandoff.current = handoff.id;
-        requestTarget({ kind: "seed", data: handoff.data });
-        onHandoffConsumed?.();
-    }, [handoff, busy]);
+        }
+        const startedAsEditor = accessRef.current;
+        let accepted = false;
+        const done = await run("Получаем КП из источника…", async () => {
+            const workspace = await getWorkspaceInfo();
+            if (!current()) throw new Error("Переход или источник КП изменился. Повторите получение текущего предложения.");
+            const check = async () => {
+                if (!current()) throw new Error("Переход или источник КП изменился. Повторите получение текущего предложения.");
+                const fresh = await getWorkspaceInfo();
+                if (!current() || fresh.root !== workspace.root || startedAsEditor && (!accessRef.current || !fresh.editor)) throw new Error("Рабочая папка или доступ изменились. КП не принято; повторите получение из текущего источника.");
+            };
+            await performTarget(target, { root: workspace.root, check });
+            accepted = true;
+        });
+        if (!mounted.current || handoffContext.current.handoff !== incoming) return;
+        if (done && accepted) onHandoffConsumed?.();
+        else setFailedHandoff(incoming.id);
+    };
+    useEffect(() => {
+        if (!active || !handoff || seenHandoff.current === handoff.id || operation.current) return;
+        void receiveHandoff(handoff);
+    }, [handoff, busy, active]);
     useEffect(() => {
         if (!openRecordId) { seenRecord.current = undefined; return; }
         if (store.loading || store.error || seenRecord.current === openRecordId || operation.current)
@@ -356,11 +448,11 @@ export function Proposals({ active = true, openRecordId, onRecordOpened, handoff
         const savedData = saved.payload as ProposalData;
         setSession({ ...current, id: saved.id, data: savedData, savedJson: snapshot(savedData), draftKey: `proposal:${saved.id}`, persistedStatus: savedData.status });
         try {
-            await clearDraft("commercial-proposals", current.draftKey);
-            setDraftStatus("Все изменения сохранены в общей базе");
+            await queueDraftCleanup(current);
+            setSavedStatus("Все изменения сохранены в общей базе");
         }
         catch (reason) {
-            setDraftStatus(`Карточка сохранена, но старый черновик не очищен: ${message(reason)}`);
+            setSavedStatus(`Карточка сохранена, но старый черновик не очищен: ${message(reason)}`);
         }
         return savedData;
     };
@@ -376,7 +468,7 @@ export function Proposals({ active = true, openRecordId, onRecordOpened, handoff
             }
             else if (session && !session.local && access.editor && session.persistedStatus === "draft") {
                 await draftQueue.current.catch(() => undefined);
-                await clearDraft("commercial-proposals", session.draftKey);
+                await queueDraftCleanup(session);
             }
             await performTarget(target);
             setPendingTarget(null);
@@ -475,9 +567,10 @@ export function Proposals({ active = true, openRecordId, onRecordOpened, handoff
     <div className="proposal-toolbar"><small>Предложений: {proposals.length} · шаблонов: {templates.length}</small><button className="primary" type="button" disabled={Boolean(busy)} onClick={() => requestTarget({ kind: "new" })}>{access.editor ? "Новое КП" : "Новое локальное КП"}</button></div>
     {store.error && <div className="notice error" role="alert">Не удалось прочитать КП: {store.error}<button type="button" onClick={() => void store.reload()}>Повторить</button></div>}
     {error && <div className="notice error" role="alert">{error}</div>}{notice && <div className="notice" role="status">{notice}</div>}
-    {!session ? <><label className="proposal-search">Поиск по номеру, предмету или заказчику<input aria-label="Поиск КП" value={search} onChange={(event) => setSearch(event.target.value)}/></label>{store.loading ? <p role="status">Загружаем предложения…</p> : <div className="proposal-registry">{filtered.map((entry) => <article className="proposal-record-card" key={entry.id}><button className="proposal-record" type="button" disabled={Boolean(busy)} onClick={() => requestTarget({ kind: "record", record: entry })}><strong>{entry.payload.number} · редакция {entry.payload.revision}</strong><span>{entry.payload.title || "Без предмета"}</span><small>{entry.payload.recipient.name || "Заказчик не указан"} · {statuses[entry.payload.status]}</small></button>{access.editor && <div className="proposal-record-actions"><button type="button" className="secondary small" disabled={Boolean(busy)} aria-label={`Архивировать КП ${entry.payload.number} · редакция ${entry.payload.revision}`} onClick={() => requestArchive(entry)}>Архивировать</button></div>}</article>)}{!filtered.length && <p className="empty-inline">{search ? "КП по этому запросу не найдены." : "Коммерческих предложений пока нет. Начните с нового КП или перенесите цену из калькулятора."}</p>}</div>}</> : <>
+    {handoff && failedHandoff === handoff.id && <div className="notice warning" role="status">Получение КП не завершено. Данные источника сохранены; после восстановления доступа повторите действие.<button type="button" className="secondary" disabled={Boolean(busy) || !active} onClick={() => void receiveHandoff(handoff)}>Повторить получение КП</button></div>}
+    {!session ? <><label className="proposal-search">Поиск по номеру, предмету или заказчику<input aria-label="Поиск КП" value={search} onChange={(event) => setSearch(event.target.value)}/></label>{store.loading ? <p role="status">Загружаем предложения…</p> : <div className="proposal-registry">{filtered.map((entry) => <article className="proposal-record-card" key={entry.id}><button className="proposal-record" type="button" aria-label={`Открыть КП ${entry.payload.number} · редакция ${entry.payload.revision}`} disabled={Boolean(busy)} onClick={() => requestTarget({ kind: "record", record: entry })}><span className="proposal-record-heading"><strong>{entry.payload.number} · ред. {entry.payload.revision}</strong><small className="proposal-record-status">{statuses[entry.payload.status]}</small></span><span className="proposal-record-subject">{entry.payload.title || "Без предмета"}</span><small>{entry.payload.recipient.name || "Заказчик не указан"}</small><span className="proposal-record-open">Открыть КП <span aria-hidden="true">→</span></span></button>{access.editor && <div className="proposal-record-actions"><button type="button" className="proposal-archive-action" disabled={Boolean(busy)} aria-label={`Архивировать КП ${entry.payload.number} · редакция ${entry.payload.revision}`} onClick={() => requestArchive(entry)}>Архивировать</button></div>}</article>)}{!filtered.length && <p className="empty-inline">{search ? "КП по этому запросу не найдены." : "Коммерческих предложений пока нет. Начните с нового КП или перенесите цену из калькулятора."}</p>}</div>}</> : <>
       <div className="proposal-context">
-        <div><strong>{data!.number} · редакция {data!.revision}</strong><span>{session.local ? "Локальная копия · не сохраняется в общую базу" : immutable ? "Сохранённая редакция защищена от изменения" : draftStatus || (dirty ? "Изменения не сохранены в карточку" : "Карточка сохранена")}</span></div>
+        <div><strong>{data!.number} · редакция {data!.revision}</strong><span role="status">{session.local ? "Локальная копия · не сохраняется в общую базу" : immutable ? "Сохранённая редакция защищена от изменения" : dirty ? draftStatus || "Изменения не сохранены в карточку" : savedStatus || "Карточка сохранена"}</span></div>
         <div className="button-row">
           {session.id && <VersionHistory module="commercial-proposals" id={session.id} title={data!.number} payload={data} onRestore={restoreHistory} />}
           <button type="button" className="secondary small" disabled={Boolean(busy)} onClick={() => requestTarget({ kind: "close" })}>К списку</button>

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { MAX_PREVIEW_ZOOM, MIN_PREVIEW_ZOOM, clampPreviewZoom, previewPointAtViewport, previewScrollForAnchor, previewViewportLayout, previewWheelAction, wheelPreviewZoom, type PreviewAnchor, type PreviewPoint } from "./previewViewport";
+import { MAX_PREVIEW_ZOOM, MIN_PREVIEW_ZOOM, clampPreviewZoom, fitPagePreviewZoom, previewPointAtViewport, previewScrollForAnchor, previewViewportLayout, previewWheelAction, wheelPreviewZoom, type PreviewAnchor, type PreviewPoint } from "./previewViewport";
 
 const viewport = { width: 740, height: 610 };
 const points = [0, .01, .5, .99, 1];
@@ -10,6 +10,35 @@ function expectPoint(actual: PreviewPoint, expected: PreviewPoint) {
 }
 
 describe("scanner cursor-anchored viewport", () => {
+  it.each([
+    { width: 740, height: 300, aspect: .707 },
+    { width: 1240, height: 770, aspect: .707 },
+    { width: 280, height: 400, aspect: 1.414 },
+    { width: 450, height: 180, aspect: .707 },
+    { width: 740, height: 300, aspect: .01 },
+  ])("fits the complete portrait/landscape page inside both available dimensions: %j", ({ aspect, ...size }) => {
+    const zoom = fitPagePreviewZoom(size, aspect);
+    const layout = previewViewportLayout(size, zoom, aspect, { fitPage: true });
+    expect(layout.pageWidth).toBeLessThanOrEqual(size.width - 32 + 1e-8);
+    expect(layout.pageHeight).toBeLessThanOrEqual(size.height - 32 + 1e-8);
+    const anchor = { page: { x: .5, y: .5 }, viewport: { x: size.width / 2, y: size.height / 2 } };
+    const scroll = previewScrollForAnchor(layout, anchor);
+    expect(layout.pageLeft - scroll.x).toBeGreaterThanOrEqual(16 - 1e-8);
+    expect(layout.pageTop - scroll.y).toBeGreaterThanOrEqual(16 - 1e-8);
+    expectPoint(previewPointAtViewport(layout, scroll, anchor.viewport), anchor.page);
+  });
+
+  it("allows a fit-only scale below the manual minimum without changing manual layout or wheel/toolbar clamps", () => {
+    const size = { width: 740, height: 300 }, zoom = fitPagePreviewZoom(size, .01);
+    expect(zoom).toBeLessThan(MIN_PREVIEW_ZOOM);
+    expect(previewViewportLayout(size, zoom, .01, { fitPage: true }).pageHeight).toBeCloseTo(268);
+    expect(previewViewportLayout(size, zoom, .01).pageHeight).toBeGreaterThan(size.height);
+    expect(clampPreviewZoom(zoom)).toBe(MIN_PREVIEW_ZOOM);
+    expect(wheelPreviewZoom(zoom, 100)).toBe(zoom);
+    expect(wheelPreviewZoom(zoom, 0)).toBe(zoom);
+    expect(wheelPreviewZoom(zoom, -100)).toBe(MIN_PREVIEW_ZOOM);
+  });
+
   it("blocks both zoom and native Shift/horizontal scrolling throughout a page edit or pan", () => {
     for (const interaction of [{ panning: true, editing: false }, { panning: false, editing: true }, { panning: true, editing: true }]) {
       for (const shiftKey of [true, false]) for (const deltaY of [-100, 0, 100]) {

@@ -654,8 +654,14 @@ function App() {
               <p>{subtitle}</p>
             </div>
             <div className="topbar-actions">
-            <button className="secondary network-diagnostics-button" type="button" title={`Связь с общей базой и локальная диагностика (${networkDiagnosticsShortcutLabel})`} aria-keyshortcuts="Control+Shift+D Meta+Shift+D" onClick={() => setShowNetworkDiagnostics(true)}>Связь и диагностика</button>
-            <button className="secondary global-search-button" type="button" aria-label="Глобальный поиск" title="Поиск по рабочей папке (Ctrl/⌘ K)" onClick={() => setShowSearch(true)}><ToolIcon name="search" /><span>Поиск</span></button>
+            <button className="secondary network-diagnostics-button" type="button" title={`Связь с общей базой и локальная диагностика (${networkDiagnosticsShortcutLabel})`} aria-keyshortcuts="Control+Shift+D Meta+Shift+D" onClick={(event) => {
+              event.currentTarget.focus({ preventScroll: true });
+              setShowNetworkDiagnostics(true);
+            }}>Связь и диагностика</button>
+            <button className="secondary global-search-button" type="button" aria-label="Глобальный поиск" title="Поиск по рабочей папке (Ctrl/⌘ K)" onClick={(event) => {
+              event.currentTarget.focus({ preventScroll: true });
+              setShowSearch(true);
+            }}><ToolIcon name="search" /><span>Поиск</span></button>
             <button className={`workspace-access-chip ${workspace.editor ? "is-editor" : access.unknown ? "is-unknown" : "is-viewer"}`} type="button" onClick={() => selectTool("settings")} title={workspace.accessMessage} aria-label={`${accessLabel}. Открыть настройки доступа`}>
               <ToolIcon name={workspace.editor ? "check" : "lock"} />
               <span><strong>{accessLabel}</strong>{networkPaused ? <small>Данные не обновляются</small> : !workspace.editor && access.occupied && !access.unknown && <small>{workspace.editorOwner ? `Сеанс закреплён: ${access.text}` : "Сеанс занят: имя не подтверждено"}</small>}</span>

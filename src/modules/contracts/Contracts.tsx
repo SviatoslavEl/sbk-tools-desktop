@@ -57,7 +57,8 @@ import { matchContract, type ContractSelectionCriteria } from "./selection";
 import { CompanyNameField, useCompanyDirectory } from "./CompanyDirectory";
 import { contractCompanySelectionErrors, normalizeCompanyName, resolveCompanyReference, type CompanyCard } from "./companies";
 import { ContractReadCard } from "./RegistryReadCard";
-import { RegistryTableView } from "./RegistryTableView";
+import { RegistryTableView, useRegistryColumns, type RegistryColumn } from "./RegistryTableView";
+import { RegistryCellText, RegistryScrollHint } from "./RegistryOverviewCells";
 import { ContractSelectionDocuments } from "./ContractSelectionDocuments";
 import { contractSelectionArchivePlan, contractSelectionDocumentGroups, pruneContractDocumentSelection } from "./selectionDocuments";
 import "./registry.css";
@@ -69,6 +70,9 @@ const money = (value: number) =>
 const date = (value: string) =>
   value ? new Date(`${value}T00:00:00`).toLocaleDateString("ru-RU") : "—";
 type ContractSortKey = "number" | "performer" | "customer" | "subject" | "amount" | "period" | "stage" | "payment" | "acts" | "importantDate" | "responsible";
+const registryColumns: RegistryColumn[] = [
+  { key: "number", label: "Номер и дата", compact: true }, { key: "performer", label: "Юрлицо", compact: false }, { key: "customer", label: "Заказчик", compact: true }, { key: "subject", label: "Предмет", compact: false }, { key: "amount", label: "Сумма", compact: true }, { key: "period", label: "Период", compact: false }, { key: "stage", label: "Стадия", compact: true }, { key: "payment", label: "Оплата", compact: false }, { key: "acts", label: "Акты", compact: false }, { key: "importantDate", label: "Важная дата", compact: false }, { key: "responsible", label: "Ответственный", compact: false },
+];
 const contractHeaders = [
   "Юрлицо-исполнитель",
   "Номер",
@@ -382,6 +386,7 @@ export function mergeContractImportUpdate(
 
 export function ContractsRegistry({ openRecordId, onRecordOpened, intelligenceHandoff, onIntelligenceHandoffConsumed }: { openRecordId?: string; onRecordOpened?: () => void; intelligenceHandoff?: Extract<IntelligenceHandoff, { destination: "contracts" }>; onIntelligenceHandoffConsumed?: () => void } = {}) {
   const store = useRecords<ContractData>("contract-experience");
+  const tableColumns = useRegistryColumns("contracts", registryColumns);
   const companyDirectory = useCompanyDirectory(store.records);
   const [search, setSearch] = useViewState("contracts.search", "");
   const [stageFilter, setStageFilter] = useViewState("contracts.stageFilter", "");
@@ -1170,12 +1175,11 @@ export function ContractsRegistry({ openRecordId, onRecordOpened, intelligenceHa
           <button className="secondary" type="button" disabled={store.loading} onClick={() => void store.reload()}>Повторить чтение</button>
         </div>
       )}
-      <div className="surface table-surface">
-        <RegistryTableView name="contracts" count={filtered.length} cacheNotice={store.cacheNotice} columns={[
-          { key: "number", label: "Номер и дата", compact: true }, { key: "performer", label: "Юрлицо", compact: false }, { key: "customer", label: "Заказчик", compact: true }, { key: "subject", label: "Предмет", compact: false }, { key: "amount", label: "Сумма", compact: true }, { key: "period", label: "Период", compact: false }, { key: "stage", label: "Стадия", compact: true }, { key: "payment", label: "Оплата", compact: true }, { key: "acts", label: "Акты", compact: true }, { key: "importantDate", label: "Важная дата", compact: false }, { key: "responsible", label: "Ответственный", compact: false },
-        ]} />
-        <div className="table-scroll">
-          <table className="registry-contracts-table registry-compact-table">
+      <div className="surface table-surface registry-overview-surface">
+        <RegistryTableView count={filtered.length} cacheNotice={store.cacheNotice} columns={registryColumns} selected={tableColumns.selected} onChange={tableColumns.update} />
+        <RegistryScrollHint id="contracts-scroll-hint" />
+        <div className="table-scroll registry-overview-scroll" role="region" aria-label="Список договоров" aria-describedby="contracts-scroll-hint" tabIndex={0}>
+          <table className="registry-contracts-table registry-compact-table registry-overview-table">
             <thead>
               <tr>
                 <th className="selection-cell"><input type="checkbox" aria-label="Выбрать все найденные договоры" checked={filtered.length > 0 && filtered.every((record) => selectedRegistryContracts.has(record.id))} onChange={(event) => setSelectedRegistryContracts((current) => { const next = new Set(current); filtered.forEach((record) => event.target.checked ? next.add(record.id) : next.delete(record.id)); return next; })} /></th>
@@ -1183,8 +1187,8 @@ export function ContractsRegistry({ openRecordId, onRecordOpened, intelligenceHa
                   "number", "Номер и дата"], ["performer", "Юрлицо-исполнитель"], ["customer", "Заказчик"],
                   ["subject", "Предмет"], ["amount", "Сумма"], ["period", "Период"], ["stage", "Стадия"],
                   ["payment", "Оплата"], ["acts", "Акты"], ["importantDate", "Важная дата"], ["responsible", "Ответственный"],
-                ] as Array<[ContractSortKey, string]>).map(([column, label]) => <SortableHeader key={column} label={label} column={column} active={sort?.key === column} direction={sort?.direction || "asc"} onSort={(key) => setSort((current) => toggleSort(current, key))} />)}
-                <th />
+                ] as Array<[ContractSortKey, string]>).filter(([column]) => tableColumns.visible(column)).map(([column, label]) => <SortableHeader key={column} label={label} column={column} active={sort?.key === column} direction={sort?.direction || "asc"} onSort={(key) => setSort((current) => toggleSort(current, key))} />)}
+                <th className="registry-row-actions" scope="col">Действия</th>
               </tr>
             </thead>
             <tbody>
@@ -1212,14 +1216,12 @@ export function ContractsRegistry({ openRecordId, onRecordOpened, intelligenceHa
                       )}
                       <VersionHistory module="contract-experience" id={record.id} title={record.title} payload={record.payload} />
                     </td>
-                    <td>
-                      {item.performingLegalEntity || (
-                        <span className="field-error">Не указано</span>
-                      )}
-                    </td>
-                    <td>{item.customer}</td>
-                    <td className="wide-cell">
-                      {item.subject}
+                    {tableColumns.visible("performer") && <td>
+                      {item.performingLegalEntity ? <RegistryCellText text={item.performingLegalEntity} /> : <span className="field-error">Не указано</span>}
+                    </td>}
+                    {tableColumns.visible("customer") && <td><RegistryCellText text={item.customer} /></td>}
+                    {tableColumns.visible("subject") && <td className="wide-cell">
+                      <RegistryCellText text={item.subject} />
                       {checks.length > 0 && (
                         <small
                           className="validation-summary"
@@ -1230,54 +1232,52 @@ export function ContractsRegistry({ openRecordId, onRecordOpened, intelligenceHa
                           ⚠ {checks.length} замеч.
                         </small>
                       )}
-                    </td>
-                    <td>
-                      {money(item.amount)}
+                    </td>}
+                    {tableColumns.visible("amount") && <td>
+                      <span className="registry-money">{money(item.amount)}</span>
                       {contractBalance(item).overpayment > 0 && (
                         <small className="field-error">
-                          Переплата {money(contractBalance(item).overpayment)}
+                          Переплата <span className="registry-money">{money(contractBalance(item).overpayment)}</span>
                         </small>
                       )}
-                    </td>
-                    <td>
+                    </td>}
+                    {tableColumns.visible("period") && <td>
                       {date(item.startDate)} — {date(item.endDate)}
-                    </td>
-                    <td>
+                    </td>}
+                    {tableColumns.visible("stage") && <td>
                       <span className={`status ${contractStageTone(item.stage)}`}>{item.stage}</span>
-                    </td>
-                    <td>
+                    </td>}
+                    {tableColumns.visible("payment") && <td>
                       <span
                         className={`status ${paymentStatusTone(item.paymentStatus)}`}
                       >
                         {item.paymentStatus}
                       </span>
-                    </td>
-                    <td>
+                    </td>}
+                    {tableColumns.visible("acts") && <td>
                       <span className={`status ${actsStatusTone(item.actsStatus)}`}>{item.actsStatus}</span>
-                    </td>
-                    <td>{date(item.nextImportantDate)}</td>
-                    <td>{item.responsible || "—"}</td>
-                    <td>
-                      {!readOnly && (
-                        <div className="row-actions">
+                    </td>}
+                    {tableColumns.visible("importantDate") && <td>{date(item.nextImportantDate)}</td>}
+                    {tableColumns.visible("responsible") && <td><RegistryCellText text={item.responsible || "—"} /></td>}
+                    <td className="registry-row-actions">
+                      <div className="row-actions">
                           <button
                             className="secondary small"
                             type="button"
-                            aria-label={`Редактировать договор ${item.number}`}
+                            aria-label={`${readOnly ? "Открыть" : "Редактировать"} договор ${item.number}`}
                             onClick={() => setEditing(record)}
                           >
-                            Редактировать
+                            Открыть
                           </button>
-                          <button
+                          {!readOnly && <button
                             className="icon-button danger"
                             type="button"
                             aria-label={`Архивировать ${item.number}`}
                             onClick={() => setArchiving(record)}
                           >
                             ×
-                          </button>
+                          </button>}
                         </div>
-                      )}
                     </td>
                   </tr>
                 );

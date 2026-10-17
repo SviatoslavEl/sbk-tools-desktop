@@ -31,7 +31,8 @@ describe("scanner operation feedback ownership", () => {
     expect(html).not.toContain("Документ готов");
     expect(html).not.toContain("Предупреждение документа");
     expect(html).not.toContain("Ошибка только документа");
-    expect(html).toMatch(/<button[^>]*disabled=""[^>]*>Объединить 0 стр. из 0 файлов<\/button>/);
+    expect(html).not.toContain("Объединить 0 стр. из 0 файлов");
+    expect(html).toContain("Выбрать несколько файлов");
   });
 
   it("does not present a completed merge as the single-document result", () => {
@@ -47,7 +48,8 @@ describe("scanner operation feedback ownership", () => {
     expect(html).not.toContain("Документы объединены");
     expect(html).not.toContain("Ошибка только объединения");
     expect(html).not.toContain("Предупреждение объединения");
-    expect(html).toMatch(/<button[^>]*disabled=""[^>]*>Сохранить PDF<\/button>/);
+    expect(html).not.toContain("Сохранить PDF");
+    expect(html).toContain("Выбрать файл");
   });
 
   it("keeps each saved result on return to its own mode", () => {

@@ -1,11 +1,12 @@
 import { useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent, type PointerEvent } from "react";
-import { clampPreviewZoom, previewPointAtViewport, previewScrollForAnchor, previewViewportLayout, previewWheelAction, wheelPreviewZoom, type PreviewAnchor, type PreviewPoint } from "./previewViewport";
+import { clampPreviewZoom, fitPagePreviewZoom, previewPointAtViewport, previewScrollForAnchor, previewViewportLayout, previewWheelAction, wheelPreviewZoom, type PreviewAnchor, type PreviewPoint } from "./previewViewport";
 
 export function usePreviewViewport({ active, documentKey, aspect, drawing, isEditingPage }: { active: boolean; documentKey: string; aspect: number; drawing: boolean; isEditingPage: () => boolean }) {
   const stageElement = useRef<HTMLDivElement | null>(null);
   const pageElement = useRef<HTMLDivElement | null>(null);
   const [size, setSize] = useState({ width: 800, height: 610 });
   const [zoom, setZoomState] = useState(1);
+  const [fittingPage, setFittingPage] = useState(false);
   const zoomRef = useRef(1);
   const center = useRef<PreviewPoint>({ x: .5, y: .5 });
   const pendingAnchor = useRef<PreviewAnchor | null>(null);
@@ -14,7 +15,15 @@ export function usePreviewViewport({ active, documentKey, aspect, drawing, isEdi
   const [panning, setPanning] = useState(false);
   const editingPage = useRef(isEditingPage);
   editingPage.current = isEditingPage;
-  const layout = useMemo(() => previewViewportLayout(size, zoom, aspect), [size, zoom, aspect]);
+  const displayedZoom = fittingPage ? fitPagePreviewZoom(size, aspect) : zoom;
+  zoomRef.current = displayedZoom;
+  const layout = useMemo(() => previewViewportLayout(size, displayedZoom, aspect, { fitPage: fittingPage }), [size, displayedZoom, aspect, fittingPage]);
+
+  const measureSize = () => {
+    const stage = stageElement.current;
+    if (!stage?.clientWidth || !stage.clientHeight) return;
+    setSize((current) => current.width === stage.clientWidth && current.height === stage.clientHeight ? current : { width: stage.clientWidth, height: stage.clientHeight });
+  };
 
   const rememberCenter = () => {
     const stage = stageElement.current;
@@ -23,15 +32,26 @@ export function usePreviewViewport({ active, documentKey, aspect, drawing, isEdi
   };
 
   const setZoom = (value: number) => {
+    setFittingPage(false);
     const next = clampPreviewZoom(value);
-    if (next === zoomRef.current) return;
     zoomRef.current = next;
     setZoomState(next);
   };
 
-  const resetView = () => {
+  const centerPage = () => {
     center.current = { x: .5, y: .5 };
     pendingAnchor.current = null;
+    const stage = stageElement.current;
+    if (stage) {
+      const scroll = previewScrollForAnchor(layout, { page: center.current, viewport: { x: stage.clientWidth / 2, y: stage.clientHeight / 2 } });
+      stage.scrollLeft = scroll.x; stage.scrollTop = scroll.y;
+    }
+  };
+
+  const fitPage = () => { measureSize(); centerPage(); setFittingPage(true); };
+
+  const resetView = () => {
+    centerPage();
     setZoom(1);
     const stage = stageElement.current;
     if (stage && zoomRef.current === zoom) {
@@ -48,13 +68,11 @@ export function usePreviewViewport({ active, documentKey, aspect, drawing, isEdi
       pendingAnchor.current = null;
       zoomRef.current = 1;
       setZoomState(1);
+      setFittingPage(false);
     }
     const stage = stageElement.current;
     if (!stage || !active) { pan.current = null; setPanning(false); return; }
-    const measure = () => {
-      if (!stage.clientWidth || !stage.clientHeight) return;
-      setSize((current) => current.width === stage.clientWidth && current.height === stage.clientHeight ? current : { width: stage.clientWidth, height: stage.clientHeight });
-    };
+    const measure = measureSize;
     measure();
     const observer = new ResizeObserver(measure);
     observer.observe(stage);
@@ -75,6 +93,7 @@ export function usePreviewViewport({ active, documentKey, aspect, drawing, isEdi
       };
       // Keep accumulating rapid wheel events even when React batches a frame.
       zoomRef.current = next;
+      setFittingPage(false);
       setZoomState(next);
     };
     stage.addEventListener("wheel", wheel, { passive: false });
@@ -84,14 +103,14 @@ export function usePreviewViewport({ active, documentKey, aspect, drawing, isEdi
   useLayoutEffect(() => {
     const stage = stageElement.current;
     if (!active || !stage?.clientWidth || !stage.clientHeight) return;
-    const anchor = pendingAnchor.current ?? { page: center.current, viewport: { x: stage.clientWidth / 2, y: stage.clientHeight / 2 } };
+    const anchor = pendingAnchor.current ?? { page: fittingPage ? { x: .5, y: .5 } : center.current, viewport: { x: stage.clientWidth / 2, y: stage.clientHeight / 2 } };
     const scroll = previewScrollForAnchor(layout, anchor);
     // Apply after layout, before paint. No rAF race with the old page geometry.
     stage.scrollLeft = scroll.x;
     stage.scrollTop = scroll.y;
     pendingAnchor.current = null;
     center.current = previewPointAtViewport(layout, { x: stage.scrollLeft, y: stage.scrollTop }, { x: stage.clientWidth / 2, y: stage.clientHeight / 2 });
-  }, [active, documentKey, layout]);
+  }, [active, documentKey, layout, fittingPage]);
 
   const startPan = (event: PointerEvent<HTMLDivElement>) => {
     const stage = stageElement.current;
@@ -133,5 +152,5 @@ export function usePreviewViewport({ active, documentKey, aspect, drawing, isEdi
     rememberCenter();
   };
 
-  return { stageElement, pageElement, zoom, setZoom, resetView, layout, panning, rememberCenter, startPan, movePan, stopPan, panFromKeyboard };
+  return { stageElement, pageElement, zoom: displayedZoom, fittingPage, setZoom, resetView, fitPage, layout, panning, rememberCenter, startPan, movePan, stopPan, panFromKeyboard };
 }

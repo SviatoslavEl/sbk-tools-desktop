@@ -24,7 +24,7 @@ vi.mock("react", async (original) => {
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 vi.mock("@tauri-apps/plugin-dialog", () => ({ save: vi.fn() }));
 
-type Props = { children?: ReactNode; disabled?: boolean; type?: string; value?: unknown; onClick?: () => unknown; onChange?: (event: { target: { value: string } }) => void };
+type Props = { children?: ReactNode; disabled?: boolean; type?: string; value?: unknown; onClick?: (event?: { currentTarget: { focus: (options?: FocusOptions) => void } }) => unknown; onChange?: (event: { target: { value: string } }) => void };
 let tree: ReactNode;
 let component: () => ReactNode;
 function render() { hooks.cursor = 0; hooks.changed = false; tree = component(); for (const effect of hooks.effects.splice(0)) effect(); }
@@ -113,11 +113,26 @@ describe("network diagnostics panel real handlers and lifecycle", () => {
     expect(text()).toContain("Режим редактора активен");
   });
   it("exposes a clickable local diagnostics action above a connected card without native commands", async () => {
-    const open = vi.fn(); window.addEventListener(openNetworkDiagnosticsEvent, open);
+    const order: string[] = [];
+    const focus = vi.fn((options?: FocusOptions) => { expect(options).toEqual({ preventScroll: true }); order.push("focus"); });
+    const open = vi.fn(() => { order.push("open"); }); window.addEventListener(openNetworkDiagnosticsEvent, open);
     component = () => NetworkOfflineNotice({ overlay: true }); render(); await flush();
-    button("Связь и диагностика").props.onClick!(); await flush();
+    button("Связь и диагностика").props.onClick!({ currentTarget: { focus } }); await flush();
+    expect(order).toEqual(["focus", "open"]); expect(focus).toHaveBeenCalledOnce();
     expect(open).toHaveBeenCalledOnce(); expect(nativeInvoke).not.toHaveBeenCalled();
     expect(text()).not.toContain("приостановлена");
+    window.removeEventListener(openNetworkDiagnosticsEvent, open);
+  });
+  it("focuses the offline notice initiator before opening diagnostics without changing network access", async () => {
+    const order: string[] = [];
+    const focus = vi.fn((options?: FocusOptions) => { expect(options).toEqual({ preventScroll: true }); order.push("focus"); });
+    const open = vi.fn(() => { order.push("open"); }); window.addEventListener(openNetworkDiagnosticsEvent, open);
+    applyNetworkAccessStatus(net("disconnected"));
+    component = () => NetworkOfflineNotice({}); render(); await flush();
+    button("Связь и диагностика").props.onClick!({ currentTarget: { focus } }); await flush();
+    expect(order).toEqual(["focus", "open"]); expect(focus).toHaveBeenCalledOnce();
+    expect(open).toHaveBeenCalledOnce(); expect(nativeInvoke).not.toHaveBeenCalled();
+    expect(text()).toContain("Отключено на этом компьютере");
     window.removeEventListener(openNetworkDiagnosticsEvent, open);
   });
   it("does not insert an offline banner into connected main content", async () => {

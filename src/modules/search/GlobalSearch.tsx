@@ -3,6 +3,7 @@ import { Dialog } from "../../components/Dialog";
 import { loadSearchIndex, searchEntries, searchLabels, type SearchEntry, type SearchTool } from "./index";
 import "./search.css";
 import { networkAccessIsPaused, useNetworkAccess } from "../../lib/networkDiagnostics";
+import { formatRussianCount } from "../../lib/russianCount";
 
 export function GlobalSearch({ onClose, onNavigate }: { onClose: () => void; onNavigate: (tool: SearchTool | "archive", id?: string) => void }) {
   const network = useNetworkAccess();
@@ -33,7 +34,7 @@ export function GlobalSearch({ onClose, onNavigate }: { onClose: () => void; onN
       <div className="global-search-filters"><label>Раздел<select value={tool} onChange={(event) => setTool(event.target.value as SearchTool | "all")}><option value="all">Все разделы</option>{Object.entries(searchLabels).map(([key, label]) => <option key={key} value={key}>{label}</option>)}</select></label><label className="checkbox-row"><input type="checkbox" checked={archived} onChange={(event) => setArchived(event.target.checked)} />Включая архив</label><button className="secondary" type="button" disabled={loading} onClick={() => setRevision((value) => value + 1)}>Обновить индекс</button></div>
       <p className="help-text">Поиск локальный: карточки, реквизиты, названия вложений и уже извлечённый текст документов закупок. Содержимое сканов без распознавания не индексируется. Файлы никуда не отправляются.</p>
       {errors.length > 0 && <div className="notice error" role="alert">Индекс неполный. Недоступные разделы: {errors.join(" · ")}</div>}
-      <p role="status">{loading ? "Читаем данные рабочей папки…" : !query.trim() ? `В индексе ${entries.length} карточек. Введите запрос.` : `Найдено: ${results.length}. Индекс обновлён в ${updated}.`}</p>
+      <p role="status">{loading ? "Читаем данные рабочей папки…" : !query.trim() ? `В индексе ${formatRussianCount(entries.length, ["карточка", "карточки", "карточек"])}. Введите запрос.` : `Найдено: ${results.length}. Индекс обновлён в ${updated}.`}</p>
       <div className="global-search-results">{results.slice(0, 100).map((hit) => <button key={`${hit.tool}:${hit.id}`} className="search-result" type="button" onClick={() => { onNavigate(hit.archived && hit.tool !== "counterparties" ? "archive" : hit.tool, hit.id); onClose(); }}><span className="search-result-kind">{searchLabels[hit.tool]}{hit.archived ? " · Архив — открыть архив" : ""}</span><strong>{hit.title}</strong><span>{hit.snippet}</span></button>)}</div>
       {!loading && query.trim() && results.length === 0 && <p>Совпадений нет. Попробуйте часть имени, номера или другое ключевое слово.</p>}
       {results.length > 100 && <p>Показаны первые 100 совпадений. Уточните запрос или выберите раздел.</p>}

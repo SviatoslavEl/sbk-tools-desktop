@@ -28,7 +28,7 @@ export function staffRequirements(item: StaffData, warningDays = 60, now = new D
     { label: "Должность или роль", met: Boolean(assignment.position.trim()) },
     { label: "Грейд", met: Boolean(item.grade?.trim()) },
     { label: "Навыки", met: Boolean(item.skills?.length) },
-    { label: "Основание сотрудничества", met: Boolean(assignment.engagementType && (assignment.engagementType !== "Иное" || assignment.engagementOther.trim())) },
+    { label: "Основание сотрудничества", met: Boolean(assignment.engagementType && assignment.engagementType !== "Не указано" && (assignment.engagementType !== "Иное" || assignment.engagementOther.trim())) },
     { label: "Дата начала", met: Boolean(assignment.startDate) },
     { label: "Квалификация", met: Boolean(item.qualification.trim()) },
     ...requiredCategories.map((category) => ({ label: { education: "Диплом", contract: "Документ-основание", certificate: "Действующий сертификат", permit: "Допуск", other: "Документ" }[category], met: item.documents.some((document) => document.category === category && Boolean(document.name || document.type) && !["expired", "missing"].includes(documentExpiry(document, warningDays, now))) })),

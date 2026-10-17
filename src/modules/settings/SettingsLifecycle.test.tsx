@@ -2,7 +2,8 @@ import { isValidElement, type ReactElement, type ReactNode } from "react";
 // @ts-expect-error Node built-ins are provided by the test runner.
 import { readFileSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { Settings } from "./Settings";
+import { About, Settings } from "./Settings";
+import { applicationBuild } from "../../lib/buildInfo";
 import { OwnerPanel } from "./OwnerPanel";
 import type { BackupListItem, WorkspaceInfo } from "../../lib/storage";
 
@@ -36,14 +37,15 @@ vi.mock("../../lib/storage", async (original) => ({ ...await original<typeof imp
 vi.mock("../intelligence/api", () => ({ getIntelligenceProviderStatus: hooks.intelligence }));
 vi.mock("../../lib/sharedWorkspace", () => ({ readAccessTimers: () => hooks.timers, saveAccessTimers: hooks.saveTimers, readSharedBackupPolicy: hooks.readPolicy, saveSharedBackupPolicy: hooks.savePolicy }));
 
-type Props = { children?: ReactNode; hidden?: boolean; disabled?: boolean; className?: string; onClick?: () => unknown; role?: string; onChange?: (event: { target: { value: string } }) => void; value?: unknown; expanded?: boolean; onExpandedChange?: (value: boolean) => void; "aria-controls"?: string; "data-workspace-viewer-allowed"?: boolean };
+type Props = { children?: ReactNode; hidden?: boolean; disabled?: boolean; readOnly?: boolean; open?: boolean; className?: string; onClick?: () => unknown; role?: string; onChange?: (event: { target: { value: string } }) => void; value?: unknown; expanded?: boolean; onExpandedChange?: (value: boolean) => void; "aria-controls"?: string; "data-workspace-viewer-allowed"?: boolean };
 let tree: ReactNode;
+let showAbout = false;
 const workspace: WorkspaceInfo = { root: "/tmp/sbk-settings-test", portable: false, configured: true, writable: true, editor: true, editorBusy: false, accessControlled: false, accessMessage: "Редактор", schemaVersion: 1, freeSpaceBytes: 1_000_000 };
 let currentWorkspace = workspace;
 
 function render() {
   hooks.cursor = 0; hooks.changed = false;
-  tree = Settings({ collapsed: false, onCollapsed: vi.fn(), workspace: currentWorkspace, onWorkspaceChange: vi.fn() });
+  tree = showAbout ? About() : Settings({ collapsed: false, onCollapsed: vi.fn(), workspace: currentWorkspace, onWorkspaceChange: vi.fn() });
   for (const effect of hooks.effects.splice(0)) effect();
 }
 async function flush() { for (let i = 0; i < 20; i += 1) { await Promise.resolve(); if (hooks.changed) render(); } }
@@ -59,6 +61,7 @@ const sharedPolicy = { source: "shared", policy: { version: 1, backupHours: 24, 
 beforeEach(() => {
   hooks.cursor = 0; hooks.changed = false; hooks.slots = []; hooks.effects = []; hooks.loading = false; hooks.error = null;
   hooks.editor = true;
+  showAbout = false;
   currentWorkspace = workspace;
   for (const fn of [hooks.list, hooks.verify, hooks.backup, hooks.intelligence, hooks.save, hooks.reload, hooks.readPolicy, hooks.savePolicy, hooks.saveTimers]) fn.mockReset();
   hooks.list.mockResolvedValue([]); hooks.intelligence.mockResolvedValue(null); hooks.save.mockResolvedValue(undefined);
@@ -69,6 +72,24 @@ beforeEach(() => {
   vi.stubGlobal("window", { confirm: vi.fn(() => true), dispatchEvent: vi.fn(), setTimeout, clearTimeout });
 });
 afterEach(() => { for (const slot of hooks.slots) slot.cleanup?.(); vi.unstubAllGlobals(); });
+
+describe("about build information", () => {
+  it("shows the compiled identity and copies only the short support summary", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined); vi.stubGlobal("navigator", { clipboard: { writeText } });
+    showAbout = true; render(); await flush(); expect(text()).toContain(applicationBuild.label);
+    button("Скопировать информацию о сборке").props.onClick?.(); await flush();
+    expect(writeText).toHaveBeenCalledExactlyOnceWith(applicationBuild.supportText); expect(text()).toContain("Информация о сборке скопирована");
+    expect(hooks.list).not.toHaveBeenCalled(); expect(hooks.save).not.toHaveBeenCalled();
+  });
+  it("keeps the summary selectable when clipboard permission is unavailable", async () => {
+    vi.stubGlobal("navigator", {}); showAbout = true; render(); await flush();
+    button("Скопировать информацию о сборке").props.onClick?.(); await flush();
+    expect(text()).toContain("Не удалось скопировать автоматически"); expect(text()).not.toContain("Информация о сборке скопирована");
+    const field = nodes().find((node) => node.type === "textarea")!;
+    expect(field.props.readOnly).toBe(true); expect(field.props.value).toBe(applicationBuild.supportText);
+    expect(nodes().some((node) => node.type === "details" && node.props.open)).toBe(true);
+  });
+});
 
 describe("settings navigation and backup confidence", () => {
   it("loads shared backup fields without mount writes and saves only after an explicit click", async () => {

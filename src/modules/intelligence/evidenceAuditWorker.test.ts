@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { runEvidenceAudit, type EvidenceAuditRequest } from "./evidenceAuditWorker";
 import type { IntelligenceItem } from "./workbenchTypes";
 
@@ -6,6 +6,12 @@ const card: IntelligenceItem = { id: "card", title: "Закупка QA", destina
 const request = (revision = 17): EvidenceAuditRequest => ({ revision, items: [card], sources: [{ id: "source", name: "Источник QA", text: "Закупка QA" }] });
 
 describe("local evidence worker replies", () => {
+  it("does not replace the host window message handler when imported by the UI", async () => {
+    const handler = vi.fn(), host = { onmessage: handler, postMessage: vi.fn() };
+    vi.stubGlobal("self", host); vi.stubGlobal("document", {}); vi.resetModules();
+    try { await import("./evidenceAuditWorker"); expect(host.onmessage).toBe(handler); expect(host.postMessage).not.toHaveBeenCalled(); }
+    finally { vi.unstubAllGlobals(); }
+  });
   it("returns the requested revision and an evidence report without touching external boundaries", () => {
     const reply = runEvidenceAudit(request());
     expect(reply.revision).toBe(17); expect(reply.failed).toBeUndefined(); expect(reply.report?.fields[0].status).toBe("confirmed");

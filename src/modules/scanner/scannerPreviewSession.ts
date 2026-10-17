@@ -40,6 +40,7 @@ export interface PreparedPreviews {
 }
 export type PreviewPreparation = { state: "idle" | "preparing" | "ready" | "unavailable" | "changed"; prepared: number; total: number };
 export const SOURCE_CHANGED_MESSAGE = "Исходный документ изменился. Откройте его повторно через «Заменить файл», чтобы не применить разметку к другой версии.";
+const INITIAL_WORKER_SOURCE_CHANGED = "Исходный документ изменился. Откройте обновлённый файл повторно.";
 export interface PreviewTransport {
   run(jobId: string, operation: "preview" | "preparePreview", config: Record<string, unknown>): Promise<WorkerPreview | PreparedPreviews>;
   cancel(jobId: string): Promise<unknown>;
@@ -80,6 +81,7 @@ export class ScannerPreviewSession {
   private generation = 0;
   private timer: ReturnType<typeof setTimeout> | undefined;
   private fingerprint: string | undefined;
+  private sourceCommitted = false;
   private sourceRevision = "";
   private sourcePath = "";
   private changed = false;
@@ -98,12 +100,22 @@ export class ScannerPreviewSession {
     throw new Error(SOURCE_CHANGED_MESSAGE);
   }
 
-  private async checkRevision(path: string, isCurrent: () => boolean): Promise<boolean> {
+  private async checkRevision(path: string, isCurrent: () => boolean, refreshUncommitted = false): Promise<boolean> {
     if (!isCurrent()) return false;
     if (this.changed) return this.sourceChanged();
     const revision = await this.transport.revision(path);
     if (!isCurrent()) return false;
-    if (this.sourcePath && (this.sourcePath !== path || this.sourceRevision !== revision)) return this.sourceChanged();
+    if (this.sourcePath && (this.sourcePath !== path || this.sourceRevision !== revision)) {
+      // macOS may finish recording the file picker's last-used metadata while
+      // the first raster is being prepared. Nothing has been displayed or
+      // edited yet: discard that raster and render the current revision once.
+      // Never rebind an established document (or accept the discarded image).
+      if (refreshUncommitted && !this.sourceCommitted && this.sourcePath === path) {
+        this.sourceRevision = revision;
+        return false;
+      }
+      return this.sourceChanged();
+    }
     this.sourcePath = path;
     this.sourceRevision = revision;
     return true;
@@ -130,6 +142,7 @@ export class ScannerPreviewSession {
     this.cancel(this.foreground);
     this.foreground = "";
     this.fingerprint = undefined;
+    this.sourceCommitted = false;
     this.sourceRevision = "";
     this.sourcePath = "";
     this.changed = false;
@@ -207,17 +220,44 @@ export class ScannerPreviewSession {
       if (!await this.checkRevision(settings.inputPath, () => this.foreground === jobId)) return undefined;
       const cached = this.cache.get(previewSettingsKey(settings));
       if (cached) { this.activate(cached); return cached; }
-      response = await this.transport.run(jobId, "preview", workerConfig(settings)) as WorkerPreview;
-      if (this.foreground !== jobId) return undefined;
-      const result = await this.readResult(response);
-      loaded = result;
-      if (this.foreground !== jobId) return undefined;
-      if (!await this.checkRevision(settings.inputPath, () => this.foreground === jobId)) return undefined;
-      if (this.fingerprint && result.sourceFingerprint && this.fingerprint !== result.sourceFingerprint) return this.sourceChanged();
-      this.fingerprint = result.sourceFingerprint;
-      this.activate(result);
-      this.store(settings, result);
-      return result;
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        try {
+          response = await this.transport.run(jobId, "preview", workerConfig(settings)) as WorkerPreview;
+        } catch (reason) {
+          if (this.foreground !== jobId) return undefined;
+          const message = reason instanceof Error ? reason.message : typeof reason === "string" ? reason : "";
+          // The worker may reject its very first raster while macOS finishes
+          // recording picker metadata. Nothing was accepted/displayed yet:
+          // reopen once and keep every normal source guard on the fresh run.
+          // Never recover an established document or retry arbitrary failures.
+          if (attempt !== 0 || this.sourceCommitted || this.changed || this.sourcePath !== settings.inputPath || message.trim() !== INITIAL_WORKER_SOURCE_CHANGED) throw reason;
+          const revision = await this.transport.revision(settings.inputPath);
+          if (this.foreground !== jobId) return undefined;
+          if (this.sourceCommitted || this.changed || this.sourcePath !== settings.inputPath) throw reason;
+          this.sourceRevision = revision;
+          continue;
+        }
+        if (this.foreground !== jobId) return undefined;
+        const result = await this.readResult(response);
+        loaded = result;
+        if (this.foreground !== jobId) return undefined;
+        if (!await this.checkRevision(settings.inputPath, () => this.foreground === jobId, attempt === 0)) {
+          if (this.foreground !== jobId) return undefined;
+          this.releaseResult(result);
+          loaded = undefined;
+          await this.removeOutputs([response]);
+          response = undefined;
+          if (this.foreground !== jobId) return undefined;
+          continue;
+        }
+        if (this.fingerprint && result.sourceFingerprint && this.fingerprint !== result.sourceFingerprint) return this.sourceChanged();
+        this.fingerprint = result.sourceFingerprint;
+        this.sourceCommitted = true;
+        this.activate(result);
+        this.store(settings, result);
+        return result;
+      }
+      return this.sourceChanged();
     } finally {
       if (this.foreground === jobId) this.foreground = "";
       if (loaded && loaded !== this.activeResult && !this.retained.has(loaded)) this.releaseResult(loaded);

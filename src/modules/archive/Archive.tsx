@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { ConfirmDialog } from "../../components/Dialog";
 import { archiveRecord, archiveRecords, deleteRecord, deleteRecords, listRecords, type ModuleId, type StoredRecord } from "../../lib/storage";
 import { useWorkspaceAccess } from "../../lib/workspaceAccess";
+import "./archive.css";
 
 const sections: Array<{ module: ModuleId; title: string }> = [
   { module: "calculator", title: "Расчёты" },
@@ -85,15 +86,19 @@ export function Archive() {
     if (checked) next.add(id); else next.delete(id);
     return { ...current, [module]: next };
   });
+  const total = sections.reduce((sum, { module }) => sum + (data[module]?.length || 0), 0);
 
   return <div className="archive-grid">
     {!workspaceAccess.editor && <div className="notice warning"><strong>Режим просмотра</strong><span>{workspaceAccess.message}</span></div>}
     {loading && <p role="status">Загружаем архив…</p>}
     {error && <div className="notice error" role="alert">Не удалось выполнить действие или обновить архив. {error}<button type="button" disabled={Boolean(busy) || loading} onClick={() => void reload()}>Повторить загрузку</button></div>}
-    {sections.map(({ module, title }) => <section className="surface" key={module}>
-      <div className="surface-title"><h2>{title}</h2><div className="button-row"><span>{loading || error ? "—" : data[module]?.length || 0}</span>{workspaceAccess.editor && Boolean(data[module]?.length) && <><label className="archive-select-all"><input type="checkbox" disabled={Boolean(busy) || loading} checked={(selected[module]?.size || 0) === (data[module]?.length || 0)} onChange={(event) => setSelected((current) => ({ ...current, [module]: event.target.checked ? new Set((data[module] || []).map((record) => record.id)) : new Set() }))} /> Выбрать все</label>{Boolean(selected[module]?.size) && <><button className="secondary small" type="button" disabled={Boolean(busy) || loading} onClick={() => setPending({ module, action: "restore", ids: [...selected[module]] })}>Восстановить выбранные ({selected[module].size})</button><button className="secondary small danger" type="button" disabled={Boolean(busy) || loading} onClick={() => setPending({ module, action: "delete", ids: [...selected[module]] })}>Удалить выбранные</button></>}</>}</div></div>
+    {!loading && !error && total === 0 && <section className="surface archive-empty"><h2>В архиве нет записей</h2><p>Перенесённые в архив записи появятся здесь. Их можно будет выбрать и восстановить.</p></section>}
+    {total > 0 && <p className="archive-summary">Записей в архиве: {total}</p>}
+    {total > 0 && sections.map(({ module, title }) => <details className="surface archive-section" key={module} open={Boolean(data[module]?.length)}>
+      <summary><span>{title}</span><span className="archive-section-count">{data[module]?.length || 0}</span></summary>
+      {workspaceAccess.editor && Boolean(data[module]?.length) && <div className="archive-section-actions button-row"><label className="archive-select-all"><input type="checkbox" disabled={Boolean(busy) || loading} checked={(selected[module]?.size || 0) === (data[module]?.length || 0)} onChange={(event) => setSelected((current) => ({ ...current, [module]: event.target.checked ? new Set((data[module] || []).map((record) => record.id)) : new Set() }))} /> Выбрать все</label>{Boolean(selected[module]?.size) && <><button className="secondary small" type="button" disabled={Boolean(busy) || loading} onClick={() => setPending({ module, action: "restore", ids: [...selected[module]] })}>Восстановить выбранные ({selected[module].size})</button><button className="secondary small danger" type="button" disabled={Boolean(busy) || loading} onClick={() => setPending({ module, action: "delete", ids: [...selected[module]] })}>Удалить выбранные</button></>}</div>}
       <div className="surface-body archive-list">
-        {!loading && !error && !data[module]?.length && <div className="empty-inline">В архиве нет записей.</div>}
+        {!loading && !error && !data[module]?.length && <p className="help-text">В этом разделе записей нет.</p>}
         {data[module]?.map((record) => <div className="archive-row" key={record.id}>
           {workspaceAccess.editor && <input className="archive-row-checkbox" type="checkbox" disabled={Boolean(busy) || loading} aria-label={`Выбрать ${record.title}`} checked={selected[module]?.has(record.id) || false} onChange={(event) => toggleSelected(module, record.id, event.target.checked)} />}
           <div><strong>{record.title}</strong><span>Архивировано или изменено: {new Date(record.updatedAt).toLocaleString("ru-RU")}</span></div>
@@ -101,7 +106,7 @@ export function Archive() {
           {workspaceAccess.editor && <button className="secondary small danger" disabled={Boolean(busy) || loading} type="button" onClick={() => void remove(module, record)}>Удалить навсегда</button>}
         </div>)}
       </div>
-    </section>)}
+    </details>)}
     {pending && <ConfirmDialog title={pending.action === "delete" ? "Удалить выбранные записи навсегда?" : "Восстановить выбранные записи?"} message={pending.action === "delete" ? `Будет удалено записей: ${pending.ids.length}. История и связанные вложения будут удалены без возможности восстановления.` : `Будет восстановлено записей: ${pending.ids.length}.`} confirmLabel={pending.action === "delete" ? "Удалить" : "Восстановить"} onClose={() => setPending(null)} onConfirm={processSelected} />}
   </div>;
 }

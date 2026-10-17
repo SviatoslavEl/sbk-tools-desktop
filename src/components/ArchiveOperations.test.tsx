@@ -30,7 +30,7 @@ vi.mock("../lib/storage", async (original) => ({ ...await original<typeof import
 vi.mock("../lib/workspaceAccess", () => ({ useWorkspaceAccess: () => ({ editor: runtime.editor, message: "Тестовый доступ" }) }));
 vi.mock("../hooks/useRecords", () => ({ useRecords: (module: string) => ({ records: module === "tender-calendar" ? runtime.schedules : [], loading: false, error: null, archive: runtime.scheduleArchive }) }));
 
-type Props = { children?: ReactNode; disabled?: boolean; closeDisabled?: boolean; className?: string; "aria-label"?: string; onClick?: (event: { stopPropagation: () => void }) => unknown; onChange?: (event: { target: { checked: boolean } }) => unknown; onConfirm?: () => Promise<void>; onClose?: () => void };
+type Props = { children?: ReactNode; disabled?: boolean; closeDisabled?: boolean; open?: boolean; className?: string; "aria-label"?: string; onClick?: (event: { stopPropagation: () => void }) => unknown; onChange?: (event: { target: { checked: boolean } }) => unknown; onConfirm?: () => Promise<void>; onClose?: () => void };
 let tree: ReactNode;
 let component: () => ReactNode;
 function render() { runtime.cursor = 0; runtime.changed = false; tree = component(); for (const effect of runtime.effects.splice(0)) effect(); }
@@ -91,6 +91,17 @@ describe("history and archive operation boundaries", () => {
     click("Повторить загрузку"); await flush();
     expect(text()).toContain("В архиве нет записей");
     expect(text()).not.toContain("Чтение не удалось");
+    expect(text().split("В архиве нет записей")).toHaveLength(2);
+    expect(nodes().filter((node) => node.type === "details")).toHaveLength(0);
+  });
+
+  it("opens only populated archive sections and keeps empty types compact", async () => {
+    runtime.list.mockImplementation(async (module: string) => module === "staff" ? [record("one")] : []);
+    component = Archive; render(); await flush();
+    const sections = nodes().filter((node) => node.type === "details");
+    expect(sections).toHaveLength(6); expect(sections.filter((node) => node.props.open)).toHaveLength(1);
+    expect(text(sections.find((node) => node.props.open))).toContain("Тест one");
+    expect(text()).not.toContain("В архиве нет записей");
   });
 
   it("serializes single-row restore and delete, keeping records visible on failure", async () => {

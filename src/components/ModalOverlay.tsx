@@ -24,16 +24,21 @@ export function readModalWorkspaceMarkers(origin: Pick<HTMLElement, "closest">):
 function OverlaySurface({ className, onClose, children, networkLocal = false }: { className: string; onClose: () => void; children: ReactNode; networkLocal?: boolean }) {
   const element = useRef<HTMLDivElement>(null);
   const registration = useRef<ModalRegistration | null>(null);
+  const [auxiliaryHost, setAuxiliaryHost] = useState<HTMLElement | null>(null);
   const close = useRef(onClose);
   close.current = onClose;
   useLayoutEffect(() => {
     if (!element.current) return;
+    const content = element.current.querySelector<HTMLElement>('[role="dialog"], [role="alertdialog"]');
+    setAuxiliaryHost(content?.querySelector<HTMLElement>(":scope > header") || content);
     registration.current = registerModalOverlay(element.current, () => close.current());
     return () => { registration.current?.dispose(); registration.current = null; };
   }, []);
   return <div ref={element} className={className} role="presentation" onMouseDown={(event) => {
     if (event.currentTarget === event.target) registration.current?.requestClose();
-  }}>{!networkLocal && <NetworkOfflineNotice overlay />}{children}</div>;
+  }}>{children}{!networkLocal && (typeof document === "undefined"
+    ? <NetworkOfflineNotice overlay />
+    : auxiliaryHost && createPortal(<div className="modal-network-controls"><NetworkOfflineNotice overlay /></div>, auxiliaryHost))}</div>;
 }
 
 /** Shared body portal prevents a nested editor being trapped below its parent dialog. */

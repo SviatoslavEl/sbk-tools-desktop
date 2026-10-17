@@ -6,6 +6,7 @@ import os
 import posixpath
 import re
 import stat
+import time
 import zipfile
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP, localcontext
@@ -16,6 +17,7 @@ import pypdfium2.raw as pdfium_raw
 from lxml import etree
 
 from scandocument.tempfiles import SecureWorkspace
+from scandocument.pdf_table_layout import extract_pdf_table_rows
 from scandocument.validation import MAX_FILE_BYTES, MAX_PAGES, validate_docx_archive
 
 
@@ -25,6 +27,10 @@ MAX_ZIP_UNPACKED_BYTES = 500 * 1024 * 1024
 MAX_XML_PART_BYTES = 50 * 1024 * 1024
 MAX_FRAGMENTS = 50_000
 MAX_SHEETS = 1_000
+MAX_PDF_GRID_PAGES = 64
+MAX_PDF_GRID_ROWS = 256
+MAX_PDF_GRID_OUTPUT_CHARS = 200_000
+MAX_PDF_GRID_SECONDS = 1.
 NS_MAIN = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 NS_REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 NS_PACKAGE_REL = "http://schemas.openxmlformats.org/package/2006/relationships"
@@ -97,7 +103,9 @@ def _bounded(fragments: list[dict]) -> tuple[list[dict], str]:
     if sum(map(len, texts)) > MAX_EXTRACTED_CHARS:
         raise ValueError("Извлечённый текст превышает безопасный предел 20 МБ.")
     # Leading tabs identify missing XLSX columns and must survive model input.
-    return fragments, "\n".join(text for text in texts if text.strip())
+    # Grid rows supplement page evidence, not the original reading-order text.
+    return fragments, "\n".join(text for fragment, text in zip(fragments, texts, strict=True)
+                                if text.strip() and not fragment.get("pdfGrid"))
 
 
 def _xml(archive: zipfile.ZipFile, name: str):
@@ -130,18 +138,39 @@ def _pdf(path: Path) -> tuple[str, list[dict], list[str], dict]:
     image_pages: list[int] = []
     scanner_producer = False
     scanner_ocr_attempted = False
+    grid_limited = False
+    grid_rows = 0
+    grid_characters = 0
+    grid_ocr = False
+    grid_deadline = time.monotonic() + MAX_PDF_GRID_SECONDS
     try:
-        if len(document) > MAX_PAGES:
+        page_count = len(document)
+        if page_count > MAX_PAGES:
             raise ValueError("PDF содержит слишком много страниц.")
         scanner_producer = _pdf_metadata_value(document, "Producer") == "ScanDocument"
         scanner_ocr_attempted = scanner_producer and _pdf_metadata_value(document, "ScanDocumentOCR") == "attempted-v1"
-        for index in range(len(document)):
+        for index in range(page_count):
             page = document[index]
             text_page = page.get_textpage()
             try:
                 text = text_page.get_text_range().strip()
                 # Text in the body does not prove that a raster letterhead was OCRed.
                 has_images = next(page.get_objects(filter=[pdfium_raw.FPDF_PAGEOBJ_IMAGE]), None) is not None
+                extra_rows = []
+                if index < MAX_PDF_GRID_PAGES and time.monotonic() <= grid_deadline:
+                    grid = extract_pdf_table_rows(page, text_page, index + 1, deadline=grid_deadline)
+                    characters = sum(len(fragment["text"]) for fragment in grid.fragments)
+                    if (grid_rows + len(grid.fragments) <= MAX_PDF_GRID_ROWS
+                            and grid_characters + characters <= MAX_PDF_GRID_OUTPUT_CHARS):
+                        extra_rows = grid.fragments
+                        grid_ocr = grid_ocr or any(fragment["pdfGrid"]["textLayer"] == "ocr" for fragment in extra_rows)
+                        grid_rows += len(extra_rows)
+                        grid_characters += characters
+                    else:
+                        grid_limited = True
+                    grid_limited = grid_limited or grid.limited
+                else:
+                    grid_limited = True
             finally:
                 text_page.close()
                 page.close()
@@ -152,15 +181,21 @@ def _pdf(path: Path) -> tuple[str, list[dict], list[str], dict]:
             fragments.append({"id": f"page-{index + 1}", "locator": f"Страница {index + 1}",
                               "page": index + 1, "text": text, "hasImages": has_images,
                               "textCoverage": "partial" if not text or has_images else "text-layer"})
+            for fragment in extra_rows:
+                fragments.append(fragment)
     finally:
         document.close()
     warnings: list[str] = []
+    if grid_limited:
+        warnings.append("Достигнут безопасный предел проверки геометрии таблиц PDF. Текст страниц сохранён без сокращений; непроверенные связи ячеек нужно проверить по документу или разделить файл.")
+    if grid_ocr:
+        warnings.append("Связь ячеек таблицы установлена по геометрии OCR-слоя; текст требует сверки с изображением документа. Это не подтверждение точности или полноты OCR.")
     if scanner_ocr_attempted:
         warnings.append("По метаданным PDF ранее выполнялось OCR сканером приложения; это отметка обработки, а не подтверждение полноты распознавания.")
-    elif scanner_producer and len(no_text) < len(fragments):
+    elif scanner_producer and len(no_text) < page_count:
         warnings.append("По метаданным PDF создан сканером приложения. Найден текстовый слой; наличие прежнего OCR по этим метаданным не подтверждено.")
     if no_text:
-        if len(no_text) == len(fragments):
+        if len(no_text) == page_count:
             warnings.append("В PDF нет текстового слоя. " + (
                 "Проверьте качество скана и языки распознавания; при необходимости выполните OCR повторно."
                 if scanner_ocr_attempted else "Для поиска сначала выполните OCR в модуле сканирования."))
@@ -171,7 +206,7 @@ def _pdf(path: Path) -> tuple[str, list[dict], list[str], dict]:
     if image_pages:
         warnings.append(f"PDF содержит изображения на страницах: {', '.join(map(str, image_pages))}. " + (
             "Найден текстовый слой; полнота текста внутри изображений и растровых шапок не подтверждена. Проверьте извлечённый текст по страницам и при пропусках выполните OCR для нужных страниц."
-            if len(no_text) < len(fragments) else
+            if len(no_text) < page_count else
             "Текст внутри изображений и растровых шапок сейчас недоступен для извлечения; полнота документа не подтверждена."))
     return "application/pdf", fragments, warnings, _coverage(not no_text and not image_pages, no_text=no_text, images=image_pages)
 

@@ -17,10 +17,16 @@ export const networkPhaseLabels: Record<NetworkPhase, string> = {
 
 export function NetworkOfflineNotice({ overlay = false }: { overlay?: boolean }) {
   const network = useNetworkAccess();
-  if (network.phase === "connected") return overlay ? <div className="network-overlay-access" data-network-offline-allowed><button className="secondary" type="button" title="Открыть диагностику, не закрывая карточку" onClick={() => window.dispatchEvent(new Event(openNetworkDiagnosticsEvent))}>Связь и диагностика</button></div> : null;
+  if (network.phase === "connected") return overlay ? <div className="network-overlay-access" data-network-offline-allowed><button className="secondary" type="button" title="Открыть диагностику, не закрывая карточку" onClick={(event) => {
+    event.currentTarget.focus({ preventScroll: true });
+    window.dispatchEvent(new Event(openNetworkDiagnosticsEvent));
+  }}>Связь и диагностика</button></div> : null;
   return <div className="network-offline-notice notice warning" role="status" data-network-offline-allowed>
     <div><strong>{networkPhaseLabels[network.phase]}</strong><span>{networkPausedMessage}</span></div>
-    <button className="secondary" type="button" onClick={() => window.dispatchEvent(new Event(openNetworkDiagnosticsEvent))}>Связь и диагностика</button>
+    <button className="secondary" type="button" onClick={(event) => {
+      event.currentTarget.focus({ preventScroll: true });
+      window.dispatchEvent(new Event(openNetworkDiagnosticsEvent));
+    }}>Связь и диагностика</button>
   </div>;
 }
 

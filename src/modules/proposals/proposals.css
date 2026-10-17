@@ -5,10 +5,17 @@
 .proposals-tool input, .proposals-tool select, .proposals-tool textarea { min-width: 0; max-width: 100%; }
 .proposals-tool textarea { min-height: 84px; resize: vertical; }
 .proposal-search { max-width: 640px; }
-.proposal-registry { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr)); gap: 12px; }
+.proposal-registry { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 340px), 1fr)); gap: 10px; }
 .proposal-record-card { display: flex; flex-direction: column; min-width: 0; background: var(--surface, #fff); border: 1px solid var(--border, #d8e2dd); border-radius: 12px; }
-.proposal-record { display: flex; flex: 1; flex-direction: column; gap: 6px; width: 100%; text-align: left; padding: 16px; background: transparent; border: 0; border-radius: 12px; overflow-wrap: anywhere; }
-.proposal-record-actions { display: flex; justify-content: flex-end; padding: 0 16px 12px; }
+.proposal-record { display: flex; flex: 1; flex-direction: column; gap: 5px; width: 100%; text-align: left; padding: 12px 14px 8px; background: transparent; border: 0; border-radius: 12px; overflow-wrap: anywhere; }
+.proposal-record-heading { display: flex; justify-content: space-between; flex-wrap: wrap; align-items: baseline; gap: 5px 12px; }
+.proposal-record-status { color: var(--text-muted, #52675c); font-weight: 500; }
+.proposal-record-subject { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; font-weight: 650; line-height: 1.4; }
+.proposal-record-open { display: flex; justify-content: space-between; gap: 10px; margin-top: 5px; color: var(--primary-hover, #1c523b); font-size: 12px; font-weight: 700; }
+.proposal-record:hover .proposal-record-open, .proposal-record:focus-visible .proposal-record-open { text-decoration: underline; text-underline-offset: 3px; }
+.proposal-record-actions { display: flex; justify-content: flex-end; padding: 0 14px 8px; }
+.proposal-archive-action { padding: 4px 0 4px 10px; border: 0; background: transparent; color: var(--text-muted, #52675c); font-size: 11px; }
+.proposal-archive-action:hover { color: var(--danger, #9a2934); text-decoration: underline; }
 .proposal-context, .proposal-footer { display: flex; justify-content: space-between; flex-wrap: wrap; align-items: center; gap: 12px; padding: 14px; background: var(--surface, #fff); border: 1px solid var(--border, #d8e2dd); border-radius: 12px; }
 .proposal-context > div:first-child, .proposal-footer > div:first-child { display: flex; flex-direction: column; gap: 5px; overflow-wrap: anywhere; }
 .proposal-context span, .proposal-footer small { color: var(--muted, #52675c); }

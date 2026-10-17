@@ -30,7 +30,7 @@ export function useUiListSnapshot<T, D = unknown>(module: ModuleId) {
   const refreshing = cached && snapshot.loading;
   const cacheNotice = !cached ? "" : snapshot.stale || networkAccessIsPaused()
     ? refreshing ? "Обновляем данные; показан предыдущий снимок." : "Показан последний снимок; данные могут быть неактуальны."
-    : `Снимок данных: ${new Date(snapshot.updatedAt).toLocaleTimeString("ru-RU")}`;
+    : `Данные на ${new Date(snapshot.updatedAt).toLocaleTimeString("ru-RU")}`;
   return { ...snapshot, loading: !cached && !snapshot.error && !networkAccessIsPaused(), refreshing, cacheNotice, reload };
 }
 

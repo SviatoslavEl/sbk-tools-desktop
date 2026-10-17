@@ -180,8 +180,7 @@ def process_document(
     expected_source_fingerprint: str | None = None,
     preview_cache_dir: Path | None = None,
 ) -> tuple[list[str], float | None, str, list[dict[str, Any]]]:
-    import pypdfium2 as pdfium
-    from scandocument.pdf_engine import StreamingPdfWriter, render_page
+    from scandocument.pdf_engine import StreamingPdfWriter, open_render_document, render_page
     from scandocument.preview_cache import source_fingerprint
 
     token = cancellation or CancellationToken()
@@ -242,7 +241,7 @@ def process_document(
             )
         try:
             document = (prepared_document.document if prepared_document is not None
-                        else pdfium.PdfDocument(str(pdf_source)))
+                        else open_render_document(pdf_source))
         except Exception as exc:
             raise ScanDocumentError("Документ не удалось подготовить к обработке.") from exc
         source_total = len(document)
@@ -429,7 +428,7 @@ def open_preview_document(
     preview_cache_dir: Path | None = None,
 ):
     """Open/validate once per small batch, retaining only the PDF parser."""
-    import pypdfium2 as pdfium
+    from scandocument.pdf_engine import open_render_document
     from scandocument.preview_cache import source_fingerprint
 
     token = cancellation or CancellationToken()
@@ -468,7 +467,7 @@ def open_preview_document(
             prepared_warnings = []
         token.check()
         try:
-            document = pdfium.PdfDocument(str(pdf_source))
+            document = open_render_document(pdf_source)
         except Exception:
             if kind != "docx" or cached_pdf is None or pdf_source != cached_pdf:
                 raise
@@ -481,7 +480,7 @@ def open_preview_document(
             token.check()
             _check_source_fingerprint(source, fingerprint)
             pdf_source = _cache_preview_conversion(recovered_pdf, cached_pdf, prepared_warnings)
-            document = pdfium.PdfDocument(str(pdf_source))
+            document = open_render_document(pdf_source)
         try:
             prepared = PreviewDocument(source, pdf_source, document, prepared_warnings, fingerprint)
             prepared.check_source()

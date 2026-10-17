@@ -11,6 +11,7 @@ import { useWorkspaceAccess } from "../../lib/workspaceAccess";
 import type { CalculatorData } from "../calculator/types";
 import type { ContractData } from "../contracts/types";
 import type { StaffData } from "../staff/types";
+import { RegistryCellText, RegistryScrollHint } from "../contracts/RegistryOverviewCells";
 import {
   buildRebidSteps,
   complianceSummary,
@@ -84,6 +85,7 @@ export function ProcurementRegistry({ openRecordId, onRecordOpened, onCreateProp
   const store = useRecords<ProcurementData>("procurement");
   const [search, setSearch] = useViewState("procurement:search", "");
   const [status, setStatus] = useViewState("procurement:status", "");
+  const [tableDetails, setTableDetails] = useViewState("procurement:table-details", false);
   const [editing, setEditing] = useState<
     StoredRecord<ProcurementData> | "new" | null
   >(null);
@@ -186,20 +188,22 @@ export function ProcurementRegistry({ openRecordId, onRecordOpened, onCreateProp
           </div>
         )}
       </div>
-      <div className="surface table-surface">
-        <div className="table-scroll">
-          <table>
+      <div className="surface table-surface registry-overview-surface">
+        <div className="registry-procurement-view"><strong role="status">Найдено: {filtered.length}</strong><button type="button" className="secondary small" aria-pressed={tableDetails} onClick={() => setTableDetails((current) => !current)}>{tableDetails ? "Кратко" : "Подробно"}</button><small>{tableDetails ? "Все сведения" : "Обзор · предмет, площадка и матрица — в подробном виде"}</small></div>
+        <RegistryScrollHint id="procurement-scroll-hint" />
+        <div className="table-scroll registry-overview-scroll" role="region" aria-label="Список закупок" aria-describedby="procurement-scroll-hint" tabIndex={0}>
+          <table className="registry-overview-table procurement-overview-table">
             <thead>
               <tr>
                 <th>Закупка</th>
                 <th>Заказчик</th>
-                <th>Предмет</th>
+                {tableDetails && <th>Предмет</th>}
                 <th>НМЦ</th>
-                <th>Площадка</th>
+                {tableDetails && <th>Площадка</th>}
                 <th>Подача</th>
                 <th>Статус</th>
-                <th>Матрица</th>
-                <th />
+                {tableDetails && <th>Матрица</th>}
+                <th className="registry-row-actions" scope="col">Действия</th>
               </tr>
             </thead>
             <tbody>
@@ -215,14 +219,14 @@ export function ProcurementRegistry({ openRecordId, onRecordOpened, onCreateProp
                           type="button"
                           onClick={() => setEditing(record)}
                         >
-                          <strong>{item.name}</strong>
+                          <strong className="registry-identifier-text" title={item.name}>{item.name}</strong>
                           <small>{record.updatedAt.slice(0, 10)}</small>
                         </button>
                     </td>
-                    <td>{item.customer}</td>
-                    <td className="wide-cell">{item.subject}</td>
-                    <td>{nmcLabel(item.nmc)}</td>
-                    <td>{item.platform || "—"}</td>
+                    <td><RegistryCellText text={item.customer} /></td>
+                    {tableDetails && <td className="wide-cell"><RegistryCellText text={item.subject} /></td>}
+                    <td><span className="registry-money">{nmcLabel(item.nmc)}</span></td>
+                    {tableDetails && <td><RegistryCellText text={item.platform || "—"} /></td>}
                     <td>
                       <span
                         className={`status ${deadline.tone}`}
@@ -232,10 +236,11 @@ export function ProcurementRegistry({ openRecordId, onRecordOpened, onCreateProp
                       </span>
                     </td>
                     <td>{item.status}</td>
-                    <td>
+                    {tableDetails && <td>
                       {compliance.confirmed} из {compliance.total}
-                    </td>
-                    <td>
+                    </td>}
+                    <td className="registry-row-actions">
+                      <button className="secondary small" type="button" aria-label={`Открыть закупку ${item.name}`} onClick={() => setEditing(record)}>Открыть</button>
                       {onCreateProposal && <button className="secondary small" type="button" aria-label={`Создать КП из закупки ${item.name}`} onClick={() => setProposalSource(record)}>КП</button>}
                       {!readOnly && (
                         <button

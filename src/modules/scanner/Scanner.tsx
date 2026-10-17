@@ -19,6 +19,7 @@ import {
   facsimileAppliesTo,
   facsimileGeometry,
   facsimileOverlayStyle,
+  facsimilePreviewGeometry,
   positionFacsimileInRegion,
   selectedFacsimilePages,
   suppressLabelActivation,
@@ -32,7 +33,7 @@ import { readPreviewImage, releasePreviewImage } from "./scannerPreviewImages";
 import { captureFacsimilePresetForPage, normalizeFacsimilePreset, type FacsimilePresetSettings } from "./facsimilePresets";
 import { readCurrentPreview, resumableSplitPlan, runSplitPlan, ScannerSingleFlight, subscribeScannerProgress, type SplitPlan } from "./scannerAsyncOperations";
 import { compressionProfile, type CompressionMode } from "./compression";
-import { MAX_PREVIEW_ZOOM, MIN_PREVIEW_ZOOM } from "./previewViewport";
+import { MAX_PREVIEW_ZOOM, MIN_PREVIEW_ZOOM, previewZoomLabel } from "./previewViewport";
 import { usePreviewViewport } from "./usePreviewViewport";
 import { usePreviewPanelHeight } from "./usePreviewPanelHeight";
 import { ScannerPageControls } from "./ScannerPageControls";
@@ -42,6 +43,7 @@ import { PreviewDebounce } from "./previewDebounce";
 import { ScannerEditHistory, scannerSettingsKey, SCANNER_DRAFT_KEY, encodeScannerDraft, decodeScannerDraft, validScannerDraftSettings, plannedBatchNames, scannerRetryLabel, type ScannerLocalDraft, type ScannerRetryOperation } from "./scannerEditHistory";
 import { annotationColor, DEFAULT_ANNOTATION_COLORS, isColoredAnnotationKind, updateAnnotationColor } from "./annotationColors";
 import { ScannerSizeSummary, positiveFileBytes, totalScannerOutputBytes, type ScannerResultSize } from "./ScannerSizeSummary";
+import { FacsimileFitSummary } from "./FacsimileFitSummary";
 import { belongsToScannerResult, useScannerOperationUi, type ScannerProgress, type ScannerWorkspaceMode } from "./scannerOperationState";
 import { IntelligenceOcrBridge, isIntelligenceOcrSha256, type IntelligenceOcrRequest, type IntelligenceOcrReturn } from "./intelligenceOcrBridge";
 import {
@@ -227,6 +229,8 @@ export function Scanner({ active = true, intelligenceOcrRequest, onIntelligenceO
   const [finalPreview, setFinalPreview] = useState<{ url: string; key: string; page: number } | null>(null);
   const [finalPreviewing, setFinalPreviewing] = useState(false);
   const finalPreviewJob = useRef("");
+  const finalPreviewVisit = useRef({ active, epoch: 0 });
+  if (finalPreviewVisit.current.active !== active) finalPreviewVisit.current = { active, epoch: finalPreviewVisit.current.epoch + 1 };
   const [mergePaths, setMergePaths] = useState<string[]>([]);
   const [mergePageOrder, setMergePageOrder] = useState<MergePageItem[]>([]);
   const [mergeInspecting, setMergeInspecting] = useState(false);
@@ -291,6 +295,9 @@ export function Scanner({ active = true, intelligenceOcrRequest, onIntelligenceO
   const dirty = !!inputPath && historyDocument.current === inputPath && editHistory.current.dirty(editSnapshot);
   const [draftEnabled, setDraftEnabled] = useState(false);
   const [draftNotice, setDraftNotice] = useState("");
+  const draftRecoveryGate = useRef(new ScannerSingleFlight());
+  const draftRecoveryEpoch = useRef(0);
+  const [draftRecovering, setDraftRecovering] = useState(false);
   const [recoverableDraft, setRecoverableDraft] = useState<ScannerLocalDraft<ScannerEditSnapshot> | null>(() => {
     try { return typeof sessionStorage === "undefined" ? null : decodeScannerDraft(sessionStorage.getItem(SCANNER_DRAFT_KEY)); } catch { return null; }
   });
@@ -342,6 +349,8 @@ export function Scanner({ active = true, intelligenceOcrRequest, onIntelligenceO
   }, setPreparation);
   useEffect(() => () => previewSession.current?.clear(), []);
   const intelligenceOcrSettingsKey = scannerSettingsKey(editSnapshot);
+  const initialIntelligenceOcrSettings = useRef(intelligenceOcrSettingsKey);
+  const intelligenceOcrAutoAttempt = useRef("");
   const intelligenceOcrPreviousSettings = useRef(intelligenceOcrSettingsKey);
   if (intelligenceOcrPreviousSettings.current !== intelligenceOcrSettingsKey) {
     intelligenceOcrBridge.current.clearResult();
@@ -363,8 +372,21 @@ export function Scanner({ active = true, intelligenceOcrRequest, onIntelligenceO
   const lastFacsimileWidth = useRef(0.22);
   const lastFacsimileWidthMm = useRef<number | null>(null);
   useEffect(() => {
-    if (!active) { setFullscreen(false); setFileDragActive(false); dragState.current = null; }
-  }, [active]);
+    if (!active) {
+      setFullscreen(false); setFileDragActive(false); dragState.current = null;
+    }
+    if (!active || workspaceMode !== "document") {
+      const jobId = finalPreviewJob.current;
+      finalPreviewJob.current = "";
+      if (jobId) void invoke("scanner_cancel", { jobId }).catch(() => undefined);
+      setFinalPreview(null); setFinalPreviewing(false);
+    }
+  }, [active, workspaceMode]);
+  useEffect(() => () => {
+    const jobId = finalPreviewJob.current;
+    finalPreviewJob.current = "";
+    if (jobId) void invoke("scanner_cancel", { jobId }).catch(() => undefined);
+  }, []);
   const journal = templates.records.filter((record) => record.payload.kind === "processing-journal").slice(0, 10);
 
   useEffect(() => subscribeScannerProgress("__TAURI_INTERNALS__" in window, () =>
@@ -462,23 +484,31 @@ export function Scanner({ active = true, intelligenceOcrRequest, onIntelligenceO
     setPageIndex(selected); void makePreview(path, snapshot.preset, selected, snapshot.pageRotations, snapshot);
   };
   const undoEdits = (redo = false) => {
-    if (activeJobRef.current || previewing) return;
+    if (workspaceModeRef.current !== "document" || activeJobRef.current || previewing) return;
     const snapshot = editHistory.current.navigate(editSnapshot, redo);
     if (snapshot) restoreEdits(snapshot);
     refreshHistory((value) => value + 1);
   };
-  const discardDraft = () => { try { sessionStorage.removeItem(SCANNER_DRAFT_KEY); } catch { /* no persistent storage available */ } setRecoverableDraft(null); setDraftEnabled(false); setDraftNotice(""); };
+  const discardDraft = () => { draftRecoveryEpoch.current += 1; try { sessionStorage.removeItem(SCANNER_DRAFT_KEY); } catch { /* no persistent storage available */ } setRecoverableDraft(null); setDraftEnabled(false); setDraftNotice(""); };
   const recoverDraft = async () => {
     if (!recoverableDraft || activeJobRef.current) return;
+    const recoveryEpoch = draftRecoveryEpoch.current;
+    let generation = previewSession.current!.sourceGeneration;
+    const current = () => intelligenceOcrMounted.current && draftRecoveryEpoch.current === recoveryEpoch && previewSession.current!.sourceGeneration === generation && !activeJobRef.current;
+    await draftRecoveryGate.current.run(async () => {
+    setDraftRecovering(true);
     try {
       const draft = recoverableDraft;
       if (!validScannerDraftSettings(draft.settings)) throw new Error("Черновик повреждён или несовместим. Документ не заменён; удалите черновик и откройте файл заново.");
-      if (await invoke<string>("scanner_source_revision", { path: draft.inputPath }) !== draft.revision) throw new Error("Исходный документ изменён. Настройки не применены — откройте документ заново.");
+      const revision = await invoke<string>("scanner_source_revision", { path: draft.inputPath });
+      if (!current()) return;
+      if (revision !== draft.revision) throw new Error("Исходный документ изменён. Настройки не применены — откройте документ заново.");
       const images = new Map<string, string>(); let imageBytes = 0;
       const loadFacsimile = async (item: FacsimileState) => {
         let imageUrl = images.get(item.imagePath);
         if (!imageUrl) {
           imageUrl = await invoke<string>("read_binary_file", { path: item.imagePath, maxBytes: 12 * 1024 * 1024 });
+          if (!current()) return null;
           imageBytes += imageUrl.length * 2;
           if (imageBytes > 48 * 1024 * 1024) throw new Error("Факсимиле черновика превышают предел памяти 48 МБ. Откройте документ и добавьте нужные изображения заново.");
           images.set(item.imagePath, imageUrl);
@@ -486,16 +516,36 @@ export function Scanner({ active = true, intelligenceOcrRequest, onIntelligenceO
         return { ...item, imageUrl };
       };
       const restoredFacsimiles: FacsimileState[] = [];
-      for (const item of draft.settings.savedFacsimiles) restoredFacsimiles.push(await loadFacsimile(item));
-      const snapshot = { ...draft.settings, facsimile: draft.settings.facsimile ? await loadFacsimile(draft.settings.facsimile) : null, savedFacsimiles: restoredFacsimiles };
-      const loaded = await openDocumentPath(draft.inputPath, true);
+      for (const item of draft.settings.savedFacsimiles) {
+        const restored = await loadFacsimile(item);
+        if (!restored || !current()) return;
+        restoredFacsimiles.push(restored);
+      }
+      const restoredActive = draft.settings.facsimile ? await loadFacsimile(draft.settings.facsimile) : null;
+      if (!current()) return;
+      const snapshot = { ...draft.settings, facsimile: restoredActive, savedFacsimiles: restoredFacsimiles };
+      const opening = openDocumentPath(draft.inputPath, true);
+      // This explicit open starts the recovery's own source epoch. A later
+      // replacement still retires it while its initial preview is pending.
+      generation = previewSession.current!.sourceGeneration;
+      const loaded = await opening;
+      if (!current()) return;
       if (!loaded) { setDraftNotice("Не удалось загрузить документ. Черновик сохранён; исправьте ошибку и повторите восстановление."); return; }
+      // Initial opening can re-render once while the file picker's metadata
+      // settles. Recovery must still bind edits to the draft's exact revision,
+      // not merely to whichever original finished opening most recently.
+      const openedRevision = await invoke<string>("scanner_source_revision", { path: draft.inputPath });
+      if (!current()) return;
+      if (openedRevision !== draft.revision) throw new Error("Исходный документ изменён. Настройки не применены — откройте документ заново.");
+      if (!await previewSession.current!.verifySource() || !current()) return;
       historyDocument.current = draft.inputPath;
       // Baseline remains the freshly opened original; restoration is undoable.
       editHistory.current.reset({ ...editSnapshot, pageOrder: Array.from({ length: loaded.pageCount }, (_, index) => index), pageRotations: {}, outputPageMode: "all", outputPageRange: "", outputBlocks: [], facsimile: null, savedFacsimiles: [], editingFacsimileId: "", activeFacsimilePage: null, redactions: [], annotations: [] });
       editHistory.current.record(snapshot); restoreEdits(snapshot, draft.inputPath);
       setRecoverableDraft(null); setDraftEnabled(true); setDraftNotice("Черновик восстановлен. Проверьте итоговый просмотр перед сохранением.");
-    } catch (reason) { setDraftNotice(String(reason)); }
+    } catch (reason) { if (current()) setDraftNotice(String(reason)); }
+    finally { if (intelligenceOcrMounted.current) setDraftRecovering(false); }
+    });
   };
 
   useEffect(() => {
@@ -517,12 +567,14 @@ export function Scanner({ active = true, intelligenceOcrRequest, onIntelligenceO
   }, [compressionMode, dpi, quality]);
 
   const chooseDocument = async () => {
+    if (intelligenceOcrBusy.current) { setError("Дождитесь завершения загрузки документа для OCR, затем замените файл."); return; }
     if (activeJobRef.current || mergeInspecting) { setError("Дождитесь завершения текущей обработки, затем замените файл."); return; }
     const path = await chooseOpenPath("Выберите PDF или DOCX", ["pdf", "docx"]);
     if (!path) return;
     await openDocumentPath(path);
   };
   const openDocumentPath = async (path: string, preserveRecoveryDraft = false, replacementConfirmed = false) => {
+    if (intelligenceOcrBusy.current && !replacementConfirmed) { setError("Дождитесь завершения загрузки документа для OCR, затем замените файл."); return; }
     if (activeJobRef.current || mergeInspecting) { setError("Дождитесь завершения текущей обработки, затем замените файл."); return; }
     if (dirty && !replacementConfirmed && !window.confirm("В документе есть несохранённые изменения. Открыть другой файл и сбросить их? Исходный файл не изменится.")) return false;
     intelligenceOcrBridge.current.invalidate();
@@ -571,6 +623,25 @@ export function Scanner({ active = true, intelligenceOcrRequest, onIntelligenceO
     } catch (reason) { if (intelligenceOcrMounted.current && request.id === intelligenceOcrRequestRef.current?.id) setIntelligenceOcrError(`Не удалось загрузить файл для OCR: ${String(reason)}`); }
     finally { intelligenceOcrBusy.current = false; if (intelligenceOcrMounted.current) { setIntelligenceOcrOpening(false); refreshIntelligenceOcr((value) => value + 1); } }
   };
+  const hasWorkingFiles = Boolean(inputPath || batchPaths.length || mergePaths.length);
+  useEffect(() => {
+    if (!active || !intelligenceOcrRequest || network.phase !== "connected" || intelligenceOcrBusy.current || activeJob || mergeInspecting || finalPreviewing || batchPlanning) return;
+    const requestKey = `${intelligenceOcrRequest.id}\n${intelligenceOcrRequest.inputPath}`;
+    if (intelligenceOcrAutoAttempt.current === requestKey) return;
+    let cancelled = false;
+    // Retire StrictMode's first effect before starting file I/O. A cancelled
+    // render must not consume the one automatic attempt for the active request.
+    void Promise.resolve().then(() => {
+      if (cancelled || !intelligenceOcrMounted.current || intelligenceOcrBusy.current || networkAccessIsPaused() || intelligenceOcrRequest.id !== intelligenceOcrRequestRef.current?.id || intelligenceOcrRequest.inputPath !== intelligenceOcrRequestRef.current.inputPath) return;
+      intelligenceOcrAutoAttempt.current = requestKey;
+      // The preceding AI action already requests OCR. Only an empty scanner
+      // with unchanged settings can fulfill it without replacement UI.
+      if (!hasWorkingFiles && !recoverableDraft && intelligenceOcrSettingsKey === initialIntelligenceOcrSettings.current) void loadIntelligenceOcr(intelligenceOcrRequest);
+    });
+    return () => { cancelled = true; };
+    // A protected or failed request is retried only by an explicit user action.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [active, intelligenceOcrRequest?.id, intelligenceOcrRequest?.inputPath, network.phase, activeJob, mergeInspecting, finalPreviewing, batchPlanning]);
   const returnIntelligenceOcr = async () => {
     if (intelligenceOcrBusy.current || activeJobRef.current || !onIntelligenceOcrReady || networkAccessIsPaused()) return;
     const candidate = intelligenceOcrBridge.current.candidate(intelligenceOcrRequestRef.current, currentIntelligenceOcrSource(), intelligenceOcrUi.current);
@@ -787,16 +858,25 @@ export function Scanner({ active = true, intelligenceOcrRequest, onIntelligenceO
   };
 
   const chooseFacsimile = async () => {
+    if (!documentReady) return;
+    const generation = previewSession.current!.sourceGeneration;
+    const current = () => intelligenceOcrMounted.current && previewSession.current!.sourceGeneration === generation;
+    await templateGate.current.run(async () => {
+    setTemplateBusy(true); setTemplateError(""); setTemplateNotice("");
     try {
     const path = await chooseOpenPath("Выберите факсимиле", ["png", "jpg", "jpeg"]);
-    if (!path) return;
+    if (!path || !current()) return;
     const imageUrl = await invoke<string>("read_binary_file", { path, maxBytes: 12 * 1024 * 1024 });
+    if (!current()) return;
     const [imageWidth, imageHeight] = await imageDimensions(imageUrl);
+    if (!current()) return;
     const imageAspect = imageWidth / Math.max(1, imageHeight);
     const width = facsimileWidthFromMm(lastFacsimileWidthMm.current ?? suggestedFacsimileWidthMm(imageAspect), pageSizeMm?.[0] || 210);
     const base = initialFacsimile(path, imageUrl, path.split(/[\\/]/).pop() || "Факсимиле", width);
     setFacsimile({ ...base, imageAspect, ...normalizeFacsimile(base, previewAspect, imageAspect) });
-    } catch (reason) { setError(String(reason)); }
+    } catch (reason) { if (current()) setTemplateError(`Факсимиле не загружено. ${String(reason)}`); }
+    finally { if (intelligenceOcrMounted.current) setTemplateBusy(false); }
+    });
   };
 
   const useTemplate = async (template: ScannerRecord) => {
@@ -807,18 +887,20 @@ export function Scanner({ active = true, intelligenceOcrRequest, onIntelligenceO
     setTemplateBusy(true); setTemplateError(""); setTemplateNotice("");
     try {
     const workspace = await getWorkspaceInfo();
+    if (!intelligenceOcrMounted.current || previewSession.current!.sourceGeneration !== generation) return;
     const separator = workspace.root.includes("\\") ? "\\" : "/";
     const path = `${workspace.root}${separator}${relativePath.replace(/\//g, separator)}`;
     const imageUrl = await invoke<string>("read_binary_file", { path, maxBytes: 12 * 1024 * 1024 });
+    if (!intelligenceOcrMounted.current || previewSession.current!.sourceGeneration !== generation) return;
     const [width, height] = await imageDimensions(imageUrl);
-    if (previewSession.current!.sourceGeneration !== generation) return;
+    if (!intelligenceOcrMounted.current || previewSession.current!.sourceGeneration !== generation) return;
     const base = initialFacsimile(path, imageUrl, fileName, lastFacsimileWidth.current);
     const settings = normalizeFacsimilePreset(template.facsimilePreset, lastFacsimileWidth.current);
     lastFacsimileWidth.current = settings.width;
     setFacsimile({ ...base, ...settings, imageAspect: width / Math.max(1, height), pageGeometries: {}, lockedSelection: undefined });
     setTemplateNotice("Пресет загружен. Проверьте положение на документе.");
-    } catch (reason) { if (previewSession.current!.sourceGeneration === generation) setTemplateError(`Пресет не загружен. Проверьте доступ к файлу и выберите пресет повторно. ${String(reason)}`); }
-    finally { setTemplateBusy(false); }
+    } catch (reason) { if (intelligenceOcrMounted.current && previewSession.current!.sourceGeneration === generation) setTemplateError(`Пресет не загружен. Проверьте доступ к файлу и выберите пресет повторно. ${String(reason)}`); }
+    finally { if (intelligenceOcrMounted.current) setTemplateBusy(false); }
     });
   };
 
@@ -909,14 +991,17 @@ export function Scanner({ active = true, intelligenceOcrRequest, onIntelligenceO
   };
 
   const makeFinalPreview = async () => {
-    if (!documentReady || activeJobRef.current || finalPreviewing) return;
+    if (!active || !documentReady || activeJobRef.current || finalPreviewing) return;
     const sourceSession = previewSession.current!;
     if (facsimile && !facsimileSelection.selection) { setError(facsimileSelection.error); return; }
     const key = scannerSettingsKey(editSnapshot);
     const jobId = crypto.randomUUID(); finalPreviewJob.current = jobId;
+    const visitEpoch = finalPreviewVisit.current.epoch;
+    const current = () => intelligenceOcrMounted.current && finalPreviewVisit.current.active
+      && workspaceModeRef.current === "document" && finalPreviewVisit.current.epoch === visitEpoch && finalPreviewJob.current === jobId;
     setFinalPreviewing(true); setRetryOperation("final-preview"); setError(""); sourceSession.pause();
     try {
-      if (!await sourceSession.verifySource()) return;
+      if (!await sourceSession.verifySource() || !current()) return;
       const order = outputPageMode === "blocks" ? outputBlockSelection.blocks.find((block) => block.order.includes(pageIndex))?.order : outputPageSelection.order;
       if (!order?.includes(pageIndex)) throw new Error("Эта страница не включена в результат. Выберите страницу итогового PDF.");
       const placements = savedFacsimiles.filter((entry) => entry.id !== editingFacsimileId).flatMap((entry) => buildFacsimilePlacements(entry, entry.lockedSelection || { application: "current", pages: [pageIndex] }, pageCount));
@@ -927,13 +1012,15 @@ export function Scanner({ active = true, intelligenceOcrRequest, onIntelligenceO
         redactions: redactions.map((entry) => ({ ...entry, pages: [entry.page] })), annotations: annotations.map((entry) => ({ ...entry, pages: [entry.page], color: annotationColor(entry.kind, entry.color) })),
       } });
       try {
+        if (!current()) return;
         const url = await invoke<string>("read_binary_file", { path: response.outputPath, maxBytes: 24 * 1024 * 1024 });
-        if (finalPreviewJob.current === jobId && await sourceSession.verifySource()) setFinalPreview({ url, key, page: pageIndex });
+        if (!current()) return;
+        if (await sourceSession.verifySource() && current()) setFinalPreview({ url, key, page: pageIndex });
       } finally {
         void invoke("delete_runtime_file", { path: response.outputPath }).catch(() => undefined);
         if (response.originalPath) void invoke("delete_runtime_file", { path: response.originalPath }).catch(() => undefined);
       }
-    } catch (reason) { if (finalPreviewJob.current === jobId) setError(String(reason)); }
+    } catch (reason) { if (current()) setError(String(reason), "document"); }
     finally { if (finalPreviewJob.current === jobId) setFinalPreviewing(false); }
   };
 
@@ -1115,13 +1202,15 @@ export function Scanner({ active = true, intelligenceOcrRequest, onIntelligenceO
     if (!facsimile || !currentFacsimileGeometry || !pageElement.current) return;
     event.preventDefault(); event.stopPropagation(); event.currentTarget.setPointerCapture(event.pointerId);
     const bounds = pageElement.current.getBoundingClientRect();
-    const displayed = workerFacsimile ? positionFacsimileInRegion(workerFacsimile, pageIndex) : currentFacsimileGeometry;
+    const positioned = workerFacsimile ? positionFacsimileInRegion(workerFacsimile, pageIndex) : null;
+    const displayed = positioned || currentFacsimileGeometry;
     const initial = { ...currentFacsimileGeometry, x: displayed.x, y: displayed.y };
-    const height = facsimileHeight(initial.width, previewAspect, facsimile.imageAspect);
+    const visual = positioned ? facsimilePreviewGeometry(positioned, { pageAspect: previewAspect, imageAspect: facsimile.imageAspect })
+      : { ...initial, height: facsimileHeight(initial.width, previewAspect, facsimile.imageAspect) };
     if (facsimile.placementMode === "random-region") setFacsimile((current) => current ? { ...current, placementMode: "region" } : current);
     dragState.current = {
       target: "facsimile", mode, start: { x: event.clientX, y: event.clientY }, initial,
-      center: { x: bounds.left + (initial.x + initial.width / 2) * bounds.width, y: bounds.top + (initial.y + height / 2) * bounds.height },
+      center: { x: bounds.left + (visual.x + visual.width / 2) * bounds.width, y: bounds.top + (visual.y + visual.height / 2) * bounds.height },
     };
   };
 
@@ -1230,7 +1319,7 @@ export function Scanner({ active = true, intelligenceOcrRequest, onIntelligenceO
     .filter(({ placement }) => facsimileAppliesTo(placement, pageIndex));
   const selectedMergePage = mergePageOrder.find((entry) => entry.id === selectedMergePageId) || mergePageOrder[0];
   dropHandler.current = (paths) => {
-    if (activeJob || mergeInspecting) { setError("Дождитесь завершения текущей обработки, затем перетащите файлы ещё раз."); return; }
+    if (intelligenceOcrBusy.current || activeJob || mergeInspecting) { setError("Дождитесь завершения текущей обработки, затем перетащите файлы ещё раз."); return; }
     try {
       const documents = droppedDocumentPaths(paths);
       if (workspaceMode === "merge") void addMergePaths(documents);
@@ -1238,20 +1327,20 @@ export function Scanner({ active = true, intelligenceOcrRequest, onIntelligenceO
       else setPendingDroppedPaths(documents);
     } catch (reason) { setError(String(reason)); }
   };
-  return <div className="scanner-layout" onKeyDown={(event) => {
+  return <div className={`scanner-layout ${hasWorkingFiles ? "" : "scanner-empty-layout"}`} onKeyDown={(event) => {
+    if (workspaceMode !== "document") return;
     if (!(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== "z" || (event.target instanceof HTMLElement && event.target.closest("input,textarea,[contenteditable=true]"))) return;
     event.preventDefault(); undoEdits(event.shiftKey);
   }}>
     {ocrLoadConfirmation && <Dialog title="Загрузить документ из окна ИИ для OCR?" onClose={() => { if (!intelligenceOcrBusy.current) setOcrLoadConfirmation(null); }} closeDisabled={intelligenceOcrOpening} width="560px"><div className="dialog-body"><p><strong>{ocrLoadConfirmation.inputPath.split(/[\\/]/).pop()}</strong></p><p>Текущий документ и его несохранённые настройки в сканере будут заменены. Уже сохранённые PDF и исходные файлы не изменятся. Список объединения останется доступен.</p><p>Будет включён поиск текста OCR. Проверьте язык и все страницы, затем сохраните новый полный PDF. Возврат в ИИ выполняется отдельной кнопкой.</p>{intelligenceOcrError && <p className="notice error" role="alert">{intelligenceOcrError}</p>}</div><footer className="dialog-actions"><button className="secondary" type="button" disabled={intelligenceOcrOpening} onClick={() => setOcrLoadConfirmation(null)}>Отмена</button><button className="primary" type="button" disabled={intelligenceOcrOpening} onClick={() => void loadIntelligenceOcr(ocrLoadConfirmation)}>{intelligenceOcrOpening ? "Загружаем документ…" : "Загрузить и включить OCR"}</button></footer></Dialog>}
-    {finalPreview && <Dialog title={`Итоговый просмотр · страница ${finalPreview.page + 1}`} width="min(1100px, 94vw)" onClose={() => setFinalPreview(null)}><div className="dialog-body scanner-final-preview"><p>{finalPreview.key === scannerSettingsKey(editSnapshot) ? "Изображение рассчитано обработчиком итогового PDF с текущими эффектами, факсимиле и JPEG-сжатием. Для экрана уменьшено до 1400 пикселей. OCR-слой и метаданные здесь не проверяются." : "Настройки изменились. Закройте просмотр и рассчитайте его заново."}{outputPageMode === "blocks" ? " При нескольких блоках показан первый блок, содержащий эту страницу; бюджет сжатия других блоков может отличаться." : ""}</p><img src={finalPreview.url} alt={`Итоговый вид страницы ${finalPreview.page + 1}`} /></div><footer className="dialog-actions"><button className="primary" type="button" onClick={() => setFinalPreview(null)}>Вернуться к редактированию</button></footer></Dialog>}
+    {active && finalPreview && <Dialog title={`Итоговый просмотр · страница ${finalPreview.page + 1}`} width="min(1100px, 94vw)" onClose={() => setFinalPreview(null)}><div className="dialog-body scanner-final-preview"><p>{finalPreview.key === scannerSettingsKey(editSnapshot) ? "Изображение рассчитано обработчиком итогового PDF с текущими эффектами, факсимиле и JPEG-сжатием. Для экрана уменьшено до 1400 пикселей. OCR-слой и метаданные здесь не проверяются." : "Настройки изменились. Закройте просмотр и рассчитайте его заново."}{outputPageMode === "blocks" ? " При нескольких блоках показан первый блок, содержащий эту страницу; бюджет сжатия других блоков может отличаться." : ""}</p><img src={finalPreview.url} alt={`Итоговый вид страницы ${finalPreview.page + 1}`} /></div><footer className="dialog-actions"><button className="primary" type="button" onClick={() => setFinalPreview(null)}>Вернуться к редактированию</button></footer></Dialog>}
     {fileDragActive && <div className="scanner-file-drop-overlay" role="status"><strong>Отпустите PDF или DOCX здесь</strong><span>{workspaceMode === "merge" ? "Документы добавятся к объединению" : "Один документ откроется в сканере; для нескольких можно выбрать объединение или пакетную обработку"}</span></div>}
     {pendingDroppedPaths.length > 1 && <Dialog title="Добавить перетащенные документы" onClose={() => setPendingDroppedPaths([])} width="560px"><div className="dialog-body"><p>Файлов: {pendingDroppedPaths.length}. Объединить страницы в один PDF или обработать каждый документ отдельно?</p></div><footer className="dialog-actions"><button className="secondary" type="button" onClick={() => { setBatchPaths(pendingDroppedPaths); setBatchPlan([]); setPendingDroppedPaths([]); setError(""); }}>Обработать отдельно</button><button className="primary" type="button" onClick={() => { const paths = pendingDroppedPaths; setPendingDroppedPaths([]); void addMergePaths(paths); }}>Объединить</button></footer></Dialog>}
-    <section className="surface scanner-controls" inert={!!activeJob || finalPreviewing}><div className="surface-title"><h2>Настройки</h2></div><div className="surface-body scanner-control-stack">
-      {intelligenceOcrRequest && <div className="notice warning" aria-label="Распознавание документа для ИИ"><strong>Документ из окна ИИ: {intelligenceOcrRequest.inputPath.split(/[\\/]/).pop()}</strong>{intelligenceOcrBound ? <p>OCR {ocrEnabled ? "включён" : "выключен"}. Сохраните полный PDF без диапазона или перестановки страниц. Распознавание не гарантирует полноту: проверьте текст перед анализом.</p> : <><p>Загрузите именно этот файл для OCR. Текущие настройки не заменяются без подтверждения.</p><button className="secondary small" type="button" disabled={!!activeJob || mergeInspecting || intelligenceOcrOpening || network.phase !== "connected"} onClick={() => { setIntelligenceOcrError(""); setOcrLoadConfirmation({ ...intelligenceOcrRequest }); }}>Загрузить для OCR</button></>}{intelligenceOcrError && !ocrLoadConfirmation && <p className="notice error" role="alert">{intelligenceOcrError}</p>}</div>}
-      <button className="primary full-width" type="button" disabled={!!activeJob || mergeInspecting} onClick={() => void chooseDocument()}>{inputPath ? "Заменить файл" : "Выбрать PDF или DOCX"}</button>
+    {hasWorkingFiles && <section className="surface scanner-controls" inert={!!activeJob || finalPreviewing || intelligenceOcrOpening}><div className="surface-title"><h2>Настройки</h2></div><div className="surface-body scanner-control-stack">
+      <button className="secondary full-width" type="button" disabled={!!activeJob || mergeInspecting || intelligenceOcrOpening} onClick={() => void chooseDocument()}>{inputPath ? "Заменить файл" : "Выбрать PDF или DOCX"}</button>
       <button className="secondary full-width" type="button" disabled={!!activeJob || batchPlanning} onClick={() => void chooseBatch()}>Пакетная обработка</button>{batchPaths.length > 0 && <div className="notice success"><span>Выбрано файлов: {batchPaths.length}</span><button className="primary small" type="button" disabled={!!activeJob || batchPlanning} onClick={() => void prepareBatch()}>{batchPlanning ? "Проверяем имена…" : "Выбрать папку и проверить имена"}</button></div>}{documentName && <p className="selected-file">▧ {documentName}</p>}
       {batchPlan.length > 0 && <details open className="scanner-output-plan"><summary>Результаты пакета · готово {batchPlan.filter((entry) => entry.status === "done").length} из {batchPlan.length}</summary><p>Существующие файлы не заменяются. Совпадающие имена получают номер. Окончательная проверка выполняется при сохранении.</p><ol>{batchPlan.map((entry, index) => <li key={`${entry.inputPath}-${index}`}><span>{entry.inputPath.split(/[\\/]/).pop()} → <strong>{entry.outputPath.split(/[\\/]/).pop()}</strong></span><small>{({ planned: "Ожидает", working: "Обрабатывается…", done: "Готово", error: "Не сохранён" })[entry.status]}{entry.error ? `: ${entry.error}` : ""}</small></li>)}</ol><button className="primary small" type="button" disabled={!!activeJob || batchPlan.every((entry) => entry.status === "done")} onClick={() => void processBatch()}>Сохранить неготовые файлы</button></details>}
-      {recoverableDraft && <div className="notice warning"><span>Есть локальный черновик настроек: {recoverableDraft.inputPath.split(/[\\/]/).pop()}</span><button type="button" className="secondary small" onClick={() => void recoverDraft()}>Восстановить черновик</button><button type="button" className="link-button" onClick={discardDraft}>Удалить черновик</button></div>}
+      {recoverableDraft && <div className="notice warning"><span>Есть локальный черновик настроек: {recoverableDraft.inputPath.split(/[\\/]/).pop()}</span><button type="button" className="secondary small" disabled={draftRecovering} onClick={() => void recoverDraft()}>{draftRecovering ? "Восстанавливаем черновик…" : "Восстановить черновик"}</button><button type="button" className="link-button" onClick={discardDraft}>Удалить черновик</button></div>}
       {inputPath && <label className="checkbox-row"><input type="checkbox" checked={draftEnabled} onChange={(event) => { if (event.target.checked) setDraftEnabled(true); else discardDraft(); }} /> Черновик настроек в этом окне</label>}
       {draftNotice && <p className="help-text" role="status">{draftNotice} При закрытии окна черновик удаляется. При перезагрузке окна его можно восстановить.</p>}
       <div><h3>Пресет</h3><div className="preset-grid">{presets.map(([name, description]) => <button key={name} className={preset === name ? "selected" : ""} type="button" onClick={() => { setPreset(name); void makePreview(inputPath, name, pageIndex); }}><strong>{name}</strong><small>{description}</small></button>)}</div></div>
@@ -1272,7 +1361,8 @@ export function Scanner({ active = true, intelligenceOcrRequest, onIntelligenceO
               {[40, 60].map((mm) => <button className="secondary small" type="button" key={mm} disabled={!pageSizeMm} onClick={() => updateSharedFacsimileAppearance({ width: facsimileWidthFromMm(mm, pageSizeMm![0]) })}>{mm === 40 ? "Печать · 40 мм" : "Подпись · 60 мм"}</button>)}
             </div>
             <p className="help-text">Ширина изображения на бумаге; для круглой печати — диаметр. Это ориентиры, не обязательный стандарт. Пропорции сохраняются. Белые поля внутри картинки входят в размер.</p>
-            <label>Размер на всех выбранных страницах <input type="range" min="8" max="60" value={currentFacsimileGeometry.width * 100} onChange={(event) => updateSharedFacsimileAppearance({ width: normalizeFacsimile({ ...currentFacsimileGeometry, width: Number(event.target.value) / 100 }, previewAspect, facsimile.imageAspect).width })} /> {Math.round(currentFacsimileGeometry.width * 100)}%{pageSizeMm ? ` · ${(pageSizeMm[0] * currentFacsimileGeometry.width).toFixed(1)} мм` : ""}</label>
+            <label>Заданный размер на выбранных страницах <input type="range" min="8" max="60" value={currentFacsimileGeometry.width * 100} onChange={(event) => updateSharedFacsimileAppearance({ width: normalizeFacsimile({ ...currentFacsimileGeometry, width: Number(event.target.value) / 100 }, previewAspect, facsimile.imageAspect).width })} /> {Math.round(currentFacsimileGeometry.width * 100)}%{pageSizeMm ? ` · ${(pageSizeMm[0] * currentFacsimileGeometry.width).toFixed(1)} мм` : ""}</label>
+            {workerFacsimile && !fullscreen && <FacsimileFitSummary placement={workerFacsimile} pageIndex={pageIndex} pageSizeMm={pageSizeMm} imageAspect={facsimile.imageAspect} />}
             <label>Поворот <input type="range" min="-180" max="180" value={currentFacsimileGeometry.rotation} onChange={(event) => updateCurrentFacsimileGeometry(normalizeFacsimile({ ...currentFacsimileGeometry, rotation: Number(event.target.value) }, previewAspect, facsimile.imageAspect))} /> {currentFacsimileGeometry.rotation}°</label>
             <label>Непрозрачность на всех выбранных страницах <input type="range" min="10" max="100" value={currentFacsimileGeometry.opacity * 100} onChange={(event) => updateSharedFacsimileAppearance({ opacity: Number(event.target.value) / 100 })} /> {Math.round(currentFacsimileGeometry.opacity * 100)}%</label>
             <label className="checkbox-row"><input type="checkbox" checked={currentFacsimileGeometry.removeLightBackground} onChange={(event) => updateSharedFacsimileAppearance({ removeLightBackground: event.target.checked })} /> Удалить светлый фон на всех размещениях</label>
@@ -1284,7 +1374,7 @@ export function Scanner({ active = true, intelligenceOcrRequest, onIntelligenceO
           <button className="primary small" type="button" disabled={!facsimileSelection.selection} onClick={() => void commitFacsimile(false)}>{editingFacsimileId ? "Сохранить изменения" : "Зафиксировать"}</button>
         </div>}
       </fieldset>
-      {templateBusy && <p role="status">Работаем с пресетом факсимиле…</p>}
+      {templateBusy && <p role="status">Работаем с факсимиле…</p>}
       {templateError && <p className="notice error" role="alert">{templateError}</p>}
       {templateNotice && <p className="notice success" role="status">{templateNotice}</p>}
       {savedFacsimiles.length > 0 && <div className="notice success"><span>Зафиксировано факсимиле: {savedFacsimiles.length}</span><div className="facsimile-saved-list">{savedFacsimiles.map((saved, index) => <div className="facsimile-saved-row" key={saved.id}><span>{index + 1}. {saved.fileName}</span><div className="button-row"><button className="link-button" type="button" disabled={!documentReady} onClick={() => editSavedFacsimile(saved)}>Изменить</button><button className="link-button danger" type="button" disabled={!documentReady} onClick={() => { setSavedFacsimiles((current) => current.filter((entry) => entry.id !== saved.id)); if (editingFacsimileId === saved.id) { setFacsimile(null); setEditingFacsimileId(""); } }}>Удалить</button></div></div>)}</div>{savedFacsimiles.length > 1 && <button className="secondary small" type="button" disabled={!documentReady} onClick={placeAllFacsimilesOnEveryPage}>Объединить и разместить все на каждой странице</button>}<button className="link-button danger" type="button" disabled={!documentReady} onClick={() => { setSavedFacsimiles([]); setFacsimile(null); setEditingFacsimileId(""); }}>Удалить все</button></div>}
@@ -1296,12 +1386,14 @@ export function Scanner({ active = true, intelligenceOcrRequest, onIntelligenceO
       <div className="compression-controls"><h3>Сжатие PDF</h3><label>Режим<select value={compressionMode} onChange={(event) => { const mode = event.target.value as CompressionMode; const profile = compressionProfile(mode); setCompressionMode(mode); if (profile.dpi) setDpi(profile.dpi); if (profile.quality) setQuality(profile.quality); }}><option value="none">Без целевого ограничения</option><option value="balanced">Бережное · цель около 70%</option><option value="strong">Сильное · цель около 50%</option><option value="maximum">Экстремальное · цель около 12%</option></select></label><p className="help-text">Оценка считается один раз по всему файлу и не меняется при переходе между страницами. Экстремальный режим использует 96 dpi и сильное JPEG-сжатие; мелкий текст следует проверить.</p></div>
       <details><summary>Точная настройка</summary><label>Разрешение<select value={dpi} onChange={(event) => setDpi(Number(event.target.value))}><option value="96">96 dpi</option><option value="120">120 dpi</option><option value="150">150 dpi</option><option value="200">200 dpi</option><option value="300">300 dpi</option></select></label><label>Качество PDF<input type="range" min="32" max="100" value={quality} onChange={(event) => setQuality(Number(event.target.value))} /> {quality}%</label><button className="secondary small" type="button" onClick={() => { setDpi(200); setQuality(84); }}>Вернуть значения пресета</button></details>
       <details><summary>Журнал обработки · {journal.length}</summary>{journal.length === 0 ? <p className="help-text">Записей пока нет.</p> : <div className="journal-list">{journal.map((record) => <div key={record.id}><strong>{record.payload.status === "completed" ? "✓" : "!"} {record.title}</strong><span>{record.payload.inputType} · {record.payload.pageCount || 0} стр. · {record.payload.durationMs ? `${(record.payload.durationMs / 1000).toFixed(1)} с` : "—"}</span>{record.payload.appliedOperations?.length ? <small>{record.payload.appliedOperations.join(" · ")}</small> : null}{record.payload.outputSha256 ? <small title={record.payload.outputSha256}>SHA-256: {record.payload.outputSha256.slice(0, 16)}…</small> : null}</div>)}</div>}</details>
-    </div></section>
-    <section ref={previewPanel} className={`surface preview-panel ${fullscreen ? "fullscreen-preview" : ""}`}><div className="surface-title scanner-workspace-header"><div className="scanner-workspace-tabs" role="tablist" aria-label="Режим сканера"><button className={workspaceMode === "document" ? "active" : ""} role="tab" aria-selected={workspaceMode === "document"} type="button" onClick={() => setWorkspaceMode("document")}>Обработка документа</button><button className={workspaceMode === "merge" ? "active" : ""} role="tab" aria-selected={workspaceMode === "merge"} type="button" onClick={() => setWorkspaceMode("merge")}>Объединение файлов</button></div>{workspaceMode === "document" ? <div className="button-row">{originalUrl && <button className="secondary small" type="button" onClick={() => setShowOriginal((value) => !value)}>{showOriginal ? "Показать обработку" : "Показать оригинал"}</button>}<button className="secondary small" type="button" disabled={previewZoom <= MIN_PREVIEW_ZOOM} aria-label="Уменьшить масштаб" onClick={() => viewport.setZoom(Number((previewZoom - .25).toFixed(3)))}>−</button><button className="secondary small zoom-value" type="button" title="Сбросить масштаб и положение листа" onClick={viewport.resetView}>{Math.round(previewZoom * 100)}%</button><button className="secondary small" type="button" disabled={previewZoom >= MAX_PREVIEW_ZOOM} aria-label="Увеличить масштаб" onClick={() => viewport.setZoom(Number((previewZoom + .25).toFixed(3)))}>+</button><button className="secondary small" type="button" onClick={() => setFullscreen((value) => !value)}>{fullscreen ? "Закрыть полный экран" : "На весь экран"}</button><span>{inputPath ? `${documentName} · ${pageCount ? `Страница ${pageIndex + 1} из ${pageCount}` : error ? "Не удалось загрузить" : "Загружаем документ…"}${pageCount && !documentReady ? error ? " · Предпросмотр недоступен" : " · Обновляем предпросмотр…" : ""}` : "Файл не выбран"} · {preset}</span></div> : <span>{mergePageOrder.length ? `${mergePaths.length} файлов · ${mergePageOrder.length} страниц` : "Добавьте минимум два файла"}</span>}</div>
+    </div></section>}
+    <section ref={previewPanel} className={`surface preview-panel ${fullscreen ? "fullscreen-preview" : ""}`}><div className="surface-title scanner-workspace-header"><div className="scanner-workspace-tabs" role="tablist" aria-label="Режим сканера"><button className={workspaceMode === "document" ? "active" : ""} role="tab" aria-selected={workspaceMode === "document"} type="button" onClick={() => setWorkspaceMode("document")}>Обработка документа</button><button className={workspaceMode === "merge" ? "active" : ""} role="tab" aria-selected={workspaceMode === "merge"} type="button" onClick={() => setWorkspaceMode("merge")}>Объединение файлов</button></div>{workspaceMode === "document" ? inputPath && <div className="button-row">{originalUrl && <button className="secondary small" type="button" onClick={() => setShowOriginal((value) => !value)}>{showOriginal ? "Показать обработку" : "Показать оригинал"}</button>}<button className="secondary small" type="button" disabled={previewZoom <= MIN_PREVIEW_ZOOM} aria-label="Уменьшить масштаб" onClick={() => viewport.setZoom(Number((previewZoom - .25).toFixed(3)))}>−</button><button className="secondary small zoom-value" type="button" title="Сбросить масштаб и положение листа" onClick={viewport.resetView}>{previewZoomLabel(previewZoom)}</button><button className="secondary small" type="button" disabled={previewZoom >= MAX_PREVIEW_ZOOM} aria-label="Увеличить масштаб" onClick={() => viewport.setZoom(Number((previewZoom + .25).toFixed(3)))}>+</button><button className="secondary small" type="button" disabled={!documentReady} aria-pressed={viewport.fittingPage} onClick={viewport.fitPage}>Страница целиком</button><button className="secondary small" type="button" onClick={() => setFullscreen((value) => !value)}>{fullscreen ? "Закрыть полный экран" : "На весь экран"}</button><span>{documentName} · {pageCount ? `Страница ${pageIndex + 1} из ${pageCount}` : error ? "Не удалось загрузить" : "Загружаем документ…"}{pageCount && !documentReady ? error ? " · Предпросмотр недоступен" : " · Обновляем предпросмотр…" : ""}</span></div> : mergePageOrder.length > 0 && <span>{mergePaths.length} файлов · {mergePageOrder.length} страниц</span>}</div>
+      {intelligenceOcrRequest && <div className="notice scanner-ocr-request" aria-label="Распознавание документа для ИИ"><strong>{intelligenceOcrOpening ? "Загружаем файл для OCR…" : intelligenceOcrBound ? `OCR ${ocrEnabled ? "включён" : "выключен"} · документ из ИИ` : "Ожидает распознавания"}</strong>{!intelligenceOcrBound && !intelligenceOcrOpening && <><span>{intelligenceOcrRequest.inputPath.split(/[\\/]/).pop()}</span><button className="secondary small" type="button" disabled={!!activeJob || mergeInspecting || network.phase !== "connected"} onClick={() => { setIntelligenceOcrError(""); setOcrLoadConfirmation({ ...intelligenceOcrRequest }); }}>Загрузить для OCR</button></>}{intelligenceOcrBound && <details><summary>Как вернуть результат в ИИ</summary><p>Сохраните полный PDF с OCR без диапазона и перестановки страниц, затем верните текст отдельной кнопкой. Проверьте полноту распознавания; автоматической отправки модели нет.</p></details>}{intelligenceOcrError && !ocrLoadConfirmation && <p className="notice error" role="alert">{intelligenceOcrError}</p>}</div>}
+      {!hasWorkingFiles && recoverableDraft && <div className="notice warning"><span>Есть локальный черновик: {recoverableDraft.inputPath.split(/[\\/]/).pop()}</span><button type="button" className="secondary small" disabled={draftRecovering} onClick={() => void recoverDraft()}>{draftRecovering ? "Восстанавливаем черновик…" : "Восстановить черновик"}</button><button type="button" className="link-button" onClick={discardDraft}>Удалить черновик</button></div>}
       {workspaceMode === "merge" ? <><div className="scanner-preview-scroll">
         {mergeSaving && <p role="status">Объединение выполняется. Дождитесь результата перед изменением порядка файлов.</p>}
-        <div className="merge-main-toolbar"><div><strong>Сборка общего документа</strong><span>Выберите лист для предпросмотра и перемещайте его между страницами других файлов.</span></div><div className="button-row"><button className="secondary" type="button" disabled={mergeInspecting || !!activeJob} onClick={() => void chooseMerge()}>{mergePaths.length ? "Добавить файлы" : "Выбрать файлы"}</button>{mergePaths.length > 0 && <button className="secondary danger" type="button" onClick={clearMerge}>Очистить</button>}</div></div>
-        {mergePageOrder.length === 0 ? <div className="drop-empty merge-drop-empty" onClick={() => void chooseMerge()}><span>▧</span><h2>Объедините документы в основном окне</h2><p>Добавьте PDF или DOCX, просмотрите каждый лист и настройте общий порядок.</p><button className="primary" type="button">Выбрать несколько файлов</button></div> : <div className="merge-main-workspace" inert={mergeSaving || !!activeJob || mergeInspecting}>
+        {mergePaths.length > 0 && <div className="merge-main-toolbar"><div><strong>Сборка общего документа</strong><span>Выберите лист для предпросмотра и перемещайте его между страницами других файлов.</span></div><div className="button-row"><button className="secondary" type="button" disabled={mergeInspecting || !!activeJob} onClick={() => void chooseMerge()}>Добавить файлы</button><button className="secondary danger" type="button" onClick={clearMerge}>Очистить</button></div></div>}
+        {mergePageOrder.length === 0 ? <div className="drop-empty merge-drop-empty"><span aria-hidden="true">▧</span><h2>Объедините документы</h2><p>Добавьте PDF или DOCX и настройте порядок страниц с предпросмотром.</p><button className="primary" type="button" disabled={mergeInspecting || !!activeJob} onClick={() => void chooseMerge()}>{mergeInspecting ? "Загружаем файлы…" : "Выбрать несколько файлов"}</button></div> : <div className="merge-main-workspace" inert={mergeSaving || !!activeJob || mergeInspecting}>
           <aside className="merge-organizer" aria-label="Листы объединяемого документа">
             <div className="merge-file-summary">{mergePaths.map((path, index) => <div className="merge-file-row" key={path}><span><strong>{index + 1}.</strong> {path.split(/[\\/]/).pop()} · {mergePageOrder.filter((page) => page.path === path).length} стр.</span><button className="icon-button danger" type="button" aria-label={`Удалить файл ${index + 1} из объединения`} onClick={() => removeMergePath(path)}>×</button></div>)}</div>
             <div className="merge-page-list">{mergePageOrder.map((page, index) => <section className={`merge-page-card ${selectedMergePage?.id === page.id ? "active" : ""}`} key={page.id}><button className="merge-page-select" type="button" aria-label={`Показать лист ${index + 1}`} onClick={() => void previewMergePage(page)}><strong>{index + 1}</strong><span>{page.path.split(/[\\/]/).pop()}</span><small>Исходная стр. {page.pageIndex + 1}</small></button><div className="merge-page-actions"><button className="icon-button small" type="button" aria-label={`Переместить лист ${index + 1} в начало`} disabled={index === 0} onClick={() => moveMergePage(index, 0)}>⇈</button><button className="icon-button small" type="button" aria-label={`Переместить лист ${index + 1} выше`} disabled={index === 0} onClick={() => moveMergePage(index, index - 1)}>↑</button><button className="icon-button small" type="button" aria-label={`Переместить лист ${index + 1} ниже`} disabled={index === mergePageOrder.length - 1} onClick={() => moveMergePage(index, index + 1)}>↓</button><button className="icon-button small" type="button" aria-label={`Переместить лист ${index + 1} в конец`} disabled={index === mergePageOrder.length - 1} onClick={() => moveMergePage(index, mergePageOrder.length - 1)}>⇊</button></div></section>)}</div>
@@ -1312,13 +1404,15 @@ export function Scanner({ active = true, intelligenceOcrRequest, onIntelligenceO
         {warnings.length > 0 && <div className="notice warning"><strong>Проверьте результат</strong>{warnings.map((warning) => <span key={warning}>{warning}</span>)}</div>}
         {progress && <div className="progress-panel"><div><strong>{progress.stage}</strong><span>{progress.totalPages ? `Страница ${progress.currentPage} из ${progress.totalPages}` : ""}</span></div><progress max="100" value={progress.percent} /><strong>{progress.percent}%</strong>{activeJob && activeJobModeRef.current === workspaceMode && <button className="secondary" type="button" onClick={() => void cancel()}>Отменить</button>}</div>}
         </div>
-        {resultPath && resultKind === "single" ? <div className="ready-panel"><div><strong>✓ Объединённый PDF готов</strong><span>{resultPath}</span></div><button className="secondary" type="button" onClick={() => void openGeneratedPath(resultPath, "PDF")}>Открыть PDF</button><button className="secondary" type="button" onClick={() => void revealGeneratedFile(resultPath)}>Открыть папку</button><button className="primary" type="button" disabled={!!activeJob} onClick={() => void processMerge()}>Сохранить ещё одну копию</button></div> : <div className="actionbar"><span>К файлам применяются выбранный пресет, OCR и настройки сжатия.</span><button className="primary" type="button" disabled={mergePaths.length < 2 || !mergePageOrder.length || !!activeJob || mergeInspecting} onClick={() => void processMerge()}>Объединить {mergePageOrder.length} стр. из {mergePaths.length} файлов</button></div>}
-      </> : <><div className="scanner-preview-scroll">
-      <div className="scanner-document-tools" role="toolbar" aria-label="Инструменты документа"><span>Инструменты</span>{(["marker", "stroke", "blur", "print_blur"] as const).map((kind) => <button key={kind} className={drawingTool === kind ? "selected-tool" : ""} type="button" aria-label={drawingToolLabels[kind]} title={drawingToolLabels[kind]} aria-pressed={drawingTool === kind} disabled={!documentReady || showOriginal} onClick={() => { if (effectsPanel.current) effectsPanel.current.open = false; setDrawingTool((current) => current === kind ? null : kind); }}><DrawingToolIcon kind={kind} /></button>)}{isColoredAnnotationKind(drawingTool) && <AnnotationColorPicker kind={drawingTool} value={drawingColors[drawingTool]} label={drawingTool === "marker" ? "Цвет нового маркера" : "Цвет нового штриха"} disabled={!documentReady || showOriginal} onChange={(color) => setDrawingColors((current) => ({ ...current, [drawingTool]: annotationColor(drawingTool, color) }))} />}</div>
+        {(mergePaths.length > 0 || resultPath) && <>{resultPath && resultKind === "single" ? <div className="ready-panel"><div><strong>✓ Объединённый PDF готов</strong><span>{resultPath}</span></div><button className="secondary" type="button" onClick={() => void openGeneratedPath(resultPath, "PDF")}>Открыть PDF</button><button className="secondary" type="button" onClick={() => void revealGeneratedFile(resultPath)}>Открыть папку</button><button className="primary" type="button" disabled={!!activeJob} onClick={() => void processMerge()}>Сохранить ещё одну копию</button></div> : <div className="actionbar"><span>К файлам применяются выбранный пресет, OCR и настройки сжатия.</span><button className="primary" type="button" disabled={mergePaths.length < 2 || !mergePageOrder.length || !!activeJob || mergeInspecting} onClick={() => void processMerge()}>Объединить {mergePageOrder.length} стр. из {mergePaths.length} файлов</button></div>}</>}
+      </> : <><div className={`scanner-preview-scroll${inputPath ? " scanner-document-body" : ""}`}>
+      {inputPath && <div className="scanner-canvas-controls">
+      {inputPath && <div className="scanner-document-tools" role="toolbar" aria-label="Инструменты документа"><span>Инструменты</span>{(["marker", "stroke", "blur", "print_blur"] as const).map((kind) => <button key={kind} className={drawingTool === kind ? "selected-tool" : ""} type="button" aria-label={drawingToolLabels[kind]} title={drawingToolLabels[kind]} aria-pressed={drawingTool === kind} disabled={!documentReady || showOriginal} onClick={() => { if (effectsPanel.current) effectsPanel.current.open = false; setDrawingTool((current) => current === kind ? null : kind); }}><DrawingToolIcon kind={kind} /></button>)}{isColoredAnnotationKind(drawingTool) && <AnnotationColorPicker kind={drawingTool} value={drawingColors[drawingTool]} label={drawingTool === "marker" ? "Цвет нового маркера" : "Цвет нового штриха"} disabled={!documentReady || showOriginal} onChange={(color) => setDrawingColors((current) => ({ ...current, [drawingTool]: annotationColor(drawingTool, color) }))} />}</div>}
       {inputPath && <fieldset disabled={!documentReady} style={{ border: 0, margin: 0, padding: 0, minWidth: 0 }}><details ref={effectsPanel} className="applied-effects-panel"><summary aria-disabled={!documentReady || !annotations.length} onClick={(event) => { if (!documentReady || !annotations.length) event.preventDefault(); else setDrawingTool(null); }}>Добавленные эффекты · {annotations.length}</summary><div>{annotations.map((entry) => <section className="geometry-control-card" key={entry.id}><div className="geometry-card-header"><button className="link-button" type="button" onClick={() => { setPageIndex(entry.page); setSelectedOverlay({ kind: "annotation", id: entry.id }); void makePreview(inputPath, preset, entry.page); }}><strong>Стр. {entry.page + 1} · {drawingToolLabels[entry.kind]}</strong></button><button className="icon-button danger" type="button" aria-label={`Удалить эффект ${drawingToolLabels[entry.kind]} со страницы ${entry.page + 1}`} onClick={() => { setAnnotations((items) => items.filter((item) => item.id !== entry.id)); setSelectedOverlay(null); }}>×</button></div><label className="geometry-intensity"><span>{drawingIntensityLabels[entry.kind]}</span><span><input aria-label={`${drawingIntensityLabels[entry.kind]} «${drawingToolLabels[entry.kind]}», страница ${entry.page + 1}`} type="range" min="5" max="100" value={Math.round(entry.intensity * 100)} onChange={(event) => updateAnnotationIntensity(entry.id, event.target.valueAsNumber)} /><output>{Math.round(entry.intensity * 100)}%</output></span></label>{isColoredAnnotationKind(entry.kind) && <AnnotationColorPicker kind={entry.kind} value={entry.color} label={`Цвет «${drawingToolLabels[entry.kind]}», страница ${entry.page + 1}`} onChange={(color) => setAnnotations((items) => updateAnnotationColor(items, entry.id, color))} />}</section>)}</div></details></fieldset>}
       {inputPath && <div className="scanner-edit-actions" role="toolbar" aria-label="История изменений документа"><button className="secondary small" type="button" disabled={!!activeJob || previewing || !(editHistory.current.canUndo || editHistory.current.hasPending(editSnapshot))} onClick={() => undoEdits()}>↶ Отменить</button><button className="secondary small" type="button" disabled={!!activeJob || previewing || !editHistory.current.canRedo} onClick={() => undoEdits(true)}>↷ Повторить</button><span role="status">{dirty ? "Есть несохранённые изменения" : resultKind === "single" || resultKind === "split" ? "Настройки сохранены в PDF" : "Исходный файл не изменяется"}</span><button className="secondary small" type="button" disabled={!documentReady || !!activeJob || finalPreviewing} onClick={() => void makeFinalPreview()}>{finalPreviewing ? "Рассчитываем итоговый вид…" : "Проверить итоговый вид"}</button></div>}
-      {inputPath && <p className="help-text scanner-preview-disclaimer">Интерактивный вид — для размещения инструментов. Размытие и качество сжатия проверяйте кнопкой «Проверить итоговый вид».</p>}
+      <details className="scanner-preview-help"><summary>О предпросмотре</summary><p className="help-text scanner-preview-disclaimer">Интерактивный вид — для размещения инструментов. Размытие и качество сжатия проверяйте кнопкой «Проверить итоговый вид». Колёсико масштабирует под курсором; «Страница целиком» вписывает обе стороны листа. Перетаскивайте свободное поле или лист средней кнопкой мыши.</p></details>
       <ScannerPreparationStatus pageCount={pageCount} preparation={preparation} />
+      {fullscreen && visibleOnCurrentPage && workerFacsimile && facsimile && <FacsimileFitSummary placement={workerFacsimile} pageIndex={pageIndex} pageSizeMm={pageSizeMm} imageAspect={facsimile.imageAspect} />}
       {inputPath && pageCount > 0 && <ScannerPageControls disabled={!documentReady} error={outputPageSelection.error || outputBlockSelection.error} summary={outputPageMode === "blocks" ? `${pageOrder.length} стр. · ${outputBlockSelection.blocks.length} файлов по блокам` : outputPageMode === "range" ? `${outputPageSelection.order.length} из ${pageOrder.length} стр. · выбранный диапазон` : `${pageOrder.length} стр. · один PDF`}>
         <div className="page-editor"><span>Итоговый порядок ({pageOrder.length}):</span><div>{pageWindow.omittedBefore > 0 && <span className="page-gap">…{pageWindow.omittedBefore}…</span>}{pageWindow.pages.map((sourceIndex) => <button key={sourceIndex} className={sourceIndex === pageIndex ? "active" : ""} type="button" onClick={() => { setPageIndex(sourceIndex); void makePreview(inputPath, preset, sourceIndex); }}>{sourceIndex + 1}{pageRotations[sourceIndex] ? ` · ${pageRotations[sourceIndex]}°` : ""}</button>)}{pageWindow.omittedAfter > 0 && <span className="page-gap">…{pageWindow.omittedAfter}…</span>}</div><label className="page-jump">К странице<input type="number" min="1" max={pageCount} value={pageIndex + 1} onChange={(event) => { const selected = Math.max(0, Math.min(pageCount - 1, Number(event.target.value) - 1)); setPageIndex(selected); void makePreview(inputPath, preset, selected); }} /></label><button className="secondary small" type="button" onClick={() => moveCurrentPage(-1)}>← Раньше</button><button className="secondary small" type="button" onClick={() => moveCurrentPage(1)}>Позже →</button><button className="secondary small" type="button" onClick={() => rotateCurrentPage(-90)}>↶ 90°</button><button className="secondary small" type="button" onClick={() => rotateCurrentPage(90)}>↷ 90°</button><button className="secondary small danger" type="button" onClick={deleteCurrentPage}>Удалить страницу</button><button className="link-button" type="button" onClick={() => { const rotations = {}; setPageOrder(Array.from({ length: pageCount }, (_, index) => index)); setPageRotations(rotations); void makePreview(inputPath, preset, pageIndex, rotations); }}>Сбросить</button></div>
         <div className="output-page-selection">
@@ -1327,7 +1421,8 @@ export function Scanner({ active = true, intelligenceOcrRequest, onIntelligenceO
           {outputPageMode === "blocks" ? <div className="split-blocks"><p>Страницы указываются по итоговому порядку. Одна страница может входить в несколько блоков.</p>{outputBlocks.map((block, index) => <div className="split-block-row" key={block.id}><label>Название файла<input aria-label={`Название блока ${index + 1}`} value={block.name} placeholder={`Блок ${index + 1}`} onChange={(event) => updateOutputBlock(block.id, { name: event.target.value })} /></label><label>Страницы<input aria-label={`Страницы блока ${index + 1}`} aria-invalid={!!outputBlockSelection.error} value={block.pageRange} placeholder="1-3, 7, 10-12" onChange={(event) => updateOutputBlock(block.id, { pageRange: event.target.value })} /></label><button className="icon-button danger" type="button" aria-label={`Удалить блок ${index + 1}`} onClick={() => setOutputBlocks((current) => current.filter((entry) => entry.id !== block.id))}>×</button></div>)}<div className="split-block-footer"><button className="secondary small" type="button" onClick={addOutputBlock}>Добавить блок</button><span>{outputBlockSelection.error ? <small className="field-error">{outputBlockSelection.error}</small> : `Будет создано файлов: ${outputBlockSelection.blocks.length}.`}</span></div></div> : <span>{outputPageSelection.error ? <small className="field-error">{outputPageSelection.error}</small> : `Будет сохранено страниц: ${outputPageSelection.order.length}. Перестановка и удаления учитываются.`}</span>}
         </div>
       </ScannerPageControls>}
-      {!inputPath ? <div className="drop-empty" onClick={() => void chooseDocument()}><span>▧</span><h2>Выберите документ</h2><p>PDF или DOCX до 1 ГБ и до 5000 страниц. Исходный файл не изменяется.</p><button className="primary" type="button">Выбрать файл</button></div> : <div className={`preview-workspace ${pageCount > 1 ? "" : "single-page"}`}>
+      </div>}
+      {!inputPath ? <div className="drop-empty scanner-document-empty"><span aria-hidden="true">▧</span><h2>Выберите документ</h2><p>PDF или DOCX до 1 ГБ и 5000 страниц. Исходный файл не изменяется.</p><button className="primary" type="button" disabled={intelligenceOcrOpening || !!activeJob} onClick={() => void chooseDocument()}>Выбрать файл</button><details className="scanner-empty-options"><summary>Другие способы обработки</summary><button className="secondary" type="button" disabled={!!activeJob || batchPlanning} onClick={() => void chooseBatch()}>Пакетная обработка</button><button className="secondary" type="button" onClick={() => setWorkspaceMode("merge")}>Объединить несколько файлов</button></details></div> : <div className={`preview-workspace ${pageCount > 1 ? "" : "single-page"}`}>
         {pageCount > 1 && <aside className="page-strip" aria-label="Страницы">{pageWindow.omittedBefore > 0 && <span className="page-gap">+{pageWindow.omittedBefore}</span>}{pageWindow.pages.map((sourceIndex) => <button key={sourceIndex} className={pageIndex === sourceIndex ? "active" : ""} type="button" disabled={!documentReady} onClick={() => { setPageIndex(sourceIndex); void makePreview(inputPath, preset, sourceIndex); }}><span>{sourceIndex + 1}</span></button>)}{pageWindow.omittedAfter > 0 && <span className="page-gap">+{pageWindow.omittedAfter}</span>}</aside>}
         <div ref={stageElement} className={`document-stage ${viewport.panning ? "panning" : ""} ${drawingTool ? "has-drawing-tool" : ""}`} role="region" tabIndex={0} aria-label="Область просмотра документа: колёсико масштабирует под курсором, свободное поле перемещается мышью, стрелки прокручивают" title="Колёсико — масштаб под курсором. Перетаскивайте свободное поле или лист средней кнопкой. Shift + колёсико — прокрутка." onScroll={viewport.rememberCenter} onPointerDownCapture={viewport.startPan} onPointerMoveCapture={viewport.movePan} onPointerUpCapture={viewport.stopPan} onPointerCancelCapture={viewport.stopPan} onLostPointerCapture={viewport.stopPan} onKeyDown={viewport.panFromKeyboard}>
           <div className="document-canvas" style={{ width: viewport.layout.canvasWidth, height: viewport.layout.canvasHeight }}>
@@ -1338,23 +1433,28 @@ export function Scanner({ active = true, intelligenceOcrRequest, onIntelligenceO
             {documentReady && !showOriginal && facsimile && facsimile.applyTo !== "current" && facsimile.placementMode !== "manual" && facsimile.region && <div className="facsimile-region editable-geometry selected" role="button" tabIndex={0} aria-label="Область размещения факсимиле: перетаскивайте или изменяйте размер за углы" style={{ left: `${facsimile.region[0] * 100}%`, top: `${facsimile.region[1] * 100}%`, width: `${facsimile.region[2] * 100}%`, height: `${facsimile.region[3] * 100}%` }} onPointerDown={(event) => startRegionDrag("move", event)}><ResizeHandles onStart={(handle, event) => startRegionDrag(handle, event)} /></div>}
             {documentReady && !showOriginal && redactions.filter((entry) => entry.page === pageIndex).map((entry) => <div key={entry.id} className={`redaction-overlay editable-geometry ${selectedOverlay?.kind === "redaction" && selectedOverlay.id === entry.id ? "selected" : ""} ${entry.color}`} role="button" tabIndex={0} aria-label={`Область скрытия на странице ${entry.page + 1}`} style={{ left: `${entry.x * 100}%`, top: `${entry.y * 100}%`, width: `${entry.width * 100}%`, height: `${entry.height * 100}%` }} onKeyDown={(event) => nudgeOverlay("redaction", entry.id, event)} onPointerDown={(event) => startRectDrag("redaction", entry.id, "move", event)}>{selectedOverlay?.kind === "redaction" && selectedOverlay.id === entry.id && <ResizeHandles onStart={(handle, event) => startRectDrag("redaction", entry.id, handle, event)} />}</div>)}
             {documentReady && !showOriginal && annotations.filter((entry) => entry.page === pageIndex).map((entry) => <div key={entry.id} className={`annotation-overlay editable-geometry ${entry.kind} ${entry.shape} ${selectedOverlay?.kind === "annotation" && selectedOverlay.id === entry.id ? "selected" : ""}`} role="button" tabIndex={0} aria-label={`${{ marker: "Маркер", stroke: "Штрих", blur: "Размытие", print_blur: "Размытие для печати" }[entry.kind]} на странице ${entry.page + 1}`} style={{ left: `${entry.x * 100}%`, top: `${entry.y * 100}%`, width: `${entry.width * 100}%`, height: `${entry.height * 100}%`, backgroundColor: entry.kind === "marker" ? annotationColor(entry.kind, entry.color) : undefined, color: entry.kind === "stroke" ? annotationColor(entry.kind, entry.color) : undefined, opacity: entry.intensity, backdropFilter: entry.kind === "blur" ? `blur(${2 + entry.intensity * 10}px)` : entry.kind === "print_blur" ? `blur(${4 + entry.intensity * 14}px)` : undefined } as CSSProperties} onKeyDown={(event) => nudgeOverlay("annotation", entry.id, event)} onPointerDown={(event) => startRectDrag("annotation", entry.id, "move", event)}>{selectedOverlay?.kind === "annotation" && selectedOverlay.id === entry.id && <ResizeHandles onStart={(handle, event) => startRectDrag("annotation", entry.id, handle, event)} />}</div>)}
-            {documentReady && !showOriginal && visibleSavedFacsimiles.map(({ saved, placement }, index) => <div className="facsimile real saved" role="button" tabIndex={0} aria-label={`Изменить зафиксированное факсимиле ${saved.fileName}`} key={`${saved.id}-${index}`} style={facsimileOverlayStyle(positionFacsimileInRegion(placement, pageIndex))} onClick={() => editSavedFacsimile(saved)} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") editSavedFacsimile(saved); }}><img src={placement.imageUrl} alt="Зафиксированное факсимиле" style={{ opacity: placement.opacity, mixBlendMode: placement.removeLightBackground ? "multiply" : "normal" }} /></div>)}
-            {documentReady && !showOriginal && visibleOnCurrentPage && workerFacsimile && currentFacsimileGeometry && <div className="facsimile real editable-geometry selected" role="button" tabIndex={0} aria-label="Факсимиле: перемещайте стрелками или мышью, меняйте размер и поворот ручками" style={facsimileOverlayStyle(positionFacsimileInRegion(workerFacsimile, pageIndex))} onKeyDown={nudge} onPointerDown={(event) => startFacsimileDrag("move", event)}><img src={facsimile.imageUrl} alt="Факсимиле" onLoad={(event) => { const aspect = event.currentTarget.naturalWidth / Math.max(1, event.currentTarget.naturalHeight); setFacsimile((current) => current && Math.abs(current.imageAspect - aspect) > .001 ? { ...current, imageAspect: aspect } : current); }} style={{ opacity: currentFacsimileGeometry.opacity, mixBlendMode: currentFacsimileGeometry.removeLightBackground ? "multiply" : "normal" }} /><button className="facsimile-resize-handle" type="button" aria-label="Изменить размер факсимиле" onPointerDown={(event) => startFacsimileDrag("resize", event)} /><button className="facsimile-rotate-handle" type="button" aria-label="Повернуть факсимиле" onPointerDown={(event) => startFacsimileDrag("rotate", event)}>↻</button></div>}
+            {documentReady && !showOriginal && visibleSavedFacsimiles.map(({ saved, placement }, index) => <div className="facsimile real saved" role="button" tabIndex={0} aria-label={`Изменить зафиксированное факсимиле ${saved.fileName}`} key={`${saved.id}-${index}`} style={facsimileOverlayStyle(positionFacsimileInRegion(placement, pageIndex), { pageAspect: previewAspect, imageAspect: saved.imageAspect })} onClick={() => editSavedFacsimile(saved)} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") editSavedFacsimile(saved); }}><img src={placement.imageUrl} alt="Зафиксированное факсимиле" style={{ opacity: placement.opacity, mixBlendMode: placement.removeLightBackground ? "multiply" : "normal" }} /></div>)}
+            {documentReady && !showOriginal && visibleOnCurrentPage && workerFacsimile && currentFacsimileGeometry && <div className="facsimile real editable-geometry selected" role="button" tabIndex={0} aria-label="Факсимиле: перемещайте стрелками или мышью, меняйте размер и поворот ручками" style={facsimileOverlayStyle(positionFacsimileInRegion(workerFacsimile, pageIndex), { pageAspect: previewAspect, imageAspect: facsimile.imageAspect })} onKeyDown={nudge} onPointerDown={(event) => startFacsimileDrag("move", event)}><img src={facsimile.imageUrl} alt="Факсимиле" onLoad={(event) => { const aspect = event.currentTarget.naturalWidth / Math.max(1, event.currentTarget.naturalHeight); setFacsimile((current) => current && Math.abs(current.imageAspect - aspect) > .001 ? { ...current, imageAspect: aspect } : current); }} style={{ opacity: currentFacsimileGeometry.opacity, mixBlendMode: currentFacsimileGeometry.removeLightBackground ? "multiply" : "normal" }} /><button className="facsimile-resize-handle" type="button" aria-label="Изменить размер факсимиле" onPointerDown={(event) => startFacsimileDrag("resize", event)} /><button className="facsimile-rotate-handle" type="button" aria-label="Повернуть факсимиле" onPointerDown={(event) => startFacsimileDrag("rotate", event)}>↻</button></div>}
           </div>
           </div>
         </div>
       </div>}
+      </div>
+      <div className="scanner-result-footer">
       {error && <div className="scanner-error"><strong>Не удалось обработать документ</strong><span>{error}</span><div><button className="secondary" type="button" disabled={!!activeJob || finalPreviewing || batchPlanning} onClick={() => { if (retryOperation === "save") void processDocument(); else if (retryOperation === "batch") { if (batchPlan.length) void processBatch(); else void prepareBatch(); } else if (retryOperation === "final-preview") void makeFinalPreview(); else void makePreview(); }}>{scannerRetryLabel(retryOperation)}</button>{ocrEnabled && <button className="secondary" type="button" onClick={() => setOcrEnabled(false)}>Без OCR</button>}<button className="secondary" type="button" disabled={!!activeJob || mergeInspecting} onClick={() => void chooseDocument()}>Другой файл</button></div></div>}
       {splitOutcomes.length > 0 && <details className="scanner-output-plan"><summary>Результаты блоков · готово {splitOutcomes.filter((entry) => entry.status === "done").length} из {splitOutcomes.length}</summary><ol>{splitOutcomes.map((entry) => <li key={entry.outputPath}><strong>{entry.outputPath}</strong><small>{({ planned: "Не запущен", working: "Обрабатывается…", done: "Готово", error: "Не сохранён" })[entry.status]}{entry.error ? `: ${entry.error}` : ""}</small></li>)}</ol></details>}
-      {warnings.length > 0 && <div className="notice warning"><strong>Проверьте результат</strong>{warnings.map((warning) => <span key={warning}>{warning}</span>)}</div>}
+      {warnings.length > 0 && <details className="notice warning scanner-preview-warnings"><summary>Проверьте результат · {warnings.length}</summary>{warnings.map((warning) => <p key={warning}>{warning}</p>)}</details>}
+      {inputPath && <details className="scanner-result-details"><summary>Сведения о файле{ocrText ? " и распознанный текст" : ""}</summary>
       {inputPath && <ScannerSizeSummary inputPath={inputPath} resultPath={resultPath} resultKind={resultKind} originalBytes={originalBytes} estimatedOutputBytes={estimatedOutputBytes} savedResult={savedResultSize}>{pageSizeMm && <span>Страница: {pageSizeMm[0].toFixed(1)} × {pageSizeMm[1].toFixed(1)} мм</span>}{ocrConfidence != null && <span>Средняя уверенность OCR: {ocrConfidence.toFixed(1)}%</span>}</ScannerSizeSummary>}
       {ocrText && <details className="ocr-result"><summary>Распознанный текст · сомнительных слов: {lowConfidenceWords.length}</summary><textarea readOnly rows={10} value={ocrText} aria-label="Распознанный текст" />{lowConfidenceWords.length > 0 && <div className="low-confidence-list">{lowConfidenceWords.slice(0, 100).map((word, index) => <span key={`${word.page}-${index}`} title={`Страница ${word.page}`}>{word.text} · {word.confidence.toFixed(0)}%</span>)}</div>}<p className="help-text">Текст показывается только в текущем окне и не записывается в журнал обработки.</p></details>}
-      {progress && <div className="progress-panel"><div><strong>{progress.stage}</strong><span>{progress.totalPages ? `Страница ${progress.currentPage} из ${progress.totalPages}` : ""}</span></div><progress max="100" value={progress.percent} /><strong>{progress.percent}%</strong>{activeJob && activeJobModeRef.current === workspaceMode && <button className="secondary" type="button" onClick={() => void cancel()}>Отменить</button>}</div>}
-      </div>
-      {resultPath ? resultKind === "batch" || resultKind === "split" ? <div className="ready-panel"><div><strong>✓ {resultKind === "split" ? splitOutcomes.every((entry) => entry.status === "done") ? "Блоки PDF готовы" : "Сохранена часть блоков" : batchPlan.every((entry) => entry.status === "done") ? "Пакет готов" : "Сохранена часть пакета"}</strong><span>{resultPath}</span></div><button className="primary" type="button" onClick={() => void openGeneratedPath(resultPath, "папку")}>Открыть папку</button><button className="secondary" type="button" onClick={() => { if (resultKind === "batch") setBatchPaths([]); setResultPath(""); setResultKind(""); setProgress(null); }}>{resultKind === "split" ? "Изменить блоки" : "Другой пакет"}</button></div> : <div className="ready-panel"><div><strong>✓ PDF готов</strong><span>{resultPath}</span></div><button className="secondary" type="button" onClick={() => void openGeneratedPath(resultPath, "PDF")}>Открыть PDF</button><button className="secondary" type="button" onClick={() => void revealGeneratedFile(resultPath)}>Открыть папку</button><button className="primary" disabled={!documentReady || !!activeJob || !!facsimileSelection.error || !!outputPageSelection.error || !!outputBlockSelection.error} type="button" onClick={() => void processDocument()}>Сохранить ещё одну версию</button><button className="secondary" type="button" disabled={!!activeJob || mergeInspecting} onClick={clearDocument}>Другой файл</button></div> : <div className="actionbar"><span>{facsimileSelection.error || outputPageSelection.error || outputBlockSelection.error || (facsimile ? "Факсимиле перемещается и поворачивается мгновенно, без повторной загрузки документа" : outputPageMode === "blocks" ? "Настройте блоки и сохраните несколько PDF" : "Выберите пресет и сохраните новый PDF")}</span><button className="primary" disabled={!documentReady || !!activeJob || !!facsimileSelection.error || !!outputPageSelection.error || !!outputBlockSelection.error} type="button" onClick={() => void processDocument()}>{outputPageMode === "blocks" ? "Сохранить блоки PDF" : "Сохранить PDF"}</button></div>}
-      </>}
-      {intelligenceOcrCandidate && onIntelligenceOcrReady && <div className="notice" aria-label="Готовый результат OCR для ИИ"><span>Полный PDF с текстом OCR сохранён. В окне ИИ он добавится в текущую задачу; автоматическая отправка модели не выполняется.</span><button className="secondary" type="button" disabled={!!activeJob || intelligenceOcrReturning || network.phase !== "connected"} onClick={() => void returnIntelligenceOcr()}>{intelligenceOcrReturning ? "Проверяем сохранённый PDF…" : "Вернуть распознанный текст в ИИ"}</button></div>}
+      </details>}
+      {progress && (activeJob || !resultPath) && <div className="progress-panel"><div><strong>{progress.stage}</strong><span>{progress.totalPages ? `Страница ${progress.currentPage} из ${progress.totalPages}` : ""}</span></div><progress max="100" value={progress.percent} /><strong>{progress.percent}%</strong>{activeJob && activeJobModeRef.current === workspaceMode && <button className="secondary" type="button" onClick={() => void cancel()}>Отменить</button>}</div>}
+      {(inputPath || batchPaths.length > 0 || resultPath) && <>{resultPath ? resultKind === "batch" || resultKind === "split" ? <div className="ready-panel"><div><strong>✓ {resultKind === "split" ? splitOutcomes.every((entry) => entry.status === "done") ? "Блоки PDF готовы" : "Сохранена часть блоков" : batchPlan.every((entry) => entry.status === "done") ? "Пакет готов" : "Сохранена часть пакета"}</strong><span>{resultPath}</span></div><button className="primary" type="button" onClick={() => void openGeneratedPath(resultPath, "папку")}>Открыть папку</button><button className="secondary" type="button" onClick={() => { if (resultKind === "batch") setBatchPaths([]); setResultPath(""); setResultKind(""); setProgress(null); }}>{resultKind === "split" ? "Изменить блоки" : "Другой пакет"}</button></div> : <div className="ready-panel"><div><strong>✓ PDF готов</strong><span>{resultPath}</span></div><button className="secondary" type="button" onClick={() => void openGeneratedPath(resultPath, "PDF")}>Открыть PDF</button><button className="secondary" type="button" onClick={() => void revealGeneratedFile(resultPath)}>Открыть папку</button><button className="primary" disabled={!documentReady || !!activeJob || !!facsimileSelection.error || !!outputPageSelection.error || !!outputBlockSelection.error} type="button" onClick={() => void processDocument()}>Сохранить ещё одну версию</button><button className="secondary" type="button" disabled={!!activeJob || mergeInspecting} onClick={clearDocument}>Другой файл</button></div> : <div className="actionbar"><span>{facsimileSelection.error || outputPageSelection.error || outputBlockSelection.error || (facsimile ? "Факсимиле перемещается и поворачивается мгновенно, без повторной загрузки документа" : outputPageMode === "blocks" ? "Настройте блоки и сохраните несколько PDF" : "Выберите пресет и сохраните новый PDF")}</span><button className="primary" disabled={!documentReady || !!activeJob || !!facsimileSelection.error || !!outputPageSelection.error || !!outputBlockSelection.error} type="button" onClick={() => void processDocument()}>{outputPageMode === "blocks" ? "Сохранить блоки PDF" : "Сохранить PDF"}</button></div>}</>}
+      {intelligenceOcrCandidate && onIntelligenceOcrReady && <div className="notice scanner-ocr-return" aria-label="Готовый результат OCR для ИИ"><button className="secondary" type="button" disabled={!!activeJob || intelligenceOcrReturning || network.phase !== "connected"} onClick={() => void returnIntelligenceOcr()}>{intelligenceOcrReturning ? "Проверяем сохранённый PDF…" : "Вернуть распознанный текст в ИИ"}</button><details><summary>О передаче результата</summary><p>Полный PDF с текстом OCR сохранён. В окне ИИ он добавится в текущую задачу; автоматическая отправка модели не выполняется.</p></details></div>}
       {resultActionError && belongsToScannerResult(resultActionError, workspaceMode, resultPath) && <ScannerResultActionNotice failure={resultActionError} onDismiss={() => { resultActionGeneration.current += 1; setResultActionError(null); }} />}
+      </div>
+      </>}
+      {workspaceMode === "merge" && resultActionError && belongsToScannerResult(resultActionError, workspaceMode, resultPath) && <ScannerResultActionNotice failure={resultActionError} onDismiss={() => { resultActionGeneration.current += 1; setResultActionError(null); }} />}
     </section>
   </div>;
 }

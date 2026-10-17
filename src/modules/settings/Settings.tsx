@@ -36,6 +36,7 @@ import { useWorkspaceAccess } from "../../lib/workspaceAccess";
 import { workspacePasswordError, workspacePasswordHint } from "./passwordPolicy";
 import { OwnerPanel } from "./OwnerPanel";
 import { editorStatus, unavailableWorkspaceInfo } from "../../lib/editorStatus";
+import { applicationBuild } from "../../lib/buildInfo";
 import "./settings.css";
 
 interface AppSettings {
@@ -767,7 +768,20 @@ export function Settings({
 }
 
 export function About() {
-  const version = packageInfo.version;
+  const [copyStatus, setCopyStatus] = useState("");
+  const [copyError, setCopyError] = useState("");
+  const supportText = useRef<HTMLTextAreaElement | null>(null);
+  const copyBuildInfo = async () => {
+    setCopyStatus(""); setCopyError("");
+    try {
+      if (!navigator.clipboard?.writeText) throw new Error("Буфер обмена недоступен. Выделите и скопируйте справку ниже.");
+      await navigator.clipboard.writeText(applicationBuild.supportText);
+      setCopyStatus("Информация о сборке скопирована.");
+    } catch (reason) {
+      setCopyError(String(reason));
+    }
+  };
+  useEffect(() => { if (copyError) supportText.current?.select(); }, [copyError]);
   return (
     <div className="about-layout">
       <section className="surface about-hero">
@@ -779,11 +793,12 @@ export function About() {
             документов, договорного опыта и кадров.
           </p>
           <div className="about-badges">
-            <span>Версия {version}</span>
+            <span>Версия {applicationBuild.label}</span>
             <span>GPL-3.0</span>
             <span>Windows · macOS</span>
           </div>
           <p>Издатель: СБК · Автор: {packageInfo.author}</p>
+          <div className="about-build-info"><button className="secondary small" type="button" onClick={() => void copyBuildInfo()}>Скопировать информацию о сборке</button>{copyStatus && <p role="status">{copyStatus}</p>}{copyError && <p className="notice error" role="alert">Не удалось скопировать автоматически. {copyError}</p>}<details open={Boolean(copyError)}><summary>Техническая справка о сборке</summary><textarea ref={supportText} readOnly aria-label="Информация о сборке" value={applicationBuild.supportText} rows={6} /></details></div>
         </div>
       </section>
       <section className="surface">

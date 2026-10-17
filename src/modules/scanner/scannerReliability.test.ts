@@ -38,7 +38,14 @@ describe("scanner reliability wiring", () => {
     expect(source).toContain("return await makePreview(path, preset, 0, {})");
     expect(source).toContain("if (!preserveRecoveryDraft) discardDraft(); else setDraftEnabled(false)");
     const recover = source.slice(source.indexOf("const recoverDraft ="), source.indexOf("const chooseDocument ="));
-    expect(recover).toContain("const loaded = await openDocumentPath(draft.inputPath, true)");
+    expect(recover).toContain("const opening = openDocumentPath(draft.inputPath, true)");
+    expect(recover).toContain("const loaded = await opening");
+    const opening = recover.indexOf("const opening = openDocumentPath");
+    const openedEpoch = recover.indexOf("generation = previewSession.current!.sourceGeneration", opening);
+    const loaded = recover.indexOf("const loaded = await opening", opening);
+    expect(openedEpoch).toBeGreaterThan(opening);
+    expect(openedEpoch).toBeLessThan(loaded);
+    expect(recover.indexOf("if (!current()) return", loaded)).toBeLessThan(recover.indexOf("editHistory.current.reset"));
     expect(recover.indexOf("if (!loaded)")).toBeLessThan(recover.indexOf("editHistory.current.reset"));
     expect(recover.indexOf("editHistory.current.reset")).toBeLessThan(recover.indexOf("editHistory.current.record(snapshot)"));
     expect(recover).toContain("Черновик сохранён; исправьте ошибку");

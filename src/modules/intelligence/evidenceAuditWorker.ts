@@ -13,7 +13,7 @@ export function runEvidenceAudit(request: EvidenceAuditRequest): EvidenceAuditRe
   } catch { return { revision: request.revision, failed: true }; }
 }
 
-if (typeof self !== "undefined") {
+if (typeof self !== "undefined" && typeof document === "undefined" && typeof self.postMessage === "function") {
   const worker = self as unknown as { onmessage: ((event: MessageEvent<EvidenceAuditRequest>) => void) | null; postMessage: (message: EvidenceAuditReply) => void };
   worker.onmessage = (event) => worker.postMessage(runEvidenceAudit(event.data));
 }

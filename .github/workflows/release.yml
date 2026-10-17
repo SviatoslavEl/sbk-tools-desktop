@@ -45,7 +45,7 @@ jobs:
       - run: python -m pytest -q
         working-directory: scanner-worker
       - name: Verify safe extraction of the reusable installed worker
-        run: python -m pytest -q scripts/tests/test_extract_verified_installed_worker.py scripts/tests/test_installed_startup_contract.py scripts/tests/test_worker_package_data.py scripts/tests/test_benchmark_scanner.py scripts/tests/test_smoke_intelligence_extraction.py
+        run: python -m pytest -q scripts/tests/test_extract_verified_installed_worker.py scripts/tests/test_installed_startup_contract.py scripts/tests/test_worker_package_data.py scripts/tests/test_benchmark_scanner.py scripts/tests/test_smoke_intelligence_extraction.py scripts/tests/test_finalize_macos_manual_bundle.py scripts/tests/test_check_versions.py
       - run: python -m ruff check .
         working-directory: scanner-worker
       - name: Prepare sidecar placeholder for Tauri metadata checks
@@ -75,7 +75,7 @@ jobs:
   build:
     needs: quality-gate
     env:
-      ARTIFACT_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('2.9.0-test.{0}', github.run_number) }}
+      ARTIFACT_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('3.0.0-test.{0}', github.run_number) }}
     strategy:
       fail-fast: false
       matrix:
@@ -252,9 +252,10 @@ jobs:
         shell: bash
         run: |
           APP="src-tauri/target/${{ matrix.target }}/release/bundle/macos/СБК Инструменты.app"
-          xattr -cr "$APP"
-          codesign --force --deep --sign - "$APP"
-          codesign --verify --deep --strict --verbose=2 "$APP"
+          python scripts/finalize_macos_manual_bundle.py \
+            --app "$APP" \
+            --source-worker "src-tauri/binaries/sbk-scanner-worker-${{ matrix.target }}" \
+            --source-runtime src-tauri/runtime-resources
       - name: Test final macOS app scanner runtime
         if: runner.os == 'macOS'
         shell: bash
@@ -506,7 +507,7 @@ jobs:
     runs-on: windows-latest
     env:
       TARGET: x86_64-pc-windows-msvc
-      ARTIFACT_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('2.9.0-test.{0}', github.run_number) }}
+      ARTIFACT_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('3.0.0-test.{0}', github.run_number) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6

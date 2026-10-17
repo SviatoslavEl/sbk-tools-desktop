@@ -15,14 +15,35 @@ if TYPE_CHECKING:
     from pypdf import PdfWriter
 
 
+def open_render_document(source: Path | str) -> pdfium.PdfDocument:
+    """Initialize visible form appearances before obtaining page handles.
+
+    Rendering page contents alone omits Widget appearances, including ordinary
+    text boxes used for visible certificate information. This does not validate
+    a signature or change/flatten the source file.
+    """
+    document = pdfium.PdfDocument(str(source))
+    try:
+        document.init_forms()
+        return document
+    except BaseException:
+        document.close()
+        raise
+
+
 def render_page(document: pdfium.PdfDocument, index: int, dpi: int) -> tuple[Image.Image, tuple[float, float]]:
+    # Idempotent fallback for callers that supply an already-open parser.
+    document.init_forms()
     page = document[index]
-    size = tuple(map(float, page.get_size()))
-    bitmap = page.render(scale=dpi / 72.0, rotation=0)
-    image = bitmap.to_pil().convert("RGB")
-    bitmap.close()
-    page.close()
-    return image, size
+    try:
+        size = tuple(map(float, page.get_size()))
+        bitmap = page.render(scale=dpi / 72.0, rotation=0, may_draw_forms=True, draw_annots=True)
+        try:
+            return bitmap.to_pil().convert("RGB"), size
+        finally:
+            bitmap.close()
+    finally:
+        page.close()
 
 
 def _jpeg_for_budget(image: Image.Image, quality: int, target_bytes: int | None) -> bytes:

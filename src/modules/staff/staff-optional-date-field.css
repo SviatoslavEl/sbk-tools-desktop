@@ -1,0 +1,8 @@
+.staff-optional-date-field { display: flex; flex-direction: column; align-items: stretch; gap: 6px; min-width: 0; }
+.staff-optional-date-field > label { margin: 0; }
+.staff-optional-date-field > input { display: block; width: 100%; min-width: 0; min-height: 38px; padding: 8px 10px; color: var(--text); background: var(--surface); border: 1px solid var(--line-strong); border-radius: 8px; font-size: 13px; }
+.staff-optional-date-empty { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 4px 10px; min-height: 38px; padding: 4px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-muted); }
+.staff-optional-date-empty > span, .staff-optional-date-field > small { color: var(--text-muted); font-size: 12px; }
+.staff-optional-date-field .staff-optional-date-action { align-self: flex-start; min-height: 28px; padding: 2px 0; border: 0; background: transparent; color: var(--primary-hover); font-size: 12px; line-height: 1.5; text-align: left; overflow-wrap: anywhere; }
+.staff-optional-date-field .staff-optional-date-action:enabled:hover { text-decoration: underline; text-underline-offset: 3px; }
+.staff-optional-date-field .staff-optional-date-action:disabled { color: var(--text-muted); }

@@ -32,13 +32,13 @@ interface Layer {
 }
 
 function layerContainsFocus(layer: Layer, target: Element | null): boolean {
-  return Boolean(target && (layer.content.contains(target) || (
-    layer.backdrop.contains(target) && target.closest("[data-network-offline-allowed]")
-  )));
+  // An offline-access marker authorizes a local operation, not keyboard focus
+  // outside aria-modal. Auxiliary controls must live inside the actual dialog.
+  return Boolean(target && layer.content.contains(target));
 }
 
 function layerControls(layer: Layer): HTMLElement[] {
-  return focusableElements(layer.backdrop).filter((control) => layerContainsFocus(layer, control));
+  return focusableElements(layer.content);
 }
 
 export interface ModalRegistration {
@@ -50,36 +50,70 @@ export interface ModalRegistration {
 export class ModalStack {
   private layers: Layer[] = [];
   private redirectingFocus = false;
+  private synchronizing = false;
+  private syncPending = false;
+  private pendingActivation: (() => void) | undefined;
   private revision = 0;
 
   constructor(private readonly document: Document) {}
 
   private top() { return this.layers[this.layers.length - 1]; }
 
-  private sync() {
-    this.layers.forEach((layer, index) => {
-      const active = layer === this.top();
-      layer.backdrop.style.zIndex = String(1000 + index * 10);
-      restoreAttribute(layer.backdrop, "inert", active ? layer.original.inert : "");
-      restoreAttribute(layer.backdrop, "aria-hidden", active ? layer.original.hidden : "true");
-      layer.content.setAttribute("aria-modal", String(active));
-    });
+  private sync(activateFocus?: () => void) {
+    this.syncPending = true;
+    if (activateFocus) this.pendingActivation = activateFocus;
+    // focus() dispatches synchronous application handlers. They can mount or
+    // close another portal; finish the current focus dispatch, then activate
+    // the latest top instead of applying a stale layer's visibility snapshot.
+    if (this.synchronizing || this.redirectingFocus) return;
+    this.synchronizing = true;
+    try {
+      while (this.syncPending) {
+        this.syncPending = false;
+        const activation = this.pendingActivation;
+        this.pendingActivation = undefined;
+        const active = this.top();
+        const revision = this.revision;
+        this.layers.forEach((layer, index) => {
+          layer.backdrop.style.zIndex = String(1000 + index * 10);
+        });
+        // Move the actual focus/AX owner before removing the old owner from the
+        // accessibility tree. Hiding a still-focused modal first can leave a
+        // nested body portal without an exposed owner, even though it is visible.
+        if (active) {
+          restoreAttribute(active.backdrop, "inert", active.original.inert);
+          restoreAttribute(active.backdrop, "aria-hidden", active.original.hidden);
+          active.content.setAttribute("aria-modal", "true");
+        }
+        activation?.();
+        if (revision !== this.revision || active !== this.top()) { this.syncPending = true; continue; }
+        for (const layer of this.layers) if (layer !== active) layer.content.setAttribute("aria-modal", "false");
+        for (const layer of this.layers) if (layer !== active) {
+          layer.backdrop.setAttribute("inert", "");
+          layer.backdrop.setAttribute("aria-hidden", "true");
+        }
+      }
+    } finally { this.synchronizing = false; }
   }
 
-  private focusInside(layer: Layer, preferLast = false) {
+  private focusInside(layer: Layer, preferLast = false, opening = false) {
     if (this.redirectingFocus) return;
     this.redirectingFocus = true;
     try {
       const preferred = layer.content.querySelector<HTMLElement>("[autofocus], [data-autofocus]");
       const last = preferLast && layer.lastFocus && layerContainsFocus(layer, layer.lastFocus) && canFocus(layer.lastFocus)
         ? layer.lastFocus : null;
-      // The auxiliary diagnostics button participates in Tab traversal, but it
-      // must not steal initial focus from the actual card/confirmation controls.
-      const target = last || (canFocus(preferred) ? preferred : focusableElements(layer.content)[0] || layerControls(layer)[0]) || layer.content;
+      // Keep initial focus on the requested field, not an auxiliary action.
+      // Establish the named dialog itself as the initial AX/focus owner before
+      // entering its controls. WebKit can otherwise prune the initial modal's
+      // accessible subtree while focus moves straight into a newly portalled
+      // button. Explicit form autofocus still takes precedence.
+      const target = last || (canFocus(preferred) ? preferred : opening ? layer.content : focusableElements(layer.content)[0] || layerControls(layer)[0]) || layer.content;
       target.focus({ preventScroll: true });
       layer.lastFocus = target;
     } finally {
       this.redirectingFocus = false;
+      if (this.syncPending && !this.synchronizing) this.sync();
     }
   }
 
@@ -132,8 +166,7 @@ export class ModalStack {
     if (layer.original.tabIndex === null) content.setAttribute("tabindex", "-1");
     this.layers.push(layer);
     this.revision += 1;
-    this.sync();
-    this.focusInside(layer);
+    this.sync(() => this.focusInside(layer, false, true));
     let disposed = false;
     return {
       requestClose: () => { if (!disposed && this.top() === layer) layer.onClose(); },
@@ -143,12 +176,20 @@ export class ModalStack {
         const wasTop = this.top() === layer;
         this.layers = this.layers.filter((candidate) => candidate !== layer);
         const revision = ++this.revision;
+        // Retire the outgoing modal role before exposing its surviving parent.
+        // React removes the outgoing portal in this commit; return focus while
+        // both DOM nodes still exist, then release the outgoing attributes.
+        content.setAttribute("aria-modal", "false");
+        this.sync(wasTop ? () => {
+          const current = this.top();
+          if (canFocus(layer.returnFocus) && (!current || layerContainsFocus(current, layer.returnFocus))) layer.returnFocus.focus({ preventScroll: true });
+          else if (current) this.focusInside(current, true);
+        } : undefined);
         backdrop.style.zIndex = layer.original.zIndex;
         restoreAttribute(backdrop, "inert", layer.original.inert);
         restoreAttribute(backdrop, "aria-hidden", layer.original.hidden);
         restoreAttribute(content, "aria-modal", layer.original.modal);
         restoreAttribute(content, "tabindex", layer.original.tabIndex);
-        this.sync();
         if (!this.layers.length) {
           this.document.removeEventListener("keydown", this.onKeyDown, true);
           this.document.removeEventListener("focusin", this.onFocus, true);
@@ -159,6 +200,11 @@ export class ModalStack {
         queueMicrotask(() => {
           if (revision !== this.revision) return;
           const current = this.top();
+          const active = this.document.activeElement as HTMLElement | null;
+          // A later layout/focus handler may already have chosen a valid field.
+          // Only recover lost/outgoing focus; never undo that newer choice.
+          if (canFocus(active) && active !== this.document.body && active !== this.document.documentElement
+            && !layer.backdrop.contains(active) && (!current || layerContainsFocus(current, active))) return;
           if (canFocus(layer.returnFocus) && (!current || layerContainsFocus(current, layer.returnFocus))) {
             layer.returnFocus.focus({ preventScroll: true });
           } else if (current) this.focusInside(current, true);

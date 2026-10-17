@@ -5,6 +5,7 @@ import { VersionHistory } from '../../components/VersionHistory';
 import { ConfirmDialog } from '../../components/Dialog';
 import { Archive } from '../archive/Archive';
 import { createProposal } from './defaults';
+import { resetProposalDraftPersistenceForTests } from './proposalDraftPersistence';
 import { buildProposalPublic, proposalExportAssets } from './exportPublic';
 import type { ProposalData, ProposalRenderResult, ProposalTemplateData } from './types';
 import type { StoredRecord } from '../../lib/storage';
@@ -59,6 +60,7 @@ const renderCalls = () => runtime.invoke.mock.calls.filter(([command]) => comman
 const archiveConfirmation = () => nodes().find((node) => node.type === ConfirmDialog && node.props.title === 'Архивировать КП?');
 
 beforeEach(() => {
+  resetProposalDraftPersistenceForTests();
   vi.useFakeTimers(); vi.setSystemTime(new Date('2026-09-18T12:00:00Z'));
   runtime.cursor = 0; runtime.changed = false; runtime.slots = []; runtime.effects = []; runtime.editor = true; props = {}; renderOverride = undefined;
   runtime.store.records = []; runtime.store.loading = false; runtime.store.error = null;
@@ -197,6 +199,148 @@ describe('proposal saving and viewer workflow', () => {
   });
 });
 
+describe('persisted proposal draft lifecycle after reverting saved values', () => {
+  function persistence() {
+    const drafts = new Map<string, unknown>();
+    runtime.readDraft.mockImplementation(async (module: string, key: string) => structuredClone(drafts.get(`${module}:${key}`) ?? null));
+    runtime.saveDraft.mockImplementation(async (module: string, value: unknown, key: string) => { drafts.set(`${module}:${key}`, structuredClone(value)); });
+    runtime.clearDraft.mockImplementation(async (module: string, key: string) => { drafts.delete(`${module}:${key}`); });
+    runtime.store.save.mockImplementation(async (_title: string, value: ProposalData, id: string) => {
+      const saved = record(id, value);
+      runtime.store.records = [...runtime.store.records.filter((entry) => entry.id !== id), saved];
+      return saved;
+    });
+    return drafts;
+  }
+  async function openSaved(data = proposal('Исходный предмет')) {
+    runtime.store.records = [record('saved', data)]; render({ openRecordId: 'saved' }); await flush(); return data;
+  }
+  async function reopen(data: ProposalData) {
+    const open = nodes().find((node) => node.type === 'button' && node.props['aria-label'] === `Открыть КП ${data.number} · редакция ${data.revision}`)!;
+    expect(open).toBeDefined(); open.props.onClick!(); await flush();
+  }
+  async function remountSaved() {
+    runtime.slots.forEach((slot) => slot.cleanup?.()); runtime.slots = []; runtime.effects = []; props = {};
+    render({ openRecordId: 'saved' }); await flush();
+  }
+
+  it('deletes an already persisted temporary draft on exact revert and reopens the saved payload', async () => {
+    const drafts = persistence(), original = await openSaved(), saved = structuredClone(runtime.store.records[0]);
+    await edit('proposal-title', 'Временный предмет'); await vi.advanceTimersByTimeAsync(600); await flush();
+    expect(drafts.has('commercial-proposals:proposal:saved')).toBe(true);
+    await edit('proposal-title', original.title);
+    expect(button('Сохранить КП').props.disabled).toBe(true);
+    await click('К списку'); await reopen(original);
+    expect(input('proposal-title').props.value).toBe(original.title);
+    expect(drafts.has('commercial-proposals:proposal:saved')).toBe(false);
+    expect(runtime.store.records[0]).toEqual(saved); expect(runtime.store.save).not.toHaveBeenCalled();
+  });
+
+  it('waits for the in-flight autosave before cleaning the reverted draft and opening the list', async () => {
+    const drafts = persistence(), original = await openSaved(), writing = deferred<void>();
+    runtime.saveDraft.mockImplementationOnce(async (module: string, value: unknown, key: string) => { await writing.promise; drafts.set(`${module}:${key}`, structuredClone(value)); });
+    await edit('proposal-title', 'Поздний временный предмет'); await vi.advanceTimersByTimeAsync(600); await flush();
+    expect(runtime.saveDraft).toHaveBeenCalledOnce();
+    await edit('proposal-title', original.title); await click('К списку');
+    expect(input('proposal-title').props.value).toBe(original.title);
+    writing.resolve(); await flush(); await reopen(original);
+    expect(input('proposal-title').props.value).toBe(original.title);
+    expect(drafts.has('commercial-proposals:proposal:saved')).toBe(false);
+    expect(runtime.store.save).not.toHaveBeenCalled();
+  });
+
+  it('cancels a not-yet-started autosave when the saved value is restored', async () => {
+    const drafts = persistence(), original = await openSaved();
+    await edit('proposal-title', 'Короткая правка'); await edit('proposal-title', original.title);
+    await vi.advanceTimersByTimeAsync(1200); await flush(); await click('К списку'); await reopen(original);
+    expect(runtime.saveDraft).not.toHaveBeenCalled(); expect(drafts.size).toBe(0);
+    expect(input('proposal-title').props.value).toBe(original.title);
+  });
+
+  it('keeps the close warning until a clean reverted form has finished clearing its in-flight draft', async () => {
+    const drafts = persistence(), original = await openSaved(), writing = deferred<void>();
+    runtime.saveDraft.mockImplementationOnce(async (module: string, value: unknown, key: string) => { await writing.promise; drafts.set(`${module}:${key}`, structuredClone(value)); });
+    await edit('proposal-title', 'Временная правка перед закрытием'); await vi.advanceTimersByTimeAsync(600); await flush();
+    await edit('proposal-title', original.title);
+    const listeners = (window.addEventListener as unknown as { mock: { calls: Array<[string, (event: { preventDefault: () => void; returnValue?: string }) => void]> } }).mock.calls;
+    const unload = listeners.find(([name]) => name === 'beforeunload')![1];
+    const pendingEvent = { preventDefault: vi.fn(), returnValue: undefined as string | undefined };
+    unload(pendingEvent); expect(pendingEvent.preventDefault).toHaveBeenCalledOnce();
+    writing.resolve(); await flush(); expect(drafts.size).toBe(0);
+    const settledEvent = { preventDefault: vi.fn(), returnValue: undefined as string | undefined };
+    unload(settledEvent); expect(settledEvent.preventDefault).not.toHaveBeenCalled();
+  });
+
+  it('does not restore a late temporary autosave after revert, unmount and immediate remount', async () => {
+    const drafts = persistence(), original = await openSaved(), writing = deferred<void>();
+    runtime.saveDraft.mockImplementationOnce(async (module: string, value: unknown, key: string) => { await writing.promise; drafts.set(`${module}:${key}`, structuredClone(value)); });
+    await edit('proposal-title', 'Черновик старого экземпляра'); await vi.advanceTimersByTimeAsync(600); await flush();
+    await edit('proposal-title', original.title); await remountSaved();
+    writing.resolve(); await flush();
+    expect(input('proposal-title').props.value).toBe(original.title);
+    expect(drafts.has('commercial-proposals:proposal:saved')).toBe(false);
+    expect(button('Сохранить КП').props.disabled).toBe(true);
+  });
+
+  it('keeps explicit discard ordered after an in-flight autosave', async () => {
+    const drafts = persistence(), original = await openSaved(), writing = deferred<void>();
+    runtime.saveDraft.mockImplementationOnce(async (module: string, value: unknown, key: string) => { await writing.promise; drafts.set(`${module}:${key}`, structuredClone(value)); });
+    await edit('proposal-title', 'Явно отбросить'); await vi.advanceTimersByTimeAsync(600); await flush();
+    await click('К списку'); await click('Заменить без сохранения'); writing.resolve(); await flush(); await reopen(original);
+    expect(input('proposal-title').props.value).toBe(original.title); expect(drafts.size).toBe(0);
+    expect(runtime.store.save).not.toHaveBeenCalled();
+  });
+
+  it('keeps explicit save ordered after an in-flight autosave and uses its new baseline on reopening', async () => {
+    const drafts = persistence(), original = await openSaved(), writing = deferred<void>();
+    runtime.saveDraft.mockImplementationOnce(async (module: string, value: unknown, key: string) => { await writing.promise; drafts.set(`${module}:${key}`, structuredClone(value)); });
+    await edit('proposal-title', 'Сохранённый новый предмет'); await vi.advanceTimersByTimeAsync(600); await flush();
+    await click('Сохранить КП'); writing.resolve(); await flush(); await click('К списку'); await reopen(original);
+    expect(input('proposal-title').props.value).toBe('Сохранённый новый предмет'); expect(drafts.size).toBe(0);
+    expect(runtime.store.save).toHaveBeenCalledOnce(); expect(runtime.store.save.mock.calls[0][2]).toBe('saved');
+    await edit('proposal-title', 'Ещё временно'); await vi.advanceTimersByTimeAsync(600); await flush();
+    await edit('proposal-title', 'Сохранённый новый предмет'); await click('К списку'); await reopen(original);
+    expect(input('proposal-title').props.value).toBe('Сохранённый новый предмет'); expect(drafts.size).toBe(0);
+  });
+
+  it('does not silently navigate to a stale draft when cleanup fails and allows explicit retry', async () => {
+    const drafts = persistence(), original = await openSaved();
+    await edit('proposal-title', 'Временно сохранённый черновик'); await vi.advanceTimersByTimeAsync(600); await flush();
+    runtime.clearDraft.mockRejectedValue(new Error('Папка временно недоступна'));
+    await edit('proposal-title', original.title); await click('К списку');
+    expect(input('proposal-title').props.value).toBe(original.title);
+    expect(text()).toContain('черновик'); expect(text()).toContain('Папка временно недоступна');
+    runtime.clearDraft.mockImplementation(async (module: string, key: string) => { drafts.delete(`${module}:${key}`); });
+    await click('К списку'); await reopen(original);
+    expect(input('proposal-title').props.value).toBe(original.title); expect(drafts.size).toBe(0);
+  });
+
+  it.each(['different-workspace', 'viewer'])('never cleans a reverted draft through stale workspace access: %s', async (mode) => {
+    const drafts = persistence(), original = await openSaved();
+    await edit('proposal-title', 'Сохранённый временный черновик'); await vi.advanceTimersByTimeAsync(600); await flush();
+    runtime.getWorkspace.mockResolvedValue({ root: mode === 'different-workspace' ? '/tmp/other-workspace' : '/tmp/qa-workspace', editor: mode !== 'viewer' });
+    await edit('proposal-title', original.title); await click('К списку');
+    expect(input('proposal-title').props.value).toBe(original.title);
+    expect(text()).toContain('Рабочая папка или доступ изменились');
+    expect(runtime.clearDraft).not.toHaveBeenCalled(); expect(drafts.has('commercial-proposals:proposal:saved')).toBe(true);
+    expect(runtime.store.save).not.toHaveBeenCalled();
+  });
+
+  it('keeps a new revision dirty until explicit save and cleans only its own draft key', async () => {
+    const drafts = persistence(), original = proposal('Сохранённая редакция'); original.status = 'ready';
+    await openSaved(original); drafts.set('commercial-proposals:proposal:saved', { untouched: 'immutable revision recovery' });
+    await click('Новая редакция'); await edit('proposal-title', 'Новая редакция с правкой');
+    await vi.advanceTimersByTimeAsync(600); await flush();
+    expect(drafts.has('commercial-proposals:proposal:new')).toBe(true);
+    await edit('proposal-title', original.title); expect(button('Сохранить КП').props.disabled).toBe(false);
+    await click('Сохранить КП');
+    expect(runtime.store.save.mock.calls[0][1]).toMatchObject({ familyId: original.familyId, revision: 2, status: 'draft' });
+    expect(drafts.has('commercial-proposals:proposal:new')).toBe(false);
+    expect(drafts.get('commercial-proposals:proposal:saved')).toEqual({ untouched: 'immutable revision recovery' });
+    expect(runtime.store.records.find((entry) => entry.id === 'saved')!.payload).toEqual(original);
+  });
+});
+
 describe('proposal native rendering boundary and cancellation', () => {
   it('requires explicit zero-price consent and clears it after changing the document', async () => {
     const data = proposal(); data.lines[0].unitPrice = '0'; await seed(data); await click('5. Проверка и экспорт');
@@ -232,6 +376,56 @@ describe('proposal native rendering boundary and cancellation', () => {
     // The existing dirty proposal requires an explicit decision before replacement.
     expect(nodes().some((node) => node.props.title === 'Есть несохранённые изменения КП')).toBe(true); await click('Заменить без сохранения');
     expect(input('proposal-title').props.value).toBe('Второй источник'); expect(consumed).toHaveBeenCalledOnce(); expect(nodes().filter((node) => node.type === 'img')).toHaveLength(0);
+  });
+  it('retains a cold handoff after a deferred draft-read failure and accepts only an explicit successful retry', async () => {
+    const read = deferred<null>();
+    runtime.readDraft.mockImplementation((module: string, key: string) => module === 'commercial-proposals' && key === 'proposal:new' ? read.promise : Promise.resolve(null));
+    const incoming = proposal('КП из ИИ после восстановления сети'), consumed = vi.fn();
+    render({ handoff: { id: 'recoverable-ai-seed', data: incoming }, onHandoffConsumed: consumed }); await flush();
+    expect(consumed).not.toHaveBeenCalled(); expect(nodes().some((node) => node.props.id === 'proposal-title')).toBe(false);
+    read.reject(new Error('Сетевая папка временно недоступна')); await flush();
+    expect(consumed).not.toHaveBeenCalled(); expect(text()).toContain('Данные источника сохранены');
+    expect(text()).toContain('Сетевая папка временно недоступна'); expect(button('Повторить получение КП').props.disabled).toBe(false);
+    const attempts = runtime.readDraft.mock.calls.filter(([module]) => module === 'commercial-proposals').length;
+    render(); await flush(); expect(runtime.readDraft.mock.calls.filter(([module]) => module === 'commercial-proposals')).toHaveLength(attempts);
+    expect(runtime.saveDraft).not.toHaveBeenCalled(); expect(runtime.store.save).not.toHaveBeenCalled(); expect(runtime.clearDraft).not.toHaveBeenCalled();
+    runtime.readDraft.mockResolvedValue(null); await click('Повторить получение КП');
+    expect(input('proposal-title').props.value).toBe(incoming.title); expect(consumed).toHaveBeenCalledOnce();
+    expect(text()).not.toContain('Получение КП не завершено'); expect(incoming.title).toBe('КП из ИИ после восстановления сети');
+    expect(runtime.store.save).not.toHaveBeenCalled(); expect(runtime.clearDraft).not.toHaveBeenCalled();
+  });
+  it('does not accept a late cold handoff after the workspace changed during its draft read', async () => {
+    const read = deferred<null>(), consumed = vi.fn();
+    runtime.readDraft.mockImplementation((module: string) => module === 'commercial-proposals' ? read.promise : Promise.resolve(null));
+    render({ handoff: { id: 'workspace-scoped-seed', data: proposal('Из старой рабочей папки') }, onHandoffConsumed: consumed }); await flush();
+    runtime.getWorkspace.mockResolvedValue({ root: '/tmp/other-qa-workspace', editor: true }); read.resolve(null); await flush();
+    expect(consumed).not.toHaveBeenCalled(); expect(nodes().some((node) => node.props.id === 'proposal-title')).toBe(false);
+    expect(text()).toContain('Рабочая папка или доступ изменились'); expect(text()).toContain('Повторить получение КП');
+    expect(runtime.store.save).not.toHaveBeenCalled(); expect(runtime.saveDraft).not.toHaveBeenCalled(); expect(runtime.copyAttachment).not.toHaveBeenCalled();
+  });
+  it('does not consume or install a handoff while navigation hides the receiving tool', async () => {
+    const read = deferred<null>(), consumed = vi.fn(), incoming = { id: 'hidden-seed', data: proposal('Ожидающее КП') };
+    runtime.readDraft.mockImplementation((module: string) => module === 'commercial-proposals' ? read.promise : Promise.resolve(null));
+    render({ handoff: incoming, onHandoffConsumed: consumed }); await flush();
+    render({ handoff: incoming, onHandoffConsumed: consumed, active: false }); await flush(); read.resolve(null); await flush();
+    expect(consumed).not.toHaveBeenCalled(); expect(nodes().some((node) => node.props.id === 'proposal-title')).toBe(false);
+    expect(button('Повторить получение КП').props.disabled).toBe(true);
+    runtime.readDraft.mockResolvedValue(null); render({ handoff: incoming, onHandoffConsumed: consumed, active: true }); await flush();
+    expect(consumed).not.toHaveBeenCalled(); await click('Повторить получение КП'); expect(consumed).toHaveBeenCalledOnce(); expect(input('proposal-title').props.value).toBe('Ожидающее КП');
+  });
+  it('does not consume or install the previous incoming seed after it was replaced while reading', async () => {
+    const read = deferred<null>(), first = { id: 'first-seed', data: proposal('Старое ожидающее КП') }, second = { id: 'second-seed', data: proposal('Текущее ожидающее КП') };
+    const firstConsumed = vi.fn(), secondConsumed = vi.fn();
+    runtime.readDraft.mockImplementation((module: string) => module === 'commercial-proposals' ? read.promise : Promise.resolve(null));
+    render({ handoff: first, onHandoffConsumed: firstConsumed }); await flush(); render({ handoff: second, onHandoffConsumed: secondConsumed }); await flush();
+    read.resolve(null); await flush();
+    expect(firstConsumed).not.toHaveBeenCalled(); expect(secondConsumed).toHaveBeenCalledOnce(); expect(input('proposal-title').props.value).toBe('Текущее ожидающее КП');
+  });
+  it('does not consume or restage a cold handoff after its receiver unmounts', async () => {
+    const read = deferred<null>(), consumed = vi.fn(); runtime.readDraft.mockImplementation((module: string) => module === 'commercial-proposals' ? read.promise : Promise.resolve(null));
+    render({ handoff: { id: 'unmounted-seed', data: proposal('Позднее КП') }, onHandoffConsumed: consumed }); await flush();
+    runtime.slots.forEach((slot) => slot.cleanup?.()); read.resolve(null); await flush();
+    expect(consumed).not.toHaveBeenCalled(); expect(runtime.copyAttachment).not.toHaveBeenCalled(); expect(runtime.saveDraft).not.toHaveBeenCalled(); expect(runtime.store.save).not.toHaveBeenCalled();
   });
   it('successfully previewed pages are cleared when switching to a new target', async () => {
     await seed(); await click('5. Проверка и экспорт'); await click('Предпросмотр PDF'); expect(nodes().filter((node) => node.type === 'img')).toHaveLength(1);
@@ -348,6 +542,8 @@ describe('proposal archive workflow', () => {
   it('offers separate archive and open actions in the list, and cancellation never changes a record', async () => {
     const data = proposal(); data.revision = 3;
     runtime.store.records = [record('saved-proposal', data)]; render(); await flush();
+    const open = nodes().find((node) => node.type === 'button' && node.props['aria-label'] === `Открыть КП ${data.number} · редакция 3`)!;
+    expect(text(open)).toContain('Открыть КП');
     const archive = button('Архивировать');
     expect(archive.props['aria-label']).toBe(`Архивировать КП ${data.number} · редакция 3`);
     expect(nodes().filter((node) => node.type === 'button').every((node) => nodes(node.props.children).every((child) => child.type !== 'button'))).toBe(true);
@@ -358,6 +554,28 @@ describe('proposal archive workflow', () => {
     archiveConfirmation()!.props.onClose!(); await flush();
     expect(archiveConfirmation()).toBeUndefined(); expect(text()).toContain(data.title);
     expect(runtime.store.archive).not.toHaveBeenCalled(); expect(runtime.store.save).not.toHaveBeenCalled(); expect(runtime.clearDraft).not.toHaveBeenCalled();
+  });
+
+  it.each([0, 600])('uses the actual dirty state after reverting a saved value and cancelling archive (autosave wait %i ms)', async (wait) => {
+    const data = proposal('Исходный предмет');
+    runtime.store.records = [record('saved', data)]; render({ openRecordId: 'saved' }); await flush();
+    await edit('proposal-title', 'Временное изменение');
+    expect(text()).toContain('Несохранённые изменения…');
+    await vi.advanceTimersByTimeAsync(wait); await flush();
+    expect(button('Сохранить КП').props.disabled).toBe(false);
+    expect(button('Архивировать').props.disabled).toBe(true);
+    await edit('proposal-title', 'Исходный предмет');
+    expect(text()).toContain('Карточка сохранена');
+    expect(text()).not.toContain('Несохранённые изменения…');
+    expect(text()).not.toContain('Черновик сохранён · карточка в базе не изменена');
+    expect(button('Сохранить КП').props.disabled).toBe(true);
+    expect(button('Архивировать').props.disabled).toBe(false);
+    await click('Архивировать'); archiveConfirmation()!.props.onClose!(); await flush();
+    expect(text()).toContain('Карточка сохранена');
+    expect(text()).not.toContain('Несохранённые изменения…');
+    await click('К списку');
+    expect(nodes().some((node) => node.props.title === 'Есть несохранённые изменения КП')).toBe(false);
+    expect(runtime.store.save).not.toHaveBeenCalled(); expect(runtime.store.archive).not.toHaveBeenCalled();
   });
 
   it('archives only the confirmed list record and keeps sibling revisions unchanged', async () => {

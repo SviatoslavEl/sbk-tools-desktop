@@ -110,7 +110,7 @@ describe("global search lifecycle", () => {
     const old = deferred<{ entries: SearchEntry[]; errors: string[] }>(); const current = deferred<{ entries: SearchEntry[]; errors: string[] }>();
     runtime.index.mockReturnValueOnce(old.promise).mockReturnValueOnce(current.promise); component = () => GlobalSearch({ onClose: vi.fn(), onNavigate: vi.fn() }); render(); strictReplay(); await flush();
     current.resolve({ entries: [searchEntry("новая")], errors: [] }); await flush(); old.resolve({ entries: [searchEntry("старая"), searchEntry("другая")], errors: ["stale"] }); await flush();
-    expect(text()).toContain("В индексе 1 карточек"); expect(text()).not.toContain("stale");
+    expect(text()).toContain("В индексе 1 карточка"); expect(text()).not.toContain("stale");
   });
   it("keeps healthy partial results and routes only the clicked record", async () => {
     const navigate = vi.fn(); const close = vi.fn(); runtime.index.mockResolvedValue({ entries: [searchEntry("Тестовый договор")], errors: ["Кадры: offline"] });

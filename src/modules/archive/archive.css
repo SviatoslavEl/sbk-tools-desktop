@@ -1,0 +1,11 @@
+.archive-grid .archive-empty { padding: 32px 24px; text-align: center; }
+.archive-empty h2 { margin: 0 0 8px; font-size: 18px; }
+.archive-empty p { margin: 0; color: var(--text-muted); }
+.archive-summary { margin: 0; color: var(--text-muted); font-size: 12px; }
+.archive-section > summary { display: flex; align-items: center; gap: 10px; padding: 12px 16px; list-style: none; cursor: pointer; font-weight: 600; }
+.archive-section > summary::before { content: "›"; color: var(--text-muted); }
+.archive-section[open] > summary::before { transform: rotate(90deg); }
+.archive-section-count { margin-left: auto; color: var(--text-muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.archive-section-actions { padding: 0 16px 8px; }
+.archive-section .surface-body { padding: 0 16px 8px; }
+.archive-section > summary:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }

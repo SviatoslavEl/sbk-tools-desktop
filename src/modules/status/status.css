@@ -1,5 +1,12 @@
 .status-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; }
 .status-toolbar p { margin-right: auto; }
+.status-toolbar p { font-size: 12px; color: var(--text-muted); }
+.status-center details { margin-top: 12px; font-size: 12px; }
+.status-center details summary { cursor: pointer; color: var(--text-muted); }
+.status-center details p { margin: 8px 0 0; }
+.status-center .status-next-step { color: var(--text-muted); font-size: 12px; line-height: 1.5; }
+.status-owner { margin-bottom: 0; }
+.status-center .status-grid > section { padding: 16px; }
 .status-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(270px, 100%), 1fr)); gap: 16px; }
 .status-grid > section, .status-center > section { padding: 20px; min-width: 0; }
 .status-grid h2, .status-center > section h2 { margin-top: 0; font-size: 17px; }

@@ -263,10 +263,8 @@ export function Calculator({ openRecordId, onRecordOpened, active = true, onCrea
   };
 
   return <NumberValidityContext.Provider value={reportNumberValidity}><div className="module-stack">{initialLoadError && <div className="notice error" role="alert"><span>{initialLoadError}</span><button type="button" onClick={() => setInitialRetry((value) => value + 1)}>Повторить загрузку черновика</button></div>}{!draftReady && saved.error && <div className="notice error" role="alert"><span>{saved.error}</span><button type="button" onClick={() => void saved.reload()}>Повторить загрузку расчётов</button></div>}<fieldset disabled={busy || !draftReady} aria-busy={busy || !draftReady} className={`module-stack calculator-module calculator-session calculator-${experienceMode}`}>
-    <div className="calculator-mode-switch" role="group" aria-label="Уровень калькулятора"><button type="button" aria-pressed={experienceMode === "guided"} onClick={() => setExperienceMode("guided")}>Пошаговый расчёт</button><button type="button" aria-pressed={experienceMode === "expert"} onClick={() => setExperienceMode("expert")}>Экспертный режим</button><span>Один расчёт — переключение без потери данных</span></div>
-    {!workspaceAccess.editor && <div className="notice"><strong>Локальный расчёт в режиме просмотра</strong><span>Все параметры и экспорт доступны. Сохранение в общую базу и автоматическая запись черновика отключены.</span></div>}
-    {experienceMode === "guided" && <section ref={guideRef} className="surface calculator-guide" aria-label="Шаги расчёта"><nav aria-label="Этапы калькулятора">{steps.map((label, index) => <button type="button" key={label} aria-current={step === index ? "step" : undefined} onClick={() => setStep(index)}>{index + 1}. {label}</button>)}</nav><h2>Шаг {step + 1}. {steps[step]}</h2><p>{guidance[step]}</p></section>}
-    <div className="module-toolbar">
+    <div className="calculator-mode-switch" role="group" aria-label="Уровень калькулятора"><button type="button" aria-pressed={experienceMode === "guided"} onClick={() => setExperienceMode("guided")}>Пошаговый расчёт</button><button type="button" aria-pressed={experienceMode === "expert"} onClick={() => setExperienceMode("expert")}>Экспертный режим</button></div>
+    <div className="module-toolbar calculator-toolbar">
       <div className="record-switcher">
         <label>Текущий расчёт
           <select disabled={saved.loading} value={recordId || ""} onChange={(event) => { if (event.target.value) void loadCalculation(event.target.value); }}>
@@ -275,22 +273,27 @@ export function Calculator({ openRecordId, onRecordOpened, active = true, onCrea
           </select>
         </label>
         <span className="autosave-status" role="status">{busy ? "Выполняем…" : workspaceAccess.editor ? savedStatus : "Локальная копия · без записи в базу"}</span>
-        <strong className="calculator-record-status">{recordId ? hasRecordChanges ? "Есть изменения, не сохранённые в базу" : "Совпадает с сохранённой записью" : "Новый расчёт · в общей базе ещё нет"}</strong>
+        <details className="calculator-save-details"><summary>Состояние записи</summary><strong className="calculator-record-status">{recordId ? hasRecordChanges ? "Есть изменения, не сохранённые в базу" : "Совпадает с сохранённой записью" : "Новый расчёт · в общей базе ещё нет"}</strong></details>
       </div>
       <div className="toolbar-actions">
         <button className="secondary" type="button" onClick={newCalculation}>Новый</button>
+        <button data-workspace-mutation data-workspace-managed-disabled="true" className="primary" disabled={!calculationValid || !workspaceAccess.editor || (Boolean(recordId) && !hasRecordChanges)} type="button" onClick={() => void saveCalculation(false)}>Сохранить в базу</button>
+        <details className="calculator-record-actions"><summary>Действия с расчётом</summary><div>
         <button className="secondary" type="button" onClick={() => void importCalculation()}>Импорт</button>
         <button className="secondary" disabled={!calculationValid} type="button" onClick={() => void exportCalculation()}>Экспорт</button>
         {recordId && <><button data-workspace-mutation data-workspace-managed-disabled="true" className="secondary" disabled={!calculationValid || !workspaceAccess.editor} type="button" onClick={() => void saveCalculation(true)}>Сохранить как копию</button><button data-workspace-mutation data-workspace-managed-disabled="true" className="secondary danger" disabled={!workspaceAccess.editor} type="button" onClick={() => setArchiving(true)}>В архив</button></>}
-        <button data-workspace-mutation data-workspace-managed-disabled="true" className="primary" disabled={!calculationValid || !workspaceAccess.editor || (Boolean(recordId) && !hasRecordChanges)} type="button" onClick={() => void saveCalculation(false)}>Сохранить в базу</button>
         {onCreateProposal && <button className="secondary" type="button" disabled={!calculationValid || busy} onClick={() => { try { const proposal = proposalFromCalculator(data, recordId, hasRecordChanges); if (result.profit < 0) setLossProposal(proposal); else onCreateProposal(proposal); } catch (reason) { setFormError(String(reason)); } }}>Создать КП</button>}
+        </div></details>
       </div>
     </div>
+    {experienceMode === "guided" && <section ref={guideRef} className="surface calculator-guide" aria-label="Шаги расчёта"><nav aria-label="Этапы калькулятора">{steps.map((label, index) => <button type="button" key={label} aria-current={step === index ? "step" : undefined} onClick={() => setStep(index)}>{index + 1}. {label}</button>)}</nav><details className="calculator-step-help"><summary>Подсказка к шагу {step + 1}</summary><p>{guidance[step]}</p></details></section>}
+    {!workspaceAccess.editor && <details className="calculator-viewer-note"><summary>Локальный расчёт в режиме просмотра</summary><p>Все параметры и экспорт доступны. Сохранение в общую базу и автоматическая запись черновика отключены.</p></details>}
 
     {saved.loading && <p role="status">Загружаем сохранённые расчёты…</p>}
     {saved.error && <div className="notice error"><strong>База недоступна.</strong><span>{saved.error}</span><button type="button" onClick={() => void saved.reload()}>Повторить загрузку</button></div>}
     {formError && <div className="notice error" role="alert"><strong>Проверьте результат действия.</strong><span>{formError}</span></div>}
     <div className="calculator-layout">
+      {(experienceMode === "expert" || step < 4) && <aside className={`surface calculator-live-summary ${resultStatus}`} aria-label="Текущий итог расчёта"><div><span>Цена с НДС</span><strong>{calculationValid ? money(result.priceGross) : "Проверьте поля"}</strong></div><div><span>Прибыль</span><strong>{calculationValid ? money(result.profit) : "—"}</strong></div><div><span>Маржа</span><strong>{calculationValid ? percent(result.margin) : "—"}</strong></div><small>{!calculationValid ? result.issues.find((issue) => issue.blocking)?.message || "Исправьте неверно заполненные числовые поля." : resultStatus === "danger" ? "Убыток или маржа ниже порога" : resultStatus === "warning" ? "Маржа ниже желаемой" : "По текущим данным"}{experienceMode === "guided" && " · подробный итог на шаге 5"}</small></aside>}
       <section className="input-column" hidden={experienceMode === "guided" && step === 4}>
         <div className="surface" hidden={!visibleStep(0)}>
           <div className="surface-title"><h2>Основные параметры</h2></div>
@@ -368,7 +371,6 @@ export function Calculator({ openRecordId, onRecordOpened, active = true, onCrea
         </details>
       </section>
 
-      {experienceMode === "guided" && step < 4 && <aside className={`surface calculator-live-summary ${resultStatus}`} aria-label="Предварительный результат"><span>Предварительная цена с НДС</span><strong>{calculationValid ? money(result.priceGross) : "Проверьте поля"}</strong><span>Прибыль: {money(result.profit)} · маржа: {percent(result.margin)}</span><small>Итог, состав затрат и предупреждения — на шаге 5.</small></aside>}
       <section className="result-column" hidden={experienceMode === "guided" && step < 4}>
         <div className={`surface result-panel ${resultStatus}`}>
           <div className="surface-title"><h2>Результат</h2><span className={`status ${resultStatus}`}>{!calculationValid ? "! Исправьте исходные данные" : resultStatus === "success" ? "✓ Расчёт устойчив" : resultStatus === "warning" ? "⚠ Низкая маржа" : "! Убыточно или ниже порога"}</span></div>

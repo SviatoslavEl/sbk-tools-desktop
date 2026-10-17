@@ -17,6 +17,121 @@ function harness() {
 afterEach(() => vi.useRealTimers());
 
 describe("bounded page preparation", () => {
+  it.each([false, true])("reopens once after the exact cold worker source-change failure without accepting a stale image; string=%s", async (asString) => {
+    const { session, transport } = harness();
+    const message = "Исходный документ изменился. Откройте обновлённый файл повторно.";
+    vi.mocked(transport.revision).mockResolvedValueOnce("picked").mockResolvedValue("settled");
+    vi.mocked(transport.run).mockRejectedValueOnce(asString ? message : new Error(message)).mockResolvedValueOnce({ ...response(), sourceFingerprint: "settled-fingerprint" });
+    const result = await session.request(settings, "cold");
+    expect(result?.sourceFingerprint).toBe("settled-fingerprint"); expect(session.sourceFingerprint).toBe("settled-fingerprint");
+    expect(transport.run).toHaveBeenCalledTimes(2); expect(transport.read).toHaveBeenCalledTimes(2); expect(transport.remove).toHaveBeenCalledTimes(2);
+    expect(session.isCached(settings)).toBe(true);
+  });
+
+  it("does not retry the exact worker failure indefinitely or accept a partial result", async () => {
+    const { session, transport } = harness();
+    vi.mocked(transport.run).mockRejectedValue(new Error("Исходный документ изменился. Откройте обновлённый файл повторно."));
+    await expect(session.request(settings, "unstable-worker")).rejects.toThrow("Исходный документ изменился");
+    expect(transport.run).toHaveBeenCalledTimes(2); expect(transport.read).not.toHaveBeenCalled(); expect(session.sourceFingerprint).toBeUndefined(); expect(session.isCached(settings)).toBe(false);
+  });
+
+  it.each(["disk full", "Обработка отменена. Исходный документ не изменён.", "Исходный документ изменился после предпросмотра. Откройте его повторно."])("does not retry other errors on cold open: %s", async (message) => {
+    const { session, transport } = harness(); vi.mocked(transport.run).mockRejectedValueOnce(new Error(message));
+    await expect(session.request(settings, "other-error")).rejects.toThrow(message); expect(transport.run).toHaveBeenCalledOnce();
+  });
+
+  it.each([false, true])("never reopens an accepted document on a worker source-change failure; legacy=%s", async (legacy) => {
+    const { session, transport } = harness();
+    vi.mocked(transport.run).mockResolvedValueOnce({ ...response(), ...(legacy ? { sourceFingerprint: undefined } : {}) });
+    await session.request(settings, "accepted");
+    vi.mocked(transport.run).mockRejectedValueOnce(new Error("Исходный документ изменился. Откройте обновлённый файл повторно."));
+    await expect(session.request({ ...settings, pageIndex: 1 }, "later-error")).rejects.toThrow("Исходный документ изменился");
+    expect(transport.run).toHaveBeenCalledTimes(2); expect(transport.revision).toHaveBeenCalledTimes(3);
+  });
+
+  it("does not restart a cancelled first worker failure", async () => {
+    const { session, transport } = harness(); let reject!: (reason: Error) => void;
+    vi.mocked(transport.run).mockReturnValueOnce(new Promise((_resolve, failed) => { reject = failed; }));
+    const request = session.request(settings, "cancelled-cold"); await vi.waitFor(() => expect(transport.run).toHaveBeenCalledOnce());
+    session.clear(); reject(new Error("Исходный документ изменился. Откройте обновлённый файл повторно."));
+    expect(await request).toBeUndefined(); expect(transport.run).toHaveBeenCalledOnce(); expect(session.sourceFingerprint).toBeUndefined();
+  });
+
+  it("does not adopt an old post-error revision after another document has opened", async () => {
+    const { session, transport } = harness(), settling = deferred<string>();
+    vi.mocked(transport.revision).mockResolvedValueOnce("picked").mockReturnValueOnce(settling.promise).mockResolvedValue("new-document");
+    vi.mocked(transport.run).mockRejectedValueOnce(new Error("Исходный документ изменился. Откройте обновлённый файл повторно."));
+    const old = session.request(settings, "old-cold"); await vi.waitFor(() => expect(transport.revision).toHaveBeenCalledTimes(2));
+    session.clear(); const next = await session.request({ ...settings, inputPath: "/qa/new.pdf" }, "new-document");
+    settling.resolve("old-settled"); expect(await old).toBeUndefined(); expect(next).toBeDefined(); expect(await session.verifySource()).toBe(true); expect(transport.run).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps the second attempt strict when the source changes again after rendering", async () => {
+    const { session, transport } = harness(); transport.release = vi.fn();
+    vi.mocked(transport.revision).mockResolvedValueOnce("picked").mockResolvedValueOnce("settled").mockResolvedValue("changed-again");
+    vi.mocked(transport.run).mockRejectedValueOnce(new Error("Исходный документ изменился. Откройте обновлённый файл повторно."));
+    await expect(session.request(settings, "changed-again")).rejects.toThrow("Исходный документ изменился");
+    expect(transport.run).toHaveBeenCalledTimes(2); expect(session.sourceFingerprint).toBeUndefined(); expect(session.isCached(settings)).toBe(false); expect(transport.remove).toHaveBeenCalledTimes(2); expect(transport.release).toHaveBeenCalledTimes(2);
+  });
+
+  it("discards an initial raster if picker metadata changes, then renders a stable revision once", async () => {
+    const { session, transport, report } = harness();
+    transport.release = vi.fn();
+    vi.mocked(transport.revision).mockResolvedValueOnce("picked").mockResolvedValue("settled");
+    vi.mocked(transport.run).mockResolvedValueOnce(response()).mockResolvedValueOnce({ ...response(), sourceFingerprint: "settled-fingerprint" });
+    const result = await session.request(settings, "first");
+    expect(result?.sourceFingerprint).toBe("settled-fingerprint");
+    expect(session.sourceFingerprint).toBe("settled-fingerprint");
+    expect(transport.run).toHaveBeenCalledTimes(2);
+    expect(transport.release).toHaveBeenCalledTimes(2);
+    expect(transport.remove).toHaveBeenCalledTimes(4);
+    expect(report).not.toHaveBeenCalledWith(expect.objectContaining({ state: "changed" }));
+  });
+
+  it("does not retry a continuously changing initial document forever", async () => {
+    const { session, transport } = harness();
+    transport.release = vi.fn();
+    vi.mocked(transport.revision).mockResolvedValueOnce("first").mockResolvedValueOnce("second").mockResolvedValue("third");
+    await expect(session.request(settings, "unstable")).rejects.toThrow("Исходный документ изменился");
+    expect(transport.run).toHaveBeenCalledTimes(2);
+    expect(transport.release).toHaveBeenCalledTimes(4);
+    expect(transport.remove).toHaveBeenCalledTimes(4);
+    expect(session.sourceFingerprint).toBeUndefined();
+    expect(session.isCached(settings)).toBe(false);
+  });
+
+  it("never silently rebinds a document after its first accepted preview", async () => {
+    const { session, transport } = harness();
+    await session.request(settings, "first");
+    vi.mocked(transport.revision).mockResolvedValueOnce("revision-1").mockResolvedValue("revision-2");
+    await expect(session.request({ ...settings, pageIndex: 1 }, "changed")).rejects.toThrow("Исходный документ изменился");
+    expect(transport.run).toHaveBeenCalledTimes(2);
+    expect(session.isCached(settings)).toBe(false);
+  });
+
+  it("considers an accepted legacy result committed even without its optional fingerprint", async () => {
+    const { session, transport } = harness();
+    vi.mocked(transport.run).mockResolvedValueOnce({ ...response(), sourceFingerprint: undefined });
+    await session.request(settings, "legacy");
+    vi.mocked(transport.revision).mockResolvedValueOnce("revision-1").mockResolvedValue("revision-2");
+    await expect(session.request({ ...settings, pageIndex: 1 }, "changed")).rejects.toThrow("Исходный документ изменился");
+    expect(transport.run).toHaveBeenCalledTimes(2);
+    expect(session.isCached(settings)).toBe(false);
+  });
+
+  it("does not retry after a different document replaces the discarded initial raster", async () => {
+    const { session, transport } = harness();
+    vi.mocked(transport.revision).mockResolvedValueOnce("picked").mockResolvedValue("settled");
+    const cleanup = deferred<unknown>();
+    vi.mocked(transport.remove).mockReturnValue(cleanup.promise);
+    const request = session.request(settings, "old");
+    await vi.waitFor(() => expect(transport.remove).toHaveBeenCalledTimes(2));
+    session.clear();
+    cleanup.resolve(undefined);
+    expect(await request).toBeUndefined();
+    expect(transport.run).toHaveBeenCalledOnce();
+  });
+
   it("keeps the committed frame until React replaces it even if output cleanup is slow", async () => {
     const { session, transport } = harness();
     transport.release = vi.fn();

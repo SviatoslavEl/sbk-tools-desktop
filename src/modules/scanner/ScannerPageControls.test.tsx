@@ -1,7 +1,7 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
 import { ScannerPageControls } from "./ScannerPageControls";
-import { applyPreviewPanelHeight, availablePreviewPanelHeight, observePreviewPanelArea } from "./usePreviewPanelHeight";
+import { applyPreviewPanelHeight, availablePreviewPanelHeight, observePreviewPanelArea, observeMeasuredPreviewSpace, scannerPreviewSpaceBudget } from "./usePreviewPanelHeight";
 
 describe("compact scanner page settings", () => {
   it("starts collapsed with the export mode in its accessible summary", () => {
@@ -29,6 +29,47 @@ describe("compact scanner page settings", () => {
 });
 
 describe("scanner panel uses the available window height", () => {
+  it("reserves a positive measured canvas even when OCR metadata, tools and returned-result summaries are fully expanded", () => {
+    for (const panelHeight of [240, 320, 400, 697, 900, 1450]) {
+      const headerNaturalHeight = 200;
+      const budget = scannerPreviewSpaceBudget(panelHeight, headerNaturalHeight)!;
+      const visibleHeader = Math.min(headerNaturalHeight, budget.headerMax);
+      const visibleRequest = Math.min(120, budget.requestMax);
+      const visibleTools = Math.min(700, budget.toolsMax);
+      const visibleSummary = Math.min(800, budget.summaryMax);
+      const canvas = panelHeight - visibleHeader - visibleRequest - visibleTools - visibleSummary;
+      expect(canvas).toBeGreaterThan(0);
+      expect(canvas).toBeGreaterThanOrEqual(budget.canvasReserve);
+      expect(budget.canvasReserve).toBeGreaterThanOrEqual((panelHeight - visibleHeader) * .25);
+      expect(budget.summaryMax).toBeLessThan(panelHeight);
+    }
+    expect(scannerPreviewSpaceBudget(0, 100)).toBeNull();
+  });
+
+  it("writes definite pixel caps from actual DOM measurements and recomputes them for resize/fullscreen and wrapping headers", () => {
+    let onResize = () => {};
+    const resize = { observe: vi.fn(), disconnect: vi.fn() };
+    vi.stubGlobal("ResizeObserver", class { constructor(callback: () => void) { onResize = callback; return resize; } });
+    try {
+      const values = new Map<string, string>();
+      const setProperty = vi.fn((name: string, value: string) => values.set(name, value));
+      const header = { scrollHeight: 94 };
+      const panel = { clientHeight: 697, querySelector: () => header, style: { getPropertyValue: (name: string) => values.get(name) || "", setProperty } };
+      const stop = observeMeasuredPreviewSpace(panel as unknown as HTMLElement);
+      expect(values.get("--scanner-summary-max-height")).toBe("241px");
+      expect(values.get("--scanner-tools-max-height")).toBe("150px");
+      expect(resize.observe.mock.calls.map(([node]) => node)).toEqual([panel, header]);
+      const writes = setProperty.mock.calls.length;
+      onResize(); expect(setProperty.mock.calls).toHaveLength(writes);
+      panel.clientHeight = 400; header.scrollHeight = 150; onResize();
+      expect(values.get("--scanner-header-max-height")).toBe("80px");
+      expect(values.get("--scanner-summary-max-height")).toBe("128px");
+      panel.clientHeight = 1450; header.scrollHeight = 94; onResize();
+      expect(values.get("--scanner-summary-max-height")).toBe("542px");
+      stop(); expect(resize.disconnect).toHaveBeenCalledOnce();
+    } finally { vi.unstubAllGlobals(); }
+  });
+
   const normal = { viewportHeight: 768, contentTop: 78, contentBottom: 768, panelTop: 100, paddingTop: 22, paddingBottom: 28, stacked: false };
 
   it("fits the native 1215×768 workspace without pushing the footer below the window", () => {

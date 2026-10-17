@@ -9,3 +9,8 @@
 .settings-grid .settings-interface-fields { padding: 18px; }
 .settings-module .backup-surface { grid-column: auto; }
 .settings-module .settings-form select, .settings-module .settings-form input:not([type="checkbox"]) { min-height: 36px; }
+.about-build-info { margin-top: 16px; }
+.about-build-info details { margin-top: 10px; text-align: left; font-size: 12px; }
+.about-build-info summary { color: var(--text-muted); cursor: pointer; }
+.about-build-info textarea { width: 100%; min-height: 150px; margin-top: 10px; resize: vertical; font-family: ui-monospace, monospace; font-size: 12px; }
+.about-build-info [role="status"] { color: var(--primary); font-size: 12px; }

@@ -1,0 +1,45 @@
+/* Scoped to the three business registries; editor and nested tables are unchanged. */
+.registry-overview-surface { min-width: 0; }
+.registry-overview-surface .registry-scroll-hint { margin: 0; padding: 5px 12px 7px; color: var(--text-muted, #64748b); font-size: 11px; line-height: 1.45; }
+.registry-overview-scroll { overflow: auto; overscroll-behavior: contain; scrollbar-gutter: stable; scroll-padding: 44px 108px 10px 192px; }
+.registry-overview-scroll:focus-visible { outline: 2px solid var(--primary, #35795e); outline-offset: -2px; }
+.registry-overview-table { table-layout: auto; width: 100%; isolation: isolate; }
+.registry-overview-table > :is(thead, tbody) > tr > :is(th, td) { min-width: 100px; max-width: 240px; padding: 8px 10px; overflow-wrap: normal; word-break: normal; }
+.registry-overview-table .sortable-header > span:first-child { min-width: min-content; overflow-wrap: normal; word-break: normal; }
+.registry-overview-table > :is(thead, tbody) > tr > .selection-cell { min-width: 32px; width: 32px; max-width: 32px; position: sticky; left: 0; z-index: 2; padding: 8px 7px; background: var(--surface, #fff); }
+.registry-overview-table > thead > tr > .selection-cell { z-index: 5; background: var(--surface-muted, #f3f6f8); }
+.registry-overview-table > :is(thead, tbody) > tr > .sticky-cell,
+.registry-overview-table > thead > tr > :nth-child(2) { min-width: 150px; width: 170px; max-width: 190px; left: 32px; position: sticky; z-index: 2; box-shadow: 1px 0 0 var(--line, #d8e2dd); }
+.registry-overview-table > thead > tr > :nth-child(2) { z-index: 5; }
+.registry-overview-table > :is(thead, tbody) > tr > .registry-row-actions { position: sticky; right: 0; z-index: 3; min-width: 92px; max-width: 110px; width: 92px; background: var(--surface, #fff); border-left: 1px solid var(--line, #d8e2dd); }
+.registry-overview-table > thead > tr > .registry-row-actions { z-index: 6; background: var(--surface-muted, #f3f6f8); }
+.registry-overview-table .registry-row-actions .row-actions { flex-wrap: wrap; justify-content: flex-end; gap: 3px; }
+.registry-overview-table .registry-row-actions .small { padding: 5px 7px; font-size: 11px; }
+.registry-overview-table .registry-row-actions .icon-button { width: 25px; height: 25px; }
+.registry-overview-table > tbody > tr:hover > :is(.selection-cell, .registry-row-actions) { background: var(--surface-muted, #f3f6f8); }
+.registry-overview-table .registry-money { white-space: nowrap; overflow-wrap: normal; }
+.registry-overview-table .registry-identifier-text { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; overflow: hidden; }
+.registry-procurement-view { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 12px; padding: 8px 12px; }
+.registry-procurement-view > strong { font-size: 12px; }
+.registry-procurement-view > small { color: var(--text-muted, #64748b); font-size: 11px; }
+.registry-overview-table .registry-cell-text { display: block; max-width: 230px; white-space: pre-wrap; }
+.registry-cell-disclosure { max-width: 240px; }
+.registry-cell-disclosure > summary { display: list-item; cursor: pointer; font-size: inherit; line-height: 1.45; }
+.registry-cell-disclosure > summary > span { overflow-wrap: anywhere; }
+.registry-cell-disclosure[open] > summary { color: var(--primary-hover, #1c523b); }
+.registry-cell-disclosure > div { max-height: 180px; overflow: auto; margin-top: 5px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.registry-overview-table .wide-cell { min-width: 180px; }
+.registry-overview-table .status { min-width: min-content; max-width: 240px; white-space: normal; overflow-wrap: normal; word-break: normal; }
+.procurement-overview-table > :is(thead, tbody) > tr > .sticky-cell,
+.procurement-overview-table > thead > tr > :first-child { min-width: 170px; max-width: 210px; left: 0; position: sticky; z-index: 2; background: var(--surface, #fff); }
+.procurement-overview-table > thead > tr > :first-child { z-index: 5; background: var(--surface-muted, #f3f6f8); }
+.procurement-overview-table > thead > tr > :nth-child(2) { position: sticky; left: auto; z-index: 2; }
+@media (max-width: 900px) {
+  .registry-overview-table > :is(thead, tbody) > tr > :is(th, td) { min-width: 84px; padding: 7px 8px; }
+  .registry-overview-table > :is(thead, tbody) > tr > .selection-cell { min-width: 30px; width: 30px; max-width: 30px; padding: 7px 6px; }
+  .registry-overview-table > :is(thead, tbody) > tr > .sticky-cell,
+  .registry-overview-table > thead > tr > :nth-child(2) { min-width: 130px; width: 145px; max-width: 160px; left: 30px; }
+  .registry-overview-table > :is(thead, tbody) > tr > .registry-row-actions { min-width: 84px; width: 84px; max-width: 84px; }
+  .procurement-overview-table > :is(thead, tbody) > tr > .sticky-cell { left: 0; }
+  .procurement-overview-table > thead > tr > :nth-child(2) { left: auto; }
+}

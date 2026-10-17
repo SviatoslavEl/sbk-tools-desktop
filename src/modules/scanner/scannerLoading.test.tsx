@@ -5,13 +5,27 @@ import { readFileSync } from "node:fs";
 import { Scanner } from "./Scanner";
 
 describe("scanner loading controls", () => {
-  it("does not offer zero-page arrangement and keeps save/tools disabled before a document is ready", () => {
+  it("allows the measured canvas to shrink below 240px and bounds ready plus OCR-return panels together", () => {
+    const css = readFileSync(new URL("./scanner.css", import.meta.url), "utf8");
+    const canvasRule = css.match(/\.scanner-layout \.scanner-preview-scroll > \.preview-workspace\s*\{([^}]+)\}/)?.[1];
+    expect(canvasRule).toContain("min-height: 0");
+    expect(canvasRule).not.toContain("240px");
+    const footerRule = css.match(/\.scanner-result-footer\s*\{([^}]+)\}/)?.[1];
+    expect(footerRule).toContain("min-height: 0");
+    expect(footerRule).toContain("max-height: var(--scanner-summary-max-height, 30dvh)");
+    expect(footerRule).not.toContain("max-height: 40%");
+    expect(footerRule).toContain("overflow-y: auto");
+  });
+
+  it("keeps arrangement, saving and output tools out of the empty scanner", () => {
     const html = renderToStaticMarkup(<Scanner />);
     expect(html).not.toContain("Итоговый порядок (0)");
     expect(html).not.toContain("Сохранение страниц");
-    expect(html).toMatch(/<button[^>]*disabled=""[^>]*>Сохранить PDF<\/button>/);
+    expect(html).not.toContain("Сохранить PDF");
+    expect(html).toMatch(/<button[^>]*class="primary"[^>]*>Выбрать файл<\/button>/);
+    expect(html).not.toContain("Выбрать PDF или DOCX");
     for (const label of ["Маркер", "Штрих", "Размытие", "Размытие для печати"]) {
-      expect(html).toMatch(new RegExp(`<button[^>]*aria-label="${label}"[^>]*disabled=""`));
+      expect(html).not.toContain(`aria-label="${label}"`);
     }
   });
 

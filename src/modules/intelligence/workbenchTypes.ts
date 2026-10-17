@@ -6,10 +6,21 @@ import type { StaffData } from "../staff/types";
 
 export type IntelligenceDestination = "procurement" | "contracts" | "staff" | "counterparties" | "proposals";
 export type IntelligenceFieldValue = string | number | boolean | string[];
+export type PdfBounds = [left: number, bottom: number, right: number, top: number];
+export interface PdfGridRow {
+  version: 1;
+  page: number;
+  /** Describes the extracted text, not OCR accuracy or source completeness. */
+  textLayer?: "ocr" | "text";
+  bounds: PdfBounds;
+  cells: Array<{ bounds: PdfBounds; text: string }>;
+}
 export interface IntelligenceFragment {
   id?: string;
   locator: string;
   text: string;
+  /** Closed vector-grid cells from the same immutable PDF extraction snapshot. */
+  pdfGrid?: PdfGridRow;
   sheetId?: string;
   sheetState?: "visible" | "hidden" | "veryHidden";
   /** Explicit opt-in for hidden sheets; false on visible sheets means default inclusion. */
@@ -30,6 +41,22 @@ export interface IntelligenceSource {
   warnings?: string[];
   coverage?: { complete: boolean; requiresOcr: boolean; pagesWithoutText?: number[]; pagesWithImages?: number[] };
 }
+/** A whole certificate row bound to its explicitly named owner. These source
+ * facts are candidates, not acknowledgements, files or employment claims. */
+export interface IntelligenceStaffDocument {
+  id: string;
+  ownerFullName: string;
+  category: "certificate";
+  name: string;
+  seriesNumber: string;
+  examDate: string;
+  reportedValidity: string;
+  sourceId: string;
+  fragmentId: string;
+  headerFragmentId: string;
+  quote: string;
+  headerQuote: string;
+}
 export interface IntelligenceItem {
   id: string;
   title: string;
@@ -38,6 +65,7 @@ export interface IntelligenceItem {
   sourceIds: string[];
   selectedFields: string[];
   evidence?: IntelligenceEvidence[];
+  staffDocuments?: IntelligenceStaffDocument[];
 }
 export interface IntelligenceFieldDefinition {
   key: string;
