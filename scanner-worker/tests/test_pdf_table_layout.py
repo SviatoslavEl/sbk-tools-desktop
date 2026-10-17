@@ -45,7 +45,9 @@ def grid_pdf(path: Path, *, defect: str = "", opaque_text=True, thin_rectangles=
                 line(x, 750, x, 390)
                 continue
             if defect == "curved-border" and x == 150:
-                p = document.beginPath(); p.moveTo(x, 100); p.curveTo(x + 2, 250, x - 2, 600, x, 750)
+                p = document.beginPath()
+                p.moveTo(x, 100)
+                p.curveTo(x + 2, 250, x - 2, 600, x, 750)
                 document.drawPath(p)
                 continue
             line(x, 100, x, 750)
@@ -92,23 +94,29 @@ def grid_pdf(path: Path, *, defect: str = "", opaque_text=True, thin_rectangles=
         document.doForm("qa-grid")
     else:
         paint()
-    document.showPage(); document.save()
+    document.showPage()
+    document.save()
     if defect == "rotated-page":
         reader = PdfReader(path)
-        writer = PdfWriter(); writer.add_page(reader.pages[0]); writer.pages[0].rotate(90)
+        writer = PdfWriter()
+        writer.add_page(reader.pages[0])
+        writer.pages[0].rotate(90)
         writer.write(path)
     return path
 
 
 def inspect_grid(path: Path, **kwargs):
     document = pdfium.PdfDocument(path)
-    page = document[0]; text = page.get_textpage()
+    page = document[0]
+    text = page.get_textpage()
     try:
         original = text.get_text_range().strip()
         result = layout.extract_pdf_table_rows(page, text, 1, **kwargs)
         return result, original
     finally:
-        text.close(); page.close(); document.close()
+        text.close()
+        page.close()
+        document.close()
 
 
 def test_closed_vector_cells_preserve_header_and_all_components_without_order_guessing(tmp_path):

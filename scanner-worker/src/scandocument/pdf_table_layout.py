@@ -89,7 +89,7 @@ def _path_edges(obj) -> tuple[list[tuple[float, float, float]], list[tuple[float
         closed = bool(pdfium_raw.FPDFPathSegment_GetClose(segment))
     if closed and points[-1] != points[0]:
         points.append(points[0])
-    if any(abs(a[0] - b[0]) > 1e-5 and abs(a[1] - b[1]) > 1e-5 for a, b in zip(points, points[1:])):
+    if any(abs(a[0] - b[0]) > 1e-5 and abs(a[1] - b[1]) > 1e-5 for a, b in zip(points, points[1:], strict=False)):
         return [], []
     fill, stroke = ctypes.c_int(), ctypes.c_int()
     if not pdfium_raw.FPDFPath_GetDrawMode(obj, fill, stroke):
@@ -111,7 +111,7 @@ def _path_edges(obj) -> tuple[list[tuple[float, float, float]], list[tuple[float
     if not pdfium_raw.FPDFPageObj_GetStrokeWidth(obj, width) or not 0 <= width.value <= MAX_EDGE_THICKNESS:
         return [], []
     horizontal, vertical = [], []
-    for a, b in zip(points, points[1:]):
+    for a, b in zip(points, points[1:], strict=False):
         if abs(a[1] - b[1]) <= 1e-5 and abs(a[0] - b[0]) >= 3:
             horizontal.append((a[1], min(a[0], b[0]), max(a[0], b[0])))
         elif abs(a[0] - b[0]) <= 1e-5 and abs(a[1] - b[1]) >= 3:
@@ -331,8 +331,8 @@ def extract_pdf_table_rows(page, text_page, page_number: int, *, deadline: float
         # Short closed cells are examined for literal labels. Tall body cells
         # are never mistaken for headings based on the start of their prose.
         headers = []
-        for top, bottom in zip(reversed(ys), reversed(ys[:-1])):
-            for left, right in zip(xs, xs[1:]):
+        for top, bottom in zip(reversed(ys), reversed(ys[:-1]), strict=False):
+            for left, right in zip(xs, xs[1:], strict=False):
                 if time.monotonic() > deadline:
                     raise _GridLimit()
                 if top - bottom > 100 or not _closed(horizontal, vertical, left, bottom, right, top):
@@ -370,8 +370,8 @@ def extract_pdf_table_rows(page, text_page, page_number: int, *, deadline: float
                     if any(_covers(vertical, x, bottom, boundary) for x in (left, middle, right)):
                         raise _UncertainGrid()
                     break
-                cells = [{"bounds": [l, bottom, r, boundary], "text": ""}
-                         for l, r in ((left, middle), (middle, right))]
+                cells = [{"bounds": [cell_left, bottom, cell_right, boundary], "text": ""}
+                         for cell_left, cell_right in ((left, middle), (middle, right))]
                 rows.append(cells)
                 boundary = bottom
                 if len(rows) > MAX_GRID_ROWS:
