@@ -77,6 +77,14 @@ function wholeSubset(previous: string, canonical: string): boolean {
   const old = literal(previous), full = literal(canonical);
   return Boolean(old) && full.includes(old);
 }
+function emptyUnboundProposal(item: IntelligenceItem): boolean {
+  const genericTitle = (value: string) => /^(?:коммерческое\s+предложение|кп|проект\s+(?:коммерческого\s+предложения|кп))\s*[.:]?$/iu.test(value.trim());
+  if (item.destination !== "proposals" || item.sourceIds.length || item.title.trim() && !genericTitle(item.title)) return false;
+  // Inspect every field, not just selected fields: unchecked model facts must
+  // never acquire an inferred source owner. Zero and false are also facts.
+  if (Object.entries(item.fields).some(([field, value]) => typeof value === "string" ? Boolean(value.trim()) && !(field === "title" && genericTitle(value)) : !Array.isArray(value) || value.length > 0)) return false;
+  return [item.evidence, item.staffDocuments, item.proposalSourceFinancials, item.proposalSourceParties].every((value) => value === undefined || Array.isArray(value) && value.length === 0);
+}
 
 /** Literal source-derived preparation, never a provider response or approval.
  * No dates, prices, quantities, files, contacts or acknowledgements are made. */
@@ -89,6 +97,19 @@ export function completeContractProposalFields(items: readonly IntelligenceItem[
   if (inventory.limited) return stop("contract-proposal-inventory-limit", "Договор или ТЗ не разобраны целиком. Частичное дополнение не выполнено; разделите материалы.");
   const result = unchanged();
   const eligible = inventory.documents.filter((document) => document.eligible && document.complete);
+  // A provider may return one schema-valid empty shell with sourceIds:[]
+  // instead of items:[]. The explicit sole КП task and fresh unique document,
+  // not any model value or a prior ACK, establish the source-derived owner.
+  // Preserve the shell's ID and the raw response; meaningful unbound replies
+  // keep their unresolved ownership and are never blessed by this recovery.
+  if (destinations.length === 1 && result.items.length === 1 && eligible.length === 1 && inventory.documents.length === 1 && emptyUnboundProposal(result.items[0])) {
+    const document = eligible[0], original = result.items[0], fact = inventory.facts.find((entry) => entry.documentId === document.documentId);
+    if (fact) {
+      result.items[0] = { ...original, sourceIds: [...document.sourceIds] };
+      result.changes.push({ ...proof(fact), quote: fact.quote.slice(0, LIMITS.quote), itemId: original.id, field: "record", kind: "replaced", previousValue: [], value: [...document.sourceIds], requiresReview: true });
+      result.skipped.push({ ...proof(fact), quote: fact.quote.slice(0, LIMITS.quote), itemId: original.id, reason: "contract-proposal-empty-shell-bound", message: "Пустая карточка ИИ не указала источники. По явно выбранной задаче КП она связана с единственным полностью извлечённым договором / ТЗ и дополнена его данными. Исходный ответ сохранён; проверьте применимость исходных условий.", requiresReview: true });
+    }
+  }
   // Creation is deliberately restricted to the explicit standalone КП task.
   // A multi-direction request must not manufacture a new intention or owner.
   if (!items.some((item) => item.destination === "proposals") && destinations.length === 1 && eligible.length === 1 && inventory.documents.length === 1) {

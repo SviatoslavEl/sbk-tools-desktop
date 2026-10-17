@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { completeContractProposalFields, createContractProposalProver } from "./contractProposalCompletion";
+import { runResponsePreparation } from "./responsePreparationWorker";
+import { buildIntelligenceResponseSchema } from "./workbenchModel";
 import type { IntelligenceItem, IntelligenceSource } from "./workbenchTypes";
 
 const source = (): IntelligenceSource => ({ id: "contract-qa", name: "Учебный источник", text: "Не использовать агрегат", fragments: [
@@ -44,6 +46,47 @@ describe("whole contract to source-derived proposal preparation", () => {
     expect(completeContractProposalFields([], [input, { ...input, id: "second" }], ["proposals"]).items).toEqual([]);
     input.coverage = { complete: false, requiresOcr: true };
     expect(completeContractProposalFields([], [input], ["proposals"]).items).toEqual([]);
+  });
+
+  it("recovers the exact all-null/sourceIds-empty provider class through the real preparation pipeline", () => {
+    const input = source(), schema = buildIntelligenceResponseSchema(["proposals"]) as { properties: { items: { items: { properties: { fields: { properties: Record<string, unknown> } } } } } };
+    const fields = Object.fromEntries(Object.keys(schema.properties.items.items.properties.fields.properties).map((key) => [key, null]));
+    const raw = JSON.stringify({ items: [{ destination: "proposals", title: "Коммерческое предложение", fields, positions: null, sourceIds: [], evidence: [] }] });
+    const request = { revision: 4, raw, sources: [input], destinations: ["proposals"] }, before = structuredClone(request);
+    const reply = runResponsePreparation(request);
+    expect(reply.failed).toBeUndefined(); expect(reply.prepared?.items).toHaveLength(1);
+    const prepared = reply.prepared!.items[0];
+    expect(prepared.sourceIds).toEqual([input.id]); expect(prepared.fields.lines).toEqual(["проверке учебной системы"]);
+    expect(prepared.fields.paymentTerms).toContain("или истечения срока отказа");
+    expect((prepared.fields.lineDescriptions as string[])[0]).toContain("SBOM при наличии");
+    expect(prepared.proposalSourceParties).toHaveLength(2);
+    expect(reply.prepared!.sourcePreparation!.changes.some((change) => change.field === "record" && change.kind === "replaced" && JSON.stringify(change.previousValue) === "[]" && JSON.stringify(change.value) === JSON.stringify([input.id]))).toBe(true);
+    expect(reply.prepared!.sourcePreparation!.skipped.some((skip) => skip.reason === "contract-proposal-empty-shell-bound")).toBe(true);
+    expect(request).toEqual(before);
+  });
+
+  it("retains the empty shell ID and records the source binding without mutating it", () => {
+    const input = source(), item = { ...card({ title: "Коммерческое предложение" }), sourceIds: [] }, before = structuredClone(item);
+    const prepared = completeContractProposalFields([item], [input], ["proposals"]);
+    expect(prepared.items[0].id).toBe(item.id); expect(prepared.items[0].sourceIds).toEqual([input.id]);
+    expect(prepared.items[0].fields.lines).toHaveLength(1); expect(item).toEqual(before);
+    expect(createContractProposalProver([input]).prove(prepared.items[0], prepared.items)?.fields.has("lineDescriptions")).toBe(true);
+  });
+
+  it.each(["meaningful-title", "meaningful-field", "unchecked-field", "zero", "evidence", "multiple-cards", "multiple-documents", "all-directions", "partial-source"])("does not infer an empty-shell owner for %s", (variant) => {
+    const input = source(), item = { ...card(), sourceIds: [] }, items = [item], sources = [input];
+    let destinations: Array<IntelligenceItem["destination"]> = ["proposals"];
+    if (variant === "meaningful-title") item.title = "Аудит другой системы";
+    if (variant === "meaningful-field" || variant === "unchecked-field") { item.fields.recipientName = "Иная компания"; item.selectedFields = variant === "unchecked-field" ? [] : ["recipientName"]; }
+    if (variant === "zero") item.fields.unknownAmount = 0;
+    if (variant === "evidence") item.evidence = [{ field: "title", sourceId: input.id, fragmentId: input.fragments![4].id, quote: input.fragments![4].text }];
+    if (variant === "multiple-cards") items.push({ ...card(), id: "second-empty", sourceIds: [] });
+    if (variant === "multiple-documents") sources.push({ ...input, id: "second-source" });
+    if (variant === "all-directions") destinations = ["proposals", "contracts", "counterparties", "staff", "procurement"];
+    if (variant === "partial-source") input.coverage = { complete: false, requiresOcr: true };
+    const result = completeContractProposalFields(items, sources, destinations);
+    expect(result.items[0].sourceIds).toEqual([]); expect(result.changes).toEqual([]);
+    expect(result.skipped.some((skip) => skip.reason === "contract-proposal-empty-shell-bound")).toBe(false);
   });
 
   it("proves the complete freshly recollected multifragment values, not an arbitrary substring or old prefix", () => {
