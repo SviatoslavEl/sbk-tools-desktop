@@ -151,7 +151,12 @@ def _resource_inventory(resources: Path, entries: dict) -> dict[str, str]:
                 else:
                     raise ValueError(f"Runtime contains a special file: {relative}")
     if files != set(entries):
-        raise ValueError("Runtime file inventory does not match its manifest")
+        missing = sorted(set(entries) - files)
+        extra = sorted(files - set(entries))
+        raise ValueError(
+            f"Runtime file inventory does not match its manifest: {resources}; "
+            f"missing={len(missing)} {missing[:5]!r}; extra={len(extra)} {extra[:5]!r}"
+        )
     return aliases
 
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
+import shutil
 
 import pytest
 
@@ -60,3 +61,35 @@ def test_manifest_excludes_bytecode_and_final_verifier_rejects_it(tmp_path: Path
     bytecode.unlink()
     cache.rmdir()
     assert verify.verify_runtime(root, worker) == 1
+
+
+def test_materialized_libreoffice_aliases_are_fully_manifested_before_tauri_copy(tmp_path: Path) -> None:
+    stage = load_script("stage_libreoffice")
+    generate = load_script("generate_runtime_manifest")
+    verify = load_script("verify_runtime_manifest")
+    finalize = load_script("finalize_macos_manual_bundle")
+    source = tmp_path / "readonly-image/LibreOffice.app"
+    framework = source / "Contents/Frameworks/Python.framework"
+    version = framework / "Versions/3.12"
+    (version / "Resources").mkdir(parents=True)
+    (version / "Python").write_bytes(b"framework binary")
+    (version / "Resources/module.py").write_bytes(b"value = 1\n")
+    (framework / "Versions/Current").symlink_to("3.12", target_is_directory=True)
+    (framework / "Python").symlink_to("Versions/Current/Python")
+    (framework / "Resources").symlink_to("Versions/Current/Resources", target_is_directory=True)
+    root = tmp_path / "runtime"
+    resources = root / "resources"
+    destination = resources / "office/darwin/LibreOffice.app"
+    # Mirrors staging, then Tauri's regular-file resource copying.
+    stage.stage_macos_runtime(source, destination)
+    worker = tmp_path / "worker"
+    worker.write_bytes(b"trusted worker")
+    payload = generate.generate_manifest(root, worker)
+    packaged = tmp_path / "bundled-runtime"
+    shutil.copytree(root, packaged, symlinks=False)
+    assert not any(path.is_symlink() for path in destination.rglob("*"))
+    assert finalize._resource_inventory(resources, payload["resources"]) == {}
+    assert finalize._resource_inventory(packaged / "resources", payload["resources"]) == {}
+    assert verify.verify_runtime(packaged, worker) == len(payload["resources"])
+    assert (destination / "Contents/Frameworks/Python.framework/Python").read_bytes() == b"framework binary"
+    assert (destination / "Contents/Frameworks/Python.framework/Resources/module.py").is_file()

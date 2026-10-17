@@ -96,6 +96,19 @@ def remove_python_bytecode(root: Path) -> tuple[int, int]:
     return len(bytecode_files), len(cache_directories)
 
 
+def stage_macos_runtime(source: Path, destination: Path) -> tuple[int, int]:
+    if destination.exists():
+        shutil.rmtree(destination)
+    # Tauri copies file aliases as regular files and omits directory aliases.
+    # Materialize both kinds BEFORE creating the trusted manifest so its
+    # inventory describes the actual bundled tree. The source is the read-only,
+    # checksum-pinned LibreOffice image.
+    shutil.copytree(source, destination, symlinks=False)
+    # Embedded Python rewrites timestamp-based bytecode on first use, which
+    # would invalidate the signed runtime. Package sources only instead.
+    return remove_python_bytecode(destination)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Stage pinned LibreOffice runtime")
     parser.add_argument("--target", required=True, choices=PACKAGES)
@@ -114,15 +127,7 @@ def main() -> None:
             try:
                 source = mount / "LibreOffice.app"
                 destination = args.output / "office/darwin/LibreOffice.app"
-                if destination.exists():
-                    shutil.rmtree(destination)
-                shutil.copytree(source, destination, symlinks=True)
-                # The LibreOffice image ships timestamp-based Python bytecode
-                # caches whose headers predate the matching sources.  Embedded
-                # Python rewrites them on first use, which would make a signed
-                # application fail its own runtime integrity check.  Package
-                # sources only and disable cache creation in office_engine.py.
-                bytecode_count, cache_count = remove_python_bytecode(destination)
+                bytecode_count, cache_count = stage_macos_runtime(source, destination)
                 print(
                     f"Removed {bytecode_count} mutable Python bytecode files "
                     f"and {cache_count} cache directories from the macOS LibreOffice runtime",

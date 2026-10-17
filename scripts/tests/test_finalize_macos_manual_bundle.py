@@ -204,6 +204,18 @@ def test_accepts_only_matching_internal_framework_aliases(bundle) -> None:
     assert finalize(bundle)["resources"] == 1
 
 
+def test_inventory_error_identifies_tree_and_missing_or_extra_files(bundle) -> None:
+    (bundle.target_resources / "data.dat").unlink()
+    (bundle.target_resources / "unexpected.dat").write_bytes(b"unexpected")
+    with pytest.raises(ValueError) as caught:
+        finalize(bundle)
+    message = str(caught.value)
+    assert str(bundle.target_resources) in message
+    assert "missing=1 ['data.dat']" in message
+    assert "extra=1 ['unexpected.dat']" in message
+    no_outer_sign(bundle)
+
+
 @pytest.mark.parametrize("kind", ["escape", "different", "manifested"])
 def test_rejects_escaping_or_nonmatching_aliases(bundle, kind) -> None:
     if kind == "manifested":
