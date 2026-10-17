@@ -11,8 +11,11 @@ import { buildIntelligenceHandoff, destinationLabels, emptyIntelligenceItem, fie
 import { buildAnalysisPlan, mergeAnalysisResponses, type AnalysisMode, type AnalysisResponsePart } from "./analysisPlan";
 import { buildGroundedAnalysisInput } from "./groundedAnalysis";
 import type { IntelligenceDestination, IntelligenceFieldValue, IntelligenceHandoff, IntelligenceItem, IntelligenceSource } from "./workbenchTypes";
-import { auditIntelligenceResult, getBlockingEvidenceFindings, type CoverageCheck, type EvidenceExcerpt, type IntelligenceEvidenceReport } from "./resultEvidence";
-import type { EvidenceAuditReply } from "./evidenceAuditWorker";
+import { getBlockingEvidenceFindings, type CoverageCheck, type EvidenceExcerpt, type IntelligenceEvidenceReport } from "./resultEvidence";
+import { runEvidenceAudit, type EvidenceAuditReply } from "./evidenceAuditWorker";
+import { getItemTaskCompletion, type TaskCompletionReport } from "./taskCompletion";
+import { ItemTaskCompletionSummary, TaskCompletionSummary } from "./TaskCompletionSummary";
+import { ProposalContentPreview } from "./ProposalContentPreview";
 import { SourceFactsDesk } from "./SourceFactsDesk";
 import { useSourceFactsInventory } from "./useSourceFactsInventory";
 import { ResponsePreparationCancelled, startResponsePreparation } from "./responsePreparation";
@@ -45,7 +48,7 @@ interface ExtractionSheet { id: string; name: string; state: "visible" | "hidden
 type WorkbenchSource = IntelligenceSource & { selected: boolean; warnings: string[]; filePath?: string; sheets?: ExtractionSheet[] };
 interface ExtractionResult { fileName: string; sha256: string; extractedText: string; fragments: IntelligenceSource["fragments"]; warnings: string[]; sheets?: ExtractionSheet[]; coverage?: IntelligenceSource["coverage"]; }
 interface PendingRequest { id: string; epoch: number; }
-interface EvidenceState { items: IntelligenceItem[]; sources: IntelligenceSource[]; report: IntelligenceEvidenceReport; failed?: boolean; }
+interface EvidenceState { items: IntelligenceItem[]; sources: IntelligenceSource[]; destinations: IntelligenceDestination[]; report: IntelligenceEvidenceReport; completion?: TaskCompletionReport; failed?: boolean; }
 const emptyEvidenceReport = (): IntelligenceEvidenceReport => ({ fields: [], findings: [], coverage: [] });
 
 function defaultProfile(): ConnectionProfile {
@@ -130,8 +133,10 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
   const [items, setItems] = useState<IntelligenceItem[]>([]);
   const itemsRef = useRef<IntelligenceItem[]>([]); itemsRef.current = items;
   const [resultSources, setResultSources] = useState<IntelligenceSource[]>([]);
+  const [resultDestinations, setResultDestinations] = useState<IntelligenceDestination[]>([]);
   const [automaticConditions, setAutomaticConditions] = useState<Omit<AutoConditionResult, "items"> | null>(null);
   const [sourcePreparation, setSourcePreparation] = useState<SourcePreparationReceipt | null>(null);
+  const preparationLimited = Boolean(sourcePreparation?.limited || automaticConditions?.limited);
   const [preparingResponse, setPreparingResponse] = useState(false);
   const preparationPending = useRef<ReturnType<typeof startResponsePreparation> | null>(null);
   const preparationRevision = useRef(0);
@@ -144,11 +149,11 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
   const auditRevision = useRef(0);
   const previousAuditItems = useRef<IntelligenceItem[]>([]);
   const auditItems = useMemo(() => { const next = items.filter((item) => !manualItemIds.includes(item.id)); const previous = previousAuditItems.current; if (next.length === previous.length && next.every((item, index) => item === previous[index])) return previous; previousAuditItems.current = next; return next; }, [items, manualItemIds]);
-  const evidenceReady = Boolean(evidenceState && evidenceState.items === auditItems && evidenceState.sources === resultSources);
+  const evidenceReady = Boolean(evidenceState && evidenceState.items === auditItems && evidenceState.sources === resultSources && evidenceState.destinations === resultDestinations);
   const evidenceReport = evidenceReady && evidenceState ? evidenceState.report : emptyEvidenceReport();
   const manualReviewCount = items.reduce((total, item) => total + new Set(reviewedFindings[item.id] || []).size, 0);
-  const evidenceCurrent = useRef({ evidenceState, auditItems, resultSources, reviewedFindings, manualItemIds });
-  evidenceCurrent.current = { evidenceState, auditItems, resultSources, reviewedFindings, manualItemIds };
+  const evidenceCurrent = useRef({ evidenceState, auditItems, resultSources, resultDestinations, reviewedFindings, manualItemIds });
+  evidenceCurrent.current = { evidenceState, auditItems, resultSources, resultDestinations, reviewedFindings, manualItemIds };
   const [openedItems, setOpenedItems] = useState<string[]>([]);
   const [resultStale, setResultStale] = useState(false);
   const [running, setRunning] = useState(false);
@@ -222,11 +227,11 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
   useEffect(() => { if (connectionOpen && outputFocusRequest > 0) outputModeRef.current?.focus(); }, [connectionOpen, outputFocusRequest]);
   useEffect(() => {
     const revision = ++auditRevision.current;
-    if (!auditItems.length) { setEvidenceState({ items: auditItems, sources: resultSources, report: emptyEvidenceReport() }); return; }
+    if (!resultDestinations.length) { setEvidenceState({ items: auditItems, sources: resultSources, destinations: resultDestinations, report: emptyEvidenceReport() }); return; }
     setEvidenceState(null);
     const accept = (reply: EvidenceAuditReply) => {
       if (!mounted.current || revision !== auditRevision.current || reply.revision !== revision) return;
-      setEvidenceState({ items: auditItems, sources: resultSources, report: reply.report || emptyEvidenceReport(), failed: reply.failed || !reply.report });
+      setEvidenceState({ items: auditItems, sources: resultSources, destinations: resultDestinations, report: reply.report || emptyEvidenceReport(), completion: reply.completion, failed: reply.failed || !reply.report || !reply.completion });
     };
     // Keep large documents off the WebView's input/render thread. Cancellation
     // terminates the old worker, and stale results cannot authorize newer fields.
@@ -249,14 +254,14 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
         worker.onmessage = (event: MessageEvent<EvidenceAuditReply>) => finish(event.data);
         worker.onerror = fail; worker.onmessageerror = fail;
         timeout = setTimeout(() => fail(), evidenceAuditTimeoutMilliseconds);
-        worker.postMessage({ revision, items: auditItems, sources: resultSources });
+        worker.postMessage({ revision, items: auditItems, sources: resultSources, destinations: resultDestinations, preparationLimited });
       } catch { fail(); }
       return () => { disposed = true; auditRevision.current++; release(); };
     }
     // Non-browser regression harness only; native WebViews provide Web Workers.
-    try { accept({ revision, report: auditIntelligenceResult(auditItems, resultSources) }); }
+    try { accept(runEvidenceAudit({ revision, items: auditItems, sources: resultSources, destinations: resultDestinations, preparationLimited })); }
     catch { accept({ revision, failed: true }); }
-  }, [auditItems, resultSources, auditAttempt]);
+  }, [auditItems, resultSources, resultDestinations, preparationLimited, auditAttempt]);
 
   const editProfile = (patch: Partial<ConnectionProfile>) => {
     invalidateTask(); connectionEpoch.current++; connectionPending.current = null; setConnectionBusy(false); setConnectionMessage("");
@@ -367,15 +372,15 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
       if (reply.failed) throw new Error(reply.failed);
       if (reply.empty) {
       setError(""); setNotice(""); setResultStale(items.length > 0);
-      setEmptyWarning("Модель не подготовила ни одной карточки. Проверьте выбранные источники и направления, уточните задание или посмотрите исходный ответ ниже. Предыдущие карточки, если они были, сохранены отдельно.");
+      setEmptyWarning(`Последняя попытка не дала результата для: ${requestedDestinations.map((destination) => destinationLabels[destination]).join(", ")}. Модель не подготовила ни одной карточки и автоматический разбор не смог восстановить результат. Проверьте источники или повторите анализ. Предыдущие карточки ниже, если они были, относятся к другой попытке и не подтверждают выполнение текущей задачи.`);
       return;
       }
       const prepared = reply.prepared!;
       itemsRef.current = prepared.items;
-      setItems(prepared.items); setResultSources(snapshot); setAutomaticConditions({ changes: prepared.changes, skipped: prepared.skipped, limited: prepared.limited }); setSourcePreparation(prepared.sourcePreparation || null); setManualItemIds([]); setReviewedFindings({}); setOpenedItems([]); setResultStale(false); setError("");
+      setItems(prepared.items); setResultSources(snapshot); setResultDestinations([...requestedDestinations]); setAutomaticConditions({ changes: prepared.changes, skipped: prepared.skipped, limited: prepared.limited }); setSourcePreparation(prepared.sourcePreparation || null); setManualItemIds([]); setReviewedFindings({}); setOpenedItems([]); setResultStale(false); setError("");
       setEmptyWarning("");
       const added = prepared.changes.filter((change) => change.kind === "added").length;
-      setNotice(`Подготовлено карточек: ${prepared.items.length}.${added ? ` Из источников автоматически добавлено пунктов: ${added}.` : ""} Проверьте поля и откройте нужные карточки в соответствующих инструментах.`);
+      setNotice(`Получено черновиков: ${prepared.items.length}.${added ? ` Из источников автоматически добавлено пунктов: ${added}.` : ""} Идёт отдельная проверка содержания и достоверности. Заполненные поля ещё не означают, что задача выполнена.`);
     } catch (reason) {
       if (mounted.current && preparationPending.current === preparation && epoch.current === token && accessRef.current.workspaceRoot === root && !(reason instanceof ResponsePreparationCancelled)) {
         rememberFailedResponse(raw, snapshot, reason, format);
@@ -450,7 +455,7 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
     const next = itemsRef.current.map((item) => item.id === id ? { ...item, ...patch } : item); itemsRef.current = next; setItems(next);
     setOpenedItems((previous) => previous.filter((itemId) => itemId !== id)); setError("");
   };
-  const transfer = async (item: IntelligenceItem) => {
+  const transfer = async (item: IntelligenceItem, incompleteDraft = false) => {
     if (transferPending.current) return;
     if (preparationPending.current) { setError("Дождитесь подготовки карточек и условий из источников или отмените разбор."); return; }
     const now = accessRef.current;
@@ -458,7 +463,9 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
     if (itemsRef.current.find((entry) => entry.id === item.id) !== item) { setError("Карточка изменилась. Проверьте текущие значения и повторите передачу."); return; }
     const current = evidenceCurrent.current;
     if (!current.manualItemIds.includes(item.id)) {
-      if (!current.evidenceState || current.evidenceState.items !== current.auditItems || current.evidenceState.sources !== current.resultSources || current.evidenceState.failed) { setError("Локальная проверка фактов ещё не завершена. Передача недоступна до её завершения."); return; }
+      if (!current.evidenceState || current.evidenceState.items !== current.auditItems || current.evidenceState.sources !== current.resultSources || current.evidenceState.destinations !== current.resultDestinations || current.evidenceState.failed) { setError("Локальная проверка фактов и содержания ещё не завершена. Передача недоступна до её завершения."); return; }
+      const completion = current.evidenceState.completion && getItemTaskCompletion(current.evidenceState.completion, item.id);
+      if (!completion || !(incompleteDraft ? completion.canOpenIncompleteDraft : completion.canTransferPrepared)) { setError("Содержание задачи не подготовлено или его полнота не установлена. Проверьте конкретные пропуски; общее подтверждение фактов не заменяет недостающие сведения."); return; }
       const unreviewed = getBlockingEvidenceFindings(current.evidenceState.report, item, current.reviewedFindings[item.id] || []);
       if (unreviewed.length) { setError("Есть неподтверждённые факты или пропущенные условия. Исправьте / исключите значения либо проверьте каждое замечание по источнику перед передачей."); return; }
     }
@@ -475,16 +482,25 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
       // still in flight. Never open a superseded card or reuse its old ACK.
       if (itemsRef.current.find((entry) => entry.id === item.id) !== item) throw new Error("Результат заменён. Проверьте новую карточку и повторите передачу.");
       const live = evidenceCurrent.current;
-      if (!live.manualItemIds.includes(item.id) && (!live.evidenceState || live.evidenceState.items !== live.auditItems || live.evidenceState.sources !== live.resultSources || live.evidenceState.failed || getBlockingEvidenceFindings(live.evidenceState.report, item, live.reviewedFindings[item.id] || []).length)) throw new Error("Проверка результата изменилась. Повторно проверьте замечания перед передачей.");
+      const liveCompletion = live.evidenceState?.completion && getItemTaskCompletion(live.evidenceState.completion, item.id);
+      if (!live.manualItemIds.includes(item.id) && (!live.evidenceState || live.evidenceState.items !== live.auditItems || live.evidenceState.sources !== live.resultSources || live.evidenceState.destinations !== live.resultDestinations || live.evidenceState.failed || !liveCompletion || !(incompleteDraft ? liveCompletion.canOpenIncompleteDraft : liveCompletion.canTransferPrepared) || getBlockingEvidenceFindings(live.evidenceState.report, item, live.reviewedFindings[item.id] || []).length)) throw new Error("Проверка результата изменилась. Повторно проверьте замечания перед передачей.");
       onTransfer(buildIntelligenceHandoff(item, resultSources, workspaceRoot));
-      setOpenedItems((previous) => [...new Set([...previous, item.id])]); setNotice(`Открыт черновик: ${destinationLabels[item.destination]}. Сохраните его в карточке. Остальные результаты остаются в окне ИИ.`);
+      setOpenedItems((previous) => [...new Set([...previous, item.id])]); setNotice(`Открыт ${incompleteDraft ? "неполный " : ""}черновик: ${destinationLabels[item.destination]}. ${incompleteDraft ? "Оставшиеся вопросы не решены автоматически. " : ""}Сохраните его в карточке. Остальные результаты остаются в окне ИИ.`);
     } catch (reason) { if (mounted.current) setError(errorMessage(reason)); }
     finally { transferPending.current = false; if (mounted.current) setTransferring(null); }
   };
   const reset = () => {
     pendingOcr.current = null; setScanWithoutText(null);
     failedResponseRef.current = null; setFailedResponse(null); setFailedCopyMessage(""); setRawResponseOpen(false);
-    cancelPending(); extractionEpoch.current++; extractionPending.current = null; setExtracting(false); updateSources(() => []); setSourceName(""); setSourceText(""); setRawResponse(""); setItems([]); setResultSources([]); setAutomaticConditions(null); setSourcePreparation(null); setSourceFactsRequested(false); setManualItemIds([]); setReviewedFindings({}); setOpenedItems([]); setResultStale(false); setEmptyWarning(""); setResponseDetails(null); setAnalysisParts([]); setError(""); setNotice(""); setConfirm(null);
+    cancelPending(); extractionEpoch.current++; extractionPending.current = null; setExtracting(false); updateSources(() => []); setSourceName(""); setSourceText(""); setRawResponse(""); setItems([]); setResultSources([]); setResultDestinations([]); setAutomaticConditions(null); setSourcePreparation(null); setSourceFactsRequested(false); setManualItemIds([]); setReviewedFindings({}); setOpenedItems([]); setResultStale(false); setEmptyWarning(""); setResponseDetails(null); setAnalysisParts([]); setError(""); setNotice(""); setConfirm(null);
+  };
+  const requestIncompleteTransfer = (item: IntelligenceItem) => {
+    const confirmationEpoch = epoch.current;
+    setConfirm({ title: "Открыть черновик с нерешёнными вопросами?", message: "Содержание не считается завершённым. Пропуски и противоречия не исчезнут от этого действия. В редакторе проверьте условия; исходная цена потребует отдельного решения. Сохранение и экспорт выполняются там.", label: "Открыть неполный черновик", run: () => {
+      setConfirm(null);
+      if (epoch.current !== confirmationEpoch) { setError("Задача изменилась после открытия подтверждения. Проверьте текущий результат и повторите действие."); return; }
+      void transfer(item, true);
+    } });
   };
   const requestReset = () => {
     if (sources.length || sourceText || rawResponse || items.length || failedResponseRef.current) setConfirm({ title: "Очистить окно ИИ?", message: "Источники, ответ, сохранённая копия неразобранного ответа и подготовленные здесь карточки будут удалены из этого окна. Уже сохранённые карточки в других инструментах останутся.", run: reset });
@@ -586,7 +602,7 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
         {connectionMessage && <p className="iw-connection-message" role="status">{connectionMessage}</p>}
       </div>}
     </section>
-    {error && error !== (scanWithoutText ? `«${scanWithoutText.name}»: в документе не найден текст. Для скана сначала выполните распознавание в сканере.` : "") && <div className="notice error" role="alert">{error}</div>}{notice && <div className="notice success" role="status">{notice}</div>}{emptyWarning && <div className="notice warning" role="status">{emptyWarning}</div>}
+    {error && error !== (scanWithoutText ? `«${scanWithoutText.name}»: в документе не найден текст. Для скана сначала выполните распознавание в сканере.` : "") && <div className="notice error" role="alert">{error}</div>}{notice && <div className="notice" role="status">{notice}</div>}{emptyWarning && <div className="notice warning" role="status">{emptyWarning}</div>}
     {failedResponse && <section className="notice warning iw-response-recovery" aria-label="Сохранённый неразобранный ответ">
       <strong>Первая сохранённая неуспешная попытка</strong>
       <p>Этот ответ не заменил подготовленные карточки. Следующие попытки не затирают эту копию: она остаётся в памяти окна до новой задачи, её удаления, смены рабочей папки или закрытия программы. Текущий ответ ниже может относиться к другой попытке.</p>
@@ -614,10 +630,12 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
         </li>)}</ul> : <div className="iw-empty">Добавьте документы или текст. Общая база автоматически в модель не передаётся.</div>}
       </section>
       <section className="surface iw-task"><div className="iw-section-heading"><span className="iw-step">2</span><div><h3>Задача</h3><p>Выберите сценарий и уточните результат.</p></div></div><div className="iw-presets">{presetTasks.map((preset) => <button type="button" className={`secondary ${activePreset === preset.label ? "iw-preset-active" : ""}`} key={preset.label} onClick={() => { invalidateTask(); setActivePreset(preset.label); setTaskDestinations([...preset.destinations]); setInstruction(preset.text); }}>{preset.label}</button>)}</div>
-        <fieldset className="iw-destinations"><legend>Какие карточки подготовить</legend>{destinations.map((destination) => <label key={destination}><input type="checkbox" aria-label={`Подготовить ${destinationLabels[destination]}`} checked={taskDestinations.includes(destination)} onChange={(event) => { invalidateTask(); setActivePreset(""); setTaskDestinations((previous) => event.target.checked ? [...new Set([...previous, destination])] : previous.filter((entry) => entry !== destination)); }} />{destinationLabels[destination]}</label>)}</fieldset>
+        <p className="help-text">Выбран результат: {taskDestinations.map((destination) => destinationLabels[destination]).join(", ") || "Не выбран"}</p>
+        <details className="iw-request-options"><summary>Уточнить задачу и выбрать несколько результатов</summary><fieldset className="iw-destinations"><legend>Какие карточки подготовить</legend>{destinations.map((destination) => <label key={destination}><input type="checkbox" aria-label={`Подготовить ${destinationLabels[destination]}`} checked={taskDestinations.includes(destination)} onChange={(event) => { invalidateTask(); setActivePreset(""); setTaskDestinations((previous) => event.target.checked ? [...new Set([...previous, destination])] : previous.filter((entry) => entry !== destination)); }} />{destinationLabels[destination]}</label>)}</fieldset>
         <label>Что нужно сделать<textarea id="iw-instruction" rows={3} maxLength={20000} value={instruction} onChange={(event) => { if (event.target.value.length > 20000) { setError("Задание не должно превышать 20 000 символов."); return; } invalidateTask(); setInstruction(event.target.value); }} /></label>
         <label className="iw-analysis-mode">Разбор<select id="iw-analysis-mode" value={analysisMode} onChange={(event) => { invalidateTask(); setAnalysisMode(event.target.value as AnalysisMode); }}><option value="combined">Одним запросом</option><option value="by-destination">Отдельно по направлениям</option></select></label>
         {analysisMode === "by-destination" && <p className="help-text iw-batch-disclosure" role="note">Будет {taskDestinations.length} последовательных запросов. Одни и те же выбранные материалы отправятся модели {taskDestinations.length} раз. Это дольше и может увеличить стоимость; точность и полнота не гарантируются. Карточки появятся только после завершения всех этапов.</p>}
+        </details>
         <div className="iw-send-summary"><span>К отправке: {formatRussianCount(selectedSources.length, ["источник", "источника", "источников"])} · {formatRussianCount(sourceCharacters, ["символ", "символа", "символов"])}</span>{profile.scope !== "local" ? <div className="iw-disclosure" role="note"><strong>Тексты будут переданы {profile.scope === "external" ? "внешнему сервису" : "сервису в локальной сети"}:</strong><code>{profile.endpoint || "Адрес не указан"}</code></div> : <details><summary>Параметры запроса</summary><code>{profile.endpoint || "Адрес не указан"}</code><span>Формат: {profile.outputMode === "schema" ? "по схеме карточек" : "обычный JSON"}</span></details>}</div>
         {taskDestinations.includes("procurement") && <p className="help-text">В карточках закупок сертификаты и документы заявки автоматически дополнят результат из выбранных источников с сохранением чисел и оговорок. Неоднозначная принадлежность к карточке или лоту останется на проверке.</p>}
         <div className="iw-actions"><button type="button" className="primary" disabled={running || preparingResponse || extracting || !selectedSources.length} onClick={requestAnalysis}>{preparingResponse ? "Дополняем результат из источников…" : running ? "Модель готовит ответ…" : "Отправить выбранные источники"}</button>{running && !preparingResponse && <button type="button" className="secondary" onClick={() => { cancelPending(); setNotice("Запрос отменён. Поздний ответ не будет добавлен."); }}>Остановить запрос</button>}</div>
@@ -629,8 +647,9 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
     </div>
     <section className="surface iw-results"><div className="iw-section-heading"><span className="iw-step">3</span><div><h3>Проверка и распределение</h3><p>Отметьте нужные поля. Кнопка откроет новый черновик; сохранение выполняется в самой карточке.</p></div></div>
       {preparingResponse && <div className="iw-audit-progress" role="status"><span className="iw-spinner" aria-hidden="true" />Подготавливаем карточки, сертификаты и условия из источников…<button type="button" className="secondary" onClick={() => { cancelPending(); setNotice("Локальный разбор отменён. Предыдущие карточки сохранены; поздний результат не будет добавлен."); }}>Остановить разбор</button></div>}
-      <AutomaticConditionsSummary receipt={automaticConditions} items={items} />
-      <SourcePreparationSummary receipt={sourcePreparation} items={items} />
+      {evidenceReady && !evidenceState?.failed && <TaskCompletionSummary report={evidenceState?.completion} previous={resultStale || Boolean(emptyWarning)} />}
+      {(sourcePreparation?.limited || automaticConditions?.limited) && <p className="notice warning" role="status">Разбор источников выполнен не полностью. Проверьте журнал подготовки; такой результат не считается завершённым.</p>}
+      {(automaticConditions || sourcePreparation) && <details><summary>Как подготовлен результат · технические подробности</summary><AutomaticConditionsSummary receipt={automaticConditions} items={items} /><SourcePreparationSummary receipt={sourcePreparation} items={items} /></details>}
       {auditItems.length > 0 && !evidenceReady && <div className="iw-audit-progress" role="status"><span className="iw-spinner" aria-hidden="true" />Проверяем значения и обязательные условия по выбранным текстам. Передача результатов ИИ станет доступна после проверки.</div>}
       {auditItems.length > 0 && evidenceReady && evidenceState?.failed && <div className="notice error" role="alert">Локальную проверку фактов не удалось завершить. Результаты сохранены; передача ИИ-карточек пока недоступна.<button type="button" className="secondary" onClick={retryAudit}>Повторить проверку фактов</button></div>}
       {auditItems.length > 0 && evidenceReady && !evidenceState?.failed && <p className="help-text">Проверка сопоставляет выбранный текст, числа, роли и события. Она не гарантирует полноту понимания документа. Исправьте ошибки, исключите поля или явно проверьте каждое оставшееся замечание по источнику.</p>}
@@ -640,6 +659,7 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
         const errors = validateIntelligenceItem(item);
         const sourceNames = item.sourceIds.map((id) => resultSources.find((source) => source.id === id)?.name).filter(Boolean);
         const manual = manualItemIds.includes(item.id);
+        const taskCompletion = evidenceReady && evidenceState?.completion ? getItemTaskCompletion(evidenceState.completion, item.id) : undefined;
         const unreviewed = manual ? [] : getBlockingEvidenceFindings(evidenceReport, item, reviewedFindings[item.id] || []);
         const cardFindings = evidenceReport.findings.filter((finding) => finding.itemId === item.id && (!finding.field || item.selectedFields.includes(finding.field)));
         const manuallyReviewed = cardFindings.filter((finding) => finding.severity === "blocking" && (reviewedFindings[item.id] || []).includes(finding.id)).length;
@@ -647,6 +667,8 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
         return <details className="iw-card" key={item.id} open={items.length === 1}>
           <summary><span className="iw-card-index">{index + 1}</span><span><strong>{item.title || destinationLabels[item.destination]}</strong><small>{destinationLabels[item.destination]} · полей: {item.selectedFields.length}{openedItems.includes(item.id) ? " · черновик открыт" : ""}</small></span></summary>
           <div className="iw-card-body"><label>Название результата<input aria-label={`Название результата ${index + 1}`} value={item.title} maxLength={200} onChange={(event) => editItem(item.id, { title: event.target.value })} /></label><p className="help-text">Источники: {sourceNames.join(", ") || "Не указаны"}</p>
+          {!manual && <ItemTaskCompletionSummary report={evidenceReady ? evidenceState?.completion : undefined} item={taskCompletion} />}
+          {item.destination === "proposals" && <ProposalContentPreview item={item} />}
           <details className="iw-cited-sources"><summary>Выбрать источники этой карточки</summary><p className="help-text">Связывайте карточку только с документами, к которым относятся её сведения. Проверка поля использует эти источники; перечень обязательных условий учитывает весь выбранный комплект.</p>{manuallyReviewed > 0 && <p className="notice warning" role="status" aria-label={`Предупреждение о сбросе подтверждений результата ${index + 1}`}>Изменение источников этой карточки сбросит ручные подтверждения: {manuallyReviewed}. Потребуется повторная сверка.</p>}{resultSources.length ? resultSources.map((source) => <label key={source.id}><input type="checkbox" aria-label={`Источник ${source.name} для результата ${index + 1}`} checked={item.sourceIds.includes(source.id)} onChange={(event) => editItem(item.id, { sourceIds: event.target.checked ? [...new Set([...item.sourceIds, source.id])] : item.sourceIds.filter((id) => id !== source.id) })} />{source.name}</label>) : <p className="help-text">Исходные документы для этой карточки не заданы.</p>}</details>
           {manual && <p className="help-text">Ручная карточка: сведения вводите и проверяете самостоятельно. Автоматические выводы ИИ сюда не подставляются.</p>}
           <SourceFactsDesk item={item} sources={resultSources} inventory={sourceFacts.inventory} pending={sourceFacts.pending} failed={sourceFacts.failed} onRequest={() => setSourceFactsRequested(true)} onRetry={sourceFacts.retry} onApply={(patch) => {
@@ -656,7 +678,7 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
           }} />
           {!manual && cardFindings.length > 0 && <details className="iw-evidence-findings" open={unreviewed.length > 0}><summary>Проверка результата: нерешённых — {unreviewed.length} · подтверждено вручную — {manuallyReviewed}</summary>{cardFindings.map((finding) => <div className={`iw-evidence-finding ${finding.severity}`} key={finding.id}><strong>{finding.severity === "blocking" ? (reviewedFindings[item.id] || []).includes(finding.id) ? "Перенос подтверждён вручную" : "Требует решения" : "Обратите внимание"}</strong><p>{finding.message}</p>{evidenceQuotes(finding.evidence)}{finding.severity === "blocking" && <label className="iw-review-check"><input type="checkbox" aria-label={`Проверено замечание ${finding.id} результата ${index + 1}`} checked={(reviewedFindings[item.id] || []).includes(finding.id)} onChange={(event) => reviewFinding(item.id, finding.id, event.target.checked)} />Я проверил(а) это замечание по источнику и подтверждаю перенос текущих выбранных значений / неприменимость пропущенного условия.</label>}</div>)}</details>}
           {!manual && coverage.length > 0 && <details className="iw-coverage" open={coverage.some((check) => check.status !== "covered")}><summary>Сопоставление обязательных условий: {coverage.filter((check) => check.status === "covered").length} из {coverage.length} найдено</summary>{coverage.map((check) => <div className={`iw-coverage-row ${check.status}`} key={check.id}><strong>{check.status === "covered" ? "Найдено" : check.status === "missing" ? "Не найдено в переносимых данных" : "Нужна проверка"}</strong><p>{check.label}</p>{evidenceQuotes([check.evidence, ...(check.supportingEvidence || [])])}{check.status !== "covered" && ["certificate", "document", "quantity", "deadline-time"].includes(check.category) && <button type="button" className="secondary" onClick={() => addCoverageText(item, check)}>{check.category === "deadline-time" ? "Добавить время в примечания" : "Добавить точное условие в требования"}</button>}</div>)}</details>}
-          <div className="iw-field-grid">{fieldDefinitions[item.destination].filter((field) => item.destination !== "proposals" || !["lines", "lineDescriptions"].includes(field.key)).map((field) => {
+          <details className="iw-edit-result" open={item.destination !== "proposals"}><summary>Редактировать поля и состав результата</summary><div className="iw-field-grid">{fieldDefinitions[item.destination].filter((field) => item.destination !== "proposals" || !["lines", "lineDescriptions"].includes(field.key)).map((field) => {
             const value = item.fields[field.key]; const enabled = item.selectedFields.includes(field.key);
             const setValue = (next: IntelligenceFieldValue) => editItem(item.id, { fields: { ...item.fields, [field.key]: next }, selectedFields: [...new Set([...item.selectedFields, field.key])] });
             const problem = value === undefined ? undefined : intelligenceFieldError(field, value);
@@ -686,7 +708,9 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
               {item.destination === "procurement" && field.key === "nmc" && value === 0 && <p className="help-text">Проверьте НМЦ по источнику: нулевая цена строки спецификации не подтверждает начальную цену закупки. Если НМЦ не указана, снимите отметку этого поля.</p>}
               {item.destination === "procurement" && field.key === "publishedDate" && value !== undefined && <p className="help-text">Дата редакции технического задания не является датой публикации закупки.</p>}
             </div>;
-          })}</div>{item.destination === "proposals" && proposalPositions(item, index)}{errors.length > 0 && <p className="iw-validation" role="status">{errors.join(" ")}</p>}<footer className="iw-card-actions"><button type="button" className="primary" disabled={preparingResponse || !canTransfer || Boolean(transferring) || Boolean(errors.length) || (!manual && (!evidenceReady || Boolean(evidenceState?.failed) || unreviewed.length > 0))} onClick={() => void transfer(item)}>{transferring === item.id ? "Проверяем доступ…" : `Открыть черновик: ${destinationLabels[item.destination]}`}</button><button type="button" className="text-danger" onClick={() => setConfirm({ title: "Удалить результат?", message: "Эта подготовленная карточка будет удалена из окна ИИ. Данные в общей базе не изменятся.", run: () => { cancelPending(); setItems((previous) => previous.filter((entry) => entry.id !== item.id)); setManualItemIds((previous) => previous.filter((id) => id !== item.id)); setConfirm(null); } })}>Удалить результат</button></footer></div>
+          })}</div>{item.destination === "proposals" && proposalPositions(item, index)}</details>{errors.length > 0 && <p className="iw-validation" role="status">{errors.join(" ")}</p>}<footer className="iw-card-actions"><button type="button" className="primary" disabled={preparingResponse || !canTransfer || Boolean(transferring) || Boolean(errors.length) || (!manual && (!evidenceReady || Boolean(evidenceState?.failed) || unreviewed.length > 0 || !taskCompletion?.canTransferPrepared))} onClick={() => void transfer(item)}>{transferring === item.id ? "Проверяем доступ…" : `Открыть черновик: ${destinationLabels[item.destination]}`}</button>
+          {!manual && taskCompletion && !taskCompletion.canTransferPrepared && taskCompletion.canOpenIncompleteDraft && <button type="button" className="secondary" disabled={preparingResponse || !canTransfer || Boolean(transferring) || Boolean(errors.length) || !evidenceReady || Boolean(evidenceState?.failed) || unreviewed.length > 0} onClick={() => requestIncompleteTransfer(item)}>{taskCompletion.priceReviewRequired ? "Открыть КП — проверить цену и условия" : "Открыть неполный черновик"}</button>}
+          <button type="button" className="text-danger" onClick={() => setConfirm({ title: "Удалить результат?", message: "Эта подготовленная карточка будет удалена из окна ИИ. Данные в общей базе не изменятся.", run: () => { cancelPending(); setItems((previous) => previous.filter((entry) => entry.id !== item.id)); setManualItemIds((previous) => previous.filter((id) => id !== item.id)); setConfirm(null); } })}>Удалить результат</button></footer></div>
         </details>;
       })}</div> : <div className="iw-empty">Результаты появятся после анализа или разбора вставленного ответа. Также можно подготовить карточку вручную.</div>}
     </section>

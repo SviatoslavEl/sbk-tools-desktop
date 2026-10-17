@@ -1,4 +1,5 @@
 import type { AttachmentInfo } from '../../lib/storage';
+import type { ProposalSourceFinancials } from './sourcePricing';
 
 export type DecimalText = string;
 export type ProposalStatus = 'draft' | 'ready' | 'sent' | 'accepted' | 'rejected';
@@ -38,6 +39,11 @@ export interface ProposalData {
   lines: ProposalLine[]; deliveryTerms: string; paymentTerms: string;
   introduction: string; conclusion: string; attachments: AttachmentInfo[];
   template: ProposalTemplate; source?: ProposalSource; internalNote: string;
+  /** Private source candidates and explicit reviewer decision; never exported. */
+  sourceFinancials?: ProposalSourceFinancials;
+  /** Unresolved source questions survive saving, never become model approvals
+   * and are excluded from the public export allowlist. */
+  sourceQuestions?: Array<{ id: string; message: string; evidence: Array<{ sourceId: string; sourceName: string; fragmentId?: string; locator: string; quote: string }> }>;
 }
 export interface PublicLine {
   title: string; description: string; unit: string; quantity: DecimalText;

@@ -2,6 +2,10 @@ import { emptyCompany } from "../contracts/companies";
 import { emptyContract } from "../contracts/types";
 import { emptyProcurement, emptyQuestion, emptyRequirement } from "../procurement/types";
 import { createProposal, createProposalLine } from "../proposals/defaults";
+import { createProposalSourceFinancials } from "../proposals/sourcePricing";
+import { revalidateProposalSourceFinancials } from "./proposalSourceFinancials";
+import { collectContractProposalFacts } from "./contractProposalFacts";
+import { revalidateProposalSourceParties } from "./proposalSourceParties";
 import { cooperationBases, emptyStaff, emptyStaffDocument } from "../staff/types";
 import { parseUniqueJson } from "./uniqueJson";
 import { staffCertificateHandoffDocuments } from "./staffCertificateHandoff";
@@ -177,8 +181,8 @@ export function buildIntelligenceResponseSchema(destinations?: readonly Intellig
           type: ["array", "null"], maxItems: MAX_LIST_ITEMS,
           description: "Одна SKU/комплектация или предлагаемая услуга — один объект с полным описанием. Не отдельные строки компонентов; шапки таблиц и финансовые итоги не являются товарами или услугами.",
           items: { type: "object", additionalProperties: false, required: ["name", "description"], properties: {
-            name: { type: "string", minLength: 1, maxLength: 200, description: "Короткое наименование с моделью и артикулом/SKU, если они явно указаны. Разные комплектации не объединять." },
-            description: { type: "string", maxLength: MAX_TEXT_LENGTH },
+            name: { type: "string", minLength: 1, maxLength: 200, description: "Конкретный предмет услуги или короткое наименование товара с моделью и артикулом/SKU, если они явно указаны. Разные комплектации не объединять." },
+            description: { type: "string", maxLength: MAX_TEXT_LENGTH, description: "Для услуги — полный состав работ, результаты, входные данные и границы из источника. Для товара — полный состав одной конкретной комплектации." },
           } },
         } } : {}),
         sourceIds: { type: "array", items: { type: "string", minLength: 1, maxLength: 128 }, maxItems: MAX_SOURCE_IDS },
@@ -346,7 +350,7 @@ export function buildIntelligencePrompt(instruction: string, sources: readonly I
   const schema = selected.map((destination) => ({
     destination, label: destinationLabels[destination as IntelligenceDestination],
     fields: fieldDefinitions[destination].filter((field) => destination !== "proposals" || !["lines", "lineDescriptions"].includes(field.key)).map((field) => ({ key: field.key, description: extractionFieldDescription(destination, field.key, field.label), type: field.kind === "number" ? "number" : field.kind === "list" ? "string[]" : "string", ...(field.maxLength ? { maxLength: field.maxLength } : {}), ...(field.kind === "list" ? { maxEntryLength: listEntryLimit(field.key) } : {}), ...(field.options ? { allowedValues: field.options } : {}), ...(field.kind === "date" ? { format: "YYYY-MM-DD" } : {}) })),
-    ...(destination === "proposals" ? { positions: { type: "array|null", maxItems: MAX_LIST_ITEMS, items: { name: "string, 1–200 символов; модель и артикул/SKU из источника", description: "string, до 20000 символов; полный многострочный состав этой SKU" } } } : {}),
+    ...(destination === "proposals" ? { positions: { type: "array|null", maxItems: MAX_LIST_ITEMS, items: { name: "string, 1–200 символов; конкретная услуга либо модель и артикул/SKU из источника", description: "string, до 20000 символов; полный состав услуги и результаты либо многострочная комплектация этой SKU" } } } : {}),
   }));
   const prompt = [
     "Ты помогаешь подготовить новые, ещё не сохранённые карточки в СБК Инструменты. Выполни задачу пользователя по предоставленным материалам.",
@@ -360,7 +364,12 @@ export function buildIntelligencePrompt(instruction: string, sources: readonly I
     "Для всех дат строго различай событие: публикация, подача, вопросы, рассмотрение/подведение итогов, поставка/работы, дата документа, срок действия. Дата поставки не является сроком подачи; дата подведения итогов не является началом/окончанием работ. Относительные сроки (например, 14 календарных дней) без исходной даты не превращай в календарную дату; сохрани текст в примечании/условиях. Для сроков со временем полностью сохрани время и часовой пояс в notes/internalNote.",
     ...(selected.includes("procurement") ? ["Для закупки: НМЦ указывай только если прямо названа начальная максимальная цена или предел стоимости всей закупки. Нулевые цены строк спецификации не являются НМЦ. Если НМЦ неизвестна, пропусти nmc или верни null. Дата редакции извещения не является датой публикации: publishedDate только при явном указании публикации. Срок подачи — дата YYYY-MM-DD; время и часовой пояс сохрани полностью в notes. Предмет — конкретная услуга или товар из источника, не слово «Закупка». Каждое квалификационное условие, сертификат, количество специалистов, период опыта и требуемый документ сохрани отдельной строкой requirements без сокращения или объединения разных условий."] : []),
     ...(selected.includes("contracts") ? ["Для опыта по договорам: каждая строка с отдельным договором — отдельная карточка, даже если таблица одна или заказчик скрыт. Цитаты остальных договоров в evidence первой карточки не заменяют отдельные карточки. Сверь число явно перечисленных договоров и число карточек. Неизвестные реквизиты каждой строки оставь null; не переноси дату заявки, соседнюю сумму или конфиденциального заказчика в другую строку. Месяц без дня не превращай в полную дату."] : []),
-    ...(selected.includes("proposals") ? ["Для КП верни positions рядом с fields: массив объектов {name,description}, а не два независимых списка. Каждая SKU/модель/различная комплектация — ровно один объект с коротким name до 200 символов. В name сохрани явно указанные модель И артикул/SKU: одинаковое название модели не заменяет разные артикулы. Если артикула нет, не придумывай его. Все процессоры, память, диски, RAID, питание и остальные строки состава этой SKU объедини переносами строки внутри её description (до 20000 символов; пустая строка допустима). Две SKU должны дать два объекта независимо от числа компонентов. Не создавай отдельную позицию на каждый компонент и не смешивай разные комплектации. Шапка таблицы, промежуточный итог, НДС и общая сумма не являются позициями КП. Предлагаемую услугу бери из предмета документа, а не выдумывай из итоговой суммы. Если позиции неизвестны — positions:null. fields.lines и fields.lineDescriptions не возвращай; evidence для названий использует field=lines, для состава field=lineDescriptions. Цены, количества, налоги и полномочия в positions не добавляй: их пользователь заполняет отдельно. Сохрани ВСЕ этапы оплаты в paymentTerms, включая аванс, окончательный расчёт, доли, сроки и события приёмки/отказа; аванс не заменяет оставшуюся оплату. Не меняй роли исполнителя и адресата по шапке документа."] : []),
+    ...(selected.includes("proposals") ? [
+      "Для КП верни positions рядом с fields: массив объектов {name,description}, а не два независимых списка. Сначала определи тип предмета: услуга/работы либо товары. Предлагаемую услугу бери из предмета документа, а не выдумывай из итоговой суммы. Один заголовок «Коммерческое предложение» и две компании не составляют результат задачи. fields.lines и fields.lineDescriptions не возвращай; evidence для названий использует field=lines, для состава field=lineDescriptions. Если предмет неизвестен — positions:null, а не фиктивная позиция.",
+      "Если источник — договор на услуги или ТЗ, подготовь КП по этому же предмету: все функциональные блоки и оговорки, все результаты/отчётные документы и формат передачи, необходимые материалы и разрешения заказчика, зависимости и исключения. Сохрани это в description подходящей услуги, а сроки и оплату — в публичных deliveryTerms/paymentTerms. Общая стоимость договора не означает цену каждого блока: не распределяй её произвольно и не подставляй пять одинаковых общих сумм. Не подменяй оценку стоимости доработок выполнением самих доработок. Не превращай проект договора или запрошенные материалы в уже подписанный договор/полученные вложения. Номер и дата договора не являются номером и датой нового КП. Цена извлекается отдельно как исходный кандидат и требует решения пользователя в редакторе КП; согласия или подтверждения модели запрещены.",
+      "Если предлагаются товары, каждая SKU/модель/различная комплектация — ровно один объект с коротким name до 200 символов. В name сохрани явно указанные модель И артикул/SKU: одинаковое название модели не заменяет разные артикулы. Если артикула нет, не придумывай его. Все процессоры, память, диски, RAID, питание и остальные строки состава этой SKU объедини переносами строки внутри её description (до 20000 символов; пустая строка допустима). Две SKU должны дать два объекта независимо от числа компонентов. Не создавай отдельную позицию на каждый компонент и не смешивай разные комплектации. Шапка таблицы, промежуточный итог, НДС и общая сумма не являются позициями КП. Цены, количества, налоги и полномочия в positions не добавляй: их пользователь проверяет отдельно.",
+      "Сохрани ВСЕ этапы оплаты в paymentTerms, включая аванс, окончательный расчёт, доли, сроки и события приёмки/отказа; аванс не заменяет оставшуюся оплату. Сроки без конкретной исходной даты оставляй условными: рабочие/календарные дни, более позднее из событий начала, продления и ожидания. Не складывай параллельные этапы и не разрешай противоречия источника самостоятельно. Не меняй роли исполнителя и адресата по шапке документа; подписант не становится контактным лицом проекта автоматически.",
+    ] : []),
     "sourceIds может содержать только идентификаторы приложенных источников. До составления карточки проверь ВСЕ выбранные источники и каждый обязательный пункт: количества, модели, комплектующие, гарантии, опыт, сертификаты с минимальным числом специалистов, лицензии с подпунктами, документы заявки, сроки оплаты и исключения. Явный итог НМЦ в расчёте используй для той же закупки, а не только текст ТЗ. Требования и вопросы останутся неподтверждёнными, сертификаты и образование — описаниями без прикреплённых файлов.",
     `Схема допустимых полей: ${JSON.stringify(schema)}`,
     `Задача пользователя: ${JSON.stringify(instruction)}`,
@@ -455,7 +464,33 @@ export function buildIntelligenceHandoff(item: IntelligenceItem, sources: readon
       data.contact.fullName = (selected.contactName as string | undefined) || "";
       data.contact.phone = (selected.contactPhone as string | undefined) || "";
       data.contact.email = (selected.contactEmail as string | undefined) || "";
+      if (item.proposalSourceParties?.length) {
+        const parties = revalidateProposalSourceParties(item.proposalSourceParties, sources, item.sourceIds);
+        const key = (value: string) => value.normalize("NFKC").toLocaleLowerCase("ru").replace(/ё/gu, "е").replace(/\s+/gu, " ").trim();
+        for (const role of ["issuer", "recipient"] as const) {
+          const candidates = parties.filter((candidate) => candidate.role === role);
+          if (candidates.length > 1) throw new Error("Для одной стороны КП найдено несколько разных наборов реквизитов. Уточните принадлежность источников.");
+          const candidate = candidates[0], chosenName = selected[`${role}Name`];
+          if (!candidate || typeof chosenName !== "string" || !chosenName.trim()) continue;
+          if (![candidate.snapshot.name, candidate.snapshot.shortName].some((name) => name && key(name) === key(chosenName))) throw new Error("Название стороны изменилось и не соответствует исходным реквизитам. Повторите анализ или заполните сторону вручную в новом черновике.");
+          data[role] = structuredClone(candidate.snapshot);
+        }
+      }
       data.lines = ((selected.lines as string[] | undefined) || []).map((title, index) => ({ ...createProposalLine(), title, description: (selected.lineDescriptions as string[] | undefined)?.[index] || "", quantity: "", unit: "" }));
+      if (item.proposalSourceFinancials?.length) data.sourceFinancials = createProposalSourceFinancials(revalidateProposalSourceFinancials(item.proposalSourceFinancials, sources, item.sourceIds));
+      const sourceInventory = collectContractProposalFacts(sources.filter((source) => item.sourceIds.includes(source.id)));
+      if (sourceInventory.ambiguities.length) data.sourceQuestions = sourceInventory.ambiguities.map(({ id, message, evidence }) => ({ id, message, evidence: structuredClone(evidence) }));
+      for (const source of sources.filter((entry) => item.sourceIds.includes(entry.id))) {
+        const fragments = source.fragments?.filter((fragment) => (fragment.sheetState !== "hidden" && fragment.sheetState !== "veryHidden") || fragment.includedByUser === true)
+          ?? source.text.split(/\r?\n/u).map((text) => ({ text, locator: "Текст источника", id: undefined }));
+        for (const fragment of fragments) {
+          const noPrecedent = /(?:стоимост[ьи]|цен[аыуе])[\s\S]{0,200}(?:только\s+для\s+исполнения|не\s+может\s+служить\s+прецедентом)/iu.test(fragment.text);
+          const confidential = /(?:стоимост[ьи]|цен[аыуе])[\s\S]{0,180}(?:коммерческ[\p{L}\s]+тайн|не\s+подлеж[\p{L}\s]+разглашению)/iu.test(fragment.text);
+          if (!noPrecedent && !confidential) continue;
+          data.sourceQuestions ||= [];
+          data.sourceQuestions.push({ id: `price-use-${source.id}-${fragment.id || data.sourceQuestions.length}`, message: confidential ? "В источнике цена отнесена к конфиденциальным сведениям. Применение цены к расчёту этого КП не разрешает её раскрытие другому адресату. Проверьте полномочия и согласованный круг получателей перед отправкой." : "Источник ограничивает цену этим договором и исключает её использование как прецедента. Не переносите её на другой проект, объём или клиента без отдельного решения.", evidence: [{ sourceId: source.id, sourceName: source.name, ...(fragment.id ? { fragmentId: fragment.id } : {}), locator: fragment.locator, quote: fragment.text }] });
+        }
+      }
       data.internalNote = appendProvenance(data.internalNote, provenance);
       return { ...base, destination: "proposals", data };
     }

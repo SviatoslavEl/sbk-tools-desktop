@@ -2,6 +2,8 @@ import type { ContractData } from "../contracts/types";
 import type { CompanyCard } from "../contracts/companies";
 import type { ProcurementData } from "../procurement/types";
 import type { ProposalData } from "../proposals/types";
+import type { ProposalSourceFinancialCandidate } from "../proposals/sourcePricing";
+import type { ProposalSourcePartyCandidate } from "./proposalSourceParties";
 import type { StaffData } from "../staff/types";
 
 export type IntelligenceDestination = "procurement" | "contracts" | "staff" | "counterparties" | "proposals";
@@ -66,6 +68,10 @@ export interface IntelligenceItem {
   selectedFields: string[];
   evidence?: IntelligenceEvidence[];
   staffDocuments?: IntelligenceStaffDocument[];
+  /** Source-derived candidates only; applying a price is a separate human
+   * action in the receiving proposal editor, never a model confirmation. */
+  proposalSourceFinancials?: ProposalSourceFinancialCandidate[];
+  proposalSourceParties?: ProposalSourcePartyCandidate[];
 }
 export interface IntelligenceFieldDefinition {
   key: string;

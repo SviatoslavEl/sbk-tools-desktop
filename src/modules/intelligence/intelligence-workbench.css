@@ -161,3 +161,13 @@
 .iw-ocr-status details { margin-top: 3px; }
 .iw-ocr-status summary { cursor: pointer; font-size: 11px; }
 .iw-ocr-status p { margin: 6px 0 0; }
+.iw-proposal-preview { background: var(--surface, #fff); border: 1px solid var(--border, #d9e2e0); border-radius: 12px; padding: clamp(14px, 2vw, 28px); max-width: 100%; overflow-wrap: anywhere; }
+.iw-proposal-preview p { white-space: pre-wrap; line-height: 1.6; }
+.iw-proposal-preview dl { display: grid; grid-template-columns: minmax(90px, auto) minmax(0, 1fr); gap: 6px 14px; }
+.iw-proposal-preview dd { margin: 0; }
+.iw-proposal-preview h4 { margin-top: 24px; }
+.iw-task-completion, .iw-edit-result { margin-block: 16px; }
+.iw-task-issue { border-left: 3px solid var(--border, #d9e2e0); padding: 1px 12px; margin-block: 12px; overflow-wrap: anywhere; }
+.iw-task-issue.missing { border-left-color: #b44747; }
+.iw-task-issue.question { border-left-color: #b18335; }
+.iw-task-issue blockquote { white-space: pre-wrap; }

@@ -7,6 +7,7 @@ import { extractProposalIdentifierFacts, proposalIdentifiers, type ProposalIdent
 import { createRequirementComparator } from "./requirementDeduplication";
 import { isOrganizerBeneficiarySupport } from "./sourceTextCompletion";
 import { createProposalPublicTermsProver } from "./proposalPublicTerms";
+import { createContractProposalProver } from "./contractProposalCompletion";
 import { extractPreparedTableFacts, isPrimaryContractAmountLabel, isPrimaryNmcLabel, unsupportedMonetaryUnit, type PreparedTableFacts, type SourcePreparationProvenance } from "./sourcePreparedFacts";
 
 export interface EvidenceExcerpt { sourceId: string; sourceName: string; fragmentId?: string; locator: string; quote: string; }
@@ -1392,24 +1393,26 @@ export function auditIntelligenceResult(items: readonly IntelligenceItem[], sour
   const itemFingerprints = new Map(items.map((item) => [item.id, fingerprint({ title: item.title, fields: item.fields, selectedFields: item.selectedFields, sourceIds: item.sourceIds, evidence: item.evidence, staffDocuments: item.staffDocuments, sourceFingerprint })]));
   const finding = (item: IntelligenceItem, code: string, severity: EvidenceFinding["severity"], message: string, evidence: EvidenceExcerpt[], field?: string) => createFinding(item, code, severity, message, evidence, field, itemFingerprints.get(item.id));
   const provePublicTerms = items.some((item) => item.destination === "proposals" && item.selectedFields.includes("deliveryTerms")) ? createProposalPublicTermsProver(sources) : undefined;
+  const proveContractProposal = items.some((item) => item.destination === "proposals") ? createContractProposalProver(sources) : undefined;
   for (const item of items) {
     if (fieldChecks >= maxFieldChecks || report.findings.length >= maxFindings) { limited = true; break; }
     const scope = getFieldScope(item);
     const paymentProof = material.limited ? undefined : collectivePaymentProof(item, scope.units);
     const publicTermsProof = material.limited ? undefined : provePublicTerms?.prove(item, items);
     const tableProof = material.limited || !tableInventory ? undefined : preparedTableProof(item, items, tableInventory);
+    const contractProposalProof = material.limited ? undefined : proveContractProposal?.prove(item, items);
     for (const field of [...new Set(item.selectedFields)]) {
       if (fieldChecks >= maxFieldChecks || report.findings.length >= maxFindings) { limited = true; break; }
       const value = item.fields[field]; if (!meaningful(value)) continue;
       fieldChecks++;
       const noteIssue = item.destination === "procurement" && field === "notes" ? procurementNoteIssue(item, scope.dates) : undefined;
       const strictPublicTerms = field === "deliveryTerms" && Boolean(provePublicTerms?.needsProof(item));
-      const valueResult: FieldEvidenceStatus = strictPublicTerms ? { itemId: item.id, field, status: publicTermsProof ? "confirmed" : "unverified", message: publicTermsProof
+      const valueResult: FieldEvidenceStatus = contractProposalProof?.fields.get(field) || (strictPublicTerms ? { itemId: item.id, field, status: publicTermsProof ? "confirmed" : "unverified", message: publicTermsProof
         ? "Все публичные оговорки дословно подтверждены полными цитатами и заголовками выбранного КП в исходном порядке. Это проверка происхождения текста, не полноты или юридической применимости."
         : "Полный текст публичных оговорок, их порядок, область или принадлежность одному выбранному КП не подтверждены. Корректная добавленная оговорка не подтверждает остальные условия; проверьте всё поле перед переносом.", evidence: publicTermsProof?.evidence || [] }
         : noteIssue ? { itemId: item.id, field, ...noteIssue } : tableProof?.fields.get(field) || (field === "paymentTerms" && paymentProof
         ? { itemId: item.id, field, status: "confirmed", message: "Полные условия оплаты дословно подтверждены отдельными цитатами в порядке одной явно обозначенной секции. Это проверка наличия текста, не заключение о применимости, полноте документа или юридической достоверности.", evidence: paymentProof.evidence }
-        : fieldStatus(item, field, value!, scope.units, scope.dates, scope.index));
+        : fieldStatus(item, field, value!, scope.units, scope.dates, scope.index)));
       const ownerResult = staffOwnershipGate(item, valueResult, value!, scope.units, scope.dates, scope.index), ownerIssue = ownerResult && ownerResult.status !== "confirmed", result = ownerResult || valueResult;
       report.fields.push(result);
       if (result.status !== "confirmed") report.findings.push(finding(item, ownerIssue ? result.status === "conflict" ? "staff-owner-conflict" : "staff-owner-unverified" : item.destination === "procurement" && field === "submissionDeadline" && ambiguousLotDeadline(value!, scope.dates, scope.index) ? "ambiguous-lot-deadline" : result.status === "placeholder" ? "placeholder-value" : result.status === "conflict" ? "semantic-conflict" : "unverified-value", ownerIssue || noteIssue || isCritical(item.destination, field) || result.status !== "unverified" ? "blocking" : "warning", result.message, result.evidence, field));
@@ -1427,7 +1430,7 @@ export function auditIntelligenceResult(items: readonly IntelligenceItem[], sour
       const candidates = source ? [...quoteGroups.values()].filter((group) => group.unit.sourceId === source.id && (!claim.fragmentId || group.unit.fragmentId === claim.fragmentId)) : [];
       const quote = literalQuote(claim.quote), quoted = candidates.filter((group) => quote && group.text.includes(quote)).map((group) => group.unit);
       if (!claim.quote.trim() || !quoted.length) report.findings.push(finding(item, "invalid-evidence-quote", "blocking", "Указанная моделью цитата или фрагмент не найдены среди выбранных материалов. Эта ссылка не подтверждает поле.", [], claim.field));
-      else if (!paymentProof?.claims.has(claim) && !publicTermsProof?.claims.has(claim) && !tableProof?.claims.has(claim) && !quoteSupportsValue(item, claim.field, claim.quote)
+      else if (!paymentProof?.claims.has(claim) && !publicTermsProof?.claims.has(claim) && !tableProof?.claims.has(claim) && !contractProposalProof?.claims.has(claim) && !quoteSupportsValue(item, claim.field, claim.quote)
         && !(item.destination === "procurement" && claim.field === "customer" && typeof item.fields.customer === "string" && source && item.sourceIds.includes(source.id)
           && sources.filter((entry) => entry.id === source.id).length === 1 && isOrganizerBeneficiarySupport(item.fields.customer, source, claim, item.evidence || []))) report.findings.push(finding(item, "evidence-does-not-support-value", "blocking", "Цитата есть в источнике, но не содержит заявленное значение поля. Проверьте значение и ссылку.", quoted.slice(0, 2).map((unit) => excerpt(unit, claim.quote)), claim.field));
     }

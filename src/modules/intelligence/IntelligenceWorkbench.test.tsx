@@ -40,6 +40,12 @@ async function flush() { for (let i = 0; i < 30; i++) { await Promise.resolve();
 function nodes(node: ReactNode = tree): ReactElement<NodeProps>[] { if (Array.isArray(node)) return node.flatMap((child) => nodes(child ?? null)); if (!isValidElement<NodeProps>(node)) return []; return [node, ...nodes(node.props.children ?? null)]; }
 function text(node: ReactNode = tree): string { if (Array.isArray(node)) return node.map((child) => text(child ?? null)).join(""); if (isValidElement<NodeProps>(node)) return text(node.props.children ?? null); return typeof node === "string" || typeof node === "number" ? String(node) : ""; }
 function button(label: string) { const found = nodes().find((node) => node.type === "button" && text(node.props.children) === label); if (!found) throw new Error(`Кнопка не найдена: ${label}`); return found; }
+function incompleteButton(destination: string) {
+  const card = nodes().find((node) => node.props.className === "iw-card" && nodes(node).some((child) => child.type === "button" && text(child.props.children) === `Открыть черновик: ${destination}`));
+  const found = card && nodes(card).find((node) => node.type === "button" && ["Открыть неполный черновик", "Открыть КП — проверить цену и условия"].includes(text(node.props.children)));
+  if (!found) throw new Error(`Неполный черновик недоступен: ${destination}`);
+  return found;
+}
 function control(id: string) { const found = nodes().find((node) => node.props.id === id); if (!found) throw new Error(`Поле не найдено: ${id}`); return found; }
 function labeled(label: string) { const found = nodes().find((node) => node.props["aria-label"] === label); if (!found) throw new Error(`Элемент не найден: ${label}`); return found; }
 function sourceId(name: string) { const found = nodes().find((node) => node.type === "li" && text(node.props.children).includes(name)); if (!found?.key) throw new Error(`Источник не найден: ${name}`); return String(found.key); }
@@ -52,8 +58,9 @@ async function reviewVisibleFindings(resultIndex?: number) { const checks = node
 async function confirm() { nodes().find((node) => node.type === ConfirmDialog)!.props.onConfirm!(); await flush(); }
 function deferred<T>() { let resolve!: (value: T) => void; const promise = new Promise<T>((yes) => { resolve = yes; }); return { promise, resolve }; }
 const result = (items: unknown[]) => JSON.stringify({ items });
-const procurement = { destination: "procurement", title: "Тендер", fields: { name: "Тестовая закупка", customer: "Заказчик", nmc: 1000 } };
-async function addText(name = "ТЗ", value = "Открытый текст закупки") { await edit("iw-source-name", name); await edit("iw-source-text", value); await click("Добавить текст"); }
+const procurementSubject = "Проверка информационной системы";
+const procurement = { destination: "procurement", title: "Тендер", fields: { name: "Тестовая закупка", subject: procurementSubject, customer: "Заказчик", nmc: 1000 } };
+async function addText(name = "ТЗ", value = `Открытый текст закупки\nПредмет закупки: ${procurementSubject}`) { await edit("iw-source-name", name); await edit("iw-source-text", value); await click("Добавить текст"); }
 async function paste(items: unknown[] = [procurement]) { await edit("iw-response", result(items)); await click("Разобрать ответ"); }
 async function configureModel() { if (!nodes().some((node) => node.props.id === "iw-model")) await click("Настроить подключение"); await edit("iw-model", "qa-model"); }
 function holdPreparations() {
@@ -107,6 +114,24 @@ beforeEach(() => {
 afterEach(() => { for (const slot of runtime.slots) slot.cleanup?.(); vi.unstubAllGlobals(); vi.useRealTimers(); });
 
 describe("unified intelligence workflow", () => {
+  it("never treats a generic or source-free model card as prepared after acknowledging its facts", async () => {
+    await paste([{ destination: "procurement", title: "Модельная карточка", fields: { name: "Аудит приложения" } }]);
+    await reviewVisibleFindings(); expect(button("Открыть черновик: Закупки").props.disabled).toBe(true);
+    expect(() => incompleteButton("Закупки")).toThrow(/недоступен/u); button("Открыть черновик: Закупки").props.onClick!(); await flush();
+    expect(runtime.workspace).not.toHaveBeenCalled(); expect(transfer).not.toHaveBeenCalled();
+    await addText("Краткий материал", "Технические данные в приложении.");
+    await edit("iw-response", result([{ destination: "procurement", title: "Пустой предмет", fields: { name: "Закупка" } }])); await click("Разобрать ответ"); await confirm(); await reviewVisibleFindings();
+    expect(button("Открыть черновик: Закупки").props.disabled).toBe(true); expect(() => incompleteButton("Закупки")).toThrow(/недоступен/u);
+    expect(runtime.workspace).not.toHaveBeenCalled(); expect(transfer).not.toHaveBeenCalled();
+  });
+  it("requires a separate reversible confirmation before opening a semantically partial draft", async () => {
+    await addText("Описание", "Предлагается аудит приложения и подготовка отчёта.");
+    await paste([{ destination: "procurement", title: "Аудит приложения", fields: { name: "Аудит приложения" } }]); await reviewVisibleFindings();
+    expect(button("Открыть черновик: Закупки").props.disabled).toBe(true); expect(incompleteButton("Закупки").props.disabled).toBe(false);
+    incompleteButton("Закупки").props.onClick!(); await flush(); expect(transfer).not.toHaveBeenCalled();
+    nodes().find((node) => node.type === ConfirmDialog)!.props.onClose!(); await flush(); expect(transfer).not.toHaveBeenCalled();
+    incompleteButton("Закупки").props.onClick!(); await flush(); await confirm(); expect(transfer).toHaveBeenCalledOnce(); expect(text()).toContain("Открыт неполный черновик");
+  });
   it("inflects source, character and fragment counters without changing the counts", async () => {
     runtime.invoke.mockResolvedValueOnce({ fileName: "QA.pdf", extractedText: "a", sha256: "a".repeat(64), fragments: [{ id: "page-1", locator: "Страница 1", text: "a" }], warnings: [] });
     await click("Добавить PDF, DOCX или XLSX");
@@ -120,8 +145,8 @@ describe("unified intelligence workflow", () => {
   it("automatically includes all nine certificates and eight application documents when accepting the actual model boundary response", async () => {
     const certificates = [["OSCP", 5], ["OSEP", 2], ["BSCP", 3], ["OSWE", 3], ["OSWP", 3], ["KLCP", 1], ["eJPT", 1], ["CompTIA Pentest+", 1], ["HTB CPTS", 3]].map(([label, minimum]) => `o\tСертификат ${label} — не менее ${minimum};`);
     const documents = Array.from({ length: 8 }, (_, index) => `${index + 1}. Копия документа заявки ${index + 1}, если применимо.`);
-    await configureModel(); await click("Закупка"); await addText("Извещение QA", ["Закупка QA", ...certificates, ...documents].join("\n"));
-    const raw = result([{ destination: "procurement", title: "Закупка QA", fields: { name: "Закупка QA", requirements: [] } }]);
+    await configureModel(); await click("Закупка"); await addText("Извещение QA", ["Закупка QA", `Предмет закупки: ${procurementSubject}`, ...certificates, ...documents].join("\n"));
+    const raw = result([{ destination: "procurement", title: "Закупка QA", fields: { name: "Закупка QA", subject: procurementSubject, requirements: [] } }]);
     runtime.analyze.mockResolvedValueOnce({ text: raw, model: "qa-model" }); await click("Отправить выбранные источники");
     expect(field("requirements").props.value).toBe([...certificates, ...documents].join("\n"));
     expect(text()).toContain("Из источников автоматически добавлено пунктов: 17"); expect(control("iw-response").props.value).toBe(raw);
@@ -350,7 +375,7 @@ describe("unified intelligence workflow", () => {
     await configureModel(); await addText(); await addText("Не отправлять", "CONFIDENTIAL-UNSELECTED"); await toggle("Отправить источник Не отправлять", false);
     expect(text()).toContain("http://127.0.0.1:11434"); expect(runtime.analyze).not.toHaveBeenCalled(); await click("Отправить выбранные источники");
     expect(runtime.analyze).toHaveBeenCalledTimes(1); expect(runtime.analyze.mock.calls[0][1]).toContain("Открытый текст закупки"); expect(runtime.analyze.mock.calls[0][1]).not.toContain("CONFIDENTIAL-UNSELECTED");
-    expect(text()).toContain("Подготовлено карточек: 1"); expect(transfer).not.toHaveBeenCalled();
+    expect(text()).toContain("Получено черновиков: 1"); expect(transfer).not.toHaveBeenCalled();
   });
   it("runs optional narrow directions sequentially and accepts only the completed combined result", async () => {
     await configureModel(); await addText(); await click("Договоры"); await toggle("Подготовить Закупки", true); await edit("iw-analysis-mode", "by-destination");
@@ -364,7 +389,7 @@ describe("unified intelligence workflow", () => {
     expect(JSON.stringify(runtime.analyze.mock.calls[1][4])).not.toContain('"contracts"');
     expect(runtime.analyze.mock.calls[0][3]).not.toBe(runtime.analyze.mock.calls[1][3]);
     second.resolve({ text: result([procurement]), model: "qa-model" }); await flush();
-    expect(text()).toContain("Подготовлено карточек: 2"); expect(nodes().filter((node) => node.props.className === "iw-card")).toHaveLength(2); expect(transfer).not.toHaveBeenCalled();
+    expect(text()).toContain("Получено черновиков: 2"); expect(nodes().filter((node) => node.props.className === "iw-card")).toHaveLength(2); expect(transfer).not.toHaveBeenCalled();
     expect(JSON.parse(String(control("iw-response").props.value)).items).toHaveLength(2);
   });
   it("stops a narrow batch on a malformed part without changing prior cards or manual decisions", async () => {
@@ -383,7 +408,7 @@ describe("unified intelligence workflow", () => {
     await click("Отправить выбранные источники"); const requestId = runtime.analyze.mock.calls[0][3]; await click("Остановить запрос");
     expect(runtime.cancel).toHaveBeenCalledWith(requestId);
     first.resolve({ text: result([procurement]), model: "qa-model" }); await flush();
-    expect(runtime.analyze).toHaveBeenCalledTimes(1); expect(control("iw-response").props.value).toBe(""); expect(text()).not.toContain("Подготовлено карточек:");
+    expect(runtime.analyze).toHaveBeenCalledTimes(1); expect(control("iw-response").props.value).toBe(""); expect(text()).not.toContain("Получено черновиков:");
   });
   it("keeps old results after all-empty narrow replies and accepts an empty part followed by valid cards", async () => {
     await configureModel(); await addText(); await paste(); await click("Договоры"); await toggle("Подготовить Закупки", true); await edit("iw-analysis-mode", "by-destination");
@@ -391,7 +416,7 @@ describe("unified intelligence workflow", () => {
     await click("Отправить выбранные источники"); await confirm();
     expect(runtime.analyze).toHaveBeenCalledTimes(2); expect(field("name").props.value).toBe("Тестовая закупка"); expect(text()).toContain("Модель не подготовила ни одной карточки");
     runtime.analyze.mockResolvedValueOnce({ text: result([]), model: "qa-model" }).mockResolvedValueOnce({ text: result([procurement]), model: "qa-model" });
-    await click("Отправить выбранные источники"); await confirm(); expect(text()).toContain("Подготовлено карточек: 1");
+    await click("Отправить выбранные источники"); await confirm(); expect(text()).toContain("Получено черновиков: 1");
   });
   it("stops further narrow calls after source, profile, scope or workspace changes", async () => {
     await configureModel(); await addText(); await edit("iw-analysis-mode", "by-destination");
@@ -399,20 +424,24 @@ describe("unified intelligence workflow", () => {
       const first = deferred<{ text: string; model: string }>(); runtime.analyze.mockReturnValueOnce(first.promise);
       await click("Отправить выбранные источники"); const calls = runtime.analyze.mock.calls.length; await change();
       first.resolve({ text: result([procurement]), model: "qa-model" }); await flush(); expect(runtime.analyze).toHaveBeenCalledTimes(calls);
-      expect(text()).not.toContain("Подготовлено карточек:");
+      expect(text()).not.toContain("Получено черновиков:");
       await toggle("Отправить источник ТЗ", true);
     }
   });
   it("distributes mixed results to five unsaved editors independently with only selected fields", async () => {
     await addText(); await paste([procurement,
-      { destination: "contracts", title: "Договор", fields: { number: "QA-1", customer: "Контрагент", subject: "Работы" } },
+      { destination: "contracts", title: "Договор", fields: { number: "QA-1", customer: "Контрагент", subject: "Аудит информационной системы" } },
       { destination: "staff", title: "Сотрудник", fields: { fullName: "Иванов Иван", skills: ["Аудит"] } },
       { destination: "counterparties", title: "Компания", fields: { name: "Компания QA", inn: "1234567890" } },
-      { destination: "proposals", title: "Предложение", fields: { title: "КП QA", lines: ["Аудит"] } },
+      { destination: "proposals", title: "Предложение", fields: { title: "КП QA", lines: ["Аудит"], lineDescriptions: ["Проверка архитектуры и отчёт об обнаруженных рисках"] } },
     ]);
     await toggle("Передать поле Заказчик результата 1", false);
     await reviewVisibleFindings();
-    for (const label of ["Закупки", "Опыт по договорам", "Кадры", "Контрагенты", "Коммерческие предложения"]) { await click(`Открыть черновик: ${label}`); render({ ...props, active: false }); render({ ...props, active: true }); await flush(); }
+    for (const label of ["Закупки", "Опыт по договорам", "Кадры", "Контрагенты", "Коммерческие предложения"]) {
+      if (label === "Закупки") await click(`Открыть черновик: ${label}`);
+      else { expect(button(`Открыть черновик: ${label}`).props.disabled).toBe(true); expect(incompleteButton(label).props.disabled).toBe(false); incompleteButton(label).props.onClick!(); await flush(); await confirm(); }
+      render({ ...props, active: false }); render({ ...props, active: true }); await flush();
+    }
     expect(transfer.mock.calls.map(([handoff]) => handoff.destination)).toEqual(["procurement", "contracts", "staff", "counterparties", "proposals"]);
     const first = transfer.mock.calls[0][0]; expect(first.workspaceRoot).toBe("/qa-workspace"); expect(first.destination === "procurement" && first.data.customer).toBe("");
     expect(text()).toContain("черновик открыт"); expect(text()).toContain("Остальные результаты остаются"); expect(text()).not.toContain("успешно сохранена");
@@ -429,7 +458,7 @@ describe("unified intelligence workflow", () => {
     button("Добавить PDF, DOCX или XLSX").props.onClick!(); await flush(); expect(runtime.chooseOpen).not.toHaveBeenCalled();
   });
   it("rechecks real access and workspace root before transfer and serializes a double click", async () => {
-    await paste(); await reviewVisibleFindings(); const read = deferred<{ root: string; editor: boolean }>(); runtime.workspace.mockReturnValueOnce(read.promise);
+    await addText(); await paste(); await reviewVisibleFindings(); const read = deferred<{ root: string; editor: boolean }>(); runtime.workspace.mockReturnValueOnce(read.promise);
     const handler = button("Открыть черновик: Закупки").props.onClick!; handler(); handler(); await flush(); expect(runtime.workspace).toHaveBeenCalledTimes(1);
     read.resolve({ root: "/different-workspace", editor: true }); await flush(); expect(transfer).not.toHaveBeenCalled(); expect(text()).toContain("рабочую папку");
   });
@@ -453,7 +482,7 @@ describe("unified intelligence workflow", () => {
     await configureModel(); await addText(); const answer = deferred<{ text: string; model: string }>(); runtime.analyze.mockReturnValueOnce(answer.promise);
     await click("Отправить выбранные источники"); expect(button("Модель готовит ответ…").props.disabled).toBe(true);
     await edit("iw-instruction", "Новая задача"); expect(runtime.cancel).toHaveBeenCalledWith(runtime.analyze.mock.calls[0][3]);
-    answer.resolve({ text: result([procurement]), model: "qa-model" }); await flush(); expect(text()).not.toContain("Подготовлено карточек: 1"); expect(control("iw-response").props.value).toBe("");
+    answer.resolve({ text: result([procurement]), model: "qa-model" }); await flush(); expect(text()).not.toContain("Получено черновиков: 1"); expect(control("iw-response").props.value).toBe("");
   });
   it("protects corrected cards from a late replacement response", async () => {
     await configureModel(); await addText(); await paste(); const answer = deferred<{ text: string; model: string }>(); runtime.analyze.mockReturnValueOnce(answer.promise);
@@ -463,9 +492,10 @@ describe("unified intelligence workflow", () => {
     expect(field("customer").props.value).toBe("Исправленный заказчик"); expect(text()).not.toContain("Поздний результат");
   });
   it("retains prior valid cards after a malformed response and allows correcting or deselecting invalid edited fields", async () => {
-    await paste([{ destination: "staff", title: "Сотрудник", fields: { fullName: "Иванов", email: "qa@example.com" } }]);
+    await addText("Сведения сотрудника", "Сотрудник: Иванов Иван\nДолжность: Инженер");
+    await paste([{ destination: "staff", title: "Сотрудник", fields: { fullName: "Иванов Иван", role: "Инженер", email: "qa@example.com" } }]);
     await edit("iw-response", '{"items":[{"destination":"staff","title":"Плохой","fields":{"password":"x"}}]}'); await click("Разобрать ответ"); await confirm();
-    expect(text()).toContain("Недопустимое поле"); expect(field("fullName").props.value).toBe("Иванов");
+    expect(text()).toContain("Недопустимое поле"); expect(field("fullName").props.value).toBe("Иванов Иван");
     field("email").props.onChange!({ target: { value: "invalid-email", checked: false } }); await flush(); expect(button("Открыть черновик: Кадры").props.disabled).toBe(true);
     await toggle("Передать поле Почта результата 1", false); await reviewVisibleFindings(); expect(button("Открыть черновик: Кадры").props.disabled).toBe(false); await click("Открыть черновик: Кадры");
     const handoff = transfer.mock.calls[0][0]; expect(handoff.destination === "staff" && handoff.data.email).toBe("");
@@ -518,7 +548,7 @@ describe("unified intelligence workflow", () => {
     button("Добавить карточку вручную").props.onClick!(); await flush(); expect(text()).toContain("не более 100 карточек");
   }, 20000);
   it("keeps malformed numeric and dated values visible until explicitly corrected or deselected", async () => {
-    await paste([{ destination: "procurement", title: "Тендер с исправлениями", fields: { name: "Реальная закупка", nmc: "0,00", submissionDeadline: "2026-10-31T12:30:00+03:00", publishedDate: null } }]);
+    await addText(); await paste([{ destination: "procurement", title: "Тендер с исправлениями", fields: { name: "Реальная закупка", subject: procurementSubject, nmc: "0,00", submissionDeadline: "2026-10-31T12:30:00+03:00", publishedDate: null } }]);
     expect(field("nmc").props.type).toBe("text"); expect(field("nmc").props.value).toBe("0,00");
     expect(field("submissionDeadline").props.type).toBe("text"); expect(field("submissionDeadline").props.value).toBe("2026-10-31T12:30:00+03:00");
     expect(field("publishedDate").props.value).toBe(""); expect(button("Открыть черновик: Закупки").props.disabled).toBe(true);
@@ -530,7 +560,7 @@ describe("unified intelligence workflow", () => {
     if (handoff.destination === "procurement") { expect(handoff.data.nmc).toBe(1500.5); expect(handoff.data.submissionDeadline).toBe("2026-10-31"); expect(handoff.data.notes).toContain("12:30:00+03:00"); }
   });
   it("does not turn a provider's zero string into a confirmed numeric zero without user input", async () => {
-    await paste([{ destination: "procurement", title: "Без НМЦ", fields: { name: "Закупка", nmc: "0,00" } }]);
+    await addText(); await paste([{ destination: "procurement", title: "Без НМЦ", fields: { name: "Закупка", subject: procurementSubject, nmc: "0,00" } }]);
     expect(field("nmc").props.value).toBe("0,00"); expect(button("Открыть черновик: Закупки").props.disabled).toBe(true);
     await toggle("Передать поле Начальная цена, ₽ результата 1", false); await reviewVisibleFindings(); expect(field("nmc").props.value).toBe("0,00"); expect(button("Открыть черновик: Закупки").props.disabled).toBe(false);
     await toggle("Передать поле Начальная цена, ₽ результата 1", true); field("nmc").props.onChange!({ target: { value: "0,00", checked: false } }); await flush();
@@ -539,7 +569,7 @@ describe("unified intelligence workflow", () => {
   it("treats empty answers as warnings and preserves existing corrected cards and raw answer", async () => {
     await configureModel(); await addText(); await paste(); field("customer").props.onChange!({ target: { value: "Проверенный заказчик", checked: false } }); await flush();
     runtime.analyze.mockResolvedValueOnce({ text: '{"items":[]}', model: "qa-model" }); await click("Отправить выбранные источники"); await confirm();
-    expect(text()).toContain("Модель не подготовила ни одной карточки"); expect(text()).not.toContain("Подготовлено карточек: 0");
+    expect(text()).toContain("Модель не подготовила ни одной карточки"); expect(text()).not.toContain("Получено черновиков: 0");
     expect(field("customer").props.value).toBe("Проверенный заказчик"); expect(control("iw-response").props.value).toBe('{"items":[]}');
     expect(nodes().find((node) => node.props.className === "iw-raw-response")?.props.open).toBe(true); expect(text()).toContain("предыдущий разобранный результат");
   });
@@ -571,7 +601,7 @@ describe("unified intelligence workflow", () => {
     expect(control("iw-output-mode").props.value).toBe("json"); expect(JSON.parse(localValues.get("sbk-intelligence-connections-v1")!)[0]).not.toHaveProperty("outputMode");
   });
   it("keeps date inputs as text before correction, after valid correction, and when cleared", async () => {
-    await paste([{ destination: "procurement", title: "Дата", fields: { name: "Закупка", submissionDeadline: "2026-10-21 16:00" } }]);
+    await addText(); await paste([{ destination: "procurement", title: "Дата", fields: { name: "Закупка", subject: procurementSubject, submissionDeadline: "2026-10-21 16:00" } }]);
     expect(field("submissionDeadline").props.type).toBe("text"); expect(field("submissionDeadline").props.value).toBe("2026-10-21 16:00");
     field("submissionDeadline").props.onChange!({ target: { value: "2026-10-21", checked: false } }); await flush();
     expect(field("submissionDeadline").props.type).toBe("text"); expect(field("submissionDeadline").props.value).toBe("2026-10-21");
@@ -580,13 +610,13 @@ describe("unified intelligence workflow", () => {
     expect(field("submissionDeadline").props.type).toBe("text"); expect(field("submissionDeadline").props.value).toBe("");
   });
   it("clears the previous success notice when a manual response fails to parse", async () => {
-    await paste(); expect(text()).toContain("Подготовлено карточек: 1");
+    await paste(); expect(text()).toContain("Получено черновиков: 1");
     await edit("iw-response", "not JSON"); await click("Разобрать ответ"); await confirm();
-    expect(text()).not.toContain("Подготовлено карточек: 1"); expect(text()).toContain("не является корректным JSON");
+    expect(text()).not.toContain("Получено черновиков: 1"); expect(text()).toContain("не является корректным JSON");
     expect(control("iw-response").props.value).toBe("not JSON"); expect(field("name").props.value).toBe("Тестовая закупка");
   });
   it("blocks captured transfer callbacks until every blocking evidence finding is explicitly reviewed", async () => {
-    await paste(); const captured = button("Открыть черновик: Закупки").props.onClick!;
+    await addText(); await paste(); const captured = button("Открыть черновик: Закупки").props.onClick!;
     expect(button("Открыть черновик: Закупки").props.disabled).toBe(true); captured(); await flush(); expect(runtime.workspace).not.toHaveBeenCalled();
     expect(text()).toContain("Есть неподтверждённые факты"); await reviewVisibleFindings(); expect(button("Открыть черновик: Закупки").props.disabled).toBe(false);
     const reviewedCallback = button("Открыть черновик: Закупки").props.onClick!;
@@ -747,7 +777,7 @@ describe("unified intelligence workflow", () => {
       postMessage(request: EvidenceAuditRequest | ResponsePreparationRequest) { if (this.url.pathname.endsWith("responsePreparationWorker.ts")) this.onmessage?.({ data: runResponsePreparation(request) }); else this.request = request as EvidenceAuditRequest; }
       terminate() { this.terminated = true; }
     }
-    vi.stubGlobal("Worker", WorkerStub); await paste(); expect(text()).toContain("Проверяем значения и обязательные условия");
+    vi.stubGlobal("Worker", WorkerStub); await addText(); await paste(); expect(text()).toContain("Проверяем значения и обязательные условия");
     button("Открыть черновик: Закупки").props.onClick!(); await flush(); expect(runtime.workspace).not.toHaveBeenCalled();
     workers[0].onerror!(); await flush(); expect(text()).toContain("Локальную проверку фактов не удалось завершить");
     await click("Повторить проверку фактов"); expect(workers[0].terminated).toBe(true); expect(workers).toHaveLength(2);
@@ -761,8 +791,8 @@ describe("unified intelligence workflow", () => {
   });
   it.each(["timeout", "messageerror"] as const)("makes audit %s retryable without replacing the accepted card or accepting a late reply", async (kind) => {
     vi.useFakeTimers(); const audits = holdAudits();
-    await addText("Извещение QA", "Синтетическая закупка QA");
-    await paste([{ destination: "procurement", title: "Синтетическая закупка QA", fields: { name: "Синтетическая закупка QA" } }]);
+    await addText("Извещение QA", `Синтетическая закупка QA\nПредмет закупки: ${procurementSubject}`);
+    await paste([{ destination: "procurement", title: "Синтетическая закупка QA", fields: { name: "Синтетическая закупка QA", subject: procurementSubject } }]);
     const originalRaw = control("iw-response").props.value, first = audits[0], retainedReply = first.onmessage!;
     expect(text()).toContain("Проверяем значения и обязательные условия"); expect(button("Открыть черновик: Закупки").props.disabled).toBe(true);
     if (kind === "timeout") await vi.advanceTimersByTimeAsync(evidenceAuditTimeoutMilliseconds);
@@ -786,7 +816,10 @@ describe("unified intelligence workflow", () => {
     expect(field("requirements").props.value).toBe(""); expect(text()).toContain("Страница 1"); expect(text()).toContain("OSCP — не менее 5 специалистов"); expect(text()).toContain("Не найдено в переносимых данных");
     await click("Добавить точное условие в требования"); expect(field("requirements").props.value).toBe("OSCP — не менее 5 специалистов");
     expect(labeled("Источник Условия.pdf для результата 1").props.checked).toBe(true); expect(text()).toContain("Сопоставление обязательных условий: 1 из 1 найдено");
-    expect(button("Открыть черновик: Закупки").props.disabled).toBe(false); await click("Открыть черновик: Закупки");
+    // A repaired literal condition is not independent coverage of the whole
+    // procurement task. Its incomplete-draft route remains an explicit choice.
+    expect(button("Открыть черновик: Закупки").props.disabled).toBe(true); expect(incompleteButton("Закупки").props.disabled).toBe(false);
+    incompleteButton("Закупки").props.onClick!(); await flush(); await confirm();
     const handoff = transfer.mock.calls[0][0]; if (handoff.destination === "procurement") expect(handoff.data.requirements[0].text).toBe("OSCP — не менее 5 специалистов");
   });
   it("adds deadline time and timezone explicitly and binds the note to its source", async () => {
@@ -796,7 +829,7 @@ describe("unified intelligence workflow", () => {
     field("notes").props.onChange!({ target: { value: "", checked: false } }); await flush();
     expect(button("Открыть черновик: Закупки").props.disabled).toBe(true);
     await click("Добавить время в примечания"); expect(field("notes").props.value).toContain("16:00 МСК"); expect(text()).toContain("Сопоставление обязательных условий: 1 из 1 найдено");
-    expect(button("Открыть черновик: Закупки").props.disabled).toBe(false);
+    expect(button("Открыть черновик: Закупки").props.disabled).toBe(true); expect(incompleteButton("Закупки").props.disabled).toBe(false);
   });
   it("keeps a source-wide MSK declaration and both quote locators when adding deadline time", async () => {
     const zone = "Время в настоящем документе указано в MSK.";
@@ -810,7 +843,8 @@ describe("unified intelligence workflow", () => {
     const note = String(field("notes").props.value); expect(note).toContain("16:00 MSK"); expect(note).toContain(zone); expect(note).toContain(deadline);
     expect(note.split(zone)).toHaveLength(2); expect(note.split(deadline)).toHaveLength(2);
     expect(text()).toContain("Сопоставление обязательных условий: 1 из 1 найдено"); expect(text()).not.toContain("Цитата есть в источнике, но не содержит");
-    expect(button("Открыть черновик: Закупки").props.disabled).toBe(false); await click("Открыть черновик: Закупки");
+    expect(button("Открыть черновик: Закупки").props.disabled).toBe(true); expect(incompleteButton("Закупки").props.disabled).toBe(false);
+    incompleteButton("Закупки").props.onClick!(); await flush(); await confirm();
     const handoff = transfer.mock.calls[0][0]; if (handoff.destination === "procurement") { expect(handoff.data.notes.startsWith(`${note}\n\n`)).toBe(true); expect(handoff.provenance).toContain("Абзац 1"); expect(handoff.provenance).toContain("Абзац 8"); }
   });
   it("keeps a glued document timezone after a revision prefix in a manual source and rejects the wrong following day", async () => {
@@ -824,7 +858,7 @@ describe("unified intelligence workflow", () => {
     field("notes").props.onChange!({ target: { value: "", checked: false } }); await flush(); await click("Добавить время в примечания");
     expect(field("notes").props.value).toContain("16:00 MSK"); expect(field("notes").props.value).toContain(zone); expect(field("notes").props.value).toContain(deadline);
     expect(text()).toContain("Сопоставление обязательных условий: 1 из 1 найдено");
-    expect(button("Открыть черновик: Закупки").props.disabled).toBe(false);
+    expect(button("Открыть черновик: Закупки").props.disabled).toBe(true); expect(incompleteButton("Закупки").props.disabled).toBe(false);
     expect(runtime.analyze).not.toHaveBeenCalled();
   });
   it("adds only the missing inherited zone when the original deadline quote is already in notes", async () => {
@@ -848,7 +882,7 @@ describe("unified intelligence workflow", () => {
     field("notes").props.onChange!({ target: { value: manual, checked: false } }); await flush();
     await click("Добавить время в примечания");
     expect(String(field("notes").props.value).startsWith(`${manual}\n`)).toBe(true); expect(field("notes").props.value).toContain(deadline); expect(field("notes").props.value).toContain(zone);
-    expect(text()).not.toContain("Цитата есть в источнике, но не содержит"); expect(button("Открыть черновик: Закупки").props.disabled).toBe(false);
+    expect(text()).not.toContain("Цитата есть в источнике, но не содержит"); expect(button("Открыть черновик: Закупки").props.disabled).toBe(true); expect(incompleteButton("Закупки").props.disabled).toBe(false);
   });
   it("does not borrow MSK from another selected document", async () => {
     await addText("Пояс другого документа", "Время в настоящем документе указано в MSK.");
@@ -895,9 +929,9 @@ describe("unified intelligence workflow", () => {
     await click("Добавить время в примечания"); expect(field("notes").props.value).toBe("42"); expect(text()).toContain("Исходное значение сохранено");
   });
   it("links price facts to the selected pricing source instead of borrowing unrelated document values", async () => {
-    await addText("Техническое задание", "Поставка оборудования"); const technicalId = sourceId("Техническое задание");
+    await addText("Техническое задание", "Предмет закупки: Поставка оборудования"); const technicalId = sourceId("Техническое задание");
     await addText("Расчёт цены", "Итого НМЦ договора: 2 000 руб.");
-    await paste([{ destination: "procurement", title: "Поставка оборудования", fields: { name: "Поставка оборудования", nmc: 2000 }, sourceIds: [technicalId] }]);
+    await paste([{ destination: "procurement", title: "Поставка оборудования", fields: { name: "Поставка оборудования", subject: "Поставка оборудования", nmc: 2000 }, sourceIds: [technicalId] }]);
     expect(labeled("Источник Расчёт цены для результата 1").props.checked).toBe(false); expect(button("Открыть черновик: Закупки").props.disabled).toBe(true);
     await toggle("Источник Расчёт цены для результата 1", true); expect(button("Открыть черновик: Закупки").props.disabled).toBe(false); await click("Открыть черновик: Закупки");
     expect(transfer.mock.calls[0][0].provenance).toContain("Расчёт цены");
@@ -915,10 +949,12 @@ describe("unified intelligence workflow", () => {
     const handoff = transfer.mock.calls[0][0]; if (handoff.destination === "proposals") { expect(handoff.data.lines).toHaveLength(2); expect(handoff.data.lines[0].description).toBe(""); expect(handoff.data.lines[1].description).toBe("Процессор A\nПамять A\nНакопитель A"); expect(handoff.data.lines.every((line) => line.quantity === "" && line.unitPrice === "")).toBe(true); }
   });
   it("recovers one invalid scalar description as one multiline description rather than splitting lines", async () => {
+    await addText("Описание оборудования", "Сервер: процессор, память, накопитель.");
     await paste([{ destination: "proposals", title: "КП", fields: { title: "КП", lines: ["Сервер"], lineDescriptions: "Процессор\nПамять\nНакопитель" } }]);
     expect(field("lineDescriptions").props.value).toBe("Процессор\nПамять\nНакопитель"); await click("Использовать текст как одно описание");
     expect(labeled("Описание позиции 1 результата 1").props.value).toBe("Процессор\nПамять\nНакопитель");
-    await reviewVisibleFindings(); await click("Открыть черновик: Коммерческие предложения"); const handoff = transfer.mock.calls[0][0];
+    await reviewVisibleFindings(); expect(button("Открыть черновик: Коммерческие предложения").props.disabled).toBe(true);
+    expect(incompleteButton("Коммерческие предложения").props.disabled).toBe(false); incompleteButton("Коммерческие предложения").props.onClick!(); await flush(); await confirm(); const handoff = transfer.mock.calls[0][0];
     if (handoff.destination === "proposals") { expect(handoff.data.lines).toHaveLength(1); expect(handoff.data.lines[0].description).toBe("Процессор\nПамять\nНакопитель"); }
   });
   it("keeps hidden worksheets excluded by default and transmits warnings with selected material", async () => {

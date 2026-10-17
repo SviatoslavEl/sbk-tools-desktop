@@ -1,4 +1,5 @@
 import type { PartySnapshot, ProposalContact, ProposalData, ProposalLine, ProposalTemplate } from './types';
+import { resetProposalSourcePricing } from './sourcePricing';
 
 export function emptyParty(): PartySnapshot {
   return { name: '', shortName: '', inn: '', kpp: '', ogrn: '', address: '', contact: '', paymentDetails: '' };
@@ -21,7 +22,7 @@ export function createProposal(now = new Date()): ProposalData {
 }
 export function cloneProposal(source: ProposalData): ProposalData {
   const fresh = createProposal();
-  return { ...structuredClone(source), familyId: fresh.familyId, number: fresh.number, documentDate: fresh.documentDate, validUntil: fresh.validUntil, revision: 1, status: 'draft' };
+  return resetProposalSourcePricing({ ...structuredClone(source), familyId: fresh.familyId, number: fresh.number, documentDate: fresh.documentDate, validUntil: fresh.validUntil, revision: 1, status: 'draft' });
 }
 export function nextProposalRevision(source: ProposalData, maxRevision = source.revision): ProposalData {
   return { ...structuredClone(source), revision: Math.max(source.revision, maxRevision) + 1, status: 'draft' };

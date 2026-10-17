@@ -1,6 +1,7 @@
 import type { AttachmentInfo } from '../../lib/storage';
 import { localDate } from './defaults';
 import { MAX_PROPOSAL_LINES, priceProposal, priceProposalLine, ProposalPricingError } from './pricing';
+import { proposalSourcePricingIssues } from './sourcePricing';
 import type { PartySnapshot, ProposalContact, ProposalData, ProposalIssue, ProposalPublicDocument, PublicAsset } from './types';
 
 function validDate(value: string): boolean {
@@ -49,6 +50,8 @@ export function validateProposal(data: ProposalData, options: ProposalValidation
   }
   if (data.template.logo && (!['image/png', 'image/jpeg'].includes(data.template.logo.mimeType) || data.template.logo.sizeBytes > 5 * 1024 * 1024)) issue('template.logo', 4, 'Логотип: PNG или JPEG размером до 5 МБ');
   if (data.attachments.length > 100) issue('attachments', 3, 'Не более 100 приложений');
+  for (const message of proposalSourcePricingIssues(data)) issue('sourceFinancials', 2, message);
+  for (const question of data.sourceQuestions || []) issue('sourceQuestions', 3, question.message, 'warning');
   return issues;
 }
 function publicParty(party: PartySnapshot): ProposalPublicDocument['issuer'] {

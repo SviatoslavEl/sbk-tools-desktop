@@ -5,6 +5,10 @@ import { completeSourceDates } from "./sourceDateCompletion";
 import { completeSourceTextFields } from "./sourceTextCompletion";
 import { completeSourcePositions } from "./sourcePositionCompletion";
 import { completeSourceStaffCertificates } from "./sourceStaffCertificates";
+import { completeContractProposalFields } from "./contractProposalCompletion";
+import { extractProposalSourceFinancials } from "./proposalSourceFinancials";
+import { extractProposalSourceParties } from "./proposalSourceParties";
+import { createProposalSourceFinancials, type ProposalSourceFinancialCandidate } from "../proposals/sourcePricing";
 import { quarantineConflictingFields } from "./quarantineConflictingFields";
 import { buildIntelligenceResponseSchema, destinationLabels, fieldDefinitions, parseIntelligenceResult } from "./workbenchModel";
 import { assertResponsePreparationRaw, assertResponsePreparationSources, RESPONSE_PREPARATION_LIMITS } from "./responsePreparationBounds";
@@ -34,7 +38,7 @@ const distinct = (values: unknown[]) => new Set(values).size === values.length;
 const errorLimit = 1000;
 
 function validItem(value: unknown): value is IntelligenceItem {
-  if (!object(value) || !keys(value, ["id", "destination", "title", "fields", "selectedFields", "sourceIds", "evidence", "staffDocuments"])
+  if (!object(value) || !keys(value, ["id", "destination", "title", "fields", "selectedFields", "sourceIds", "evidence", "staffDocuments", "proposalSourceFinancials", "proposalSourceParties"])
     || !id(value.id) || typeof value.destination !== "string" || !own(destinationLabels, value.destination) || !text(value.title, 40_000)
     || !object(value.fields)) return false;
   const definitions = fieldDefinitions[value.destination as IntelligenceDestination], fields = value.fields;
@@ -46,6 +50,25 @@ function validItem(value: unknown): value is IntelligenceItem {
     && optional(value, "evidence", (entry) => array(entry, 500, (claim) => object(claim)
       && typeof claim.field === "string" && definitions.some((definition) => definition.key === claim.field)
       && id(claim.sourceId) && (value.sourceIds as unknown[]).includes(claim.sourceId) && optional(claim, "fragmentId", id) && text(claim.quote, 4000, true)))
+    && optional(value, "proposalSourceFinancials", (entry) => {
+      if (value.destination !== "proposals" || !Array.isArray(entry) || entry.length > 100) return false;
+      const candidateKeys = ["id", "sourceId", "sourceName", "sourceSha256", "fragmentId", "locator", "quote", "sourceKind", "scope", "positionName", "currency", "net", "vatAmount", "gross", "quantity", "unit", "unitPrice", "priceBasis", "tax", "issues"];
+      if (!entry.every((candidate) => object(candidate) && keys(candidate, candidateKeys) && (value.sourceIds as unknown[]).includes(candidate.sourceId)
+        && object(candidate.tax) && keys(candidate.tax, candidate.tax.kind === "vat" ? ["kind", "rate"] : ["kind"])
+        && ["net", "vatAmount", "gross", "quantity", "unitPrice"].every((key) => optional(candidate, key, (part) => text(part, 40, true))))) return false;
+      try { return JSON.stringify(createProposalSourceFinancials(entry as ProposalSourceFinancialCandidate[]).candidates) === JSON.stringify(entry); }
+      catch { return false; }
+    })
+    && optional(value, "proposalSourceParties", (entry) => value.destination === "proposals" && array(entry, 200, (candidate) => object(candidate)
+      && keys(candidate, ["id", "documentId", "sourceId", "sourceName", "sourceSha256", "role", "snapshot", "evidence", "issues"])
+      && text(candidate.id, 200, true) && text(candidate.documentId, 200, true) && id(candidate.sourceId) && (value.sourceIds as unknown[]).includes(candidate.sourceId)
+      && text(candidate.sourceName, 2000) && optional(candidate, "sourceSha256", (part) => typeof part === "string" && /^[a-f\d]{64}$/iu.test(part))
+      && ["issuer", "recipient"].includes(String(candidate.role)) && object(candidate.snapshot)
+      && keys(candidate.snapshot, ["name", "shortName", "inn", "kpp", "ogrn", "address", "contact", "paymentDetails"])
+      && ["name", "shortName", "inn", "kpp", "ogrn", "address", "contact", "paymentDetails"].every((key) => text((candidate.snapshot as Record<string, unknown>)[key], 20_000))
+      && array(candidate.evidence, 100, (part) => object(part) && keys(part, ["sourceId", "sourceName", "fragmentId", "locator", "quote"])
+        && part.sourceId === candidate.sourceId && text(part.sourceName, 2000) && optional(part, "fragmentId", id) && text(part.locator, 20_000) && text(part.quote, 20_000, true))
+      && array(candidate.issues, 100, (part) => text(part, 2000))))
     && optional(value, "staffDocuments", (entry) => {
       if (value.destination !== "staff" || !Array.isArray(entry) || entry.length > 100) return false;
       const documentKeys = ["id", "ownerFullName", "category", "name", "seriesNumber", "examDate", "reportedValidity", "sourceId", "fragmentId", "headerFragmentId", "quote", "headerQuote"];
@@ -136,18 +159,36 @@ export function runResponsePreparation(request: unknown): ResponsePreparationRep
     const deduplicated = deduplicateRequirements(items);
     const sourcePrepared = prepareIntelligenceSourceFacts(deduplicated.items, sources, request.destinations as IntelligenceDestination[]);
     const staffPrepared = completeSourceStaffCertificates(sourcePrepared.items, sources, request.destinations as IntelligenceDestination[]);
-    if (!staffPrepared.items.length) {
-      if (sourcePrepared.limited || staffPrepared.limited) throw new Error("Явные таблицы не разобраны полностью: достигнут предел подготовки. Разделите материалы и повторите анализ.");
+    const contractPrepared = completeContractProposalFields(staffPrepared.items, sources, request.destinations as IntelligenceDestination[]);
+    if (!contractPrepared.items.length) {
+      if (sourcePrepared.limited || staffPrepared.limited || contractPrepared.limited) throw new Error("Источники не разобраны полностью: достигнут предел подготовки. Разделите материалы и повторите анализ.");
       return { revision, empty: true };
     }
-    const textPrepared = completeSourceTextFields(staffPrepared.items, sources);
+    const textPrepared = completeSourceTextFields(contractPrepared.items, sources);
     const dated = completeSourceDates(textPrepared.items, sources);
     const positioned = completeSourcePositions(dated.items, sources);
     const completed = completeIntelligenceConditions(positioned.items, sources, { includeOperational: true });
     const expanded = collapseExpandedRequirementHeadings(completed.items, sources);
     const quarantined = quarantineConflictingFields(expanded.items, sources);
-    const receipt: SourcePreparationReceipt = { changes: [...deduplicated.changes, ...sourcePrepared.changes, ...staffPrepared.changes, ...textPrepared.changes, ...dated.changes, ...positioned.changes, ...expanded.changes, ...quarantined.changes], skipped: [...sourcePrepared.skipped, ...staffPrepared.skipped, ...textPrepared.skipped, ...dated.skipped, ...positioned.skipped, ...quarantined.skipped], limited: sourcePrepared.limited || staffPrepared.limited || textPrepared.limited || dated.limited || positioned.limited || quarantined.limited };
-    const prepared: ResponsePreparationResult = { ...completed, items: quarantined.items, ...(receipt.changes.length || receipt.skipped.length || receipt.limited ? { sourcePreparation: receipt } : {}) };
+    const receipt: SourcePreparationReceipt = { changes: [...deduplicated.changes, ...sourcePrepared.changes, ...staffPrepared.changes, ...contractPrepared.changes, ...textPrepared.changes, ...dated.changes, ...positioned.changes, ...expanded.changes, ...quarantined.changes], skipped: [...sourcePrepared.skipped, ...staffPrepared.skipped, ...contractPrepared.skipped, ...textPrepared.skipped, ...dated.skipped, ...positioned.skipped, ...quarantined.skipped], limited: sourcePrepared.limited || staffPrepared.limited || contractPrepared.limited || textPrepared.limited || dated.limited || positioned.limited || quarantined.limited };
+    const financialItems = quarantined.items.map((item) => {
+      if (item.destination !== "proposals") return item;
+      const financial = extractProposalSourceFinancials(sources.filter((source) => item.sourceIds.includes(source.id)));
+      receipt.limited ||= financial.limited;
+      for (const message of financial.issues) receipt.skipped.push({ itemId: item.id, field: "source-price", reason: "financial-review", message, requiresReview: true });
+      const candidates = financial.candidates.filter((candidate) => {
+        if (quarantined.items.filter((other) => other.destination === "proposals" && other.sourceIds.includes(candidate.sourceId)).length === 1) return true;
+        receipt.skipped.push({ itemId: item.id, field: "source-price", reason: "financial-owner-ambiguous", message: "Один источник связан с несколькими КП. Общая цена не сопоставлена с конкретным проектом и не предлагается к применению автоматически.", requiresReview: true });
+        return false;
+      });
+      const partyResult = extractProposalSourceParties(sources.filter((source) => item.sourceIds.includes(source.id)));
+      receipt.limited ||= partyResult.limited;
+      for (const message of partyResult.issues) receipt.skipped.push({ itemId: item.id, field: "source-party", reason: "party-review", message, requiresReview: true });
+      const parties = partyResult.candidates.filter((candidate) => quarantined.items.filter((other) => other.destination === "proposals" && other.sourceIds.includes(candidate.sourceId)).length === 1);
+      for (const candidate of parties) for (const message of candidate.issues) receipt.skipped.push({ itemId: item.id, field: "source-party", reason: "party-field-review", message, requiresReview: true });
+      return { ...item, ...(candidates.length ? { proposalSourceFinancials: candidates } : {}), ...(parties.length ? { proposalSourceParties: parties } : {}) };
+    });
+    const prepared: ResponsePreparationResult = { ...completed, items: financialItems, ...(receipt.changes.length || receipt.skipped.length || receipt.limited ? { sourcePreparation: receipt } : {}) };
     if (!validPrepared(prepared)) throw new Error("Результат подготовки ответа некорректен или превышает допустимый объём. Разделите материалы.");
     return { revision, prepared };
   } catch (reason) {
