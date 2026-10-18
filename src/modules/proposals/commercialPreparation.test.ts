@@ -191,6 +191,30 @@ describe("source-derived commercial review draft", () => {
     expect(target.quote).toContain("что наступит позднее"); expect(ref.localTargetIds).toHaveLength(1);
     expect(blocks(document).some((block) => block.kind === "paragraph" && block.content.some((part) => part.kind === "local-ref" && part.targetId === ref.localTargetIds![0]))).toBe(true);
   });
+  it("links a unique split source clause to every complete part without choosing an advance answer", async () => {
+    const input = source();
+    input.fragments![8].text += " Аванс определяется п. 3.2 Договора.";
+    input.text = input.fragments!.map(fragment => fragment.text).join("\n");
+    const before = JSON.stringify(input), document = (await prepare([input])).document!;
+    const advance = placement(document, input.fragments![5].text);
+    expect(advance.receipt.kind).toBe("split"); expect(advance.ids).toHaveLength(2);
+    const caller = placement(document, input.fragments![8].text);
+    const reference = document.privateAppendix.references.find(ref => ref.sourceClauseId === caller.clause.id && ref.printed === "3.2")!;
+    expect(reference.candidateClauseIds).toEqual([advance.clause.id]);
+    expect(reference.localTargetIds).toEqual(advance.ids);
+    expect(text(blocks(document).find(block => block.id === caller.ids[0])!)).toContain(advance.ids.map(id => `[${id}]`).join(", "));
+    expect(validateCommercialSourceProjection(document)).toEqual([]);
+    expect(await validateCommercialQuoteHashes(document)).toEqual([]);
+    expect(document.questions.some(question => question.kind === "advance-base")).toBe(true);
+    expect(document.questions.some(question => question.kind === "advance-days")).toBe(true);
+    expect(document.questions.some(question => question.sourceReferenceIds.includes(reference.id))).toBe(false);
+    expect(document.decisions).toEqual([]); expect(JSON.stringify(input)).toBe(before);
+    const partial = structuredClone(document);
+    partial.privateAppendix.references.find(ref => ref.id === reference.id)!.localTargetIds = [advance.ids[0]];
+    expect(validateCommercialSourceProjection(partial).some(issue => issue.code === "commercial-source-projection")).toBe(true);
+    const price = document.privateAppendix.references.find(ref => ref.sourceClauseId === advance.clause.id && ref.printed === "3.1")!;
+    expect(price.localTargetIds).toBeUndefined();
+  });
   it("retains OR and separate primary/repeat acceptance targets", async () => {
     const document = (await prepare()).document!, final = document.privateAppendix.clauses.find((clause) => clause.quote.startsWith("3.3."))!;
     const refs = document.privateAppendix.references.filter((ref) => ref.sourceClauseId === final.id && ref.kind === "clause");

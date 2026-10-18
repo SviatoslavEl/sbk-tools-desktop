@@ -193,6 +193,15 @@ function freezePrivateAppendix(document: ProposalCommercialDocumentV1): void {
   freeze(document.privateAppendix);
 }
 
+/** A source clause may occupy several independently editable terms. A link
+ * to the whole clause must retain all of them; taking the first split part
+ * would silently narrow the referenced advance or stage condition. */
+function completeCoverageTargets(entry: CommercialClauseCoverage | undefined): string[] {
+  if (!entry) return [];
+  if (entry.kind === "literal" || entry.kind === "projected" || entry.kind === "deduplicated") return entry.targetBlockIds;
+  return entry.kind === "split" ? [...new Set(entry.parts.map(part => part.targetBlockId))] : [];
+}
+
 /** A literal/source-projection receipt is checked against actual current body
  * content, not trusted because its coverage label says 'literal'. Human term
  * replacements are not reclassified as source quotes here. */
@@ -230,7 +239,7 @@ export function validateCommercialSourceProjection(document: ProposalCommercialD
     if (ref.localTargetIds?.length) {
       const targets = ref.candidateClauseIds.flatMap((id) => {
         const entry = appendix.coverage.find((part) => part.sourceClauseId === id);
-        return entry && (entry.kind === "literal" || entry.kind === "projected" || entry.kind === "deduplicated") && entry.targetBlockIds.length === 1 ? entry.targetBlockIds : [];
+        return completeCoverageTargets(entry);
       });
       if (!ref.labels?.length || ref.candidateClauseIds.length !== ref.labels.length || commercialCanonicalJson([...new Set(targets)]) !== commercialCanonicalJson(ref.localTargetIds)) changed(ref.sourceClauseId, "Локальная ссылка не ведёт к полному однозначному исходному целевому условию.");
     }
@@ -394,8 +403,8 @@ export async function prepareCommercialDocument(input: CommercialPreparationInpu
       if (!["clause", "section"].includes(ref.kind) || !ref.labels?.length) continue;
       const targets = ref.labels.map((label) => ref.candidateClauseIds.filter((id) => source.clauses.find((clause) => clause.id === id)?.printedLabel === label));
       if (!targets.every((matches) => matches.length === 1)) continue;
-      const mapped = targets.map(([id]) => blockForClause.get(id));
-      if (mapped.every((entry) => entry?.length === 1)) ref.localTargetIds = [...new Set(mapped.flatMap((entry) => entry!))];
+      const mapped = targets.map(([id]) => completeCoverageTargets(coverage.find(entry => entry.sourceClauseId === id)));
+      if (mapped.every(entry => entry.length > 0)) ref.localTargetIds = [...new Set(mapped.flat())];
     }
     // Replace only exact numeric spans belonging to proven local targets.
     // Governing-document words and their events remain literal/unresolved.
