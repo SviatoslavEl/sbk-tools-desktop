@@ -6,18 +6,19 @@ import { applyTermDecision, validateTermAnswer } from "./commercialDecisions";
 
 // Real component callbacks/hooks, not a native DOM/layout claim. The actual
 // decision gate is exercised in the payment preview/Apply integration below.
-const hooks = vi.hoisted(() => ({ index: 0, changed: false, slots: [] as Array<{ value?: unknown; deps?: readonly unknown[]; cleanup?: () => void }>, effects: [] as Array<() => void> }));
+const hooks = vi.hoisted(() => ({ index: 0, changed: false, slots: [] as Array<{ value?: unknown; deps?: readonly unknown[]; cleanup?: () => void; effect?: () => void | (() => void) }>, effects: [] as Array<() => void> }));
 vi.mock("react", async (original) => {
   const same = (a?: readonly unknown[], b?: readonly unknown[]) => a !== undefined && b !== undefined && a.length === b.length && a.every((value, index) => Object.is(value, b[index]));
   return { ...await original<typeof import("react")>(),
     useState: (initial: unknown) => { const index = hooks.index++; if (!hooks.slots[index]) hooks.slots[index] = { value: typeof initial === "function" ? initial() : initial }; return [hooks.slots[index].value, (next: unknown) => { const value = typeof next === "function" ? next(hooks.slots[index].value) : next; if (!Object.is(value, hooks.slots[index].value)) { hooks.slots[index].value = value; hooks.changed = true; } }]; },
     useRef: (initial: unknown) => { const index = hooks.index++; if (!hooks.slots[index]) hooks.slots[index] = { value: { current: initial } }; return hooks.slots[index].value; },
-    useEffect: (effect: () => void | (() => void), deps?: readonly unknown[]) => { const index = hooks.index++, old = hooks.slots[index]; if (old && same(old.deps, deps)) return; hooks.slots[index] = { ...old, deps }; hooks.effects.push(() => { old?.cleanup?.(); const cleanup = effect(); hooks.slots[index].cleanup = typeof cleanup === "function" ? cleanup : undefined; }); },
+    useEffect: (effect: () => void | (() => void), deps?: readonly unknown[]) => { const index = hooks.index++, old = hooks.slots[index]; if (old && same(old.deps, deps)) return; hooks.slots[index] = { ...old, deps, effect }; hooks.effects.push(() => { old?.cleanup?.(); const cleanup = effect(); hooks.slots[index].cleanup = typeof cleanup === "function" ? cleanup : undefined; }); },
   };
 });
-type Props = { children?: ReactNode; disabled?: boolean; value?: unknown; checked?: boolean; "aria-label"?: string; "data-issue-paths"?: string; role?: string; onClick?: () => unknown; onChange?: (event: { target: { value: string; checked?: boolean } }) => void };
+type Props = { children?: ReactNode; disabled?: boolean; value?: unknown; checked?: boolean; "aria-label"?: string; "aria-describedby"?: string; "data-issue-code"?: string; "data-issue-paths"?: string; role?: string; onClick?: () => unknown; onChange?: (event: { target: { value: string; checked?: boolean } }) => void };
 const nodes = (node: ReactNode): Array<{ type: unknown; props: Props }> => Array.isArray(node) ? node.flatMap(nodes) : isValidElement<Props>(node) ? [{ type: node.type, props: node.props }, ...nodes(node.props.children)] : [];
 const text = (node: ReactNode): string => Array.isArray(node) ? node.map(text).join("") : isValidElement<Props>(node) ? text(node.props.children) : typeof node === "string" || typeof node === "number" ? String(node) : "";
+const visibleText = (node: ReactNode): string => Array.isArray(node) ? node.map(visibleText).join("") : isValidElement<Props>(node) ? node.type === "details" ? visibleText(nodes(node.props.children).find(child => child.type === "summary")?.props.children) : visibleText(node.props.children) : typeof node === "string" || typeof node === "number" ? String(node) : "";
 function deferred<T>() { let resolve!: (value: T) => void, reject!: (error: Error) => void; const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; }
 beforeEach(() => { hooks.index = 0; hooks.changed = false; hooks.slots = []; hooks.effects = []; });
 
@@ -57,11 +58,131 @@ async function setup(kind: CommercialTermQuestionKind = "advance-days", seed?: A
   const change = (label: string, value: string) => { field(label).onChange!({ target: { value } }); render(); };
   const check = (label: string, checked = true) => { field(label).onChange!({ target: { value: "", checked } }); render(); };
   const click = async (label: string) => { await button(label).onClick!(); render(); };
+  const remountEffects = () => { const active = hooks.slots.filter(slot => slot.effect); active.forEach(slot => slot.cleanup?.()); active.forEach(slot => { const cleanup = slot.effect!(); slot.cleanup = typeof cleanup === "function" ? cleanup : undefined; }); render(); };
   render();
-  return { get props() { return props; }, set props(value: CommercialQuestionEditorProps) { props = value; }, render, field, button, change, check, click, onApply, dirty, text: () => text(render()), unmount: () => hooks.slots.forEach((slot) => slot.cleanup?.()) };
+  return { get props() { return props; }, set props(value: CommercialQuestionEditorProps) { props = value; }, render, field, button, change, check, click, onApply, dirty, text: () => text(render()), unmount: () => hooks.slots.forEach((slot) => slot.cleanup?.()), remountEffects };
 }
 
 describe("concrete commercial question forms", () => {
+  it("shows one compact passive dependency block, retaining both distinct reasons and every code/path in details", async () => {
+    const seed = await fixture("source-reference"), base = { ...seed.question, id: "question-advance-base-related", kind: "advance-base" as const }, days = { ...seed.question, id: "question-advance-days-related", kind: "advance-days" as const };
+    seed.doc.questions.push(base, days);
+    const issues = [
+      { code: "commercial-decision-target-overlap", path: "questions.current.overlap", message: `Решение пересекает блоки других вопросов: ${base.id}, ${days.id}. Сначала разделите условия; применение не выполнено.`, severity: "error" as const },
+      { code: "commercial-upstream-unresolved", path: "questions.current.upstream", message: `Сначала рассмотрите связанные вопросы: ${days.id}, ${base.id}.`, severity: "error" as const },
+    ], before = structuredClone(seed.doc), ui = await setup("source-reference", seed);
+    ui.props = { ...ui.props, currentState: { question: seed.question, sourceCurrent: true, dependencyFingerprint: seed.question.dependencyFingerprint, status: "blocked", issues } };
+    const rendered = ui.render(), visible = visibleText(rendered);
+    expect(nodes(rendered).filter(node => node.props["aria-label"] === "Связанные условия этого вопроса")).toHaveLength(1);
+    expect(visible.match(/Вопрос 2: База аванса и НДС/g)).toHaveLength(1); expect(visible.match(/Вопрос 3: Срок перечисления аванса/g)).toHaveLength(1);
+    expect(visible).toContain("Сначала согласуйте связанные вопросы"); expect(visible).toContain("Общие пункты требуют разделения перед применением");
+    expect(ui.text()).not.toContain("применение не выполнено"); expect(ui.text()).not.toContain("Сначала устраните связанные ошибки");
+    for (const issue of issues) expect(nodes(rendered).some(node => node.props["data-issue-code"] === issue.code && node.props["data-issue-paths"] === issue.path)).toBe(true);
+    expect(ui.button("Применить решение").disabled).toBe(true); expect(ui.props.currentState?.issues).toEqual(issues); expect(ui.props.doc).toEqual(before); expect(ui.onApply).not.toHaveBeenCalled();
+  });
+
+  it("does not merge blockers for different related questions or drop other constraints", async () => {
+    const seed = await fixture(), first = { ...seed.question, id: "question-first-related" }, second = { ...seed.question, id: "question-second-related" }; seed.doc.questions.push(first, second);
+    const ui = await setup("advance-days", seed);
+    ui.props = { ...ui.props, currentState: { question: seed.question, sourceCurrent: true, dependencyFingerprint: seed.question.dependencyFingerprint, status: "blocked", issues: [
+      { code: "commercial-upstream-unresolved", path: "questions.first", message: `Сначала рассмотрите связанные вопросы: ${first.id}.`, severity: "error" },
+      { code: "commercial-upstream-unresolved", path: "questions.second", message: `Сначала рассмотрите связанные вопросы: ${second.id}.`, severity: "error" },
+      { code: "commercial-other", path: "questions.other", message: "Отдельное ограничение остаётся для проверки.", severity: "review" },
+    ] } };
+    expect(nodes(ui.render()).filter(node => node.props["aria-label"] === "Связанные условия этого вопроса")).toHaveLength(2); expect(ui.text()).toContain("Отдельное ограничение остаётся для проверки");
+    ui.props = { ...ui.props, currentState: { ...ui.props.currentState!, issues: ui.props.currentState!.issues.filter(issue => issue.severity === "review") } };
+    expect(ui.text()).toContain("Сначала устраните связанные ошибки"); expect(ui.text()).toContain("Отдельное ограничение остаётся для проверки");
+  });
+
+  it("requires a fresh valid Preview and revokes it on field edits, including an old captured Apply callback", async () => {
+    const ui = await setup(); expect(ui.button("Применить решение").disabled).toBe(true);
+    ui.change("Какие дни применяются к авансу", "business"); expect(ui.button("Применить решение").disabled).toBe(true);
+    await ui.click("Применить решение"); expect(ui.onApply).not.toHaveBeenCalled();
+    await ui.click("Посмотреть изменения"); expect(ui.button("Применить решение").disabled).toBe(false); expect(ui.props.doc.decisions).toEqual([]);
+    const oldApply = ui.button("Применить решение").onClick!;
+    ui.change("Какие дни применяются к авансу", "calendar"); expect(ui.button("Применить решение").disabled).toBe(true); await oldApply(); expect(ui.onApply).not.toHaveBeenCalled();
+    expect(ui.text()).not.toContain("Предлагаемые изменения — ещё не применены");
+    await ui.click("Посмотреть изменения"); expect(ui.button("Применить решение").disabled).toBe(false); await oldApply(); expect(ui.onApply).not.toHaveBeenCalled();
+    await ui.click("Применить решение"); expect(ui.onApply).toHaveBeenCalledWith({ kind: "advance-days", dayKind: "calendar" });
+  });
+
+  it.each([true, false])("rejects an explicitly foreign currentState (sourceCurrent=%s), but preserves the optional absent-state contract", async sourceCurrent => {
+    const ui = await setup(); ui.change("Какие дни применяются к авансу", "business"); await ui.click("Посмотреть изменения");
+    const oldApply = ui.button("Применить решение").onClick!, oldPreview = ui.button("Посмотреть изменения").onClick!;
+    const onPreview = vi.fn<NonNullable<CommercialQuestionEditorProps["onPreview"]>>().mockResolvedValue({ valid: true, issues: [], dependencyFingerprint: ui.props.question.dependencyFingerprint, previewBlocks: [] });
+    ui.props = { ...ui.props, onPreview, currentState: { question: { ...ui.props.question, id: "another-question" }, sourceCurrent, dependencyFingerprint: ui.props.question.dependencyFingerprint, status: "unresolved", issues: [] } };
+    ui.render(); expect(ui.button("Применить решение").disabled).toBe(true); expect(ui.button("Посмотреть изменения").disabled).toBe(true);
+    expect(ui.field("Какие дни применяются к авансу").value).toBe("business"); await oldApply(); await oldPreview(); expect(ui.onApply).not.toHaveBeenCalled(); expect(onPreview).not.toHaveBeenCalled();
+    ui.props = { ...ui.props, currentState: undefined }; ui.render(); expect(ui.button("Применить решение").disabled).toBe(true); await oldApply(); expect(ui.onApply).not.toHaveBeenCalled();
+    await ui.click("Посмотреть изменения"); expect(ui.button("Применить решение").disabled).toBe(false); await ui.click("Применить решение"); expect(ui.onApply).toHaveBeenCalledWith({ kind: "advance-days", dayKind: "business" });
+  });
+
+  it("does not revive a pending Preview after a foreign owner-state interval has ended", async () => {
+    const ui = await setup(), wait = deferred<Awaited<ReturnType<NonNullable<CommercialQuestionEditorProps["onPreview"]>>>>();
+    ui.props = { ...ui.props, onPreview: () => wait.promise }; ui.change("Какие дни применяются к авансу", "business"); const original = ui.props;
+    const preview = ui.button("Посмотреть изменения").onClick!();
+    ui.props = { ...original, currentState: { question: { ...original.question, id: "another-question" }, sourceCurrent: true, dependencyFingerprint: original.question.dependencyFingerprint, status: "unresolved", issues: [] } }; ui.render();
+    ui.props = original; ui.render();
+    wait.resolve({ valid: true, issues: [], dependencyFingerprint: original.question.dependencyFingerprint, previewBlocks: [] }); await preview; ui.render();
+    expect(ui.button("Применить решение").disabled).toBe(true); expect(ui.field("Какие дни применяются к авансу").value).toBe("business"); expect(ui.onApply).not.toHaveBeenCalled();
+  });
+
+  it("revokes captured Apply and field callbacks on unmount without another dirty notification", async () => {
+    const ui = await setup(); ui.change("Какие дни применяются к авансу", "business"); await ui.click("Посмотреть изменения");
+    const oldApply = ui.button("Применить решение").onClick!, oldField = ui.field("Какие дни применяются к авансу").onChange!;
+    ui.unmount(); hooks.changed = false; const notifications = ui.dirty.mock.calls.length;
+    await oldApply(); oldField({ target: { value: "calendar" } });
+    expect(ui.onApply).not.toHaveBeenCalled(); expect(hooks.changed).toBe(false); expect(ui.dirty).toHaveBeenLastCalledWith(false); expect(ui.dirty).toHaveBeenCalledTimes(notifications);
+  });
+
+  it("drops a late Preview after unmount, including its captured Apply callback", async () => {
+    const ui = await setup(), wait = deferred<Awaited<ReturnType<NonNullable<CommercialQuestionEditorProps["onPreview"]>>>>();
+    ui.props = { ...ui.props, onPreview: () => wait.promise }; ui.change("Какие дни применяются к авансу", "business");
+    const oldApply = ui.button("Применить решение").onClick!, preview = ui.button("Посмотреть изменения").onClick!();
+    ui.unmount(); hooks.changed = false;
+    wait.resolve({ valid: true, issues: [], dependencyFingerprint: ui.props.question.dependencyFingerprint, previewBlocks: [] }); await preview; await oldApply();
+    expect(ui.onApply).not.toHaveBeenCalled(); expect(hooks.changed).toBe(false); expect(ui.dirty).toHaveBeenLastCalledWith(false);
+  });
+
+  it("supports effect cleanup/setup replay while preserving input, dirty ownership and a new explicit Preview", async () => {
+    const ui = await setup(); ui.change("Какие дни применяются к авансу", "business"); await ui.click("Посмотреть изменения");
+    ui.remountEffects(); expect(ui.field("Какие дни применяются к авансу").value).toBe("business"); expect(ui.button("Применить решение").disabled).toBe(true);
+    expect(ui.dirty.mock.calls).toEqual([[false], [true], [false], [true]]);
+    await ui.click("Посмотреть изменения"); expect(ui.button("Применить решение").disabled).toBe(false); await ui.click("Применить решение"); expect(ui.onApply).toHaveBeenCalledWith({ kind: "advance-days", dayKind: "business" });
+  });
+
+  it.each(["dependency/pricing", "source-key", "source-current", "revision"] as const)("revokes a successful Preview after a %s change, without clearing dirty input or reviving old callbacks", async variant => {
+    const ui = await setup(), originalDoc = ui.props.doc;
+    ui.props = { ...ui.props, currentState: { question: ui.props.question, sourceCurrent: true, dependencyFingerprint: ui.props.question.dependencyFingerprint, status: "unresolved", issues: [] } };
+    ui.render(); ui.change("Какие дни применяются к авансу", "business"); await ui.click("Посмотреть изменения"); expect(ui.button("Применить решение").disabled).toBe(false);
+    const original = ui.props, oldApply = ui.button("Применить решение").onClick!;
+    if (variant === "dependency/pricing") ui.props = { ...original, currentState: { ...original.currentState!, dependencyFingerprint: `sha256:${"b".repeat(64)}` } };
+    else if (variant === "source-current") ui.props = { ...original, currentState: { ...original.currentState!, sourceCurrent: false } };
+    else { const doc = structuredClone(originalDoc); if (variant === "revision") doc.revision++; else doc.privateAppendix.sourceSnapshotKey = `sha256:${"b".repeat(64)}`; ui.props = { ...original, doc }; }
+    ui.render(); expect(ui.field("Какие дни применяются к авансу").value).toBe("business"); expect(ui.button("Применить решение").disabled).toBe(true);
+    expect(ui.text()).not.toContain("Предлагаемые изменения — ещё не применены"); await oldApply(); expect(ui.onApply).not.toHaveBeenCalled();
+    ui.props = original; ui.render(); expect(ui.button("Применить решение").disabled).toBe(true); await oldApply(); expect(ui.onApply).not.toHaveBeenCalled();
+    await ui.click("Посмотреть изменения"); expect(ui.button("Применить решение").disabled).toBe(false); expect(ui.field("Какие дни применяются к авансу").value).toBe("business");
+  });
+
+  it("allows a newly valid owner Preview to repair a prior blocked state without treating Preview as Apply", async () => {
+    const ui = await setup(), before = structuredClone(ui.props.doc);
+    ui.props = { ...ui.props, currentState: { question: ui.props.question, sourceCurrent: true, dependencyFingerprint: `sha256:${"c".repeat(64)}`, status: "blocked", issues: [{ code: "commercial-decision-stale", path: "questions.question", message: "Прежний вариант требует исправления.", severity: "error" }] } };
+    ui.render(); ui.change("Какие дни применяются к авансу", "business"); await ui.click("Посмотреть изменения");
+    // Real validateTermAnswer validates this NEW answer. Its answer-dependent
+    // fingerprint need not equal the owner's prior no-answer state fingerprint.
+    expect(ui.button("Применить решение").disabled).toBe(false); expect(ui.onApply).not.toHaveBeenCalled(); expect(ui.props.doc).toEqual(before);
+    await ui.click("Применить решение"); expect(ui.onApply).toHaveBeenCalledWith({ kind: "advance-days", dayKind: "business" });
+  });
+
+  it("does not reuse an older successful Preview after a later validation fails or throws", async () => {
+    const ui = await setup(); ui.change("Какие дни применяются к авансу", "business"); await ui.click("Посмотреть изменения"); expect(ui.button("Применить решение").disabled).toBe(false);
+    ui.props = { ...ui.props, onPreview: async () => ({ valid: false, dependencyFingerprint: ui.props.question.dependencyFingerprint, previewBlocks: [], issues: [{ code: "commercial-upstream-unresolved", path: "questions.question", message: "Связанные условия ещё не согласованы.", severity: "error" }] }) };
+    await ui.click("Посмотреть изменения"); expect(ui.button("Применить решение").disabled).toBe(true); await ui.click("Применить решение"); expect(ui.onApply).not.toHaveBeenCalled();
+    ui.props = { ...ui.props, onPreview: async () => { throw new Error("Проверка недоступна"); } };
+    await ui.click("Посмотреть изменения"); expect(ui.button("Применить решение").disabled).toBe(true); expect(ui.text()).toContain("Проверка недоступна"); expect(ui.field("Какие дни применяются к авансу").value).toBe("business");
+  });
+
   it("names every unresolved dependency by its distinct question, section and target without changing the gate or source question", async () => {
     const seed = await fixture(), plan = { ...seed.question, id: "question-stage-plan-fixture", kind: "stage-plan" as const, sectionId: "scope", targetBlockIds: ["scope-block"] }, parallel = { ...seed.question, id: "question-stage-parallelism-fixture", kind: "stage-parallelism" as const };
     seed.doc.questions.push(plan, parallel);
@@ -71,7 +192,7 @@ describe("concrete commercial question forms", () => {
     expect(shown).toContain("Вопрос 2: Согласованный план этапов — раздел 2 «Состав», пункт 2.1");
     expect(shown).toContain("Вопрос 3: Последовательность и параллельность — раздел 1 «Уточняемое условие», пункт 1.1");
     expect(shown).toContain("связанный вопрос, который сейчас не найден"); expect(shown).not.toContain("question-stage-");
-    expect(shown).toContain("Сначала устраните связанные ошибки");
+    expect(shown).toContain("Сначала согласуйте связанные вопросы"); expect(shown).not.toContain("Сначала устраните связанные ошибки");
     expect(ui.field("Вопрос 1: Срок перечисления аванса — раздел 1 «Уточняемое условие», пункт 1.1")).toBeDefined();
     expect(shown).toContain(seed.question.message); expect(ui.props.doc).toEqual(original); expect(ui.onApply).not.toHaveBeenCalled();
   });
@@ -94,16 +215,24 @@ describe("concrete commercial question forms", () => {
     ui.props = { ...ui.props, onPreview: async () => ({ valid: false, issues: [{ code: "commercial-decision-target-overlap", path: "questions.question", message, severity: "error" }], dependencyFingerprint: seed.question.dependencyFingerprint, previewBlocks: [] }) };
     ui.change("Какие дни применяются к авансу", "business"); await ui.click("Посмотреть изменения");
     expect(ui.text()).toContain("Этот вопрос затрагивает пункты других вопросов:"); expect(ui.text()).toContain("Согласованный план этапов — раздел 2 «Состав», пункт 2.1"); expect(ui.text()).not.toContain(plan.id);
-    expect(ui.text()).toContain("применение не выполнено"); expect(ui.props.doc.decisions).toEqual([]);
-    ui.onApply.mockRejectedValueOnce(new Error(message)); await ui.click("Применить решение");
-    expect(ui.text()).not.toContain(plan.id); expect(ui.text()).toContain("Ввод сохранён"); expect(ui.field("Какие дни применяются к авансу").value).toBe("business");
+    expect(ui.text()).not.toContain("применение не выполнено"); expect(ui.props.doc.decisions).toEqual([]); expect(ui.button("Применить решение").disabled).toBe(true);
+    await ui.click("Применить решение"); expect(ui.onApply).not.toHaveBeenCalled();
+    // The owner subsequently validates a repaired candidate. An actual rejected
+    // Apply remains an attempted-operation error, unlike the passive wording.
+    ui.props = { ...ui.props, onPreview: async () => ({ valid: true, issues: [], dependencyFingerprint: seed.question.dependencyFingerprint, previewBlocks: [] }) };
+    await ui.click("Посмотреть изменения"); ui.onApply.mockRejectedValueOnce(new Error(message)); await ui.click("Применить решение");
+    expect(ui.text()).not.toContain(plan.id); expect(ui.text()).toContain("применение не выполнено"); expect(ui.text()).toContain("Ввод сохранён"); expect(ui.field("Какие дни применяются к авансу").value).toBe("business");
   });
   it("never defaults the advance base/VAT or automatically applies an answer", async () => {
     const ui = await setup("advance-base");
     expect(ui.field("База расчёта аванса").value).toBe(""); expect(ui.field("Порядок учёта НДС в авансе").value).toBe("");
     expect(ui.onApply).not.toHaveBeenCalled(); expect(ui.dirty.mock.calls).toEqual([[false]]);
-    await ui.click("Применить решение"); expect(ui.onApply).not.toHaveBeenCalled(); expect(ui.text()).toContain("Выберите отдельно");
+    expect(ui.button("Применить решение").disabled).toBe(true); expect(ui.button("Применить решение")["aria-describedby"]).toBeDefined();
+    await ui.click("Применить решение"); expect(ui.onApply).not.toHaveBeenCalled(); expect(ui.text()).toContain("Заполните ответ и проверьте изменения перед применением"); expect(nodes(ui.render()).some(node => node.props.role === "alert")).toBe(false);
     ui.change("База расчёта аванса", "net"); ui.change("Порядок учёта НДС в авансе", "additional");
+    const expected = { kind: "advance-base", base: "net", vatTreatment: "additional" } as const;
+    ui.props = { ...ui.props, onPreview: async answer => { expect(answer).toEqual(expected); return { valid: true, issues: [], dependencyFingerprint: ui.props.question.dependencyFingerprint, previewBlocks: [] }; } };
+    expect(ui.button("Применить решение").disabled).toBe(true); await ui.click("Посмотреть изменения"); expect(ui.button("Применить решение").disabled).toBe(false);
     await ui.click("Применить решение"); expect(ui.onApply).toHaveBeenCalledWith({ kind: "advance-base", base: "net", vatTreatment: "additional" }); expect(ui.dirty).toHaveBeenLastCalledWith(false);
   });
   it("uses the real gate for specific payment preview and only an explicit owner Apply installs a decision", async () => {
@@ -121,6 +250,7 @@ describe("concrete commercial question forms", () => {
   it("keeps false/throw owner rejections and oversized text intact without implicit approval or truncation", async () => {
     const ui = await setup("source-reference"); ui.change("Как разрешить исходные ссылки", "governing-document"); ui.change("Название действующего документа", "Согласованное задание");
     const explanation = "Документ и условие его подписания определяются отдельно сторонами."; ui.change("Определение документа и события", explanation);
+    await ui.click("Посмотреть изменения"); expect(ui.button("Применить решение").disabled).toBe(false);
     ui.onApply.mockResolvedValueOnce(false); await ui.click("Применить решение"); expect(ui.field("Определение документа и события").value).toBe(explanation); expect(ui.dirty).toHaveBeenLastCalledWith(true);
     ui.onApply.mockRejectedValueOnce(new Error("Доступ изменился")); await ui.click("Применить решение"); expect(ui.text()).toContain("Доступ изменился"); expect(ui.field("Определение документа и события").value).toBe(explanation);
     const long = "я".repeat(20001); ui.change("Определение документа и события", long); const calls = ui.onApply.mock.calls.length;
@@ -134,7 +264,11 @@ describe("concrete commercial question forms", () => {
     await ui.click("Применить решение"); expect(ui.onApply).not.toHaveBeenCalled();
     ui.change("Срок этапа 2", "5"); ui.change("Вид дней этапа 2", "business"); ui.change("Общий максимальный срок", "20"); ui.change("Вид дней общего максимума", "business");
     await ui.click("Добавить этап"); expect(ui.field("Название этапа 3").value).toBe(""); await ui.click("Применить решение"); expect(ui.onApply).not.toHaveBeenCalled();
-    await ui.click("Удалить этап 3"); await ui.click("Применить решение");
+    await ui.click("Удалить этап 3");
+    // This form/serialization fixture supplies the owner boundary explicitly;
+    // actual stage-plan semantics are independently tested by the core suite.
+    ui.props = { ...ui.props, onPreview: async answer => { expect(answer.kind).toBe("stage-plan"); return { valid: true, issues: [], dependencyFingerprint: ui.props.question.dependencyFingerprint, previewBlocks: [] }; } };
+    await ui.click("Посмотреть изменения"); await ui.click("Применить решение");
     expect(ui.onApply.mock.calls[0][0]).toMatchObject({ kind: "stage-plan", maximum: { count: "20", dayKind: "business" }, stages: [{ title: "Этап 1. Анализ", duration: { count: "10", dayKind: "business" } }, { title: "Этап 2. Обсуждение", duration: { count: "5", dayKind: "business" } }] });
     expect(ui.onApply.mock.calls[0][0].kind === "stage-plan" && ui.onApply.mock.calls[0][0].stages).toHaveLength(2);
   });
@@ -172,19 +306,21 @@ describe("concrete commercial question forms", () => {
     ui.change("Тип связи 1", "after"); ui.change("Начинающийся этап связи 1", "stage-b"); ui.change("После завершения этапа связи 1", "stage-a"); ui.change("Тип связи 1", "may-overlap");
     expect(ui.field("Условие параллельной связи 1").value).toContain("независимых комплектов");
     ui.props = { ...ui.props, activeStages: [{ id: "stage-a", title: "Анализ" }] }; await ui.click("Применить решение"); expect(ui.onApply).not.toHaveBeenCalled(); expect(ui.text()).toContain("не удалены автоматически");
-    ui.props = { ...ui.props, activeStages: [{ id: "stage-a", title: "Анализ" }, { id: "stage-b", title: "Проверка" }] }; await ui.click("Применить решение"); expect(ui.onApply).toHaveBeenCalledWith({ kind: "stage-parallelism", relations: [{ kind: "may-overlap", stageIds: ["stage-a", "stage-b"], conditions: "После предоставления независимых комплектов материалов" }] });
+    ui.props = { ...ui.props, activeStages: [{ id: "stage-a", title: "Анализ" }, { id: "stage-b", title: "Проверка" }], onPreview: async answer => { expect(answer.kind).toBe("stage-parallelism"); return { valid: true, issues: [], dependencyFingerprint: ui.props.question.dependencyFingerprint, previewBlocks: [] }; } }; await ui.click("Посмотреть изменения"); await ui.click("Применить решение"); expect(ui.onApply).toHaveBeenCalledWith({ kind: "stage-parallelism", relations: [{ kind: "may-overlap", stageIds: ["stage-a", "stage-b"], conditions: "После предоставления независимых комплектов материалов" }] });
   });
   it("builds protocol milestones with explicit conditions and before/after stage choices", async () => {
     const ui = await setup("boundary-protocol"); ui.props = { ...ui.props, activeStages: [{ id: "prepare", title: "Подготовка" }, { id: "test", title: "Тестирование" }] };
     await ui.click("Добавить контрольную точку"); expect(ui.field("Условие контрольной точки 1").value).toBe(""); expect(ui.text()).toContain("Границы согласованы, письменное разрешение получено"); expect(ui.text()).toContain("похожих слов не подтверждает разрешение"); ui.change("Название контрольной точки 1", "Согласование границ"); ui.change("Условие контрольной точки 1", "Границы утверждены, разрешение получено");
     await ui.click("Применить решение"); expect(ui.onApply).not.toHaveBeenCalled();
-    ui.check("До начала этапов, точка 1: Тестирование"); ui.check("После завершения этапов, точка 1: Подготовка"); await ui.click("Применить решение");
+    ui.check("До начала этапов, точка 1: Тестирование"); ui.check("После завершения этапов, точка 1: Подготовка");
+    ui.props = { ...ui.props, onPreview: async answer => { expect(answer.kind).toBe("boundary-protocol"); return { valid: true, issues: [], dependencyFingerprint: ui.props.question.dependencyFingerprint, previewBlocks: [] }; } };
+    await ui.click("Посмотреть изменения"); await ui.click("Применить решение");
     expect(ui.onApply).toHaveBeenCalledWith({ kind: "boundary-protocol", milestones: [{ title: "Согласование границ", condition: "Границы утверждены, разрешение получено", beforeStageIds: ["test"], afterStageIds: ["prepare"] }] });
   });
   it("offers exact body targets, governing definitions and own-block rewrites without a blanket acknowledgement", async () => {
     const ui = await setup("source-reference"); expect(ui.field("Как разрешить исходные ссылки").value).toBe(""); expect(ui.text()).toContain("Синтетический источник"); expect(ui.text()).toContain("Исходная ссылка: Договора");
-    ui.change("Как разрешить исходные ссылки", "body-target"); ui.check("Цели исходной ссылки: 2. Состав"); await ui.click("Применить решение"); expect(ui.onApply).toHaveBeenLastCalledWith({ kind: "source-reference", referenceIds: ["reference"], resolution: { kind: "body-target", targetIds: ["scope"] } });
-    ui.change("Как разрешить исходные ссылки", "replace-clauses"); ui.change("Новая редакция пункта 1", "Работы начинаются после подписания согласованного задания и получения материалов."); await ui.click("Применить решение"); expect(ui.onApply).toHaveBeenLastCalledWith({ kind: "source-reference", referenceIds: ["reference"], resolution: { kind: "replace-clauses", replacements: [{ blockId: "answer-block", publicText: "Работы начинаются после подписания согласованного задания и получения материалов." }] } });
+    ui.change("Как разрешить исходные ссылки", "body-target"); ui.check("Цели исходной ссылки: 2. Состав"); await ui.click("Посмотреть изменения"); await ui.click("Применить решение"); expect(ui.onApply).toHaveBeenLastCalledWith({ kind: "source-reference", referenceIds: ["reference"], resolution: { kind: "body-target", targetIds: ["scope"] } });
+    ui.change("Как разрешить исходные ссылки", "replace-clauses"); ui.change("Новая редакция пункта 1", "Работы начинаются после подписания согласованного задания и получения материалов."); await ui.click("Посмотреть изменения"); await ui.click("Применить решение"); expect(ui.onApply).toHaveBeenLastCalledWith({ kind: "source-reference", referenceIds: ["reference"], resolution: { kind: "replace-clauses", replacements: [{ blockId: "answer-block", publicText: "Работы начинаются после подписания согласованного задания и получения материалов." }] } });
   });
   it("shows concrete ordinal destinations in preview rather than generic references or private IDs", async () => {
     const ui = await setup("source-reference"); ui.props = { ...ui.props, onPreview: async () => ({ valid: true, issues: [], dependencyFingerprint: `sha256:${"a".repeat(64)}`, previewBlocks: [{ id: "answer-block", kind: "paragraph", style: "body", content: [{ kind: "text", text: "Применяется " }, { kind: "local-ref", targetId: "scope" }, { kind: "text", text: " и " }, { kind: "local-ref", targetId: "scope-block" }] }] }) };
@@ -193,6 +329,7 @@ describe("concrete commercial question forms", () => {
   });
   it("prevents duplicate pending submissions and preserves dirty input when a revision changes during the request", async () => {
     const ui = await setup(), wait = deferred<boolean>(); ui.onApply.mockReturnValueOnce(wait.promise); ui.change("Какие дни применяются к авансу", "calendar");
+    await ui.click("Посмотреть изменения");
     const callback = ui.button("Применить решение").onClick!, first = callback(); callback(); expect(ui.onApply).toHaveBeenCalledOnce();
     ui.props = { ...ui.props, doc: { ...structuredClone(ui.props.doc), revision: 2 } }; ui.render(); expect(ui.field("Какие дни применяются к авансу").value).toBe("calendar");
     wait.resolve(false); await first; expect(ui.text()).toContain("Неприменённый ответ сохранён"); expect(ui.button("Применить решение").disabled).toBe(true); expect(ui.dirty).toHaveBeenLastCalledWith(true);
@@ -200,10 +337,10 @@ describe("concrete commercial question forms", () => {
   });
   it("refreshes untouched source forms after another decision without a reset loop or creating answers", async () => {
     const ui = await setup(); ui.props = { ...ui.props, doc: { ...structuredClone(ui.props.doc), revision: 2 } }; ui.render();
-    expect(ui.text()).not.toContain("Неприменённый ответ сохранён"); expect(ui.field("Какие дни применяются к авансу").value).toBe(""); expect(ui.button("Применить решение").disabled).toBe(false); expect(ui.onApply).not.toHaveBeenCalled(); expect(ui.dirty.mock.calls).toEqual([[false]]);
+    expect(ui.text()).not.toContain("Неприменённый ответ сохранён"); expect(ui.field("Какие дни применяются к авансу").value).toBe(""); expect(ui.button("Применить решение").disabled).toBe(true); expect(ui.onApply).not.toHaveBeenCalled(); expect(ui.dirty.mock.calls).toEqual([[false]]);
   });
   it("guards real callbacks when disabled and clears only the dirty notification on unmount", async () => {
-    const ui = await setup(); ui.change("Какие дни применяются к авансу", "business"); const oldField = ui.field("Какие дни применяются к авансу"), oldApply = ui.button("Применить решение");
+    const ui = await setup(); ui.change("Какие дни применяются к авансу", "business"); await ui.click("Посмотреть изменения"); const oldField = ui.field("Какие дни применяются к авансу"), oldApply = ui.button("Применить решение");
     ui.props = { ...ui.props, disabled: true }; ui.render(); oldField.onChange!({ target: { value: "calendar" } }); await oldApply.onClick!();
     expect(ui.field("Какие дни применяются к авансу").value).toBe("business"); expect(ui.onApply).not.toHaveBeenCalled(); expect(ui.button("Применить решение").disabled).toBe(true);
     ui.unmount(); expect(ui.dirty).toHaveBeenLastCalledWith(false);

@@ -46,7 +46,9 @@ export function commercialReadableMessage(doc: ProposalCommercialDocumentV1, mes
   return result.replace(/\bquestion-[A-Za-z0-9_-]+\b/g, "связанный вопрос, который сейчас не найден");
 }
 export function commercialIssueMessage(doc: ProposalCommercialDocumentV1, issue: Pick<CommercialIssue, "code" | "message">): string {
-  const message = issue.code === "commercial-decision-target-overlap" ? issue.message.replace("Несколько решений", "Несколько вопросов") : issue.message;
+  // Readiness and Preview are not attempted Apply operations. Actual rejected
+  // Apply errors use commercialReadableMessage directly and keep their result.
+  const message = issue.code === "commercial-decision-target-overlap" ? issue.message.replace("Несколько решений", "Несколько вопросов").replace(/; применение не выполнено\.$/u, ".") : issue.message;
   return commercialReadableMessage(doc, message);
 }
 /** Group only exact diagnostics. Keep every issue/path for the detail view. */
@@ -58,6 +60,20 @@ export function commercialIssueGroups(issues: readonly CommercialIssue[]) {
     if (existing) existing.entries.push(issue); else grouped.set(key, { key, issue, entries: [issue] });
   }
   return [...grouped.values()];
+}
+/** Merge presentation only when the exact same related question IDs occur in
+ * closed dependency diagnostics. Distinct questions/reasons remain distinct;
+ * all original codes, paths and neutral diagnostics stay in the details. */
+function dependencyGroups(issues: readonly CommercialIssue[]) {
+  const grouped = new Map<string, { ids: string[]; issues: CommercialIssue[] }>(), other: CommercialIssue[] = [];
+  for (const issue of issues) {
+    const match = issue.code === "commercial-upstream-unresolved" ? /^Сначала рассмотрите связанные вопросы: ([A-Za-z0-9_-]+(?:,\s*[A-Za-z0-9_-]+)*)\.$/u.exec(issue.message)
+      : issue.code === "commercial-decision-target-overlap" ? /^Решение пересекает блоки других вопросов: ([A-Za-z0-9_-]+(?:,\s*[A-Za-z0-9_-]+)*)\. Сначала разделите условия; применение не выполнено\.$/u.exec(issue.message) : null;
+    if (!match) { other.push(issue); continue; }
+    const ids = [...new Set(match[1].split(/,\s*/u))].sort(), key = commercialCanonicalJson(ids), group = grouped.get(key);
+    if (group) group.issues.push(issue); else grouped.set(key, { ids, issues: [issue] });
+  }
+  return { groups: [...grouped.values()], other };
 }
 const dayName = (day: Day) => day === "business" ? "рабочих дней" : day === "calendar" ? "календарных дней" : "вид дней не выбран";
 const stageCaption = (title: string, index: number) => /^этап\s*\d+(?=$|[\s.):–—-])/iu.test(title.trimStart())
@@ -138,32 +154,51 @@ function answerFor(session: Session, activeStages: CommercialQuestionEditorProps
  * decision; preview, a stored answer, and save/export never approve this card. */
 export function CommercialQuestionEditor(props: CommercialQuestionEditorProps) {
   const { doc, question, disabled = false, currentState, activeStages } = props;
+  const mismatchedState = (value: CommercialQuestionEditorProps) => value.currentState !== undefined && value.currentState.question.id !== value.question.id;
   const stateKey = (value: CommercialQuestionEditorProps) => value.currentState?.question.id === value.question.id ? value.currentState.dependencyFingerprint : undefined;
   const [session, setSession] = useState(() => start(doc, question, stateKey(props)));
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [pending, setPending] = useState<"preview" | "apply" | null>(null);
   const [preview, setPreview] = useState<CommercialAnswerValidation | null>(null);
+  const checkedPreview = useRef<{ session: Session; answerKey: string; result: CommercialAnswerValidation } | null>(null);
+  const mounted = useRef(true), proofGeneration = useRef(0), invalidProof = useRef(false);
   const pendingRef = useRef(false), dirtyRef = useRef(false), operation = useRef(0), sequence = useRef(0), latest = useRef(props);
   latest.current = props;
   const staleFor = (value: CommercialQuestionEditorProps) => session.document !== value.doc || session.revision !== value.doc.revision || session.sourceKey !== value.doc.privateAppendix.sourceSnapshotKey || session.questionKey !== commercialCanonicalJson(value.question) || session.dependencyKey !== stateKey(value);
-  const stale = staleFor(props), frozen = disabled || pending !== null || stale;
+  const stale = staleFor(props), foreignState = mismatchedState(props), frozen = disabled || pending !== null || stale || foreignState;
+  const clearPreview = () => { checkedPreview.current = null; setPreview(null); };
   const markDirty = (value: boolean) => { if (dirtyRef.current !== value) { dirtyRef.current = value; latest.current.onDirtyChange?.(value); } };
   // Listener identity is not a mount/dirty transition. Inline owner callbacks
   // must not generate false-cleanup/notify loops on every parent render.
-  useEffect(() => { latest.current.onDirtyChange?.(dirtyRef.current); return () => { latest.current.onDirtyChange?.(false); }; }, []);
   useEffect(() => {
-    if (!dirtyRef.current && !pendingRef.current && staleFor(latest.current)) {
-      operation.current++; setSession(start(latest.current.doc, latest.current.question, stateKey(latest.current))); setPreview(null); setError(""); setNotice("");
+    // StrictMode may replay cleanup/setup on the same hook state. Preserve the
+    // answer and dirty ownership, but never revive a pre-cleanup proof/request.
+    mounted.current = true; pendingRef.current = false; setPending(null); clearPreview();
+    latest.current.onDirtyChange?.(dirtyRef.current);
+    return () => {
+      mounted.current = false; operation.current++; proofGeneration.current++; pendingRef.current = false; checkedPreview.current = null;
+      latest.current.onDirtyChange?.(false);
+    };
+  }, []);
+  useEffect(() => {
+    if (!dirtyRef.current && !pendingRef.current && !mismatchedState(latest.current) && staleFor(latest.current)) {
+      operation.current++; setSession(start(latest.current.doc, latest.current.question, stateKey(latest.current))); clearPreview(); setError(""); setNotice("");
     }
-  }, [doc, doc.revision, doc.privateAppendix.sourceSnapshotKey, question, currentState?.dependencyFingerprint, pending, session]);
+  }, [doc, doc.revision, doc.privateAppendix.sourceSnapshotKey, question, currentState?.question.id, currentState?.dependencyFingerprint, pending, session]);
   const current = currentState?.question.id === question.id ? currentState : undefined;
+  const invalid = stale || foreignState || disabled || current?.sourceCurrent === false;
+  // Remember even a transient loss of ownership/access while Preview awaits.
+  // Restoring the old props cannot make its late result a fresh proof again.
+  if (invalid && !invalidProof.current) proofGeneration.current++;
+  invalidProof.current = invalid;
+  if (invalid) checkedPreview.current = null;
   const belongs = doc.questions.some((entry) => entry.id === question.id) && question.sourceClauseIds.every((id) => doc.privateAppendix.clauses.some((clause) => clause.id === id));
-  const locked = () => latest.current.disabled || pendingRef.current || staleFor(latest.current);
+  const locked = () => !mounted.current || latest.current.disabled || pendingRef.current || mismatchedState(latest.current) || staleFor(latest.current);
   const change = (transform: (draft: Draft) => void) => {
     if (locked()) return;
     markDirty(true);
-    setSession((old) => { const next = structuredClone(old.draft); transform(next); return { ...old, draft: next }; }); setPreview(null); setError(""); setNotice("");
+    setSession((old) => { const next = structuredClone(old.draft); transform(next); return { ...old, draft: next }; }); clearPreview(); setError(""); setNotice("");
   };
   const freshId = (prefix: string, used: string[]) => { let next: string; do { next = `${prefix}-${++sequence.current}`; } while (used.includes(next)); return next; };
   const field = (label: string, value: string, update: (value: string) => void, multiline = false) => <label>{label}{multiline
@@ -178,40 +213,52 @@ export function CommercialQuestionEditor(props: CommercialQuestionEditorProps) {
   const checks = (label: string, selected: string[], options: readonly (readonly [string, string])[], update: (value: string[]) => void) => <fieldset className="commercial-question-choices"><legend>{label}</legend>{options.map(([id, title]) => <label key={id} className="commercial-question-check"><input type="checkbox" aria-label={`${label}: ${title}`} checked={selected.includes(id)} onChange={(event) => update(event.target.checked ? [...selected, id] : selected.filter((value) => value !== id))} />{title}</label>)}{selected.some((id) => !options.some(([key]) => key === id)) && <p className="notice warning">В черновике есть этапы или цели, которых больше нет среди доступных. Они не удалены автоматически; проверьте ответ.</p>}</fieldset>;
   const previewBlock = (block: CommercialBlock): ReactNode => block.kind === "paragraph" ? <p key={block.id}>{displayedText(block)}</p> : block.kind === "list" ? <ul key={block.id}>{block.items.map((parts, index) => <li key={index}>{displayedText({ id: "preview", kind: "paragraph", style: "body", content: parts })}</li>)}</ul> : <div key={block.id} className="commercial-question-table"><table><thead><tr>{block.columns.map((column, index) => <th key={index}>{column}</th>)}</tr></thead><tbody>{block.rows.map((row, index) => <tr key={index}>{row.map((parts, ci) => <td key={ci}>{displayedText({ id: "preview", kind: "paragraph", style: "body", content: parts })}</td>)}</tr>)}</tbody></table></div>;
   const run = async (kind: "preview" | "apply") => {
-    if (locked() || !belongs || current?.sourceCurrent === false) return;
+    const liveState = latest.current.currentState?.question.id === latest.current.question.id ? latest.current.currentState : undefined;
+    if (locked() || !belongs || liveState?.sourceCurrent === false) return;
     let answer: CommercialTermAnswer;
-    try { answer = answerFor(session, latest.current.activeStages); } catch (reason) { setError(reason instanceof Error ? reason.message : "Заполните конкретный ответ."); return; }
-    const ticket = ++operation.current;
+    try { answer = answerFor(session, latest.current.activeStages); } catch (reason) { if (kind === "preview") setError(reason instanceof Error ? reason.message : "Заполните конкретный ответ."); return; }
+    const checked = checkedPreview.current;
+    if (kind === "apply" && (!checked || checked.session !== session || !checked.result.valid || checked.answerKey !== commercialCanonicalJson(answer))) return;
+    const ticket = ++operation.current, generation = proofGeneration.current;
     pendingRef.current = true; setPending(kind); setError(""); setNotice("");
+    if (kind === "preview") clearPreview();
     try {
       if (kind === "preview") {
         const result = latest.current.onPreview ? await latest.current.onPreview(answer) : await validateTermAnswer(doc, question.id, answer);
-        if (ticket !== operation.current) return;
-        if (staleFor(latest.current) || latest.current.disabled) { setError("Документ или доступ изменился во время проверки. Ввод сохранён, результат проверки не применён."); return; }
-        setPreview(result);
+        if (ticket !== operation.current || !mounted.current) return;
+        if (generation !== proofGeneration.current || mismatchedState(latest.current) || staleFor(latest.current) || latest.current.disabled || latest.current.currentState?.sourceCurrent === false) { setError("Документ или доступ изменился во время проверки. Ввод сохранён, результат проверки не применён."); return; }
+        checkedPreview.current = { session, answerKey: commercialCanonicalJson(answer), result }; setPreview(result);
         if (!result.valid) setError("Решение пока нельзя применить. Проверьте конкретные замечания ниже; ввод сохранён.");
       } else {
         const accepted = await latest.current.onApply(answer);
-        if (ticket !== operation.current) return;
+        if (ticket !== operation.current || !mounted.current) return;
         if (latest.current.question.id !== session.question.id || latest.current.doc.privateAppendix.documentId !== session.document.privateAppendix.documentId || latest.current.doc.privateAppendix.sourceSnapshotKey !== session.sourceKey) { setError("Во время применения открыт другой документ или источник. Этот ответ сохранён в поле; проверяйте актуальное состояние у редактора."); return; }
         if (accepted !== true) { setError("Редактор не принял решение. Ввод сохранён; проверьте актуальную редакцию и доступ."); return; }
         markDirty(false);
         setNotice("Редактор принял решение. Готовность всего предложения проверяется отдельно.");
       }
-    } catch (reason) { if (ticket === operation.current) setError(`${reason instanceof Error ? reason.message : "Не удалось проверить или применить решение"}. Ввод сохранён.`); }
-    finally { if (ticket === operation.current) { pendingRef.current = false; setPending(null); } }
+    } catch (reason) { if (ticket === operation.current && mounted.current) setError(`${reason instanceof Error ? reason.message : "Не удалось проверить или применить решение"}. Ввод сохранён.`); }
+    finally { if (ticket === operation.current && mounted.current) { pendingRef.current = false; setPending(null); } }
   };
-  const reset = () => { if (latest.current.disabled || pendingRef.current) return; operation.current++; markDirty(false); setSession(start(latest.current.doc, latest.current.question, stateKey(latest.current))); setPreview(null); setError(""); setNotice(""); };
+  const reset = () => { if (!mounted.current || latest.current.disabled || pendingRef.current || mismatchedState(latest.current)) return; operation.current++; markDirty(false); setSession(start(latest.current.doc, latest.current.question, stateKey(latest.current))); clearPreview(); setError(""); setNotice(""); };
   const d = session.draft, kind = session.question.kind;
   const targets = doc.body.sections.flatMap((section, si) => [
     ...(!section.blocks.some((block) => question.targetBlockIds.includes(block.id)) ? [[section.id, `${si + 1}. ${section.title}`] as const] : []),
     ...section.blocks.filter((block) => !question.targetBlockIds.includes(block.id)).map((block) => [block.id, `Пункт ${si + 1}.${section.blocks.indexOf(block) + 1}: ${displayedText(block).slice(0, 120)}`] as const),
   ]);
   const stateLabels = { unresolved: "Требуется конкретное решение", resolved: "Есть действующее применённое решение", stale: "Прежнее решение требует проверки", blocked: "Сначала устраните связанные ошибки" };
+  let answerKey: string | undefined;
+  try { answerKey = commercialCanonicalJson(answerFor(session, activeStages)); } catch { /* Incomplete input is a hint, not an attempted-operation error. */ }
+  const freshPreview = !invalid && checkedPreview.current?.session === session && checkedPreview.current.result === preview;
+  const canApply = Boolean(answerKey && freshPreview && preview?.valid && checkedPreview.current?.answerKey === answerKey);
+  const blockers = dependencyGroups(current?.issues || []), hintId = `commercial-apply-hint-${question.id}`;
+  const relatedLabels = (ids: string[]) => [...doc.questions.filter((entry) => ids.includes(entry.id)).map((entry) => commercialQuestionLabel(doc, entry)), ...ids.filter((id) => !doc.questions.some((entry) => entry.id === id)).map((_id, index) => `Связанный вопрос ${index + 1}, который сейчас не найден`)];
   return <section className="commercial-question-editor" aria-label={commercialQuestionLabel(doc, question)} aria-busy={pending !== null}>
     <h5>{commercialQuestionLabel(doc, question)}</h5><p>{question.message}</p>
-    {current && <p className="help-text">{stateLabels[current.status]}</p>}
+    {current && (current.status !== "blocked" || !current.issues.some(issue => issue.severity === "error")) && <p className="help-text">{stateLabels[current.status]}</p>}
+    {blockers.groups.map((group) => <section key={commercialCanonicalJson(group.ids)} className="notice warning" aria-label="Связанные условия этого вопроса"><p>{group.issues.some((issue) => issue.code === "commercial-upstream-unresolved") ? "Сначала согласуйте связанные вопросы." : "Есть связанные вопросы."}{group.issues.some((issue) => issue.code === "commercial-decision-target-overlap") ? " Общие пункты требуют разделения перед применением." : ""}</p><ul>{relatedLabels(group.ids).map((label, index) => <li key={index}>{label}</li>)}</ul><details><summary>Подробности проверки: {group.issues.length}</summary><ul>{group.issues.map((issue, index) => <li key={index} data-issue-code={issue.code} data-issue-paths={issue.path}>{commercialIssueMessage(doc, issue)} <code>{issue.code}</code> · <code>{issue.path}</code></li>)}</ul></details></section>)}
     {stale && dirtyRef.current && <p className="notice warning" role="alert">Документ, вопрос или зависимая цена изменились. Неприменённый ответ сохранён ниже и не заменит новую редакцию. Скопируйте нужный текст перед началом заново.</p>}
+    {foreignState && <p className="notice warning" role="status">Проверка относится к другому вопросу. Дождитесь актуальной проверки; введённый ответ сохранён.</p>}
     {!belongs && <p className="notice error">Вопрос или его исходные фрагменты не найдены в текущем документе. Применение недоступно.</p>}
     {error && <p className="notice error" role="alert">{commercialReadableMessage(doc, error)}</p>}{notice && <p role="status">{notice}</p>}
     <fieldset disabled={frozen} className="commercial-question-fields"><legend className="sr-only">Конкретный ответ</legend>
@@ -237,9 +284,10 @@ export function CommercialQuestionEditor(props: CommercialQuestionEditorProps) {
       {kind === "source-reference" && <>{select("Как разрешить исходные ссылки", d.referenceMode, [["body-target", "Связать с конкретными пунктами предложения"], ["governing-document", "Определить действующий документ и события"], ["replace-clauses", "Задать новую редакцию собственных пунктов"]], (value) => change((next) => { next.referenceMode = value as Draft["referenceMode"]; }))}
         {d.referenceMode === "body-target" && checks("Цели исходной ссылки", d.targetIds, targets, (value) => change((next) => { next.targetIds = value; }))}{d.referenceMode === "governing-document" && <>{field("Название действующего документа", d.definitionTitle, (value) => change((next) => { next.definitionTitle = value; }))}{field("Определение документа и события", d.definitionText, (value) => change((next) => { next.definitionText = value; }), true)}<p className="help-text">Объясните, какой документ и момент подписания или другое событие применяются. Исходный договор не становится этим КП автоматически.</p></>}{d.referenceMode === "replace-clauses" && d.replacements.map((part, index) => <div key={part.blockId}>{field(`Новая редакция пункта ${index + 1}`, part.publicText, (value) => change((next) => { next.replacements[index].publicText = value; }), true)}<details><summary>Текущий текст пункта {index + 1}</summary><pre>{doc.body.sections.flatMap((section) => section.blocks).filter((block) => block.id === part.blockId).map(displayedText).join("\n")}</pre></details></div>)}</>}
     </fieldset>
-    <div className="commercial-question-actions"><button type="button" className="secondary" disabled={frozen || !belongs || current?.sourceCurrent === false} onClick={() => run("preview")}>{pending === "preview" ? "Проверяю изменения…" : "Посмотреть изменения"}</button><button type="button" className="primary" disabled={frozen || !belongs || current?.sourceCurrent === false} onClick={() => run("apply")}>{pending === "apply" ? "Применяю решение…" : "Применить решение"}</button><button type="button" className="secondary" disabled={disabled || pending !== null} onClick={reset}>Начать заново по текущей редакции</button></div>
-    {preview && !stale && <section className="commercial-question-preview" aria-label="Предварительный просмотр решения"><h6>Предлагаемые изменения — ещё не применены</h6>{commercialIssueGroups(preview.issues).map(({ key, issue, entries }) => <p key={key} className={`notice ${issue.severity === "error" ? "error" : "warning"}`} data-issue-paths={entries.map((entry) => entry.path).join(" ")}>{commercialIssueMessage(doc, issue)}{entries.length > 1 ? ` · замечаний: ${entries.length}` : ""}</p>)}{preview.previewBlocks.map(previewBlock)}</section>}
-    {commercialIssueGroups(current?.issues || []).map(({ key, issue, entries }) => <p key={key} className="help-text" data-issue-paths={entries.map((entry) => entry.path).join(" ")}>{commercialIssueMessage(doc, issue)}{entries.length > 1 ? ` · замечаний: ${entries.length}` : ""}</p>)}
+    <div className="commercial-question-actions"><button type="button" className="secondary" disabled={frozen || !belongs || current?.sourceCurrent === false} onClick={() => run("preview")}>{pending === "preview" ? "Проверяю изменения…" : "Посмотреть изменения"}</button><button type="button" className="primary" disabled={frozen || !belongs || current?.sourceCurrent === false || !canApply} aria-describedby={!canApply ? hintId : undefined} onClick={() => run("apply")}>{pending === "apply" ? "Применяю решение…" : "Применить решение"}</button><button type="button" className="secondary" disabled={disabled || pending !== null || foreignState} onClick={reset}>Начать заново по текущей редакции</button></div>
+    {!canApply && <p id={hintId} className="help-text">Заполните ответ и проверьте изменения перед применением.</p>}
+    {preview && freshPreview && <section className="commercial-question-preview" aria-label="Предварительный просмотр решения"><h6>Предлагаемые изменения — ещё не применены</h6>{commercialIssueGroups(preview.issues).map(({ key, issue, entries }) => <p key={key} className={`notice ${issue.severity === "error" ? "error" : "warning"}`} data-issue-paths={entries.map((entry) => entry.path).join(" ")}>{commercialIssueMessage(doc, issue)}{entries.length > 1 ? ` · замечаний: ${entries.length}` : ""}</p>)}{preview.previewBlocks.map(previewBlock)}</section>}
+    {commercialIssueGroups(blockers.other).map(({ key, issue, entries }) => <p key={key} className="help-text" data-issue-paths={entries.map((entry) => entry.path).join(" ")}>{commercialIssueMessage(doc, issue)}{entries.length > 1 ? ` · замечаний: ${entries.length}` : ""}</p>)}
     <details className="commercial-question-proof"><summary>Исходные условия и ссылки</summary>{[...new Set([...question.sourceClauseIds, ...session.prefillSourceIds])].map((id) => { const clause = doc.privateAppendix.clauses.find((entry) => entry.id === id); return clause ? <div key={id}><strong>{clause.sourceName} · {clause.locator}</strong><pre>{clause.quote}</pre></div> : <p key={id}>Исходный фрагмент не найден.</p>; })}{question.sourceReferenceIds.map((id) => { const ref = doc.privateAppendix.references.find((entry) => entry.id === id); return <p key={id}>Исходная ссылка: {ref?.printed || "не найдена"}</p>; })}</details>
     <p className="help-text">Можно оставить этот вопрос нерешённым в проверочном черновике. Ни выбор полей, ни предварительный просмотр не подтверждают готовность КП.</p>
   </section>;
