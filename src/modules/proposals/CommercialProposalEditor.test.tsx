@@ -15,7 +15,9 @@ vi.mock('react', async (original) => ({ ...await original<typeof import('react')
   useEffect: (effect: () => void | (() => void), deps: readonly unknown[]) => { const index = runtime.index++, old = runtime.slots[index]; if (old?.deps?.length === deps.length && old.deps.every((value, i) => Object.is(value, deps[i]))) return; runtime.slots[index] = { ...old, deps }; runtime.effects.push(() => { old?.cleanup?.(); const cleanup = effect(); runtime.slots[index].cleanup = typeof cleanup === 'function' ? cleanup : undefined; }); },
 }));
 type Props = Parameters<typeof CommercialProposalEditor>[0];
-type NodeProps = { children?: ReactNode };
+type NodeProps = { children?: ReactNode; href?: string; 'data-question-id'?: string; 'data-issue-paths'?: string };
+const nodes = (node: ReactNode): Array<{ type: unknown; props: NodeProps }> => Array.isArray(node) ? node.flatMap(nodes) : isValidElement<NodeProps>(node) ? [{ type: node.type, props: node.props }, ...nodes(node.props.children)] : [];
+const text = (node: ReactNode): string => Array.isArray(node) ? node.map(text).join('') : isValidElement<NodeProps>(node) ? text(node.props.children) : typeof node === 'string' || typeof node === 'number' ? String(node) : '';
 const fingerprint = `sha256:${'a'.repeat(64)}` as const;
 function deferred<T>() { let resolve!: (value: T) => void; const promise = new Promise<T>((yes) => { resolve = yes; }); return { promise, resolve }; }
 function fixture(): ProposalData {
@@ -44,6 +46,40 @@ beforeEach(async () => {
 const answer = { kind: 'advance-days' as const, dayKind: 'calendar' as const };
 
 describe('commercial document sole-owner controller', () => {
+  it('groups exact readiness messages but retains all distinct question links and reports zero applied decisions truthfully', async () => {
+    const value = fixture(), doc = value.commercialDocument!;
+    doc.questions = Array.from({ length: 12 }, (_, index) => ({ ...doc.questions[0], id: `question-source-reference-${index}`, kind: 'source-reference', message: 'Нужно проверить исходную ссылку.' }));
+    const issues: CommercialReadiness['issues'] = [
+      ...doc.questions.map((entry) => ({ code: 'commercial-material-question', path: `questions.${entry.id}`, message: 'Нужно проверить', severity: 'review' as const })),
+      ...doc.questions.slice(0, 7).map((entry) => ({ code: 'commercial-decision-target-overlap', path: `questions.${entry.id}`, message: 'Несколько решений затрагивают одни и те же пункты.', severity: 'error' as const })),
+      { code: 'commercial-source-incomplete', path: 'privateAppendix.extraction', message: 'Не все исходные материалы прочитаны.', severity: 'error' },
+    ];
+    runtime.readiness.mockImplementationOnce(async () => ({ canSaveDraft: true, canFinalize: false, issues, questions: doc.questions.map((entry) => ({ question: entry, sourceCurrent: true, status: 'unresolved', dependencyFingerprint: fingerprint, issues: [] })), activeDecisionIds: [], staleDecisionIds: [] } satisfies CommercialReadiness));
+    render({ value }); await flush();
+    const shown = text(tree), links = nodes(tree).filter((node) => node.type === 'a');
+    expect(shown.match(/Нужно проверить/g)).toHaveLength(1);
+    expect(shown.match(/Несколько вопросов/g)).toHaveLength(1); expect(shown).not.toContain('Несколько решений');
+    expect(shown).toContain('Вопросов без действующего решения: 12 из 12. Действующих применённых решений: 0.');
+    expect(shown).toContain('Не все исходные материалы прочитаны.');
+    expect(shown).toContain('Остаются вопросы для проверки');
+    expect(new Set(links.map((node) => node.props.href))).toEqual(new Set(doc.questions.map((entry) => `#commercial-question-${entry.id}`)));
+    expect(nodes(tree).filter((node) => node.props['data-question-id']).map((node) => node.props['data-question-id'])).toHaveLength(19);
+    expect(nodes(tree).find((node) => node.props['data-issue-paths']?.split(' ').length === 12)).toBeDefined();
+    expect(shown).not.toContain('question-source-reference-'); expect(shown).toContain('Вопрос 12: Смысл исходных ссылок — раздел 1 «Оплата», пункт 1.1');
+    expect(doc.decisions).toEqual([]); expect(props.onChange).not.toHaveBeenCalled();
+    expect(view().value.questions).toEqual(doc.questions);
+  });
+  it('keeps similarly worded but distinct readiness diagnostics separate', async () => {
+    const value = fixture(), doc = value.commercialDocument!;
+    runtime.readiness.mockImplementationOnce(async () => ({ canSaveDraft: true, canFinalize: false, issues: [
+      { code: 'commercial-review', path: 'questions.days', message: 'Нужно проверить срок.', severity: 'review' },
+      { code: 'commercial-review', path: 'questions.days', message: 'Нужно проверить срок и основание.', severity: 'review' },
+    ], questions: [], activeDecisionIds: [], staleDecisionIds: [] } satisfies CommercialReadiness));
+    render({ value }); await flush();
+    expect(nodes(tree).filter((node) => node.props['data-issue-paths'])).toHaveLength(2);
+    expect(text(tree)).toContain('Нужно проверить срок.'); expect(text(tree)).toContain('Нужно проверить срок и основание.');
+    expect(view().value).toBe(doc);
+  });
   it('keeps text changes local until accepted and forwards pending edits without native metadata requests', () => {
     const child = view(), next = { ...structuredClone(props.value.commercialDocument!), revision: 2 };
     child.onPendingEditChange!(true); expect(props.onPendingChange).toHaveBeenLastCalledWith(true);

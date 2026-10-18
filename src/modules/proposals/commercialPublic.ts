@@ -1,4 +1,5 @@
 import { COMMERCIAL_DOCUMENT_LIMITS, validateCommercialBody, type CommercialBody, type CommercialInline, type CommercialIssue, type CommercialTermQuestionKind } from "./commercialDocument";
+import type { CommercialReadiness } from "./commercialDecisions";
 import type { ProposalPublicDocument } from "./types";
 
 /** Document-local ordinal anchors only. No private provenance identifiers are
@@ -49,10 +50,85 @@ export function publicCommercialIssueMessage(issue: Pick<CommercialIssue, 'code'
     'commercial-stale-coverage-decision': 'Некоторые изменения условий утратили актуальность; согласуйте их заново.',
     'commercial-source-projection': 'Редакция условий отличается от исходной формулировки и требует проверки.',
     'commercial-unresolved-reference': 'В исходных ссылках остались неуточнённые документы или условия.',
-    'commercial-decision-target-overlap': 'Несколько решений затрагивают один пункт; согласуйте непротиворечивую редакцию.',
-    'commercial-upstream-unresolved': 'Сначала согласуйте связанные условия, затем проверьте зависимые решения.',
+    'commercial-decision-target-overlap': 'Связанные вопросы затрагивают один пункт; согласуйте непротиворечивую редакцию условий.',
+    'commercial-upstream-unresolved': 'Сначала согласуйте связанные условия, затем проверьте зависимые условия.',
+    'commercial-financial-context': 'Перед расчётом аванса проверьте применяемую цену предложения, валюту и порядок учёта НДС.',
+    'commercial-question-source-stale': 'Исходные условия этого вопроса изменились; проверьте их заново.',
+    'commercial-decision-stale': 'Прежняя редакция условий утратила актуальность и требует нового согласования.',
+    'commercial-source-layout-missing': 'Связь исходных условий с изменёнными пунктами утрачена; восстановите её перед согласованием.',
   };
   return known[issue.code] || (questionKind ? publicCommercialQuestionMessage(questionKind) : 'Некоторые исходные условия требуют дополнительной проверки. Этот проект не готов к отправке.');
+}
+
+/** A public draft has one actionable caution per question, with its current
+ * document-local targets. Private IDs/messages are only join keys, never text.
+ * Multiple diagnostics of that question become distinct safe details instead
+ * of separate copies of its generic question. This is presentation only: no
+ * question, source constraint or decision is removed or marked resolved. */
+export function projectCommercialReviewPublic(
+  readiness: Readonly<CommercialReadiness>,
+  projection: CommercialPublicBodyProjection,
+  mode: 'review-draft' | 'final',
+): Pick<ProposalPublicDocumentV2['commercial'], 'sections' | 'unresolved'> {
+  if (mode !== 'review-draft' && mode !== 'final') throw new Error('Неизвестный режим публичного документа.');
+  if (mode === 'final' && (!readiness.canFinalize || readiness.issues.length)) throw new Error('Остались нерешённые вопросы. Можно выгрузить только проект для проверки.');
+  const sections = structuredClone(projection.sections), unresolved: ProposalPublicDocumentV2['commercial']['unresolved'] = [];
+  const sectionAnchors = new Set(sections.map(section => section.anchor));
+  const questionIssues = new Map(readiness.questions.map(state => [state.question.id, [] as CommercialIssue[]]));
+  const issueOwners = new Map<string, Set<string>>();
+  const own = (path: string, id: string) => {
+    let ids = issueOwners.get(path); if (!ids) { ids = new Set(); issueOwners.set(path, ids); }
+    ids.add(id);
+  };
+  for (const state of readiness.questions) {
+    own(`questions.${state.question.id}`, state.question.id);
+    for (const reference of state.question.sourceReferenceIds) own(`privateAppendix.references.${reference}`, state.question.id);
+  }
+  const generic: Array<{ section?: string; message: string }> = [];
+  const genericKeys = new Set<string>();
+  for (const issue of readiness.issues) {
+    const owners = issueOwners.get(issue.path);
+    if (owners?.size) { for (const id of owners) questionIssues.get(id)!.push(issue); continue; }
+    const candidate = projection.anchors.get(issue.sectionId || ''), section = candidate && sectionAnchors.has(candidate) ? candidate : undefined;
+    const message = publicCommercialIssueMessage(issue), key = `${section || ''}\u0000${message}`;
+    if (!genericKeys.has(key)) { genericKeys.add(key); generic.push({ section, message }); }
+  }
+  const add = (section: string, message: string) => {
+    if (!sectionAnchors.has(section)) throw new Error('Вопрос проверки не имеет публичного раздела. Документ не выгружен.');
+    if (Array.from(message).length > COMMERCIAL_DOCUMENT_LIMITS.element) throw new Error('Предупреждение превышает 20000 символов. Ничего не усечено.');
+    if (unresolved.length >= COMMERCIAL_DOCUMENT_LIMITS.questions) throw new Error('Более 2000 вопросов проверки. Документ не усечён.');
+    unresolved.push({ section, message });
+  };
+  if (mode === 'review-draft') for (const [index, state] of readiness.questions.entries()) {
+    const issues = questionIssues.get(state.question.id)!;
+    if (state.activeDecision && !issues.length) continue;
+    const section = projection.anchors.get(state.question.sectionId);
+    if (!section || !sectionAnchors.has(section)) throw new Error('Вопрос проверки потерял свой публичный раздел. Документ не выгружен.');
+    const targets = state.question.targetBlockIds.map(id => {
+      const anchor = projection.anchors.get(id), match = /^s([1-9]\d*)b([1-9]\d*)$/u.exec(anchor || '');
+      if (!match) throw new Error('Вопрос проверки потерял свой публичный пункт. Документ не выгружен.');
+      return `${match[1]}.${match[2]}`;
+    });
+    const context = targets.length ? ` ${targets.length === 1 ? 'Пункт' : 'Пункты'} ${targets.join(', ')}.` : '';
+    const base = publicCommercialQuestionMessage(state.question.kind), details = new Set<string>();
+    for (const issue of issues) {
+      if (issue.code === 'commercial-material-question') continue;
+      const message = publicCommercialIssueMessage(issue, state.question.kind);
+      details.add(message === base ? 'Есть дополнительные неуточнённые ограничения этого вопроса; их необходимо проверить перед выпуском.' : message);
+    }
+    add(section, `Вопрос ${index + 1}. ${base}${context}${details.size ? ` ${[...details].join(' ')}` : ''}`);
+  }
+  let genericAnchor: string | undefined;
+  for (const issue of generic) {
+    if (issue.section) { add(issue.section, issue.message); continue; }
+    if (!genericAnchor) {
+      if (sections.length >= COMMERCIAL_DOCUMENT_LIMITS.sections) throw new Error('Для вопросов проверки нужен отдельный раздел; достигнут предел 64 разделов. Документ не усечён.');
+      genericAnchor = `s${sections.length + 1}`;
+      sections.push({ anchor: genericAnchor, title: 'Вопросы для проверки', blocks: [] }); sectionAnchors.add(genericAnchor);
+    }
+    add(genericAnchor, issue.message);
+  }
+  return { sections, unresolved };
 }
 
 /** Include metadata, price lines, unresolved questions and layout in the same

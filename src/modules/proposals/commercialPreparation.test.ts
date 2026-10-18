@@ -243,6 +243,25 @@ describe("source-derived commercial review draft", () => {
     expect(definitions.length).toBeGreaterThan(0);
     for (const question of definitions) { expect(question.targetBlockIds).toHaveLength(1); expect(question.targetBlockIds[0]).toMatch(/^definition-/); expect(ordinary).not.toContain(question.targetBlockIds[0]); }
   });
+  it("describes distinct governing-reference tasks by actual document namespace and affected sections", async () => {
+    const document = (await prepare()).document!;
+    const questions = document.questions.filter(question => question.kind === "source-reference" && question.sourceReferenceIds.every(id => document.privateAppendix.references.some(ref => ref.id === id && ["document", "event"].includes(ref.kind))));
+    expect(questions.length).toBeGreaterThan(1);
+    expect(new Set(questions.map(question => question.message)).size).toBe(questions.length);
+    const caveats = questions.map(question => text(blocks(document).find(block => block.id === question.targetBlockIds[0])!));
+    expect(new Set(caveats).size).toBe(caveats.length);
+    expect(questions.some(question => question.message.includes("исходного договора"))).toBe(true);
+    expect(questions.some(question => question.message.includes("исходного ТЗ"))).toBe(true);
+    expect(questions.some(question => question.message.includes("«Оплата»"))).toBe(true);
+    for (const question of questions) {
+      expect(question.material).toBe(true);
+      expect(question.message).not.toContain(question.id);
+      expect(question.message).toContain("не заменяется на КП автоматически");
+    }
+    expect(document.decisions).toEqual([]);
+    expect(validateCommercialDocument(document)).toEqual([]);
+    expect(validateCommercialSourceProjection(document)).toEqual([]);
+  });
   it("exposes only explicit source stages, not an inferred missing stage", async () => {
     const document = (await prepare()).document!, catalog = collectCommercialStageCatalog(document);
     expect(catalog.issues).toEqual([]); expect(catalog.stages.map((stage) => stage.printedNumber)).toEqual(["1", "2"]);

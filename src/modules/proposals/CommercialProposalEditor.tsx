@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { CommercialDocumentView } from './CommercialDocumentView';
-import { CommercialQuestionEditor } from './CommercialQuestionEditor';
+import { CommercialQuestionEditor, commercialIssueGroups, commercialIssueMessage, commercialQuestionLabel } from './CommercialQuestionEditor';
 import { commercialCanonicalJson, type CommercialTermAnswer, type ProposalCommercialDocumentV1 } from './commercialDocument';
 import { applyTermDecision, projectReadiness, validateTermAnswer, type CommercialReadiness } from './commercialDecisions';
 import type { ProposalData } from './types';
@@ -72,8 +72,12 @@ export function CommercialProposalEditor(props: Props) {
   };
   const activePlan = ready?.readiness?.questions.find((state) => state.activeDecision?.answer.kind === 'stage-plan')?.activeDecision;
   const activeStages = activePlan?.answer.kind === 'stage-plan' ? activePlan.answer.stages.map(({ id, title }) => ({ id, title })) : undefined;
+  const unresolvedQuestions = ready?.readiness?.questions.filter((state) => !state.activeDecision).length;
   return <>
-    {!ready ? <p role="status">Проверяем связи и актуальность условий…</p> : ready.error ? <p className="notice error" role="alert">{ready.error} Сохранённый документ не изменён.</p> : ready.readiness && <details className="notice warning"><summary>{ready.readiness.canFinalize ? 'Связи исходных условий проверены' : 'Остаются вопросы для проверки'} · сохранить рабочий проект можно отдельно</summary><p>Это локальная проверка содержания, не разрешение раскрывать конфиденциальную информацию и не подтверждение сохранения или отправки.</p><ul>{[...new Set(ready.readiness.issues.map((issue) => issue.message))].map((message) => <li key={message}>{message}</li>)}</ul></details>}
+    {!ready ? <p role="status">Проверяем связи и актуальность условий…</p> : ready.error ? <p className="notice error" role="alert">{ready.error} Сохранённый документ не изменён.</p> : ready.readiness && <details className="notice warning"><summary>{ready.readiness.canFinalize ? 'Связи исходных условий проверены' : 'Остаются вопросы для проверки'} · сохранить рабочий проект можно отдельно</summary><p>Это локальная проверка содержания, не разрешение раскрывать конфиденциальную информацию и не подтверждение сохранения или отправки.</p><p>Вопросов без действующего решения: {unresolvedQuestions} из {ready.readiness.questions.length}. Действующих применённых решений: {ready.readiness.activeDecisionIds.length}.</p><ul>{commercialIssueGroups(ready.readiness.issues).map(({ key, issue, entries }) => {
+      const related = doc.questions.filter((question, index) => entries.some((entry) => entry.path === `questions.${question.id}` || entry.path === `questions[${index}]`));
+      return <li key={key} data-issue-paths={entries.map((entry) => entry.path).join(' ')}>{commercialIssueMessage(doc, issue)}{entries.length > 1 && <span> · замечаний: {entries.length}</span>}{related.length > 0 && <details><summary>Связанные вопросы: {related.length}</summary><ul>{related.map((question) => <li key={question.id} data-question-id={question.id}><a href={`#commercial-question-${question.id}`}>{commercialQuestionLabel(doc, question)}</a></li>)}</ul></details>}</li>;
+    })}</ul></details>}
     <CommercialDocumentView value={doc} readOnly={disabled} onPendingEditChange={pendingCallback('body')} onChange={(next) => {
       const current = latest.current;
       if (current.disabled || current.sessionKey !== sessionKey || current.value.commercialDocument !== doc) return false;

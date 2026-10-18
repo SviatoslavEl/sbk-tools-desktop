@@ -9,7 +9,7 @@ vi.mock("react", async (original) => ({ ...await original<typeof import("react")
   if (!(index in hooks.values)) hooks.values[index] = initial;
   return [hooks.values[index], (next: unknown) => { hooks.values[index] = typeof next === "function" ? next(hooks.values[index]) : next; }];
 } }));
-type Props = { children?: ReactNode; disabled?: boolean; value?: unknown; href?: string; "aria-label"?: string; role?: string; onClick?: () => void; onChange?: (event: { target: { value: string } }) => void };
+type Props = { children?: ReactNode; disabled?: boolean; value?: unknown; href?: string; id?: string; "data-question-id"?: string; "aria-label"?: string; role?: string; onClick?: () => void; onChange?: (event: { target: { value: string } }) => void };
 const text = (node: ReactNode): string => Array.isArray(node) ? node.map(text).join("") : isValidElement<Props>(node) ? text(node.props.children) : typeof node === "string" || typeof node === "number" ? String(node) : "";
 function find(node: ReactNode, check: (type: unknown, props: Props) => boolean): Props | undefined {
   if (Array.isArray(node)) { for (const child of node) { const result = find(child, check); if (result) return result; } }
@@ -41,6 +41,14 @@ async function setup() {
 }
 
 describe("controlled working commercial document", () => {
+  it("keeps distinct questions with identical wording addressable beside their original section", async () => {
+    const ui = await setup(), fingerprint = ui.value.privateAppendix.sourceSnapshotKey;
+    ui.value.questions = ["intro", "list"].map((blockId, index) => ({ id: `question-source-reference-${index}`, kind: "source-reference", sectionId: "scope", targetBlockIds: [blockId], sourceClauseIds: ["clause"], sourceReferenceIds: [], message: "Нужно проверить исходную ссылку.", material: true, dependencyFingerprint: fingerprint }));
+    const original = structuredClone(ui.value), rendered = ui.render();
+    expect(text(rendered)).toContain("Вопросы по разделу: 2"); expect(text(rendered).match(/Нужно проверить исходную ссылку\./g)).toHaveLength(2);
+    for (const question of ui.value.questions) expect(find(rendered, (_type, props) => props.id === `commercial-question-${question.id}`)?.["data-question-id"]).toBe(question.id);
+    expect(text(rendered)).not.toContain("question-source-reference-"); expect(ui.value).toEqual(original); expect(ui.onChange).not.toHaveBeenCalled();
+  });
   it("edits inline text only after Apply and keeps the source, siblings, history and local reference intact", async () => {
     const ui = await setup(), original = structuredClone(ui.value);
     ui.begin(); ui.change("Текст пункта 1.1, группа 1, фрагмент 1", "Согласованный анализ.");

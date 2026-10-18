@@ -4,7 +4,7 @@ import { MAX_PROPOSAL_LINES, priceProposal, priceProposalLine, ProposalPricingEr
 import { proposalSourcePricingIssues } from './sourcePricing';
 import { validateCommercialDocument, validateCommercialQuoteHashes } from './commercialDocument';
 import { projectReadiness } from './commercialDecisions';
-import { assertPublicDocumentBudget, projectCommercialBodyPublic, publicCommercialIssueMessage, publicCommercialQuestionMessage, type AnyProposalPublicDocument, type ProposalPublicDocumentV2 } from './commercialPublic';
+import { assertPublicDocumentBudget, projectCommercialBodyPublic, projectCommercialReviewPublic, type AnyProposalPublicDocument, type ProposalPublicDocumentV2 } from './commercialPublic';
 import { hasFreshCommercialScopeSnapshot } from './commercialScopeSnapshot';
 import type { PartySnapshot, ProposalContact, ProposalData, ProposalIssue, ProposalPublicDocument, PublicAsset } from './types';
 
@@ -135,26 +135,7 @@ export async function buildProposalDocumentPublic(data: ProposalData, options: {
   const mode = options.mode ?? 'review-draft';
   if (mode === 'final' && !readiness.canFinalize) throw new Error(readiness.issues[0]?.message || 'Остались нерешённые вопросы. Можно выгрузить только проект для проверки.');
   const common = buildPublicCommon(captured, options), projection = projectCommercialBodyPublic(captured.commercialDocument.body);
-  const sections = projection.sections;
-  const unresolved: ProposalPublicDocumentV2['commercial']['unresolved'] = [];
-  const add = (section: string, message: string) => { if (!unresolved.some((entry) => entry.section === section && entry.message === message)) unresolved.push({ section, message }); };
-  const generic: string[] = [];
-  for (const entry of readiness.issues) {
-    const question = readiness.questions.find((state) => entry.path === `questions.${state.question.id}`)?.question;
-    const section = projection.anchors.get(entry.sectionId || question?.sectionId || '');
-    const message = publicCommercialIssueMessage(entry, question?.kind);
-    if (section) add(section, message); else if (!generic.includes(message)) generic.push(message);
-  }
-  // Optional questions may stay private in a final file. Review drafts show
-  // them honestly; material unresolved questions have already blocked final.
-  if (mode === 'review-draft') for (const state of readiness.questions) if (!state.activeDecision) add(projection.anchors.get(state.question.sectionId)!, publicCommercialQuestionMessage(state.question.kind));
-  if (generic.length) {
-    if (sections.length >= 64) throw new Error('Для вопросов проверки нужен отдельный раздел; достигнут предел 64 разделов. Документ не усечён.');
-    const anchor = `s${sections.length + 1}`;
-    sections.push({ anchor, title: 'Вопросы для проверки', blocks: [] });
-    for (const message of generic) add(anchor, message);
-  }
-  if (unresolved.length > 2000) throw new Error('Более 2000 вопросов проверки. Документ не усечён.');
+  const { sections, unresolved } = projectCommercialReviewPublic(readiness, projection, mode);
   const { schemaVersion: _version, terms: _legacyTerms, ...publicMetadata } = common;
   const result: ProposalPublicDocumentV2 = { ...publicMetadata, schemaVersion: 2, commercial: { version: 1, mode, sections, unresolved } };
   assertPublicDocumentBudget(result);

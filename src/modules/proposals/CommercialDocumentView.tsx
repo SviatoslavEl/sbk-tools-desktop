@@ -93,7 +93,7 @@ export function CommercialDocumentView({ value, onChange, readOnly = false, rend
           <div className="commercial-block-heading"><small>{si + 1}.{bi + 1}</small>{!readOnly && <button type="button" className="secondary" disabled={Boolean(editing && editing.blockId !== block.id)} aria-label={`Изменить текст пункта ${si + 1}.${bi + 1}`} onClick={() => begin(block)}>Изменить текст</button>}</div>
           {!detached && editing?.blockId === block.id ? editor(editing, `${si + 1}.${bi + 1}`) : body(block)}
         </div>)}
-        {questions.length > 0 && <aside className="commercial-section-questions" aria-label={`Вопросы по разделу ${si + 1}`}><h4>Нужно уточнить</h4>{questions.map((question) => <div key={question.id}>{renderQuestion ? renderQuestion(question) : <p>{question.message}</p>}</div>)}</aside>}
+        {questions.length > 0 && <aside className="commercial-section-questions" aria-label={`Вопросы по разделу ${si + 1}`}><h4>Вопросы по разделу: {questions.length}</h4>{questions.map((question) => <div key={question.id} id={`commercial-question-${question.id}`} data-question-id={question.id}>{renderQuestion ? renderQuestion(question) : <p>{question.message}</p>}</div>)}</aside>}
       </section>;
     })}
   </section>;

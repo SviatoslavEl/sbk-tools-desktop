@@ -157,6 +157,37 @@ function textInlines(text: string, start: number, references: readonly Commercia
   return parts;
 }
 
+/** Explain each actual source-reference task without leaking its technical
+ * IDs or merging decisions that belong to different source namespaces. */
+function referenceContext(
+  refs: readonly CommercialSourceReference[],
+  clauses: readonly CommercialSourceClause[],
+  containers: readonly CommercialSourceContainer[],
+  sections: readonly CommercialSection[],
+  targets: readonly string[],
+): { message: string; publicCaveat: string } {
+  const sourceContainers = [...new Set(refs.map(ref => clauses.find(clause => clause.id === ref.sourceClauseId)?.containerId))];
+  const origin = sourceContainers.map(id => containers.find(container => container.id === id)?.kind)
+    .map(kind => kind === "technical-task" ? "исходного ТЗ" : kind === "contract" ? "исходного договора" : "исходного документа");
+  const originLabel = [...new Set(origin)].join(" / ");
+  const affected = sections.filter(section => section.blocks.some(block => targets.includes(block.id))).map(section => `«${section.title}»`);
+  const location = affected.length ? affected.join(", ") : "условия предложения";
+  const governing = refs.every(ref => ref.kind === "document" || ref.kind === "event");
+  if (governing) {
+    const names = [...new Set(refs.map(ref => ref.scopeHint === "contract" ? "Договор" : ref.scopeHint === "technical-task" ? "ТЗ" : "исходный документ"))];
+    const label = names.map(name => `«${name}»`).join(" / ");
+    return {
+      message: `В разделах ${location} используются ссылки на ${label} из ${originLabel}. Укажите применяемый документ и связанные события, включая подписание, если оно упомянуто. Название исходного документа не заменяется на КП автоматически.`,
+      publicCaveat: `Для разделов ${location} нужно определить документ ${label} и связанные с ним события по условиям ${originLabel}.`,
+    };
+  }
+  const printed = [...new Set(refs.map(ref => `«${ref.printed}»`))].join(", ");
+  return {
+    message: `В разделах ${location} осталась исходная ссылка ${printed} из ${originLabel}. Она не сопоставлена с единственным полным условием предложения. Выберите конкретную цель или явно отредактируйте связанный пункт.`,
+    publicCaveat: "Исходная ссылка требует уточнения.",
+  };
+}
+
 function freezePrivateAppendix(document: ProposalCommercialDocumentV1): void {
   const freeze = (value: unknown) => { if (value && typeof value === "object" && !Object.isFrozen(value)) { for (const child of Object.values(value)) freeze(child); Object.freeze(value); } };
   freeze(document.privateAppendix);
@@ -406,7 +437,8 @@ export async function prepareCommercialDocument(input: CommercialPreparationInpu
       const fingerprint = await commercialQuestionSourceFingerprint({ version: 1, sourceSnapshotKey: freshKey, documentId: eligible[0]?.documentId || "unresolved-envelope", extraction: { complete, requiresOcr, visualAssessment: "unassessed" }, containers: source.containers, clauses: source.clauses, references, coverage }, { kind, sourceClauseIds, sourceReferenceIds });
       if (kind === "source-reference" && sourceReferenceIds.every((id) => references.some((ref) => ref.id === id && (ref.kind === "document" || ref.kind === "event")))) {
         owner = section("definitions"); const id = `definition-${fingerprint.slice(7, 31)}`;
-        owner.blocks.push({ id, kind: "paragraph", style: "caveat", content: [{ kind: "text", text: "Связь исходных ссылок «Договор» / «ТЗ» с условиями этого предложения требует отдельного решения." }] }); targetBlockIds = [id];
+        const context = referenceContext(references.filter(ref => sourceReferenceIds.includes(ref.id)), source.clauses, source.containers, [...sections.values()], targetBlockIds);
+        owner.blocks.push({ id, kind: "paragraph", style: "caveat", content: [{ kind: "text", text: context.publicCaveat }] }); targetBlockIds = [id];
       }
       questions.push({ id: `question-${kind}-${fingerprint.slice(7, 31)}`, kind, sectionId: owner.id, targetBlockIds, sourceClauseIds, sourceReferenceIds, message, material: true, dependencyFingerprint: fingerprint });
     };
@@ -425,7 +457,11 @@ export async function prepareCommercialDocument(input: CommercialPreparationInpu
       const key = ref.kind === "document" || ref.kind === "event" ? `document:${clause.containerId}:${ref.scopeHint}` : `pointer:${ref.id}`;
       groups.set(key, [...(groups.get(key) || []), ref]);
     }
-    for (const group of groups.values()) await question("source-reference", group.every((ref) => ref.kind === "document" || ref.kind === "event") ? "Уточните, какой документ и события его подписания имеют в виду эти условия. Слова «Договор» / «ТЗ» не заменены на КП автоматически." : "Исходная ссылка не сопоставлена с единственным полным условием предложения. Выберите конкретную цель или явно отредактируйте связанный пункт.", [...new Set(group.map((ref) => ref.sourceClauseId))], group.map((ref) => ref.id));
+    for (const group of groups.values()) {
+      const sourceClauseIds = [...new Set(group.map(ref => ref.sourceClauseId))];
+      const targets = sourceClauseIds.flatMap(id => blockForClause.get(id) || []);
+      await question("source-reference", referenceContext(group, source.clauses, source.containers, [...sections.values()], targets).message, sourceClauseIds, group.map(ref => ref.id));
+    }
     const unmapped = coverage.filter((entry) => entry.kind === "unmapped");
     if (unmapped.length) issues.push(review("commercial-unmapped-material", `${unmapped.length} исходных фрагментов сохранены частно, но не распределены однозначно. Классификация не является разрешением удалить существенные условия.`));
     if (!sections.size) section("other");

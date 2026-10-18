@@ -46,7 +46,7 @@ describe('structured public document dispatch', () => {
     const identity = { kind: 'advance-days' as const, sourceClauseIds: ['private-clause'], sourceReferenceIds: [] };
     doc.questions.push({ ...identity, id: 'days-question', sectionId: 'payment-section', targetBlockIds: ['payment-block'], message: 'Уточните вид дней для аванса.', material: true, dependencyFingerprint: await commercialQuestionSourceFingerprint(doc.privateAppendix, identity) });
     const output = v2(await buildProposalDocumentPublic(data));
-    expect(output.commercial.unresolved).toContainEqual({ section: 's2', message: 'Уточните, календарные или рабочие дни применяются к сроку аванса.' });
+    expect(output.commercial.unresolved).toContainEqual({ section: 's2', message: 'Вопрос 1. Уточните, календарные или рабочие дни применяются к сроку аванса. Пункт 2.1.' });
     expect(output.commercial.sections.map((section) => section.title).filter((title) => title === 'Состав работ')).toHaveLength(2);
   });
   it('does not export corrupted private provenance even as a review draft', async () => {

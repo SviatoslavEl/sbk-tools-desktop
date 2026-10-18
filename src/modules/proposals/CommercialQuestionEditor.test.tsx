@@ -15,7 +15,7 @@ vi.mock("react", async (original) => {
     useEffect: (effect: () => void | (() => void), deps?: readonly unknown[]) => { const index = hooks.index++, old = hooks.slots[index]; if (old && same(old.deps, deps)) return; hooks.slots[index] = { ...old, deps }; hooks.effects.push(() => { old?.cleanup?.(); const cleanup = effect(); hooks.slots[index].cleanup = typeof cleanup === "function" ? cleanup : undefined; }); },
   };
 });
-type Props = { children?: ReactNode; disabled?: boolean; value?: unknown; checked?: boolean; "aria-label"?: string; role?: string; onClick?: () => unknown; onChange?: (event: { target: { value: string; checked?: boolean } }) => void };
+type Props = { children?: ReactNode; disabled?: boolean; value?: unknown; checked?: boolean; "aria-label"?: string; "data-issue-paths"?: string; role?: string; onClick?: () => unknown; onChange?: (event: { target: { value: string; checked?: boolean } }) => void };
 const nodes = (node: ReactNode): Array<{ type: unknown; props: Props }> => Array.isArray(node) ? node.flatMap(nodes) : isValidElement<Props>(node) ? [{ type: node.type, props: node.props }, ...nodes(node.props.children)] : [];
 const text = (node: ReactNode): string => Array.isArray(node) ? node.map(text).join("") : isValidElement<Props>(node) ? text(node.props.children) : typeof node === "string" || typeof node === "number" ? String(node) : "";
 function deferred<T>() { let resolve!: (value: T) => void, reject!: (error: Error) => void; const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; }
@@ -62,6 +62,42 @@ async function setup(kind: CommercialTermQuestionKind = "advance-days", seed?: A
 }
 
 describe("concrete commercial question forms", () => {
+  it("names every unresolved dependency by its distinct question, section and target without changing the gate or source question", async () => {
+    const seed = await fixture(), plan = { ...seed.question, id: "question-stage-plan-fixture", kind: "stage-plan" as const, sectionId: "scope", targetBlockIds: ["scope-block"] }, parallel = { ...seed.question, id: "question-stage-parallelism-fixture", kind: "stage-parallelism" as const };
+    seed.doc.questions.push(plan, parallel);
+    const original = structuredClone(seed.doc), ui = await setup("advance-days", seed);
+    ui.props = { ...ui.props, currentState: { question: seed.question, sourceCurrent: true, status: "blocked", dependencyFingerprint: seed.question.dependencyFingerprint, issues: [{ code: "commercial-upstream-unresolved", path: "questions.question", message: `Сначала рассмотрите связанные вопросы: ${plan.id}, ${parallel.id}, question-stage-plan-missing.`, severity: "error" }] } };
+    const shown = ui.text();
+    expect(shown).toContain("Вопрос 2: Согласованный план этапов — раздел 2 «Состав», пункт 2.1");
+    expect(shown).toContain("Вопрос 3: Последовательность и параллельность — раздел 1 «Уточняемое условие», пункт 1.1");
+    expect(shown).toContain("связанный вопрос, который сейчас не найден"); expect(shown).not.toContain("question-stage-");
+    expect(shown).toContain("Сначала устраните связанные ошибки");
+    expect(ui.field("Вопрос 1: Срок перечисления аванса — раздел 1 «Уточняемое условие», пункт 1.1")).toBeDefined();
+    expect(shown).toContain(seed.question.message); expect(ui.props.doc).toEqual(original); expect(ui.onApply).not.toHaveBeenCalled();
+  });
+  it("groups only exact issue messages while preserving every original issue path and never calls unanswered questions applied decisions", async () => {
+    const ui = await setup(), question = ui.props.question;
+    ui.props = { ...ui.props, currentState: { question, sourceCurrent: true, status: "blocked", dependencyFingerprint: question.dependencyFingerprint, issues: [
+      { code: "commercial-decision-target-overlap", path: "questions.question", message: "Несколько решений затрагивают одни и те же пункты.", severity: "error" },
+      { code: "commercial-decision-target-overlap", path: "questions.other", message: "Несколько решений затрагивают одни и те же пункты.", severity: "error" },
+      { code: "commercial-review", path: "questions.question", message: "Нужно проверить отдельное основание.", severity: "review" },
+    ] } };
+    expect(ui.text().match(/Несколько вопросов/g)).toHaveLength(1); expect(ui.text()).not.toContain("Несколько решений");
+    expect(ui.text()).toContain("Нужно проверить отдельное основание.");
+    expect(nodes(ui.render()).find((node) => node.props["data-issue-paths"] === "questions.question questions.other")).toBeDefined();
+    expect(ui.props.doc.decisions).toEqual([]); expect(ui.props.currentState?.issues).toHaveLength(3); expect(ui.onApply).not.toHaveBeenCalled();
+  });
+  it("also replaces technical dependency IDs in preview diagnostics and rejected Apply errors without dropping the warning", async () => {
+    const seed = await fixture(), plan = { ...seed.question, id: "question-stage-plan-preview", kind: "stage-plan" as const, sectionId: "scope", targetBlockIds: ["scope-block"] };
+    seed.doc.questions.push(plan);
+    const ui = await setup("advance-days", seed), message = `Решение пересекает блоки других вопросов: ${plan.id}. Сначала разделите условия; применение не выполнено.`;
+    ui.props = { ...ui.props, onPreview: async () => ({ valid: false, issues: [{ code: "commercial-decision-target-overlap", path: "questions.question", message, severity: "error" }], dependencyFingerprint: seed.question.dependencyFingerprint, previewBlocks: [] }) };
+    ui.change("Какие дни применяются к авансу", "business"); await ui.click("Посмотреть изменения");
+    expect(ui.text()).toContain("Этот вопрос затрагивает пункты других вопросов:"); expect(ui.text()).toContain("Согласованный план этапов — раздел 2 «Состав», пункт 2.1"); expect(ui.text()).not.toContain(plan.id);
+    expect(ui.text()).toContain("применение не выполнено"); expect(ui.props.doc.decisions).toEqual([]);
+    ui.onApply.mockRejectedValueOnce(new Error(message)); await ui.click("Применить решение");
+    expect(ui.text()).not.toContain(plan.id); expect(ui.text()).toContain("Ввод сохранён"); expect(ui.field("Какие дни применяются к авансу").value).toBe("business");
+  });
   it("never defaults the advance base/VAT or automatically applies an answer", async () => {
     const ui = await setup("advance-base");
     expect(ui.field("База расчёта аванса").value).toBe(""); expect(ui.field("Порядок учёта НДС в авансе").value).toBe("");

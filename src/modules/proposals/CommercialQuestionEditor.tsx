@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
-import { commercialCanonicalJson, isCommercialId, type CommercialAgreedStage, type CommercialBlock, type CommercialDayKind, type CommercialTermAnswer, type CommercialTermQuestion, type ProposalCommercialDocumentV1 } from "./commercialDocument";
+import { commercialCanonicalJson, isCommercialId, type CommercialAgreedStage, type CommercialBlock, type CommercialDayKind, type CommercialIssue, type CommercialTermAnswer, type CommercialTermQuestion, type ProposalCommercialDocumentV1 } from "./commercialDocument";
 import { validateTermAnswer, type CommercialAnswerValidation, type CommercialQuestionState } from "./commercialDecisions";
 import { collectCommercialStageCatalog } from "./commercialPreparation";
 import "./commercial-question-editor.css";
@@ -26,6 +26,39 @@ export interface CommercialQuestionEditorProps {
   onDirtyChange?: (dirty: boolean) => void;
 }
 const titles = { "advance-base": "База аванса и НДС", "advance-days": "Срок перечисления аванса", "stage-plan": "Согласованный план этапов", "stage-parallelism": "Последовательность и параллельность", "boundary-protocol": "Контрольные точки и границы работ", "source-reference": "Смысл исходных ссылок" };
+export function commercialQuestionLocation(doc: ProposalCommercialDocumentV1, question: CommercialTermQuestion): string {
+  const index = doc.body.sections.findIndex((section) => section.id === question.sectionId), section = doc.body.sections[index];
+  if (!section) return "раздел пока не найден";
+  const places = doc.body.sections.flatMap((owner, si) => owner.blocks.flatMap((block, bi) => question.targetBlockIds.includes(block.id) ? [`${si + 1}.${bi + 1}`] : []));
+  return `раздел ${index + 1} «${section.title}»${places.length ? `, ${places.length === 1 ? "пункт" : "пункты"} ${places.join(", ")}` : ""}`;
+}
+export function commercialQuestionLabel(doc: ProposalCommercialDocumentV1, question: CommercialTermQuestion): string {
+  const index = doc.questions.findIndex((entry) => entry.id === question.id);
+  return `${index >= 0 ? `Вопрос ${index + 1}: ` : ""}${titles[question.kind]} — ${commercialQuestionLocation(doc, question)}`;
+}
+/** Present dependencies without changing their IDs, targets or gate results. */
+export function commercialReadableMessage(doc: ProposalCommercialDocumentV1, message: string): string {
+  let result = message.replace("Решение пересекает блоки других вопросов:", "Этот вопрос затрагивает пункты других вопросов:");
+  for (const question of [...doc.questions].sort((left, right) => right.id.length - left.id.length)) {
+    const id = question.id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    result = result.replace(new RegExp(`(?<![A-Za-z0-9_-])${id}(?![A-Za-z0-9_-])`, "g"), () => `«${commercialQuestionLabel(doc, question)}»`);
+  }
+  return result.replace(/\bquestion-[A-Za-z0-9_-]+\b/g, "связанный вопрос, который сейчас не найден");
+}
+export function commercialIssueMessage(doc: ProposalCommercialDocumentV1, issue: Pick<CommercialIssue, "code" | "message">): string {
+  const message = issue.code === "commercial-decision-target-overlap" ? issue.message.replace("Несколько решений", "Несколько вопросов") : issue.message;
+  return commercialReadableMessage(doc, message);
+}
+/** Group only exact diagnostics. Keep every issue/path for the detail view. */
+export function commercialIssueGroups(issues: readonly CommercialIssue[]) {
+  const grouped = new Map<string, { key: string; issue: CommercialIssue; entries: CommercialIssue[] }>();
+  for (const issue of issues) {
+    const key = JSON.stringify([issue.code, issue.message, issue.severity]);
+    const existing = grouped.get(key);
+    if (existing) existing.entries.push(issue); else grouped.set(key, { key, issue, entries: [issue] });
+  }
+  return [...grouped.values()];
+}
 const dayName = (day: Day) => day === "business" ? "рабочих дней" : day === "calendar" ? "календарных дней" : "вид дней не выбран";
 const blockText = (block: CommercialBlock, localLabel?: (id: string) => string) => {
   const inline = (parts: Array<{ kind: string; text?: string; targetId?: string }>) => parts.map((part) => part.kind === "text" ? part.text : localLabel?.(part.targetId || "") || "[локальная ссылка]").join("");
@@ -170,15 +203,15 @@ export function CommercialQuestionEditor(props: CommercialQuestionEditorProps) {
   const d = session.draft, kind = session.question.kind;
   const targets = doc.body.sections.flatMap((section, si) => [
     ...(!section.blocks.some((block) => question.targetBlockIds.includes(block.id)) ? [[section.id, `${si + 1}. ${section.title}`] as const] : []),
-    ...section.blocks.filter((block) => !question.targetBlockIds.includes(block.id)).map((block) => [block.id, `Пункт ${si + 1}.${section.blocks.indexOf(block) + 1}: ${blockText(block).slice(0, 120)}`] as const),
+    ...section.blocks.filter((block) => !question.targetBlockIds.includes(block.id)).map((block) => [block.id, `Пункт ${si + 1}.${section.blocks.indexOf(block) + 1}: ${displayedText(block).slice(0, 120)}`] as const),
   ]);
   const stateLabels = { unresolved: "Требуется конкретное решение", resolved: "Есть действующее применённое решение", stale: "Прежнее решение требует проверки", blocked: "Сначала устраните связанные ошибки" };
-  return <section className="commercial-question-editor" aria-label={`Решение: ${question.message}`} aria-busy={pending !== null}>
-    <h5>{titles[question.kind]}</h5><p>{question.message}</p>
+  return <section className="commercial-question-editor" aria-label={commercialQuestionLabel(doc, question)} aria-busy={pending !== null}>
+    <h5>{commercialQuestionLabel(doc, question)}</h5><p>{question.message}</p>
     {current && <p className="help-text">{stateLabels[current.status]}</p>}
     {stale && dirtyRef.current && <p className="notice warning" role="alert">Документ, вопрос или зависимая цена изменились. Неприменённый ответ сохранён ниже и не заменит новую редакцию. Скопируйте нужный текст перед началом заново.</p>}
     {!belongs && <p className="notice error">Вопрос или его исходные фрагменты не найдены в текущем документе. Применение недоступно.</p>}
-    {error && <p className="notice error" role="alert">{error}</p>}{notice && <p role="status">{notice}</p>}
+    {error && <p className="notice error" role="alert">{commercialReadableMessage(doc, error)}</p>}{notice && <p role="status">{notice}</p>}
     <fieldset disabled={frozen} className="commercial-question-fields"><legend className="sr-only">Конкретный ответ</legend>
       {kind === "advance-base" && <><div className="commercial-question-grid">{select("База расчёта аванса", d.base, [["net", "От цены без НДС"], ["gross", "От цены с НДС"]], (value) => change((next) => { next.base = value as Draft["base"]; }))}{select("Порядок учёта НДС в авансе", d.vat, [["included", "НДС уже включён в выбранную сумму"], ["additional", "Начислить НДС дополнительно"]], (value) => change((next) => { next.vat = value as Draft["vat"]; }))}</div><p className="help-text">База и НДС выбираются независимо. Сумму считает редактор по действующей цене; исходная цена не применяется автоматически.</p>{d.base === "gross" && d.vat === "additional" && <p className="notice warning">НДС поверх цены с НДС — отдельное финансовое условие, требующее согласования.</p>}</>}
       {kind === "advance-days" && daySelect("Какие дни применяются к авансу", d.dayKind, (value) => change((next) => { next.dayKind = value; }))}
@@ -203,8 +236,8 @@ export function CommercialQuestionEditor(props: CommercialQuestionEditorProps) {
         {d.referenceMode === "body-target" && checks("Цели исходной ссылки", d.targetIds, targets, (value) => change((next) => { next.targetIds = value; }))}{d.referenceMode === "governing-document" && <>{field("Название действующего документа", d.definitionTitle, (value) => change((next) => { next.definitionTitle = value; }))}{field("Определение документа и события", d.definitionText, (value) => change((next) => { next.definitionText = value; }), true)}<p className="help-text">Объясните, какой документ и момент подписания или другое событие применяются. Исходный договор не становится этим КП автоматически.</p></>}{d.referenceMode === "replace-clauses" && d.replacements.map((part, index) => <div key={part.blockId}>{field(`Новая редакция пункта ${index + 1}`, part.publicText, (value) => change((next) => { next.replacements[index].publicText = value; }), true)}<details><summary>Текущий текст пункта {index + 1}</summary><pre>{doc.body.sections.flatMap((section) => section.blocks).filter((block) => block.id === part.blockId).map(displayedText).join("\n")}</pre></details></div>)}</>}
     </fieldset>
     <div className="commercial-question-actions"><button type="button" className="secondary" disabled={frozen || !belongs || current?.sourceCurrent === false} onClick={() => run("preview")}>{pending === "preview" ? "Проверяю изменения…" : "Посмотреть изменения"}</button><button type="button" className="primary" disabled={frozen || !belongs || current?.sourceCurrent === false} onClick={() => run("apply")}>{pending === "apply" ? "Применяю решение…" : "Применить решение"}</button><button type="button" className="secondary" disabled={disabled || pending !== null} onClick={reset}>Начать заново по текущей редакции</button></div>
-    {preview && !stale && <section className="commercial-question-preview" aria-label="Предварительный просмотр решения"><h6>Предлагаемые изменения — ещё не применены</h6>{preview.issues.map((issue, index) => <p key={index} className={`notice ${issue.severity === "error" ? "error" : "warning"}`}>{issue.message}</p>)}{preview.previewBlocks.map(previewBlock)}</section>}
-    {current?.issues.map((issue, index) => <p key={index} className="help-text">{issue.message}</p>)}
+    {preview && !stale && <section className="commercial-question-preview" aria-label="Предварительный просмотр решения"><h6>Предлагаемые изменения — ещё не применены</h6>{commercialIssueGroups(preview.issues).map(({ key, issue, entries }) => <p key={key} className={`notice ${issue.severity === "error" ? "error" : "warning"}`} data-issue-paths={entries.map((entry) => entry.path).join(" ")}>{commercialIssueMessage(doc, issue)}{entries.length > 1 ? ` · замечаний: ${entries.length}` : ""}</p>)}{preview.previewBlocks.map(previewBlock)}</section>}
+    {commercialIssueGroups(current?.issues || []).map(({ key, issue, entries }) => <p key={key} className="help-text" data-issue-paths={entries.map((entry) => entry.path).join(" ")}>{commercialIssueMessage(doc, issue)}{entries.length > 1 ? ` · замечаний: ${entries.length}` : ""}</p>)}
     <details className="commercial-question-proof"><summary>Исходные условия и ссылки</summary>{[...new Set([...question.sourceClauseIds, ...session.prefillSourceIds])].map((id) => { const clause = doc.privateAppendix.clauses.find((entry) => entry.id === id); return clause ? <div key={id}><strong>{clause.sourceName} · {clause.locator}</strong><pre>{clause.quote}</pre></div> : <p key={id}>Исходный фрагмент не найден.</p>; })}{question.sourceReferenceIds.map((id) => { const ref = doc.privateAppendix.references.find((entry) => entry.id === id); return <p key={id}>Исходная ссылка: {ref?.printed || "не найдена"}</p>; })}</details>
     <p className="help-text">Можно оставить этот вопрос нерешённым в проверочном черновике. Ни выбор полей, ни предварительный просмотр не подтверждают готовность КП.</p>
   </section>;
