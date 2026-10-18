@@ -4,14 +4,37 @@ import copy
 import hashlib
 import json
 import os
+import re
+import struct
+from io import BytesIO
 from pathlib import Path
+from uuid import UUID
 from zipfile import ZipFile
 
 import pytest
 from docx import Document
 from PIL import Image
 
-from scandocument.proposals import render, render_docx, validate_document
+from scandocument.proposals import PROPOSAL_FONT_FILES, render, render_docx, validate_document
+
+
+def unicode_document_fixture():
+    document = document_fixture()
+    document["title"] = "Акт сдачи\u2011приемки — проверка Unicode"
+    document["lines"][0]["description"] = "Акт сдачи\u2011приемки, ₽ и №, латиница A4, буквы ЁЙ."
+    document["terms"]["payment"] = (
+        "Передача акта сдачи\u2011приемки — № 1; сумма 12 000,00 ₽. "
+        "Тире – и −; кавычки «условия»; неразрывный\u00a0пробел."
+    )
+    document["layout"]["footer"] = "Форма сдачи\u2011приемки"
+    return document
+
+
+def _glyph_box(font, code):
+    glyph = font.face.charToGlyph[code]
+    start, end = font.face.glyphPos[glyph:glyph + 2]
+    assert glyph > 0 and end > start
+    return struct.unpack_from(">hhhhh", font.face.get_table("glyf"), start)
 
 
 def document_fixture(count=1):
@@ -87,6 +110,117 @@ def test_docx_layout_structure_and_prices(tmp_path, count):
         assert "12 000,00" in xml
         assert "PAGE" in archive.read("word/footer1.xml").decode()
         assert "SECRET" not in b"".join(archive.read(name) for name in archive.namelist()).decode(errors="ignore")
+
+
+def test_docx_embeds_exact_pinned_fonts_and_keeps_every_source_unicode(tmp_path):
+    from lxml import etree
+    from reportlab.pdfbase.ttfonts import TTFont
+    from scandocument.resources import resource_path
+
+    document = unicode_document_fixture()
+    original = copy.deepcopy(document)
+    output = tmp_path / "unicode.docx"
+    render_docx(document, output, {})
+    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
+          "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships"}
+    with ZipFile(output) as archive:
+        table = etree.fromstring(archive.read("word/fontTable.xml"))
+        relationships = {entry.get("Id"): entry.get("Target") for entry in etree.fromstring(archive.read("word/_rels/fontTable.xml.rels"))}
+        fonts = table.xpath('w:font[@w:name="SBK Proposal Sans"]/*', namespaces=ns)
+        assert len(fonts) == 4
+        pins = json.loads(resource_path("proposals", "fonts", "SOURCE.json").read_text())
+        expected = {tag: (variant, digest) for variant, tag, digest in PROPOSAL_FONT_FILES}
+        for entry in fonts:
+            variant, digest = expected[etree.QName(entry).localname]
+            font_key = UUID(entry.get(f"{{{ns['w']}}}fontKey").strip("{}"))
+            key = font_key.bytes[::-1]
+            target = relationships[entry.get(f"{{{ns['r']}}}id")]
+            embedded = bytearray(archive.read(f"word/{target}"))
+            for index in range(32):
+                embedded[index] ^= key[index % 16]
+            assert hashlib.sha256(embedded).hexdigest() == digest == pins["files"][f"SBKProposalSans-{variant}.ttf"]
+            padded = embedded + b"\0" * (-len(embedded) % 4)
+            assert sum(struct.unpack(f">{len(padded) // 4}I", padded)) & 0xFFFFFFFF == 0xB1B0AFBA
+            font = TTFont(variant, BytesIO(embedded))
+            assert font.face.name == f"SBKProposalSans-{variant}".encode("ascii")
+            assert struct.unpack_from(">H", font.face.get_table("OS/2"), 8)[0] == 0
+            for char in "Акт сдачи\u2011приемки ₽ № ЁЙ − – —\u00a0\u202f":
+                assert font.face.charToGlyph.get(ord(char), 0) > 0
+        body = etree.fromstring(archive.read("word/document.xml"))
+        footer = etree.fromstring(archive.read("word/footer1.xml"))
+        assert "".join(body.xpath("//w:t/text()", namespaces=ns)).count("\u2011") == 3
+        assert "Форма сдачи\u2011приемки" in "".join(footer.xpath("//w:t/text()", namespaces=ns))
+        for root in (body, footer, etree.fromstring(archive.read("word/styles.xml"))):
+            for slots in root.xpath("//w:rFonts", namespaces=ns):
+                assert {slots.get(f"{{{ns['w']}}}{slot}") for slot in ("ascii", "hAnsi", "eastAsia", "cs")} == {"SBK Proposal Sans"}
+                assert not any("Theme" in key for key in slots.attrib)
+    assert document == original
+    assert "SIL OPEN FONT LICENSE Version 1.1" in resource_path("proposals", "fonts", "OFL.txt").read_text()
+
+
+def test_unknown_unicode_fails_closed_without_replacing_business_text(tmp_path):
+    document = document_fixture()
+    document["terms"]["payment"] = "Неизвестный символ \U0001f9ea не должен стать квадратом."
+    original = copy.deepcopy(document)
+    with pytest.raises(ValueError, match=r"U\+1F9EA"):
+        render_docx(document, tmp_path / "unsupported.docx", {})
+    assert document == original and not (tmp_path / "unsupported.docx").exists()
+
+
+def test_missing_proposal_font_never_falls_back_to_system_fonts(tmp_path, monkeypatch):
+    monkeypatch.setattr("scandocument.proposals.resource_path", lambda *_parts: tmp_path / "missing-fonts")
+    with pytest.raises(ValueError, match="системная подстановка отключена"):
+        render_docx(document_fixture(), tmp_path / "missing.docx", {})
+    assert not (tmp_path / "missing.docx").exists()
+
+
+def test_changed_font_asset_fails_before_writing_a_document(tmp_path, monkeypatch):
+    directory = tmp_path / "tampered-fonts"
+    directory.mkdir()
+    (directory / "SBKProposalSans-Regular.ttf").write_bytes(b"not the pinned font")
+    monkeypatch.setattr("scandocument.proposals.resource_path", lambda *_parts: directory)
+    with pytest.raises(ValueError, match="шрифт КП изменился"):
+        render_docx(document_fixture(), tmp_path / "tampered.docx", {})
+    assert not (tmp_path / "tampered.docx").exists()
+
+
+@pytest.mark.skipif(not os.environ.get("SCANDOCUMENT_SOFFICE"), reason="Bundled office runtime required")
+def test_actual_pdf_unicode_has_real_pinned_glyphs_not_merely_correct_extracted_text(tmp_path):
+    from pypdf import PdfReader
+    from reportlab.pdfbase.ttfonts import TTFont
+    from scandocument.resources import resource_path
+
+    document = unicode_document_fixture()
+    original = copy.deepcopy(document)
+    result = render({"document": document, "workdir": str(tmp_path), "format": "preview", "assets": []})
+    reader = PdfReader(result["outputPath"])
+    assert len(reader.pages) == 1
+    text = "\n".join(page.extract_text() or "" for page in reader.pages)
+    assert text.count("\u2011") == 4
+    assert "сдачи\u2011приемки" in text and "12 000,00 ₽" in text and "ЁЙ" in text
+    checked = set()
+    for reference in reader.pages[0]["/Resources"]["/Font"].get_object().values():
+        font = reference.get_object()
+        name = str(font["/BaseFont"]).split("+", 1)[-1]
+        assert name in ("SBKProposalSans-Regular", "SBKProposalSans-Bold"), "System or internal LO font substitution is not accepted"
+        descriptor = font["/FontDescriptor"].get_object()
+        embedded = TTFont(name, BytesIO(descriptor["/FontFile2"].get_object().get_data()))
+        source = TTFont(f"source-{name}", str(resource_path("proposals", "fonts", f"{name}.ttf")))
+        cmap = font["/ToUnicode"].get_object().get_data().decode("ascii")
+        for encoded, unicode_value in re.findall(r"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>", cmap):
+            if unicode_value.upper() not in ("2011", "20BD"):
+                continue
+            code = int(unicode_value, 16)
+            # A correct ToUnicode map alone is insufficient: the old Arial
+            # PDF mapped U+2011 to a 1280x1280 square. Check the actual embedded
+            # TrueType glyph against the exact pinned source glyph geometry.
+            assert _glyph_box(embedded, int(encoded, 16)) == _glyph_box(source, code)
+            checked.add((name, code))
+    assert checked == {(f"SBKProposalSans-{variant}", code) for variant in ("Regular", "Bold") for code in (0x2011, 0x20BD)}
+    assert document == original
+    assert (tmp_path / "office/office-profile").is_dir()
+    assert all(Path(path).is_file() for path in result["previewPages"])
+    print(f"PROPOSAL_UNICODE_QA: {tmp_path}")
 
 
 @pytest.mark.parametrize(
@@ -171,23 +305,26 @@ def test_cancel_stops_actual_office_child_process(tmp_path, monkeypatch):
 
     original_popen = subprocess.Popen
     children = []
+    timers = []
 
     def slow_office(_command, **kwargs):
         child = original_popen([sys.executable, "-c", "import time; time.sleep(60)"], **kwargs)
         children.append(child)
+        timer = threading.Timer(0.4, lambda: (tmp_path / "cancel.requested").write_text("cancel"))
+        timers.append(timer)
+        timer.start()
         return child
 
     monkeypatch.setattr("scandocument.proposals.find_soffice", lambda: Path(sys.executable))
     monkeypatch.setattr(office_engine.subprocess, "Popen", slow_office)
-    timer = threading.Timer(0.4, lambda: (tmp_path / "cancel.requested").write_text("cancel"))
-    timer.start()
     try:
         with pytest.raises(CancelledError):
             render({"document": document_fixture(), "workdir": str(tmp_path), "format": "pdf", "assets": []})
         assert len(children) == 1 and children[0].poll() is not None
         assert not (tmp_path / "proposal.pdf").exists()
     finally:
-        timer.cancel()
+        for timer in timers:
+            timer.cancel()
         for child in children:
             if child.poll() is None:
                 child.kill()

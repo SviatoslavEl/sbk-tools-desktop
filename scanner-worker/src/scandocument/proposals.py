@@ -7,8 +7,11 @@ import json
 import re
 import signal
 import threading
+import uuid
 from datetime import date
 from decimal import Decimal, ROUND_HALF_UP, localcontext
+from functools import lru_cache
+from io import BytesIO
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
 
@@ -16,15 +19,120 @@ from docx import Document
 from docx.enum.table import WD_TABLE_ALIGNMENT, WD_CELL_VERTICAL_ALIGNMENT
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
+from docx.oxml import parse_xml
 from docx.oxml.ns import qn
+from docx.opc.constants import RELATIONSHIP_TYPE as RT
+from docx.opc.packuri import PackURI
+from docx.opc.part import Part
 from docx.shared import Mm, Pt, RGBColor
 from PIL import Image, ImageOps
 
-from scandocument.resources import find_soffice
+from scandocument.resources import find_soffice, resource_path
 from scandocument.errors import CancelledError
 
 MAX_MINOR = 9007199254740991
 RATES = (0, 5, 7, 10, 11, 20, 22)
+PROPOSAL_FONT = "SBK Proposal Sans"
+# Separate from the older scanner/OCR fonts. The pinned OFL derivatives change
+# only naming metadata and are embedded, avoiding host/internal-Office families.
+PROPOSAL_FONT_FILES = (
+    ("Regular", "embedRegular", "9f85711ba35ccf60cc66c9995c067683d69e2d85c81d999cbf0df17ad786a6ed"),
+    ("Bold", "embedBold", "0c6ba818e63ba15471847dd402e27c9b5630cff62b6f05eab581bb4f116a900d"),
+    ("Italic", "embedItalic", "d386cbc1fef5e5c6621fa96625b615c838f9865bc385f94397c6922480e32364"),
+    ("BoldItalic", "embedBoldItalic", "101b87e65938570b3bc2d7a703d5d40ff3d1d1d04619c5530c7847a6c53e92b7"),
+)
+
+
+@lru_cache(maxsize=4)
+def _proposal_fonts(directory: Path):
+    from reportlab.pdfbase.ttfonts import TTFont
+
+    result = []
+    for variant, tag, digest in PROPOSAL_FONT_FILES:
+        path = directory / f"SBKProposalSans-{variant}.ttf"
+        if not path.is_file():
+            raise ValueError("Встроенные шрифты КП недоступны. Переустановите приложение; системная подстановка отключена")
+        data = path.read_bytes()
+        if len(data) > 2 * 1024 * 1024 or hashlib.sha256(data).hexdigest() != digest:
+            raise ValueError("Встроенный шрифт КП изменился. Экспорт остановлен; исходный текст не изменён")
+        font = TTFont(f"proposal-{variant}", BytesIO(data))
+        coverage = frozenset(code for code, glyph in font.face.charToGlyph.items() if glyph)
+        result.append((variant, tag, data, coverage))
+    return tuple(result)
+
+
+def _document_strings(value):
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from _document_strings(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _document_strings(item)
+
+
+def _font_slots(properties):
+    fonts = properties.find(qn("w:rFonts"))
+    if fonts is None:
+        fonts = _xml("w:rFonts")
+        properties.insert(0, fonts)
+    # Theme slots can otherwise override the family, notably in tables and
+    # footer fields. Keep all source characters; never replace Unicode dashes.
+    for name in list(fonts.attrib):
+        del fonts.attrib[name]
+    for slot in ("ascii", "hAnsi", "eastAsia", "cs"):
+        fonts.set(qn(f"w:{slot}"), PROPOSAL_FONT)
+
+
+def _embed_proposal_fonts(doc, document):
+    fonts = _proposal_fonts(resource_path("proposals", "fonts").resolve())
+    required = {ord(char) for text in _document_strings(document) for char in text if char not in "\n\r\t"}
+    required.update(map(ord, "Коммерческое предложение Страница № ₽ ·"))
+    missing = sorted(set.union(*(required - coverage for _, _, _, coverage in fonts)))
+    if missing:
+        codes = ", ".join(f"U+{code:04X}" for code in missing[:12])
+        raise ValueError(f"Встроенный шрифт КП не содержит символы {codes}. Текст не изменён; файл не создан")
+    table = doc.part.rels.part_with_reltype(RT.FONT_TABLE)
+    root = parse_xml(table.blob)
+    for previous in list(root):
+        if previous.get(qn("w:name")) == PROPOSAL_FONT:
+            root.remove(previous)
+    family = _xml("w:font", **{"w:name": PROPOSAL_FONT})
+    root.append(family)
+    for variant, tag, data, _coverage in fonts:
+        # ECMA-376 font obfuscation, not encryption. The reversible GUID key
+        # and complete unmodified font travel with this one document.
+        font_key = uuid.UUID(bytes=hashlib.sha256(data).digest()[:16])
+        key = font_key.bytes[::-1]
+        obfuscated = bytearray(data)
+        for index in range(min(32, len(obfuscated))):
+            obfuscated[index] ^= key[index % 16]
+        part = Part(PackURI(f"/word/fonts/proposal-{variant}.odttf"), "application/vnd.openxmlformats-officedocument.obfuscatedFont", bytes(obfuscated), doc.part.package)
+        relation = table.relate_to(part, RT.FONT)
+        family.append(_xml(f"w:{tag}", **{"r:id": relation, "w:fontKey": "{" + str(font_key).upper() + "}", "w:subsetted": "0"}))
+    from lxml import etree
+
+    table._blob = etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
+    settings = doc.settings.element
+    for tag, value in (("embedTrueTypeFonts", "1"), ("saveSubsetFonts", "0")):
+        element = settings.find(qn(f"w:{tag}"))
+        if element is None:
+            element = _xml(f"w:{tag}")
+            settings.append(element)
+        element.set(qn("w:val"), value)
+    for style in doc.styles:
+        _font_slots(style.element.get_or_add_rPr())
+    for fonts_element in doc.styles.element.iter(qn("w:rFonts")):
+        _font_slots(fonts_element.getparent())
+    defaults = doc.styles.element.find(qn("w:docDefaults"))
+    if defaults is not None:
+        properties = defaults.find(f"{qn('w:rPrDefault')}/{qn('w:rPr')}")
+        if properties is not None:
+            _font_slots(properties)
+    for part in (doc.part, *(section.footer.part for section in doc.sections)):
+        for run in part.element.iter(qn("w:r")):
+            _font_slots(run.get_or_add_rPr())
 
 
 def _object(value, required: str, optional: str = "") -> dict:
@@ -253,13 +361,13 @@ def render_docx(document: dict, output: Path, assets: dict[str, Path]) -> None:
     section.left_margin = section.right_margin = Mm(18)
     section.header_distance = section.footer_distance = Mm(9)
     normal = doc.styles["Normal"]
-    normal.font.name, normal.font.size = "Arial", Pt(11)
+    normal.font.name, normal.font.size = PROPOSAL_FONT, Pt(11)
     normal.paragraph_format.space_after = Pt(5 if compact else 7)
     normal.paragraph_format.line_spacing = 1.08
     normal.paragraph_format.widow_control = True
     for name, size in (("Title", 20), ("Heading 1", 13), ("Heading 2", 11)):
         style = doc.styles[name]
-        style.font.name, style.font.size = "Arial", Pt(size)
+        style.font.name, style.font.size = PROPOSAL_FONT, Pt(size)
         style.font.color.rgb = RGBColor.from_string(document["layout"]["accentColor"][1:])
         style.paragraph_format.keep_with_next = True
         if name == "Title":
@@ -394,6 +502,7 @@ def render_docx(document: dict, output: Path, assets: dict[str, Path]) -> None:
         _paragraph(doc, "Приложения к предложению", style="Heading 1")
         for index, asset in enumerate(document["attachments"], 1):
             _paragraph(doc, f"{index}. {asset['fileName']}")
+    _embed_proposal_fonts(doc, document)
     doc.save(output)
 
 

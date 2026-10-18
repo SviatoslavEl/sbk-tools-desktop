@@ -1,0 +1,25 @@
+{
+  "family": "SBK Proposal Sans",
+  "upstreamFamily": "Noto Sans",
+  "copyright": "Copyright 2022 The Noto Project Authors (https://github.com/notofonts/latin-greek-cyrillic)",
+  "license": "SIL Open Font License 1.1",
+  "sourcePackage": {
+    "url": "https://download.documentfoundation.org/libreoffice/stable/26.2.5/mac/aarch64/LibreOffice_26.2.5_MacOS_aarch64.dmg",
+    "sha256": "c99fb4fe574437fc4cb820a4ca15271bca325920861f7139858b36d7f9df78ad",
+    "memberDirectory": "LibreOffice.app/Contents/Resources/fonts/truetype",
+    "projectPin": "scripts/stage_libreoffice.py"
+  },
+  "derivation": { "script": "scripts/derive_proposal_fonts.py", "fonttools": "4.60.1", "changes": "Only SFNT name metadata and required head checksum adjustment; all cmap, glyph, metrics and layout tables byte-identical. Original names are not used as derivative primary font names." },
+  "files": {
+    "SBKProposalSans-Regular.ttf": "9f85711ba35ccf60cc66c9995c067683d69e2d85c81d999cbf0df17ad786a6ed",
+    "SBKProposalSans-Bold.ttf": "0c6ba818e63ba15471847dd402e27c9b5630cff62b6f05eab581bb4f116a900d",
+    "SBKProposalSans-Italic.ttf": "d386cbc1fef5e5c6621fa96625b615c838f9865bc385f94397c6922480e32364",
+    "SBKProposalSans-BoldItalic.ttf": "101b87e65938570b3bc2d7a703d5d40ff3d1d1d04619c5530c7847a6c53e92b7"
+  },
+  "upstreamFiles": {
+    "NotoSans-Regular.ttf": "f5f552c8c5edb61fe6efb824baf4d4de47b1a8689ab4925ff43f7bd6a4ebece5",
+    "NotoSans-Bold.ttf": "3a08a47daa00cade516425c15c57615aef2fd418ec9811a7b9f465088f92cc05",
+    "NotoSans-Italic.ttf": "126522ae1bb9cd92120287fc47dfc74ef981e73931d93e52c565fb7e09b2d74a",
+    "NotoSans-BoldItalic.ttf": "2e34b41a4b9c234b1be7dff6d06cba18811ecb694b41350873edf0ec16a0f0fa"
+  }
+}
