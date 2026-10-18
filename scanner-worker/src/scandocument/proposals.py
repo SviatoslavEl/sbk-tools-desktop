@@ -343,6 +343,7 @@ def _commercial(value):
         if not isinstance(item["section"], str) or item["section"] not in section_anchors:
             raise ValueError("Вопрос КП не имеет публичного раздела")
         _commercial_text(item["message"], required=True)
+    _commercial_narrative_budget(value)
 
 
 def validate_document(document: dict) -> dict:
@@ -631,6 +632,32 @@ def _narrative_commercial_table(block, labels):
         sum(len(part["text"] if part["kind"] == "text" else labels[part["target"]]) for part in cell) > 320
         for row in block["rows"] for cell in row
     )
+
+
+def _commercial_narrative_budget(commercial):
+    # Repeating long column labels for every full-width record can amplify a
+    # small valid wire document. Bound the TOTAL expanded UTF-8 prose across
+    # all adaptive blocks before Document()/OOXML allocation, never truncate.
+    # Full ordinal reference labels are a conservative upper bound: an
+    # explicitly qualified numeric-only link is shorter, never longer.
+    labels = _commercial_labels(commercial)
+    total = 0
+
+    def consume(size):
+        nonlocal total
+        total += size
+        if total > MAX_PUBLIC_BYTES:
+            raise ValueError("Развёрнутый текст таблиц КП превышает 8 МБ. Документ не усечён")
+
+    for section in commercial["sections"]:
+        for block in section["blocks"]:
+            if block["kind"] != "table" or not _narrative_commercial_table(block, labels):
+                continue
+            consume(sum(len(title.encode("utf-8")) + 2 for title in block["columns"]) * len(block["rows"]))
+            for row in block["rows"]:
+                for cell in row:
+                    for part in cell:
+                        consume(len((part["text"] if part["kind"] == "text" else labels[part["target"]]).encode("utf-8")))
 
 
 def _commercial_narrative_records(doc, block, labels):

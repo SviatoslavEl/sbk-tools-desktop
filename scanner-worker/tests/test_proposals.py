@@ -361,6 +361,66 @@ def test_public_v2_narrative_threshold_leaves_compact_tables_unchanged(tmp_path,
     assert document == original
 
 
+def test_public_v2_rejects_narrative_label_amplification_before_document_allocation(tmp_path, monkeypatch):
+    from scandocument.proposals import MAX_PUBLIC_BYTES
+    document = commercial_document_fixture()
+    block = document["commercial"]["sections"][0]["blocks"][2]
+    block["columns"] = ["К" * 20_000, "О" * 20_000, "Р" * 20_000]
+    block["rows"] = [[[], [], []] for _ in range(80)]
+    block["rows"][0][0] = [{"kind": "text", "text": "Я" * 321}]
+    assert len(json.dumps(document, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) < MAX_PUBLIC_BYTES
+    original = copy.deepcopy(document)
+    output = tmp_path / "must-not-exist.docx"
+
+    def no_document():
+        pytest.fail("Document/OOXML allocation preceded narrative budget rejection")
+
+    monkeypatch.setattr("scandocument.proposals.Document", no_document)
+    with pytest.raises(ValueError, match="Развёрнутый текст таблиц"):
+        render_docx(document, output, {})
+    assert not output.exists() and document == original
+
+
+def test_public_v2_narrative_expanded_utf8_and_reference_budget_exact_boundary(monkeypatch):
+    from scandocument.proposals import _commercial_labels
+    document = commercial_document_fixture()
+    block = document["commercial"]["sections"][0]["blocks"][2]
+    block["columns"] = ["К" * 1000, "О" * 1000, "Р" * 1000]
+    block["rows"] = [[[], [], []] for _ in range(10)]
+    block["rows"][0][0] = [{"kind": "text", "text": "Я" * 321}]
+    block["rows"][0][1] = [{"kind": "local-ref", "target": "s2b1"}]
+    labels = _commercial_labels(document["commercial"])
+    expected = sum(len((title + ": ").encode("utf-8")) for title in block["columns"]) * 10
+    expected += len(("Я" * 321).encode("utf-8")) + len(labels["s2b1"].encode("utf-8"))
+    assert len(json.dumps(document, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) < expected
+    original = copy.deepcopy(document)
+    monkeypatch.setattr("scandocument.proposals.MAX_PUBLIC_BYTES", expected)
+    validate_document(document)
+    monkeypatch.setattr("scandocument.proposals.MAX_PUBLIC_BYTES", expected - 1)
+    with pytest.raises(ValueError, match="Развёрнутый текст таблиц"):
+        validate_document(document)
+    assert document == original
+
+
+def test_public_v2_narrative_expansion_budget_is_shared_by_all_adaptive_blocks(monkeypatch):
+    document = commercial_document_fixture()
+    first = document["commercial"]["sections"][0]["blocks"][2]
+    first["columns"] = ["К" * 1000, "О" * 1000, "Р" * 1000]
+    first["rows"] = [[[{"kind": "text", "text": "Я" * 321}], [], []] for _ in range(10)]
+    second = copy.deepcopy(first)
+    second["anchor"] = "s1b4"
+    document["commercial"]["sections"][0]["blocks"].append(second)
+    each = sum(len((title + ": ").encode("utf-8")) for title in first["columns"]) * 10 + len(("Я" * 321).encode("utf-8")) * 10
+    assert len(json.dumps(document, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) < each
+    original = copy.deepcopy(document)
+    monkeypatch.setattr("scandocument.proposals.MAX_PUBLIC_BYTES", each * 2)
+    validate_document(document)
+    monkeypatch.setattr("scandocument.proposals.MAX_PUBLIC_BYTES", each * 2 - 1)
+    with pytest.raises(ValueError, match="Развёрнутый текст таблиц"):
+        validate_document(document)
+    assert document == original
+
+
 def test_public_v2_local_refs_respect_literal_inflection_and_qualified_groups(tmp_path):
     from lxml import etree
     document = commercial_document_fixture()
