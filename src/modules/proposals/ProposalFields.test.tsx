@@ -75,6 +75,13 @@ describe('controlled proposal parties and contacts', () => {
 
 const lines = (): ProposalLine[] => [{ ...createProposalLine(), id: 'one', title: 'Первая', quantity: '1', unitPrice: '10', tax: { kind: 'vat', rate: 20 } }, { ...createProposalLine(), id: 'two', title: 'Вторая', quantity: '2', unitPrice: '5' }];
 describe('controlled proposal lines', () => {
+  it('does not expose a second editable service-scope copy when the document body owns it', () => {
+    const onChange = vi.fn(); const tree = ProposalLinesEditor({ lines: lines(), onChange, scopeInDocument: true });
+    expect(find(tree, (_type, props) => props['aria-label'] === 'Позиция 1: Описание')).toBeUndefined();
+    expect(text(tree)).toContain('Состав услуг редактируется в документе');
+    change(tree, 'Позиция 1: Цена за единицу, ₽', '20'); expect(onChange).toHaveBeenCalledOnce();
+    expect(onChange.mock.lastCall![0][0].description).toBe(lines()[0].description);
+  });
   it('exposes stable IDs for navigating from validation issues to parties, signer and individual line fields', () => {
     const onChange = vi.fn();
     expect(field(ProposalPartyFields({ label: 'Исполнитель', value: emptyParty(), onChange, companies: [], scope: 'internal' }), 'Исполнитель: Полное наименование').id).toBe('proposal-issuer.name');

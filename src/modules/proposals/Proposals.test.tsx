@@ -11,6 +11,8 @@ import type { ProposalData, ProposalRenderResult, ProposalTemplateData } from '.
 import type { StoredRecord } from '../../lib/storage';
 import { createTaskDocumentOrigin, projectTaskDocumentSession, taskDocumentDraftKey } from '../intelligence/taskDocumentSession';
 import type { ProposalTaskSessionChange } from './proposalTaskBridge';
+import { CommercialProposalEditor } from './CommercialProposalEditor';
+import { commercialFingerprint } from './commercialDocument';
 
 // Real component callbacks/effects with persistent hook slots. DOM layout and
 // child components are covered separately; storage and native rendering are boundaries.
@@ -350,6 +352,96 @@ describe('existing proposal editor as a single AI-task receiver', () => {
     runtime.editor = false; runtime.getWorkspace.mockResolvedValue({ root: '/tmp/qa-workspace', editor: false }); await taskSeed();
     await edit('proposal-title', 'Локальная правка'); await vi.advanceTimersByTimeAsync(1000); await flush(); await click('5. Проверка и экспорт'); await click('Скачать PDF');
     expect(projectTaskDocumentSession(last().session).exportedCurrent).toBe(true); expect(runtime.store.save).not.toHaveBeenCalled(); expect(runtime.saveDraft).not.toHaveBeenCalled();
+  });
+});
+
+describe('structured conditions in the existing proposal receiver', () => {
+  async function structured() {
+    const data = proposal(), quote = 'Анализ по предоставленным материалам.';
+    data.commercialDocument = { version: 1, revision: 1, body: { version: 1, sections: [{ id: 'scope', kind: 'scope', title: 'Состав услуг', blocks: [{ id: 'scope-text', kind: 'paragraph', style: 'body', content: [{ kind: 'text', text: quote }] }] }] }, privateAppendix: { version: 1, sourceSnapshotKey: await commercialFingerprint('snapshot'), documentId: 'document', extraction: { complete: true, requiresOcr: false, visualAssessment: 'unassessed' }, containers: [{ id: 'container', sourceId: 'source', kind: 'contract', heading: 'Договор' }], clauses: [{ id: 'clause', containerId: 'container', sourceId: 'source', sourceName: 'PRIVATE-SOURCE', locator: 'PRIVATE-LOCATOR', quote, quoteHash: await commercialFingerprint(quote), roles: ['scope'], classification: 'commercial' }], references: [], coverage: [{ sourceClauseId: 'clause', kind: 'literal', targetBlockIds: ['scope-text'] }] }, questions: [], decisions: [] };
+    return data;
+  }
+  function editor() { return nodes().find((node) => node.type === CommercialProposalEditor)! as unknown as ReactElement<Parameters<typeof CommercialProposalEditor>[0]>; }
+  it('opens the readable working document and keeps the same editor mounted while changing steps', async () => {
+    await seed(await structured()); const initial = editor(); expect(initial).toBeDefined(); expect(text()).toContain('3. Документ и условия');
+    expect(nodes().some((node) => node.type === 'label' && text(node.props.children) === 'Вступление')).toBe(false);
+    await click('1. Стороны'); expect(editor().key).toBe(initial.key); expect(editor().props.value.commercialDocument).toEqual(initial.props.value.commercialDocument);
+    await click('3. Документ и условия'); expect(editor().key).toBe(initial.key);
+  });
+  it('changes the structured document appearance without rewriting its body or inactive legacy text', async () => {
+    const data = await structured();
+    const legacy = { introduction: 'Старое вступление', conclusion: 'Старое заключение', deliveryTerms: 'Старый срок', paymentTerms: 'Старая оплата' };
+    Object.assign(data, legacy);
+    const template: ProposalTemplateData = { ...structuredClone(data.template), kind: 'template', id: 'new-style', name: 'Стиль с текстом', style: 'compact', accentColor: '#102030', footer: 'Новый колонтитул', show: { address: false, requisites: false, contact: false, signer: false }, introduction: 'Новое вступление', conclusion: 'Новое заключение', deliveryTerms: 'Новый срок', paymentTerms: 'Новая оплата' };
+    runtime.store.records = [{ ...record('new-style', data), payload: template }];
+    await seed(data); await click('4. Оформление');
+    const chooseTemplate = nodes().find((node) => node.type === 'select' && text(node.props.children).includes(template.name))!;
+    chooseTemplate.props.onChange!({ target: { value: template.id } }); await flush();
+    expect(editor().props.value).toMatchObject(legacy);
+    expect(editor().props.value.commercialDocument).toEqual(data.commercialDocument);
+    expect(editor().props.value.template).toEqual(template);
+    expect(text()).toContain('Текст документа и его условия остаются без изменений');
+    expect(text()).not.toContain('заменяет оформление, вступление, заключение и типовые условия');
+  });
+  it('saves structured appearance without copying the document, source conditions or inactive legacy text', async () => {
+    const data = await structured();
+    Object.assign(data, { introduction: 'PRIVATE-LEGACY-INTRO', conclusion: 'PRIVATE-LEGACY-CONCLUSION', deliveryTerms: 'PRIVATE-LEGACY-DELIVERY', paymentTerms: 'PRIVATE-LEGACY-PAYMENT' });
+    data.template.footer = 'Общий колонтитул';
+    await seed(data); await click('4. Оформление'); await click('Сохранить как шаблон');
+    expect(text()).toContain('Текст документа, его условия и сведения из источников не копируются');
+    await click('Сохранить шаблон');
+    expect(runtime.store.save).toHaveBeenCalledOnce();
+    const saved = runtime.store.save.mock.calls[0][1] as ProposalTemplateData;
+    expect(saved).toMatchObject({ introduction: '', conclusion: '', deliveryTerms: '', paymentTerms: '', footer: data.template.footer, style: data.template.style, show: data.template.show });
+    expect(JSON.stringify(saved)).not.toMatch(/PRIVATE-|commercialDocument|privateAppendix|sourceQuestions/);
+    expect(editor().props.value).toEqual(data);
+  });
+  it('routes a retained source-condition warning to its existing panel beside the structured document', async () => {
+    const data = await structured(); data.sourceQuestions = [{ id: 'source-question', message: 'Уточните особое условие источника', evidence: [] }];
+    const focus = vi.fn(), scrollIntoView = vi.fn(), panel = { tagName: 'DETAILS', open: false, focus, scrollIntoView };
+    const getElementById = vi.fn().mockReturnValue(panel), querySelector = vi.fn();
+    const frames: FrameRequestCallback[] = [];
+    vi.stubGlobal('document', { getElementById, querySelector }); vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => { frames.push(callback); return frames.length; });
+    await seed(data); const owner = editor().key;
+    expect(nodes().some((node) => node.type === 'details' && node.props.id === 'proposal-sourceQuestions')).toBe(true);
+    await click('5. Проверка и экспорт'); await click(`Проверить: ${data.sourceQuestions[0].message}`);
+    for (const frame of frames.splice(0)) frame(0);
+    expect(getElementById).toHaveBeenCalledWith('proposal-sourceQuestions'); expect(querySelector).not.toHaveBeenCalled();
+    expect(panel.open).toBe(true); expect(focus).toHaveBeenCalledOnce(); expect(scrollIntoView).toHaveBeenCalledWith({ block: 'nearest' });
+    expect(button('3. Документ и условия').props).toHaveProperty('aria-current', 'step'); expect(editor().key).toBe(owner);
+    expect(nodes().filter((node) => node.type === CommercialProposalEditor)).toHaveLength(1);
+  });
+  it('does not save or export a document with unapplied local text or answers, and requests explicit replacement', async () => {
+    await seed(await structured()); editor().props.onPendingChange!(true); await flush();
+    expect(button('Сохранить КП').props.disabled).toBe(true); await click('Сохранить КП'); expect(runtime.store.save).not.toHaveBeenCalled();
+    await click('5. Проверка и экспорт'); await click('Скачать DOCX'); expect(renderCalls()).toHaveLength(0); expect(text()).toContain('неприменённые правки');
+    await click('К списку'); expect(nodes().some((node) => node.props.title === 'Есть несохранённые изменения КП')).toBe(true);
+  });
+  it('accepts a controlled body update only from the exact active receiver and ignores a stale callback', async () => {
+    await seed(await structured()); const old = editor().props, changed = { ...old.value, commercialDocument: { ...structuredClone(old.value.commercialDocument!), revision: 2 } };
+    expect(old.onChange(changed)).toBe(true); await flush();
+    expect(editor().props.value.commercialDocument!.revision).toBe(2); expect(old.onChange(old.value)).toBe(false);
+    const current = editor().props; runtime.editor = false; render(); await flush(); expect(current.onChange(current.value)).toBe(false);
+  });
+  it('exports V2 as a marked review draft without private source metadata or legacy terms', async () => {
+    await seed(await structured()); await click('5. Проверка и экспорт'); await click('Скачать DOCX');
+    await vi.waitFor(() => expect(renderCalls()).toHaveLength(1)); await flush();
+    const document = renderCalls()[0][1].document;
+    expect(document.schemaVersion).toBe(2); expect(document.commercial.mode).toBe('review-draft'); expect(document).not.toHaveProperty('terms');
+    expect(JSON.stringify(document)).not.toMatch(/PRIVATE-|privateAppendix|quoteHash|sourceSnapshotKey|decisions/);
+  });
+  it('rechecks unapplied changes immediately before generation after the save dialog has waited', async () => {
+    await seed(await structured()); const markPending = editor().props.onPendingChange!;
+    const path = deferred<string | null>(); runtime.chooseSave.mockReturnValueOnce(path.promise);
+    await click('5. Проверка и экспорт'); await click('Скачать DOCX'); await vi.waitFor(() => expect(runtime.chooseSave).toHaveBeenCalledOnce());
+    markPending(true); await flush(); path.resolve('/tmp/current.docx'); await vi.waitFor(async () => { await flush(); expect(text()).toContain('Во время подготовки появились неприменённые правки'); });
+    expect(renderCalls()).toHaveLength(0);
+  });
+  it('rechecks unapplied changes before saving after waiting for an in-flight draft', async () => {
+    await seed(await structured()); const markPending = editor().props.onPendingChange!, draft = deferred<void>(); runtime.saveDraft.mockReturnValueOnce(draft.promise);
+    await vi.advanceTimersByTimeAsync(601); await flush(); expect(runtime.saveDraft).toHaveBeenCalledOnce();
+    await click('Сохранить КП'); markPending(true); await flush(); draft.resolve(); await vi.waitFor(async () => { await flush(); expect(text()).toContain('Во время ожидания появились неприменённые правки'); });
+    expect(runtime.store.save).not.toHaveBeenCalled();
   });
 });
 

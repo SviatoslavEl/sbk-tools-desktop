@@ -10,7 +10,9 @@ import { useWorkspaceAccess } from "../../lib/workspaceAccess";
 import { trackedOperation } from "../../lib/activity";
 import { normalizeCompanyDirectory, type CompanyCard, type CompanyDirectoryData } from "../contracts/companies";
 import { BUILTIN_TEMPLATES, cloneProposal, createProposal, emptyContact, nextProposalRevision } from "./defaults";
-import { buildProposalPublic, proposalExportAssets, proposalHasFullWidthScope, safeProposalFileName, validateProposal } from "./exportPublic";
+import { buildProposalDocumentPublic, proposalExportAssets, proposalHasFullWidthScope, proposalHasStructuredScopePriceReference, proposalPrivateSourceQuestions, safeProposalFileName, validateProposal } from "./exportPublic";
+import { CommercialProposalEditor } from "./CommercialProposalEditor";
+import { validateCommercialDocument } from "./commercialDocument";
 import { formatMoneyMinor, priceProposal, taxLabel } from "./pricing";
 import { ProposalContactFields, ProposalLinesEditor, ProposalPartyFields } from "./ProposalFields";
 import { ProposalSourcePricingReview } from "./ProposalSourcePricingReview";
@@ -56,7 +58,7 @@ const checkedDraft = (stored: ProposalDraft | null, expectedOrigin?: TaskDocumen
     if (!value) return null;
     const draftOrigin = stored?.kind === "proposal-draft" ? stored.taskOrigin : undefined;
     if (expectedOrigin ? !sameTaskDocumentOrigin(draftOrigin, expectedOrigin) : draftOrigin !== undefined) throw new Error("Черновик относится к другому результату задачи. Запись поверх него остановлена.");
-    try { if (value.kind !== "proposal" || value.schemaVersion !== 1 || !value.familyId || !Array.isArray(value.attachments)) throw new Error(); validateProposal(value); }
+    try { if (value.kind !== "proposal" || value.schemaVersion !== 1 || !value.familyId || !Array.isArray(value.attachments)) throw new Error(); validateProposal(value); if (value.commercialDocument !== undefined && validateCommercialDocument(value.commercialDocument).some((issue) => issue.severity === "error")) throw new Error(); }
     catch { throw new Error("Черновик повреждён или имеет неизвестный формат. Запись поверх него остановлена; сохранённые карточки не изменены."); }
     const legacyOwners = [...new Set([...value.attachments, ...(value.template.logo ? [value.template.logo] : [])].map((file) => file.relativePath.match(/^attachment-staging\/commercial-proposals\/([^/]+)\//u)?.[1]).filter((id): id is string => Boolean(id)))];
     if (legacyOwners.length > 1) throw new Error("Черновик содержит временные вложения нескольких карточек. Сохранение остановлено, чтобы не потерять файлы.");
@@ -105,6 +107,9 @@ export function Proposals({ active = true, openRecordId, onRecordOpened, handoff
     const store = useRecords<ProposalRecord>("commercial-proposals");
     const [search, setSearch] = useViewState("proposals.search", "");
     const [session, setSession] = useState<Session | null>(null);
+    const [pendingCommercialEdit, setPendingCommercialEdit] = useState<{ writeId: string; pending: boolean } | null>(null);
+    const pendingCommercialRef = useRef(pendingCommercialEdit);
+    pendingCommercialRef.current = pendingCommercialEdit;
     const [step, setStep] = useState(0);
     const [companies, setCompanies] = useState<CompanyCard[]>([]);
     const [directoryError, setDirectoryError] = useState("");
@@ -207,7 +212,10 @@ export function Proposals({ active = true, openRecordId, onRecordOpened, handoff
     };
     useEffect(() => { if (!access.editor) setArchiving(null); }, [access.editor]);
     const data = session?.data;
+    const sourceQuestions = data ? proposalPrivateSourceQuestions(data) : [];
     const dirty = Boolean(session && snapshot(session.data) !== session.savedJson);
+    const hasPendingCommercialEdit = Boolean(session && pendingCommercialEdit?.writeId === session.writeId && pendingCommercialEdit.pending);
+    const commercialEditPending = (current: Session) => pendingCommercialRef.current?.writeId === current.writeId && pendingCommercialRef.current.pending;
     const currentTaskEntry = session?.taskOrigin ? taskBridge.current.get(session.taskOrigin) : undefined;
     const taskRequiresSave = Boolean(currentTaskEntry?.session.accepted && !projectTaskDocumentSession(currentTaskEntry.session).savedCurrent);
     const immutable = session?.persistedStatus !== "draft";
@@ -259,7 +267,7 @@ export function Proposals({ active = true, openRecordId, onRecordOpened, handoff
         return () => { alive = false; };
     }, [preview?.result.outputPath, previewPage]);
     useEffect(() => {
-        const unload = (event: BeforeUnloadEvent) => { const current = latest.current, root = draftOwnerRoot.current; if (current && (snapshot(current.data) !== current.savedJson || (!current.local && root !== null && hasPendingProposalDraftPersistence(root, current.draftKey)))) {
+        const unload = (event: BeforeUnloadEvent) => { const current = latest.current, root = draftOwnerRoot.current; if (current && (commercialEditPending(current) || snapshot(current.data) !== current.savedJson || (!current.local && root !== null && hasPendingProposalDraftPersistence(root, current.draftKey)))) {
             event.preventDefault();
             event.returnValue = "";
         } };
@@ -377,7 +385,7 @@ export function Proposals({ active = true, openRecordId, onRecordOpened, handoff
                 if (!sameTaskDocumentOrigin(latest.current?.taskOrigin, previous.taskOrigin)) notifyTask(taskBridge.current.release(previous.taskOrigin!, fresh.root));
             }).catch(() => undefined);
         }
-        generation.current += 1; latest.current = next; setSession(next); setStep(0); setPreview(null); setAllowZero(false); setDraftStatus(""); setSavedStatus("");
+        generation.current += 1; latest.current = next; pendingCommercialRef.current = null; setPendingCommercialEdit(null); setSession(next); setStep(next?.data.commercialDocument ? 2 : 0); setPreview(null); setAllowZero(false); setDraftStatus(""); setSavedStatus("");
     };
     const performTarget = async (target: Target, guard?: { check: () => Promise<void>; root: string }) => {
         if (target.kind === "close") {
@@ -463,7 +471,7 @@ export function Proposals({ active = true, openRecordId, onRecordOpened, handoff
             setNotice("Открыта карточка с ранее сохранённым черновиком изменений.");
     };
     const requestTarget = (target: Target) => { if (operation.current)
-        return; if (dirty)
+        return; if (dirty || hasPendingCommercialEdit)
         replacePendingTarget(target);
     else {
         replacePendingTarget(null);
@@ -472,7 +480,7 @@ export function Proposals({ active = true, openRecordId, onRecordOpened, handoff
     const requestArchive = (record: ArchivingProposal) => {
         if (operation.current || !accessRef.current || record.archived) return;
         const current = latest.current;
-        if (current?.id === record.id && snapshot(current.data) !== current.savedJson) {
+        if (current?.id === record.id && (commercialEditPending(current) || snapshot(current.data) !== current.savedJson)) {
             setError("Сначала сохраните изменения КП или вернитесь к списку без сохранения. Архивация не должна отбрасывать незавершённую правку.");
             return;
         }
@@ -487,7 +495,7 @@ export function Proposals({ active = true, openRecordId, onRecordOpened, handoff
             await settleCurrentDraft();
             if (!accessRef.current) throw new Error("Режим редактора недоступен. КП не перенесено в архив.");
             const current = latest.current;
-            if (current?.id === record.id && snapshot(current.data) !== current.savedJson)
+            if (current?.id === record.id && (commercialEditPending(current) || snapshot(current.data) !== current.savedJson))
                 throw new Error("Сначала сохраните изменения КП или вернитесь к списку без сохранения.");
             // Archive only the persisted record. Its payload, attachments,
             // versions and any saved draft remain available for restoration.
@@ -507,7 +515,7 @@ export function Proposals({ active = true, openRecordId, onRecordOpened, handoff
         let target: Extract<Target, { kind: "seed" }> = { kind: "seed", data: structuredClone(incoming.data), handoffId: incoming.id, ...(incoming.taskOrigin ? { taskOrigin: incoming.taskOrigin } : {}) };
         const currentGeneration = generation.current;
         const current = () => mounted.current && handoffContext.current.active && handoffContext.current.handoff === incoming && generation.current === currentGeneration;
-        if (dirty && !target.taskOrigin) {
+        if ((dirty || hasPendingCommercialEdit) && !target.taskOrigin) {
             // The seed is now held by the repeatable replacement dialog, not
             // lost with the sender's transient handoff prop.
             replacePendingTarget(target);
@@ -544,7 +552,7 @@ export function Proposals({ active = true, openRecordId, onRecordOpened, handoff
                     accepted = true;
                     return;
                 }
-                if (dirty) {
+                if (dirty || hasPendingCommercialEdit) {
                     replacePendingTarget(target, workspace.root);
                     accepted = true; // legacy consumed, NOT receiver accepted
                     return;
@@ -598,8 +606,11 @@ export function Proposals({ active = true, openRecordId, onRecordOpened, handoff
         const current = latest.current;
         if (!current || current.local || !accessRef.current || current.persistedStatus !== "draft")
             throw new Error("Сохранение общей карточки сейчас недоступно.");
-        if (current.data.status !== "draft")
-            buildProposalPublic(current.data, { allowZero });
+        if (commercialEditPending(current)) throw new Error("Есть неприменённые правки текста или условий. Примените либо отмените их в документе, затем сохраните карточку.");
+        if (current.data.status !== "draft") {
+            await buildProposalDocumentPublic(current.data, { allowZero, mode: "final" });
+            if (latest.current !== current) throw new Error("Документ изменился во время проверки готовности. Повторите сохранение.");
+        }
         // Explicit save is a recovery route after a failed autosave, not a slave of
         // a permanently rejected draft promise. It still waits for in-flight work.
         await draftQueue.current.catch(() => undefined);
@@ -616,6 +627,7 @@ export function Proposals({ active = true, openRecordId, onRecordOpened, handoff
             notifyTask(taskBridge.current.get(current.taskOrigin));
         }
         try {
+        if (commercialEditPending(current)) throw new Error("Во время ожидания появились неприменённые правки. Карточка не записана; примените или отмените их.");
         const saved = await store.save(`${current.data.number} · ${current.data.title || "Черновик КП"}`, current.data, current.id || current.writeId);
         // A failed draft cleanup must not report the successful record write as lost.
         // Saving promotes attachment-staging paths to permanent attachments.
@@ -706,9 +718,11 @@ export function Proposals({ active = true, openRecordId, onRecordOpened, handoff
             return;
         if (!("__TAURI_INTERNALS__" in window))
             throw new Error("DOCX и PDF создаются в установленном приложении. Веб-проверка не подменяет их HTML-файлами.");
-        const document = buildProposalPublic(current.data, { allowZero });
-        const assets = proposalExportAssets(current.data);
+        if (commercialEditPending(current)) throw new Error("Есть неприменённые правки. Примените или отмените их перед созданием файла.");
         const currentGeneration = generation.current;
+        const document = await buildProposalDocumentPublic(current.data, { allowZero, mode: current.data.status === "draft" ? "review-draft" : "final" });
+        if (!mounted.current || generation.current !== currentGeneration || latest.current !== current) throw new Error("Документ изменился во время проверки выгрузки. Файл не создан; повторите действие.");
+        const assets = proposalExportAssets(current.data);
         const id = crypto.randomUUID();
         const taskNeedsEditor = !current.local && accessRef.current;
         let taskAttempt: ProposalTaskAttempt | undefined;
@@ -734,6 +748,7 @@ export function Proposals({ active = true, openRecordId, onRecordOpened, handoff
                 if (generation.current !== currentGeneration || !sameTaskEditor(current)) throw new Error("Документ задачи изменился до начала экспорта.");
             }
             jobId.current = id;
+            if (commercialEditPending(current)) throw new Error("Во время подготовки появились неприменённые правки. Файл не создан; примените или отмените их.");
             const result = await trackedOperation(format === "preview" ? "Предпросмотр КП" : `Экспорт КП · ${format.toUpperCase()}`, () => invoke<ProposalRenderResult>("proposal_render", { jobId: id, document, assets, format, outputPath }));
             if (!mounted.current || generation.current !== currentGeneration || jobId.current !== id) {
                 if (format === "preview")
@@ -793,16 +808,16 @@ export function Proposals({ active = true, openRecordId, onRecordOpened, handoff
     const saveTemplate = () => void run("Сохраняем шаблон…", async () => {
         if (!data || !templateName?.trim() || !access.editor || session?.local)
             return;
-        const template: ProposalTemplateData = { kind: "template", schemaVersion: 1, id: crypto.randomUUID(), version: 1, name: templateName.trim(), style: data.template.style, accentColor: data.template.accentColor, show: { ...data.template.show }, logo: data.template.logo, introduction: data.introduction, conclusion: data.conclusion, footer: data.template.footer, deliveryTerms: data.deliveryTerms, paymentTerms: data.paymentTerms };
+        const template: ProposalTemplateData = { kind: "template", schemaVersion: 1, id: crypto.randomUUID(), version: 1, name: templateName.trim(), style: data.template.style, accentColor: data.template.accentColor, show: { ...data.template.show }, logo: data.template.logo, introduction: data.commercialDocument ? "" : data.introduction, conclusion: data.commercialDocument ? "" : data.conclusion, footer: data.template.footer, deliveryTerms: data.commercialDocument ? "" : data.deliveryTerms, paymentTerms: data.commercialDocument ? "" : data.paymentTerms };
         if (template.logo) template.logo = await restageAsset(template.logo, template.id);
         await store.save(template.name, template, template.id);
         setTemplateName(null);
-        setNotice("Шаблон сохранён. Стороны, цены, подпись и внутренние заметки в него не попали.");
+        setNotice(data.commercialDocument ? "Шаблон сохранён. Текст документа, его условия, стороны, цены, подпись и внутренние заметки в него не попали." : "Шаблон сохранён. Стороны, цены, подпись и внутренние заметки в него не попали.");
     });
     const revision = () => { if (!data)
         return; const max = Math.max(...proposals.filter((entry) => entry.payload.familyId === data.familyId).map((entry) => entry.payload.revision), data.revision); requestTarget({ kind: "seed", data: nextProposalRevision(data, max) }); };
     const restoreHistory = async (value: unknown) => {
-        if (operation.current || dirty || !accessRef.current || !data || session?.local)
+        if (operation.current || dirty || hasPendingCommercialEdit || !accessRef.current || !data || session?.local)
             throw new Error("Сначала сохраните текущие изменения; восстановление доступно редактору общей базы.");
         const previous = value as ProposalData;
         if (previous.kind !== "proposal" || previous.familyId !== data.familyId)
@@ -819,10 +834,11 @@ export function Proposals({ active = true, openRecordId, onRecordOpened, handoff
         requestAnimationFrame(() => {
             const target = document.getElementById(`proposal-${issue.field}${issue.lineId ? `-${issue.lineId}` : ""}`)
                 || document.querySelector<HTMLElement>(".proposal-workarea input:not(:disabled), .proposal-workarea textarea:not(:disabled), .proposal-workarea select:not(:disabled)");
+            if (issue.field === "sourceQuestions" && target?.tagName === "DETAILS") (target as HTMLDetailsElement).open = true;
             target?.focus(); target?.scrollIntoView({ block: "nearest" });
         });
     };
-    const field = (label: string, key: "number" | "documentDate" | "title" | "validUntil", type = "text") => <label>{label}<input id={`proposal-${key}`} type={type} value={data?.[key] || ""} onChange={(event) => update(key, event.target.value)} disabled={fieldsDisabled}/></label>;
+    const field = (label: string, key: "number" | "documentDate" | "title" | "validUntil", type = "text") => <label>{key === "validUntil" ? `${label} *` : label}<input id={`proposal-${key}`} type={type} value={data?.[key] || ""} onChange={(event) => update(key, event.target.value)} disabled={fieldsDisabled}/>{type === "date" && !data?.[key] && <small>Дата не указана — заполните перед созданием файла.</small>}</label>;
     const signerAttachment = selectedSigner?.document;
     const validSignerAttachment = signerAttachment?.relativePath && signerAttachment.fileName && signerAttachment.sha256 && signerAttachment.mimeType && signerAttachment.sizeBytes != null ? signerAttachment as AttachmentInfo : null;
     return <section className="proposals-tool" aria-label="Подготовка коммерческих предложений" data-workspace-viewer-allowed data-workspace-managed-disabled="true" hidden={!active}>
@@ -845,19 +861,39 @@ export function Proposals({ active = true, openRecordId, onRecordOpened, handoff
       {!access.editor && !session.local && <p className="notice">Просмотр и экспорт доступны. Для изменения без записи в общую папку создайте локальную копию.</p>}
       {!access.editor && session.local && <p className="help-text">Данные находятся только в памяти окна. Новые вложения и общие шаблоны недоступны; экспорт использует уже прикреплённые файлы.</p>}
       {data!.source && <p className="help-text">Источник: {data!.source.tool === "calculator" ? "калькулятор" : "закупка"} · {data!.source.priceOrigin}{data!.source.wasUnsaved ? " · несохранённый снимок" : ""}. Себестоимость и внутренние заметки не переносились.</p>}
-      {presentation === "ai-task" && Boolean(data!.sourceQuestions?.length) && <p className="notice warning">Нужно проверить условия исходного документа. Сохранение карточки и создание файла не означают, что вопросы согласованы или КП готово к отправке.</p>}
-      <nav className="proposal-steps" aria-label="Шаги подготовки КП">{steps.map((label, index) => <button key={label} type="button" aria-current={step === index ? "step" : undefined} className={step === index ? "active" : ""} onClick={() => setStep(index)}>{index + 1}. {label}</button>)}</nav>
-      {Boolean(data!.sourceQuestions?.length) && <details className="notice warning proposal-source-questions" open><summary>Нерешённые вопросы исходного документа ({data!.sourceQuestions!.length})</summary><p>Это вопросы по условиям источника, а не подтверждённые решения. Они сохраняются с черновиком; в клиентский файл не включаются. Исходные условия в тексте КП проверьте до отправки.</p>{data!.sourceQuestions!.map((question) => <div key={question.id}><p>{question.message}</p><details><summary>Показать в источнике</summary>{question.evidence.map((proof, index) => <div key={index}><small>{proof.sourceName} · {proof.locator}</small><blockquote style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{proof.quote}</blockquote></div>)}</details></div>)}</details>}
+      {presentation === "ai-task" && !data!.commercialDocument && Boolean(sourceQuestions.length) && <p className="notice warning">Нужно проверить условия исходного документа. Сохранение карточки и создание файла не означают, что вопросы согласованы или КП готово к отправке.</p>}
+      <nav className="proposal-steps" aria-label="Шаги подготовки КП">{steps.map((label, index) => <button key={label} type="button" aria-current={step === index ? "step" : undefined} className={step === index ? "active" : ""} onClick={() => setStep(index)}>{index + 1}. {data!.commercialDocument && index === 2 ? "Документ и условия" : label}</button>)}</nav>
+      {hasPendingCommercialEdit && <p className="notice warning" role="status">Есть неприменённые правки текста или условий. Они остаются в полях, но пока не входят в сохранение и выгрузку. Примените или отмените их в документе.</p>}
+      {Boolean(sourceQuestions.length) && <details id="proposal-sourceQuestions" tabIndex={-1} className="notice warning proposal-source-questions" open={!data!.commercialDocument}><summary>Дополнительные вопросы источника ({sourceQuestions.length})</summary><p>Это частные вопросы по условиям источника, а не подтверждённые решения. Они сохраняются с черновиком и не включаются в клиентский файл.</p>{sourceQuestions.map((question) => <div key={question.id}><p>{question.message}</p><details><summary>Показать в источнике</summary>{question.evidence.map((proof, index) => <div key={index}><small>{proof.sourceName} · {proof.locator}</small><blockquote style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{proof.quote}</blockquote></div>)}</details></div>)}</details>}
       <div className="proposal-workarea" aria-busy={Boolean(busy)}>
+        {data!.commercialDocument && <div hidden={step !== 2}><CommercialProposalEditor key={session.writeId} sessionKey={session.writeId} value={data!} disabled={fieldsDisabled} onPendingChange={(pending) => {
+          if (latest.current?.writeId !== session.writeId) return;
+          const next = { writeId: session.writeId, pending };
+          pendingCommercialRef.current = next;
+          setPendingCommercialEdit((previous) => previous?.writeId === next.writeId && previous.pending === pending ? previous : next);
+        }} onChange={(next) => {
+          const current = latest.current;
+          if (!current || current.writeId !== session.writeId || current.data !== data || operation.current || current.persistedStatus !== "draft" || (!current.local && !accessRef.current)) return false;
+          const updated = { ...current, data: next };
+          latest.current = updated; setSession(updated); setAllowZero(false); return true;
+        }}/></div>}
         {step === 0 && <><div className="proposal-fields-grid">{field("Номер КП *", "number")}{field("Дата *", "documentDate", "date")}{field("Предмет предложения *", "title")}{field("Действительно до", "validUntil", "date")}</div>{directoryError && <p className="notice">{directoryError}</p>}<div className="proposal-party-columns"><ProposalPartyFields label="Исполнитель" value={data!.issuer} onChange={(value) => { update("issuer", value); if (value.companyId !== data!.issuer.companyId) {
             setSession((current) => current ? { ...current, data: { ...current.data, signer: undefined } } : current);
         } }} disabled={fieldsDisabled} companies={companies} scope="internal"/><ProposalPartyFields label="Заказчик" value={data!.recipient} onChange={(value) => { update("recipient", value); if (value.companyId !== data!.recipient.companyId)
             setSession((current) => current ? { ...current, data: { ...current.data, addressee: emptyContact() } } : current); }} disabled={fieldsDisabled} companies={companies} scope="external"/></div><label>Адресат из справочника<select disabled={fieldsDisabled} value="" onChange={(event) => { const person = recipient?.decisionMakers.find((entry) => entry.id === event.target.value); if (person)
             update("addressee", { fullName: person.fullName, position: person.position, phone: person.phone, email: person.email }); }}><option value="">Ввести вручную / выбрать контакт</option>{recipient?.decisionMakers.map((person) => <option value={person.id} key={person.id}>{person.fullName} · {person.position}</option>)}</select></label><ProposalContactFields label="Адресат" value={data!.addressee} onChange={(value) => update("addressee", value)} disabled={fieldsDisabled}/></>}
-        {step === 1 && <><ProposalSourcePricingReview key={JSON.stringify([session.writeId, data!.familyId, data!.sourceFinancials?.candidates.map((entry) => entry.id)])} data={data!} disabled={fieldsDisabled} onChange={(value) => setSession((current) => current && current.data === data ? { ...current, data: value } : current)} /><ProposalLinesEditor lines={data!.lines} onChange={(value) => update("lines", value)} disabled={fieldsDisabled}/><p className="help-text">Цена до 4 знаков, количество до 6. Итоги округляются до копеек по каждой строке; «Без НДС» и «НДС 0%» — разные режимы.</p></>}
-        {step === 2 && <><div className="proposal-fields-grid">{([['introduction', 'Вступление'], ['deliveryTerms', 'Условия выполнения / поставки'], ['paymentTerms', 'Условия оплаты'], ['conclusion', 'Заключение']] as const).map(([key, label]) => <label key={key}>{label}<textarea disabled={fieldsDisabled} value={data![key]} onChange={(event) => update(key, event.target.value)}/></label>)}</div><ProposalContactFields label="Контакт исполнителя" value={data!.contact} onChange={(value) => update("contact", value)} disabled={fieldsDisabled}/><label>Подписант<select disabled={fieldsDisabled} value={data!.signer?.sourceSignerId || ""} onChange={(event) => { const person = issuer?.authorizedSigners.find((entry) => entry.id === event.target.value); update("signer", person ? { ...emptyContact(), fullName: person.fullName, position: person.position, sourceSignerId: person.id, basis: `Доверенность № ${person.powerOfAttorneyNumber}`, issuedAt: person.issuedAt, expiresAt: person.expiresAt } : { ...emptyContact(), basis: "", issuedAt: "", expiresAt: "" }); }}><option value="">Руководитель / ручной ввод</option>{issuer?.authorizedSigners.map((person) => <option key={person.id} value={person.id}>{person.fullName} · доверенность № {person.powerOfAttorneyNumber} · до {person.expiresAt || "дата не указана"}</option>)}</select></label><ProposalContactFields label="Подписант КП" value={data!.signer || emptyContact()} disabled={fieldsDisabled} onChange={(value) => update("signer", { basis: "", issuedAt: "", expiresAt: "", ...data!.signer, ...value })}/><div className="proposal-fields-grid">{([['basis', 'Основание полномочий', 'text'], ['issuedAt', 'Доверенность выдана', 'date'], ['expiresAt', 'Действует до', 'date']] as const).map(([key, label, type]) => <label key={key}>{label}<input type={type} disabled={fieldsDisabled} value={data!.signer?.[key] || ""} onChange={(event) => update("signer", { ...emptyContact(), basis: "", issuedAt: "", expiresAt: "", ...data!.signer, [key]: event.target.value })}/></label>)}</div>{validSignerAttachment && <label className="proposal-check"><input type="checkbox" disabled={fieldsDisabled} checked={data!.attachments.some((entry) => entry.relativePath === validSignerAttachment.relativePath)} onChange={(event) => update("attachments", event.target.checked ? [...data!.attachments.filter((entry) => entry.relativePath !== validSignerAttachment.relativePath), validSignerAttachment] : data!.attachments.filter((entry) => entry.relativePath !== validSignerAttachment.relativePath))}/>Приложить доверенность: {validSignerAttachment.fileName} ({validSignerAttachment.sizeBytes.toLocaleString("ru-RU")} байт)</label>}<label>Внутренняя заметка — никогда не экспортируется<textarea disabled={fieldsDisabled} value={data!.internalNote} onChange={(event) => update("internalNote", event.target.value)}/></label></>}
+        {step === 1 && <><ProposalSourcePricingReview key={JSON.stringify([session.writeId, data!.familyId, data!.sourceFinancials?.candidates.map((entry) => entry.id)])} data={data!} disabled={fieldsDisabled} onChange={(value) => setSession((current) => current && current.data === data ? { ...current, data: value } : current)} /><ProposalLinesEditor lines={data!.lines} onChange={(value) => update("lines", value)} disabled={fieldsDisabled} scopeInDocument={proposalHasStructuredScopePriceReference(data!)}/><p className="help-text">Цена до 4 знаков, количество до 6. Итоги округляются до копеек по каждой строке; «Без НДС» и «НДС 0%» — разные режимы.</p></>}
+        {step === 2 && <>
+          {!data!.commercialDocument && <div className="proposal-fields-grid">{([['introduction', 'Вступление'], ['deliveryTerms', 'Условия выполнения / поставки'], ['paymentTerms', 'Условия оплаты'], ['conclusion', 'Заключение']] as const).map(([key, label]) => <label key={key}>{label}<textarea disabled={fieldsDisabled} value={data![key]} onChange={(event) => update(key, event.target.value)}/></label>)}</div>}
+          <ProposalContactFields label="Контакт исполнителя" value={data!.contact} onChange={(value) => update("contact", value)} disabled={fieldsDisabled}/>
+          <label>Подписант<select disabled={fieldsDisabled} value={data!.signer?.sourceSignerId || ""} onChange={(event) => { const person = issuer?.authorizedSigners.find((entry) => entry.id === event.target.value); update("signer", person ? { ...emptyContact(), fullName: person.fullName, position: person.position, sourceSignerId: person.id, basis: `Доверенность № ${person.powerOfAttorneyNumber}`, issuedAt: person.issuedAt, expiresAt: person.expiresAt } : { ...emptyContact(), basis: "", issuedAt: "", expiresAt: "" }); }}><option value="">Руководитель / ручной ввод</option>{issuer?.authorizedSigners.map((person) => <option key={person.id} value={person.id}>{person.fullName} · доверенность № {person.powerOfAttorneyNumber} · до {person.expiresAt || "дата не указана"}</option>)}</select></label>
+          <ProposalContactFields label="Подписант КП" value={data!.signer || emptyContact()} disabled={fieldsDisabled} onChange={(value) => update("signer", { basis: "", issuedAt: "", expiresAt: "", ...data!.signer, ...value })}/>
+          <div className="proposal-fields-grid">{([['basis', 'Основание полномочий', 'text'], ['issuedAt', 'Доверенность выдана', 'date'], ['expiresAt', 'Действует до', 'date']] as const).map(([key, label, type]) => <label key={key}>{label}<input type={type} disabled={fieldsDisabled} value={data!.signer?.[key] || ""} onChange={(event) => update("signer", { ...emptyContact(), basis: "", issuedAt: "", expiresAt: "", ...data!.signer, [key]: event.target.value })}/></label>)}</div>
+          {validSignerAttachment && <label className="proposal-check"><input type="checkbox" disabled={fieldsDisabled} checked={data!.attachments.some((entry) => entry.relativePath === validSignerAttachment.relativePath)} onChange={(event) => update("attachments", event.target.checked ? [...data!.attachments.filter((entry) => entry.relativePath !== validSignerAttachment.relativePath), validSignerAttachment] : data!.attachments.filter((entry) => entry.relativePath !== validSignerAttachment.relativePath))}/>Приложить доверенность: {validSignerAttachment.fileName} ({validSignerAttachment.sizeBytes.toLocaleString("ru-RU")} байт)</label>}
+          <label>Внутренняя заметка — никогда не экспортируется<textarea disabled={fieldsDisabled} value={data!.internalNote} onChange={(event) => update("internalNote", event.target.value)}/></label>
+        </>}
         {step === 3 && <><label>Шаблон оформления<select disabled={fieldsDisabled} value={templates.some((template) => template.id === data!.template.id) ? data!.template.id : "snapshot"} onChange={(event) => { const template = templates.find((entry) => entry.id === event.target.value); if (template)
-            setSession((current) => current ? { ...current, data: { ...current.data, template: structuredClone(template), introduction: template.introduction, conclusion: template.conclusion, deliveryTerms: template.deliveryTerms || "", paymentTerms: template.paymentTerms || "" } } : current); }}><option value="snapshot" disabled>Сохранённый снимок шаблона</option>{templates.map((template) => <option key={template.id} value={template.id}>{template.name}</option>)}</select></label><p className="help-text">Выбор шаблона заменяет оформление, вступление, заключение и типовые условия. Стороны и цены не меняются. В сохранённом КП остаётся отдельный снимок оформления.</p><label>Акцентный цвет<input type="color" disabled={fieldsDisabled} value={data!.template.accentColor} onChange={(event) => update("template", { ...data!.template, accentColor: event.target.value })}/></label><div className="proposal-checks">{([['address', 'Адреса'], ['requisites', 'Реквизиты'], ['contact', 'Контакт'], ['signer', 'Подписант']] as const).map(([key, label]) => <label className="proposal-check" key={key}><input type="checkbox" disabled={fieldsDisabled} checked={data!.template.show[key]} onChange={(event) => update("template", { ...data!.template, show: { ...data!.template.show, [key]: event.target.checked } })}/>{label}</label>)}</div><label>Текст нижнего колонтитула<input disabled={fieldsDisabled} value={data!.template.footer} onChange={(event) => update("template", { ...data!.template, footer: event.target.value })}/></label><div className="button-row"><button className="secondary" type="button" disabled={fieldsDisabled || session.local} onClick={() => addFile(true)}>Добавить логотип</button>{data!.template.logo && <><span>{data!.template.logo.fileName}</span><button type="button" className="link-button" disabled={fieldsDisabled} onClick={() => update("template", { ...data!.template, logo: undefined })}>Убрать логотип</button></>}<button className="secondary" type="button" disabled={fieldsDisabled || session.local} onClick={() => setTemplateName(`${data!.template.name} — копия`)}>Сохранить как шаблон</button></div></>}
+            setSession((current) => current ? { ...current, data: { ...current.data, template: structuredClone(template), ...(!current.data.commercialDocument ? { introduction: template.introduction, conclusion: template.conclusion, deliveryTerms: template.deliveryTerms || "", paymentTerms: template.paymentTerms || "" } : {}) } } : current); }}><option value="snapshot" disabled>Сохранённый снимок шаблона</option>{templates.map((template) => <option key={template.id} value={template.id}>{template.name}</option>)}</select></label><p className="help-text">{data!.commercialDocument ? "Выбор шаблона заменяет оформление, логотип, колонтитул и настройки показа реквизитов. Текст документа и его условия остаются без изменений. В сохранённом КП остаётся отдельный снимок оформления." : "Выбор шаблона заменяет оформление, вступление, заключение и типовые условия. Стороны и цены не меняются. В сохранённом КП остаётся отдельный снимок оформления."}</p><label>Акцентный цвет<input type="color" disabled={fieldsDisabled} value={data!.template.accentColor} onChange={(event) => update("template", { ...data!.template, accentColor: event.target.value })}/></label><div className="proposal-checks">{([['address', 'Адреса'], ['requisites', 'Реквизиты'], ['contact', 'Контакт'], ['signer', 'Подписант']] as const).map(([key, label]) => <label className="proposal-check" key={key}><input type="checkbox" disabled={fieldsDisabled} checked={data!.template.show[key]} onChange={(event) => update("template", { ...data!.template, show: { ...data!.template.show, [key]: event.target.checked } })}/>{label}</label>)}</div><label>Текст нижнего колонтитула<input disabled={fieldsDisabled} value={data!.template.footer} onChange={(event) => update("template", { ...data!.template, footer: event.target.value })}/></label><div className="button-row"><button className="secondary" type="button" disabled={fieldsDisabled || session.local} onClick={() => addFile(true)}>Добавить логотип</button>{data!.template.logo && <><span>{data!.template.logo.fileName}</span><button type="button" className="link-button" disabled={fieldsDisabled} onClick={() => update("template", { ...data!.template, logo: undefined })}>Убрать логотип</button></>}<button className="secondary" type="button" disabled={fieldsDisabled || session.local} onClick={() => setTemplateName(`${data!.template.name} — копия`)}>Сохранить как шаблон</button></div></>}
         {step === 4 && <>
           <h2>Проверьте перед отправкой</h2><p>Экспорт содержит клиентские реквизиты, позиции и условия. Внутренние заметки, источники, себестоимость и история не включаются.</p>
           {proposalHasFullWidthScope(data!) && <p className="help-text">Подробный состав комплекса услуг будет выведен целиком в полноширинном разделе «Состав работ и результаты». В ценовой таблице останутся одна позиция и ссылка на этот раздел; цена и условия не изменятся.</p>}
@@ -884,7 +920,7 @@ export function Proposals({ active = true, openRecordId, onRecordOpened, handoff
           {step < 4 && <button className="secondary" type="button" onClick={() => setStep((value) => value + 1)}>Далее</button>}
           {!session.local && !immutable && <>
             <label>Статус<select aria-label="Статус КП" disabled={fieldsDisabled} value={data!.status} onChange={(event) => update("status", event.target.value as ProposalStatus)}>{Object.entries(statuses).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
-            <button className="primary" type="button" disabled={Boolean(busy) || !access.editor || (!dirty && !taskRequiresSave) || (data!.status !== "draft" && (issues.some((issue) => issue.severity === "error") || zeroNeedsConsent))} onClick={() => void run("Сохраняем КП…", saveCurrent)}>Сохранить КП</button>
+            <button className="primary" type="button" disabled={Boolean(busy) || hasPendingCommercialEdit || !access.editor || (!dirty && !taskRequiresSave) || (data!.status !== "draft" && (issues.some((issue) => issue.severity === "error") || zeroNeedsConsent))} onClick={() => void run("Сохраняем КП…", saveCurrent)}>Сохранить КП</button>
           </>}
         </div>
       </footer>
@@ -892,6 +928,6 @@ export function Proposals({ active = true, openRecordId, onRecordOpened, handoff
     {archiving && <ConfirmDialog title="Архивировать КП?" message={`Перенести КП «${archiving.payload.number} · редакция ${archiving.payload.revision} · ${archiving.payload.title || "Без предмета"}» в архив? Оно исчезнет из рабочего списка. Данные, история и вложения сохранятся; восстановить КП можно в разделе «Архив» → «Коммерческие предложения». Другие редакции этого КП не изменятся.`} confirmLabel="Перенести в архив" onClose={() => { if (!operation.current) setArchiving(null); }} onConfirm={archiveProposal} />}
     {pendingTarget && <Dialog title="Есть несохранённые изменения КП" onClose={cancelPendingTarget} closeDisabled={Boolean(busy)} width="540px"><div className="dialog-body"><p>{session?.taskOrigin ? "Сохраните текущую карточку или переключитесь без записи в базу. Документ задачи останется в своей сессии; его можно открыть снова из результатов." : "Сохраните текущую карточку или явно замените её. При замене несохранённые изменения и их черновик будут отброшены."}</p>{session?.local && <p>Локальная копия не записывается в общую папку. При необходимости сначала экспортируйте документ.</p>}</div><footer className="dialog-actions"><button type="button" className="secondary" disabled={Boolean(busy)} onClick={cancelPendingTarget}>Отмена</button><button type="button" className="secondary" disabled={Boolean(busy)} onClick={() => void resolveTarget(false)}>Заменить без сохранения</button>{access.editor && !session?.local && !immutable && <button type="button" className="primary" disabled={Boolean(busy)} onClick={() => void resolveTarget(true)}>Сохранить и продолжить</button>}</footer></Dialog>}
     {templateName !== null && <Dialog title="Сохранить оформление как шаблон" onClose={() => { if (!busy)
-        setTemplateName(null); }} closeDisabled={Boolean(busy)} width="540px"><div className="dialog-body"><p>Будут сохранены оформление, логотип, вступление, заключение, колонтитул и типовые условия. Стороны, подпись, цены, приложения и внутренние заметки не копируются.</p><label>Название шаблона<input autoFocus value={templateName} onChange={(event) => setTemplateName(event.target.value)}/></label></div><footer className="dialog-actions"><button type="button" className="secondary" disabled={Boolean(busy)} onClick={() => setTemplateName(null)}>Отмена</button><button type="button" className="primary" disabled={Boolean(busy) || !templateName.trim()} onClick={saveTemplate}>Сохранить шаблон</button></footer></Dialog>}
+        setTemplateName(null); }} closeDisabled={Boolean(busy)} width="540px"><div className="dialog-body"><p>{data?.commercialDocument ? "Будут сохранены оформление, логотип, колонтитул и настройки показа реквизитов. Текст документа, его условия и сведения из источников не копируются. Стороны, подпись, цены, приложения и внутренние заметки также не копируются." : "Будут сохранены оформление, логотип, вступление, заключение, колонтитул и типовые условия. Стороны, подпись, цены, приложения и внутренние заметки не копируются."}</p><label>Название шаблона<input autoFocus value={templateName} onChange={(event) => setTemplateName(event.target.value)}/></label></div><footer className="dialog-actions"><button type="button" className="secondary" disabled={Boolean(busy)} onClick={() => setTemplateName(null)}>Отмена</button><button type="button" className="primary" disabled={Boolean(busy) || !templateName.trim()} onClick={saveTemplate}>Сохранить шаблон</button></footer></Dialog>}
   </section>;
 }

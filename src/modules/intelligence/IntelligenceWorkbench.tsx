@@ -21,6 +21,7 @@ import { TaskGoalPicker } from "./TaskGoalPicker";
 import { normalizeTaskGoalSelection } from "./taskGoalSelection";
 import { createTaskDocumentOrigin, projectTaskDocumentSession, sameTaskDocumentOrigin, type TaskDocumentOrigin, type TaskDocumentSession } from "./taskDocumentSession";
 import { taskSourceSnapshotKey } from "./taskSourceIdentity";
+import { prepareCommercialTaskProposal } from "../proposals/commercialTaskPreparation";
 import { useSourceFactsInventory } from "./useSourceFactsInventory";
 import { ResponsePreparationCancelled, startResponsePreparation } from "./responsePreparation";
 import { assertResponsePreparationSources } from "./responsePreparationBounds";
@@ -516,6 +517,7 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
     };
     try {
       let taskOrigin: TaskDocumentOrigin | undefined;
+      let proposalSourceKey: Awaited<ReturnType<typeof taskSourceSnapshotKey>> | undefined;
       if (item.destination === "proposals") {
         if (ownerRevision === undefined) throw new Error("Не удалось подтвердить редакцию результата задачи. Повторите подготовку карточки.");
         const sourceSnapshotKey = await taskSourceSnapshotKey(resultSnapshot);
@@ -523,6 +525,14 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
         if (accessRef.current.workspaceRoot !== workspaceRoot || !accessRef.current.access.editor || accessRef.current.phase !== "connected" || networkAccessIsPaused()) throw new Error("Доступ к редактированию изменился. Проверьте режим и рабочую папку.");
         checkLiveResult();
         taskOrigin = createTaskDocumentOrigin({ taskId: ownerTaskId, resultId: item.id, workspaceRoot, sourceSnapshotKey, baseResultRevision: ownerRevision });
+        proposalSourceKey = sourceSnapshotKey;
+      }
+      let handoff = buildIntelligenceHandoff(item, resultSnapshot, workspaceRoot);
+      if (handoff.destination === "proposals" && proposalSourceKey && !current.manualItemIds.includes(item.id)) {
+        const structured = await prepareCommercialTaskProposal({ data: handoff.data, item, items: itemsRef.current, sources: resultSnapshot, sourceSnapshotKey: proposalSourceKey });
+        if (!mounted.current || taskEpoch !== epoch.current) return;
+        checkLiveResult();
+        handoff = { ...handoff, data: structured.data };
       }
       const fresh = await getWorkspaceInfo();
       if (!mounted.current) return;
@@ -531,7 +541,6 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
       // A completed analysis can replace the result while the access check is
       // still in flight. Never open a superseded card or reuse its old ACK.
       checkLiveResult();
-      const handoff = buildIntelligenceHandoff(item, resultSnapshot, workspaceRoot);
       onTransfer(handoff.destination === "proposals" ? { ...handoff, taskOrigin } : handoff);
       if (handoff.destination === "proposals" && taskOrigin) {
         proposalTransferOrigins.current.set(item.id, taskOrigin);
@@ -754,7 +763,7 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
         const manuallyReviewed = cardFindings.filter((finding) => finding.severity === "blocking" && (reviewedFindings[item.id] || []).includes(finding.id)).length;
         const coverage = evidenceReport.coverage.filter((check) => check.itemIds.includes(item.id));
         const receipt = proposalReceipt(item);
-        return <details className="iw-card" key={item.id} open={items.length === 1}>
+        return <details className="iw-card" data-destination={item.destination} key={item.id} open={items.length === 1}>
           <summary><span className="iw-card-index">{index + 1}</span><span><strong>{item.title || destinationLabels[item.destination]}</strong><small role={receipt ? "status" : undefined} aria-live={receipt ? "polite" : undefined}>{destinationLabels[item.destination]} · полей: {item.selectedFields.length}{receipt ? ` · ${receipt.label}` : item.destination !== "proposals" && openedItems.includes(item.id) ? " · черновик открыт" : ""}</small></span></summary>
           <div className="iw-card-body"><label>Название результата<input aria-label={`Название результата ${index + 1}`} value={item.title} maxLength={200} onChange={(event) => editItem(item.id, { title: event.target.value })} /></label><p className="help-text">Источники: {sourceNames.join(", ") || "Не указаны"}</p>
           {!manual && <ItemTaskCompletionSummary report={evidenceReady ? evidenceState?.completion : undefined} item={taskCompletion} />}
@@ -800,7 +809,7 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
               {item.destination === "procurement" && field.key === "nmc" && value === 0 && <p className="help-text">Проверьте НМЦ по источнику: нулевая цена строки спецификации не подтверждает начальную цену закупки. Если НМЦ не указана, снимите отметку этого поля.</p>}
               {item.destination === "procurement" && field.key === "publishedDate" && value !== undefined && <p className="help-text">Дата редакции технического задания не является датой публикации закупки.</p>}
             </div>;
-          })}</div>{item.destination === "proposals" && proposalPositions(item, index)}</details>{errors.length > 0 && <p className="iw-validation" role="status">{errors.join(" ")}</p>}<footer className="iw-card-actions"><button type="button" className="primary" disabled={preparingResponse || !canTransfer || Boolean(transferring) || Boolean(errors.length) || (!manual && (!evidenceReady || Boolean(evidenceState?.failed) || unreviewed.length > 0 || !taskCompletion?.canTransferPrepared))} onClick={() => void transfer(item)}>{transferring === item.id ? "Проверяем доступ…" : `Открыть черновик: ${destinationLabels[item.destination]}`}</button>
+          })}</div>{item.destination === "proposals" && proposalPositions(item, index)}</details>{errors.length > 0 && <p className="iw-validation" role="status">{errors.join(" ")}</p>}<footer className="iw-card-actions">{(item.destination !== "proposals" || manual || taskCompletion?.canTransferPrepared || !taskCompletion?.canOpenIncompleteDraft) && <button type="button" className="primary" disabled={preparingResponse || !canTransfer || Boolean(transferring) || Boolean(errors.length) || (!manual && (!evidenceReady || Boolean(evidenceState?.failed) || unreviewed.length > 0 || !taskCompletion?.canTransferPrepared))} onClick={() => void transfer(item)}>{transferring === item.id ? "Проверяем доступ…" : `Открыть черновик: ${destinationLabels[item.destination]}`}</button>}
           {!manual && taskCompletion && !taskCompletion.canTransferPrepared && taskCompletion.canOpenIncompleteDraft && <button type="button" className="secondary" disabled={preparingResponse || !canTransfer || Boolean(transferring) || Boolean(errors.length) || !evidenceReady || Boolean(evidenceState?.failed) || unreviewed.length > 0} onClick={() => requestIncompleteTransfer(item)}>{taskCompletion.priceReviewRequired ? "Открыть КП — проверить цену и условия" : "Открыть неполный черновик"}</button>}
           <button type="button" className="text-danger" onClick={() => setConfirm({ title: "Удалить результат?", message: "Эта подготовленная карточка будет удалена из окна ИИ. Данные в общей базе не изменятся.", run: () => { cancelPending(); itemResultRevisions.current.delete(item.id); proposalTransferOrigins.current.delete(item.id); setItems((previous) => previous.filter((entry) => entry.id !== item.id)); setManualItemIds((previous) => previous.filter((id) => id !== item.id)); setConfirm(null); } })}>Удалить результат</button></footer></div>
         </details>;

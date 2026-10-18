@@ -2,6 +2,7 @@ import { isValidElement, type ReactElement, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ConfirmDialog } from "../../components/Dialog";
 import { IntelligenceWorkbench, evidenceAuditTimeoutMilliseconds } from "./IntelligenceWorkbench";
+import { destinationLabels } from "./workbenchModel";
 import { SourceFactsDesk } from "./SourceFactsDesk";
 import { TaskGoalPicker, type TaskGoalPickerProps } from "./TaskGoalPicker";
 import { TASK_GOAL_OPTIONS } from "./taskGoalSelection";
@@ -47,7 +48,7 @@ function nodes(node: ReactNode = tree): ReactElement<NodeProps>[] { if (Array.is
 function text(node: ReactNode = tree): string { if (Array.isArray(node)) return node.map((child) => text(child ?? null)).join(""); if (isValidElement<NodeProps>(node)) return text(node.props.children ?? null); return typeof node === "string" || typeof node === "number" ? String(node) : ""; }
 function button(label: string) { const found = nodes().find((node) => node.type === "button" && text(node.props.children) === label); if (!found) throw new Error(`Кнопка не найдена: ${label}`); return found; }
 function incompleteButton(destination: string) {
-  const card = nodes().find((node) => node.props.className === "iw-card" && nodes(node).some((child) => child.type === "button" && text(child.props.children) === `Открыть черновик: ${destination}`));
+  const card = nodes().find((node) => node.props.className === "iw-card" && (node.props as unknown as { 'data-destination'?: string })['data-destination'] === Object.entries(destinationLabels).find(([, label]) => label === destination)?.[0]);
   const found = card && nodes(card).find((node) => node.type === "button" && ["Открыть неполный черновик", "Открыть КП — проверить цену и условия"].includes(text(node.props.children)));
   if (!found) throw new Error(`Неполный черновик недоступен: ${destination}`);
   return found;
@@ -796,7 +797,7 @@ describe("unified intelligence workflow", () => {
     await reviewVisibleFindings();
     for (const label of ["Закупки", "Опыт по договорам", "Кадры", "Контрагенты", "Коммерческие предложения"]) {
       if (label === "Закупки") await click(`Открыть черновик: ${label}`);
-      else { expect(button(`Открыть черновик: ${label}`).props.disabled).toBe(true); expect(incompleteButton(label).props.disabled).toBe(false); incompleteButton(label).props.onClick!(); await flush(); await confirm(); }
+      else { if (label !== "Коммерческие предложения") expect(button(`Открыть черновик: ${label}`).props.disabled).toBe(true); else expect(nodes().some((node) => node.type === "button" && text(node.props.children) === `Открыть черновик: ${label}`)).toBe(false); expect(incompleteButton(label).props.disabled).toBe(false); incompleteButton(label).props.onClick!(); await flush(); await confirm(); }
       render({ ...props, active: false }); render({ ...props, active: true }); await flush();
     }
     expect(transfer.mock.calls.map(([handoff]) => handoff.destination)).toEqual(["procurement", "contracts", "staff", "counterparties", "proposals"]);
@@ -1312,7 +1313,7 @@ describe("unified intelligence workflow", () => {
     await paste([{ destination: "proposals", title: "КП", fields: { title: "КП", lines: ["Сервер"], lineDescriptions: "Процессор\nПамять\nНакопитель" } }]);
     expect(field("lineDescriptions").props.value).toBe("Процессор\nПамять\nНакопитель"); await click("Использовать текст как одно описание");
     expect(labeled("Описание позиции 1 результата 1").props.value).toBe("Процессор\nПамять\nНакопитель");
-    await reviewVisibleFindings(); expect(button("Открыть черновик: Коммерческие предложения").props.disabled).toBe(true);
+    await reviewVisibleFindings(); expect(nodes().some((node) => node.type === "button" && text(node.props.children) === "Открыть черновик: Коммерческие предложения")).toBe(false);
     expect(incompleteButton("Коммерческие предложения").props.disabled).toBe(false); incompleteButton("Коммерческие предложения").props.onClick!(); await flush(); await confirm(); const handoff = transfer.mock.calls[0][0];
     if (handoff.destination === "proposals") { expect(handoff.data.lines).toHaveLength(1); expect(handoff.data.lines[0].description).toBe("Процессор\nПамять\nНакопитель"); }
   });

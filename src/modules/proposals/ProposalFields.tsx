@@ -76,10 +76,10 @@ export function ProposalContactFields({ label, value, onChange, disabled = false
   </fieldset>;
 }
 
-export function ProposalLinesEditor({ lines, onChange, disabled = false }: {
-  lines: ProposalLine[]; onChange: (lines: ProposalLine[]) => void; disabled?: boolean;
+export function ProposalLinesEditor({ lines, onChange, disabled = false, scopeInDocument = false }: {
+  lines: ProposalLine[]; onChange: (lines: ProposalLine[]) => void; disabled?: boolean; scopeInDocument?: boolean;
 }) {
-  const update = (index: number, patch: Partial<ProposalLine>) => { if (!disabled) onChange(lines.map((line, position) => position === index ? { ...line, ...patch } : line)); };
+  const update = (index: number, patch: Partial<ProposalLine>) => { if (!disabled && !(scopeInDocument && 'description' in patch)) onChange(lines.map((line, position) => position === index ? { ...line, ...patch } : line)); };
   const move = (index: number, offset: -1 | 1) => {
     const target = index + offset;
     if (disabled || target < 0 || target >= lines.length) return;
@@ -105,7 +105,7 @@ export function ProposalLinesEditor({ lines, onChange, disabled = false }: {
         </div></header>
         <div className="proposal-fields-grid proposal-line-grid">
           <label className="proposal-wide">Наименование<input id={`proposal-lines.title-${line.id}`} type="text" aria-label={`${prefix}: Наименование`} value={line.title} onChange={(event) => update(index, { title: event.target.value })} /></label>
-          <label className="proposal-wide">Описание<textarea id={`proposal-lines.description-${line.id}`} rows={2} aria-label={`${prefix}: Описание`} value={line.description} onChange={(event) => update(index, { description: event.target.value })} /></label>
+          {scopeInDocument ? <p className="proposal-wide help-text">Состав услуг редактируется в документе по разделам. В ценовой таблице будет короткая ссылка на него; исходный снимок описания не перезаписывается.</p> : <label className="proposal-wide">Описание<textarea id={`proposal-lines.description-${line.id}`} rows={2} aria-label={`${prefix}: Описание`} value={line.description} onChange={(event) => update(index, { description: event.target.value })} /></label>}
           <label>Единица измерения<input id={`proposal-lines.unit-${line.id}`} type="text" aria-label={`${prefix}: Единица измерения`} value={line.unit} onChange={(event) => update(index, { unit: event.target.value })} /></label>
           <label>Количество<input id={`proposal-lines.quantity-${line.id}`} type="text" inputMode="decimal" aria-label={`${prefix}: Количество`} value={line.quantity} onChange={(event) => update(index, { quantity: event.target.value })} /></label>
           <label>Цена за единицу, ₽<input id={`proposal-lines.unitPrice-${line.id}`} type="text" inputMode="decimal" aria-label={`${prefix}: Цена за единицу, ₽`} value={line.unitPrice} onChange={(event) => update(index, { unitPrice: event.target.value })} /></label>

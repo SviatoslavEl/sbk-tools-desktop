@@ -1,0 +1,28 @@
+.commercial-document { min-width: 0; max-width: 100%; }
+.commercial-document-heading { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 12px; margin-bottom: 16px; }
+.commercial-document-heading h2 { margin: 0 0 8px; }
+.commercial-document-heading p { margin: 0; max-width: 76ch; color: var(--text-secondary); }
+.commercial-document-heading small { flex: 0 0 auto; }
+.commercial-section { padding: 20px 0; border-top: 1px solid var(--line); scroll-margin-top: 16px; }
+.commercial-section h3 { margin: 0 0 14px; }
+.commercial-block { min-width: 0; margin: 0 0 16px; scroll-margin-top: 16px; overflow-wrap: anywhere; }
+.commercial-block-heading { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 6px; }
+.commercial-block-heading small { color: var(--text-secondary); }
+.commercial-block-heading button { font-size: 12px; min-height: 30px; }
+.commercial-paragraph, .commercial-block li { white-space: pre-wrap; line-height: 1.6; }
+.commercial-paragraph { margin: 0; }
+.commercial-paragraph.is-lead { font-size: 15px; }
+.commercial-paragraph.is-subheading { font-weight: 650; }
+.commercial-paragraph.is-caveat { border-left: 3px solid var(--line); padding-left: 12px; color: var(--text-secondary); }
+.commercial-table-scroll { max-width: 100%; overflow-x: auto; }
+.commercial-table-scroll table { width: 100%; table-layout: fixed; border-collapse: collapse; }
+.commercial-table-scroll th, .commercial-table-scroll td { border: 1px solid var(--line); padding: 10px; text-align: left; vertical-align: top; white-space: pre-wrap; overflow-wrap: anywhere; }
+.commercial-inline-editor { padding: 14px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface-muted); }
+.commercial-edit-group label { display: grid; min-width: 0; gap: 6px; margin-bottom: 12px; }
+.commercial-edit-group textarea { width: 100%; min-width: 0; max-width: 100%; resize: vertical; }
+.commercial-edit-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.commercial-section-questions { margin-top: 18px; padding: 14px; border: 1px solid var(--line); border-radius: 9px; }
+.commercial-section-questions h4 { margin: 0 0 10px; }
+.commercial-broken-reference { color: var(--danger); }
+.commercial-detached-draft { margin: 16px 0; padding: 14px; border: 1px solid var(--line); border-radius: 9px; overflow-wrap: anywhere; }
+@media (max-width: 800px) { .commercial-block-heading { align-items: flex-start; } .commercial-inline-editor, .commercial-section-questions { padding: 10px; } }

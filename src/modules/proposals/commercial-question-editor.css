@@ -1,0 +1,22 @@
+.commercial-question-editor { min-width: 0; padding: 14px 0; overflow-wrap: anywhere; }
+.commercial-question-editor h5 { margin: 0 0 8px; font-size: 15px; }
+.commercial-question-fields { min-width: 0; margin: 12px 0; padding: 0; border: 0; }
+.commercial-question-fields > legend { font-weight: 600; margin-bottom: 8px; }
+.commercial-question-fields label { display: grid; min-width: 0; gap: 6px; margin: 10px 0; }
+.commercial-question-fields input:not([type=checkbox]), .commercial-question-fields textarea, .commercial-question-fields select { width: 100%; min-width: 0; max-width: 100%; box-sizing: border-box; }
+.commercial-question-fields textarea { resize: vertical; }
+.commercial-question-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.commercial-question-item { margin: 12px 0; padding: 10px; border: 1px solid var(--line); border-radius: 8px; }
+.commercial-question-item > summary, .commercial-question-proof > summary { cursor: pointer; font-weight: 600; }
+.commercial-question-choices { min-width: 0; margin: 12px 0; padding: 10px; border: 1px solid var(--line); }
+.commercial-question-fields .commercial-question-check { display: flex; align-items: flex-start; gap: 8px; }
+.commercial-question-check input { flex: 0 0 auto; margin-top: 3px; }
+.commercial-question-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.commercial-question-proof, .commercial-question-preview { margin-top: 14px; }
+.commercial-question-proof pre, .commercial-question-preview p, .commercial-question-fields pre { max-width: 100%; white-space: pre-wrap; overflow-wrap: anywhere; }
+.commercial-question-proof pre { max-height: 20rem; overflow: auto; }
+.commercial-question-preview h6 { margin: 12px 0; font-size: 14px; }
+.commercial-question-table { max-width: 100%; overflow-x: auto; }
+.commercial-question-table table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+.commercial-question-table th, .commercial-question-table td { border: 1px solid var(--line); padding: 8px; text-align: left; vertical-align: top; white-space: pre-wrap; overflow-wrap: anywhere; }
+@media (max-width: 760px) { .commercial-question-grid { grid-template-columns: minmax(0, 1fr); gap: 0; } }
