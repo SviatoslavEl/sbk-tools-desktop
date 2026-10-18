@@ -16,7 +16,7 @@ vi.mock('react', async (original) => ({ ...await original<typeof import('react')
   useEffect: (effect: () => void | (() => void), deps: readonly unknown[]) => { const index = runtime.index++, old = runtime.slots[index]; if (old?.deps?.length === deps.length && old.deps.every((value, i) => Object.is(value, deps[i]))) return; runtime.slots[index] = { ...old, deps }; runtime.effects.push(() => { old?.cleanup?.(); const cleanup = effect(); runtime.slots[index].cleanup = typeof cleanup === 'function' ? cleanup : undefined; }); },
 }));
 type Props = Parameters<typeof CommercialProposalEditor>[0];
-type NodeProps = { children?: ReactNode; href?: string; 'data-question-id'?: string; 'data-issue-paths'?: string };
+type NodeProps = { children?: ReactNode; open?: boolean; role?: string; href?: string; 'data-question-id'?: string; 'data-issue-paths'?: string };
 const nodes = (node: ReactNode): Array<{ type: unknown; props: NodeProps }> => Array.isArray(node) ? node.flatMap(nodes) : isValidElement<NodeProps>(node) ? [{ type: node.type, props: node.props }, ...nodes(node.props.children)] : [];
 const text = (node: ReactNode): string => Array.isArray(node) ? node.map(text).join('') : isValidElement<NodeProps>(node) ? text(node.props.children) : typeof node === 'string' || typeof node === 'number' ? String(node) : '';
 const fingerprint = `sha256:${'a'.repeat(64)}` as const;
@@ -47,6 +47,45 @@ beforeEach(async () => {
 const answer = { kind: 'advance-days' as const, dayKind: 'calendar' as const };
 
 describe('commercial document sole-owner controller', () => {
+  it('passes only the current proposal title to the existing document view without readiness or document changes', () => {
+    const original = props.value.commercialDocument, calls = runtime.readiness.mock.calls.length;
+    render({ value: { ...props.value, title: 'Сервисное сопровождение' } });
+    expect(view().documentTitle).toBe('Сервисное сопровождение'); expect(view().value).toBe(original);
+    render({ value: { ...props.value, title: 'Уточнённый предмет КП' } });
+    expect(view().documentTitle).toBe('Уточнённый предмет КП'); expect(view().value).toBe(original);
+    expect(runtime.readiness).toHaveBeenCalledTimes(calls); expect(props.onChange).not.toHaveBeenCalled(); expect(runtime.apply).not.toHaveBeenCalled();
+  });
+  it('keeps readiness counts visible in a closed summary and does not call content readiness permission to send', () => {
+    const detail = nodes(tree).find((node) => node.type === 'details')!;
+    const summary = nodes(detail.props.children).find((node) => node.type === 'summary')!;
+    expect(detail.props.open).not.toBe(true);
+    expect(text(summary.props.children)).toContain('Без действующего решения: 1 из 1');
+    expect(text(summary.props.children)).toContain('Применённых решений: 0');
+    expect(text(summary.props.children)).not.toContain('разрешение раскрывать');
+    expect(text(detail.props.children)).toContain('не разрешение раскрывать конфиденциальную информацию');
+    expect(text(detail.props.children)).toContain('не подтверждение сохранения или отправки');
+    expect(view().value.decisions).toEqual([]); expect(props.onChange).not.toHaveBeenCalled();
+  });
+  it('keeps a failed readiness operation outside collapsed guidance and leaves the controlled document unchanged', async () => {
+    const value = fixture(), original = structuredClone(value); runtime.readiness.mockRejectedValueOnce(new Error('Проверка не завершена'));
+    render({ value }); await flush();
+    expect(nodes(tree).find((node) => node.props.role === 'alert')?.props.children).toContain('Проверка не завершена');
+    expect(nodes(tree).filter((node) => node.type === 'details')).toHaveLength(0);
+    expect(view().value).toEqual(original.commercialDocument); expect(props.onChange).not.toHaveBeenCalled();
+  });
+  it('keeps completed local checks separate from sending approval and does not create decisions', async () => {
+    const value = fixture(); value.commercialDocument!.questions = [];
+    runtime.readiness.mockResolvedValueOnce({ canSaveDraft: true, canFinalize: true, issues: [], questions: [], activeDecisionIds: [], staleDecisionIds: [] } satisfies CommercialReadiness);
+    render({ value }); await flush();
+    const detail = nodes(tree).find((node) => node.type === 'details')!;
+    const summary = nodes(detail.props.children).find((node) => node.type === 'summary')!;
+    expect(detail.props.open).not.toBe(true);
+    expect(text(summary.props.children)).toBe('Без действующего решения: 0 из 0 · Применённых решений: 0');
+    expect(text(summary.props.children)).not.toContain('готов');
+    expect(text(detail.props.children)).toContain('Связи исходных условий проверены');
+    expect(text(detail.props.children)).toContain('не подтверждение сохранения или отправки');
+    expect(view().value.decisions).toEqual([]); expect(props.onChange).not.toHaveBeenCalled(); expect(runtime.apply).not.toHaveBeenCalled();
+  });
   it('reuses one source presenter across callback and local metadata renders, but replaces it for a new document snapshot', async () => {
     const original = question().referencePresenter; expect(original).toBeTypeOf('function');
     for (let index = 0; index < 20; index++) render({ value: { ...props.value, internalNote: `Заметка ${index}` }, onChange: vi.fn(() => true) });
@@ -68,7 +107,7 @@ describe('commercial document sole-owner controller', () => {
     const shown = text(tree), links = nodes(tree).filter((node) => node.type === 'a');
     expect(shown.match(/Нужно проверить/g)).toHaveLength(1);
     expect(shown.match(/Несколько вопросов/g)).toHaveLength(1); expect(shown).not.toContain('Несколько решений');
-    expect(shown).toContain('Вопросов без действующего решения: 12 из 12. Действующих применённых решений: 0.');
+    expect(shown).toContain('Без действующего решения: 12 из 12 · Применённых решений: 0');
     expect(shown).toContain('Не все исходные материалы прочитаны.');
     expect(shown).toContain('Остаются вопросы для проверки');
     expect(new Set(links.map((node) => node.props.href))).toEqual(new Set(doc.questions.map((entry) => `#commercial-question-${entry.id}`)));

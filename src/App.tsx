@@ -363,7 +363,10 @@ function App() {
     setCollapsed(value);
     localStorage.setItem("sbk-tools:sidebar-collapsed", String(value));
   };
-  const [title, subtitle] = toolTitles[activeTool];
+  const [title, subtitle] = taskDocumentVisible
+    ? ["Коммерческое предложение", "Документ текущей задачи"]
+    : toolTitles[activeTool];
+  const currentHelpText = helpText[taskDocumentVisible ? "proposals" : activeTool];
   const createProposal = (data: ProposalData) => { setProposalHandoff({id:crypto.randomUUID(),data}); selectTool("proposals"); };
   const intelligenceConsumed = () => setIntelligenceHandoff(undefined);
   const transferIntelligence = (handoff: IntelligenceHandoff) => {
@@ -764,7 +767,7 @@ function App() {
             width="560px"
           >
             <div className="dialog-body">
-              <p>{helpText[activeTool]}</p>
+              <p>{currentHelpText}</p>
               <p className="help-text">
                 Передача данных между разделами выполняется только по вашему выбору.
               </p>

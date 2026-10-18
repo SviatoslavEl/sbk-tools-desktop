@@ -1,6 +1,7 @@
 import { isValidElement, type ReactElement, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
+import { Dialog } from "./components/Dialog";
 import { Proposals } from "./modules/proposals/Proposals";
 import { Settings } from "./modules/settings/Settings";
 import { Calculator } from "./modules/calculator/Calculator";
@@ -64,6 +65,14 @@ function text(node: ReactNode): string { if (Array.isArray(node)) return node.ma
 function child<T>(component: unknown): ReactElement<NonNullable<T>> { const found = nodes().find((node) => node.type === component); if (!found) throw new Error("Missing component"); return found as unknown as ReactElement<NonNullable<T>>; }
 const workbench = () => child<Parameters<typeof import("./modules/intelligence/IntelligenceWorkbench").IntelligenceWorkbench>[0]>(runtime.Workbench);
 const proposal = () => child<Parameters<typeof Proposals>[0]>(Proposals);
+const pageTitles = () => nodes().filter((node) => node.type === "h1").map((node) => text(node.props.children));
+function pageSubtitle() { const heading = nodes().find((node) => node.props.className === "topbar-heading"); return nodes(heading).filter((node) => node.type === "p").map((node) => text(node.props.children)); }
+async function openHelp(title: string) {
+  const button = nodes().find((node) => node.type === "button" && node.props["aria-label"] === `Открыть справку: ${title}`);
+  expect(button).toBeDefined();
+  (button!.props.onClick! as (event: { currentTarget: { focus: () => void } }) => void)({ currentTarget: { focus: vi.fn() } }); await flush();
+  return child<Parameters<typeof Dialog>[0]>(Dialog);
+}
 function wrapper(component: unknown) { return nodes().find((node) => Array.isArray(node.props.children) ? node.props.children.some((value) => isValidElement(value) && value.type === component) : isValidElement(node.props.children) && node.props.children.type === component)!; }
 async function navigate(label: string) { const node = nodes().find((entry) => entry.type === "button" && text(entry.props.children) === label); if (!node?.props.onClick) throw new Error(`Missing navigation ${label}`); node.props.onClick(); await flush(); }
 function handoff(resultId = "resultA", root = "/test/ProductData"): Extract<IntelligenceHandoff, { destination: "proposals" }> {
@@ -91,7 +100,10 @@ afterEach(() => { for (const slot of runtime.slots) slot.cleanup?.(); vi.unstubA
 
 describe("App task document routing", () => {
   it("opens an origin-bound proposal inside AI, with one stable receiver and no invented acceptance", async () => {
+    expect(pageTitles()).toEqual(["Рабочее окно ИИ"]);
     const initialWorkbench = workbench(); const request = handoff(); initialWorkbench.props.onTransfer(request); await flush();
+    expect(pageTitles()).toEqual(["Коммерческое предложение"]); expect(pageSubtitle()).toEqual(["Документ текущей задачи"]);
+    expect(nodes().some((node) => node.type === "button" && text(node.props.children) === "Рабочее окно ИИ")).toBe(true);
     expect(nodes().filter((node) => node.type === Proposals)).toHaveLength(1);
     expect(proposal().props.handoff?.taskOrigin).toEqual(request.taskOrigin);
     expect(proposal().props.presentation).toBe("ai-task"); expect(proposal().props.active).toBe(true);
@@ -105,6 +117,7 @@ describe("App task document routing", () => {
     expect(text(tree)).not.toContain("Открываем выбранный результат задачи");
     expect(workbench().props.taskDocumentSessions).toHaveLength(1);
     proposal().props.onReturnToTask!(); await flush();
+    expect(pageTitles()).toEqual(["Рабочее окно ИИ"]); expect(pageSubtitle()).toEqual(["Документы, анализ и подготовка карточек для всех разделов"]);
     expect(workbench().props.active).toBe(true); expect(proposal().props.active).toBe(false);
     expect(wrapper(Proposals).key).toBe(receiverKey); expect(nodes().filter((node) => node.type === Proposals)).toHaveLength(1);
     expect(wrapper(Proposals).props.hidden).toBe(true);
@@ -113,11 +126,41 @@ describe("App task document routing", () => {
   it("keeps task session projections while visiting other tools and reuses the same receiver", async () => {
     const request = handoff(); workbench().props.onTransfer(request); await flush();
     proposal().props.onTaskSessionChange!(accepted(request)); await flush(); const receiverKey = wrapper(Proposals).key;
-    await navigate("Кадры"); expect(proposal().props.active).toBe(false);
+    await navigate("Кадры"); expect(proposal().props.active).toBe(false); expect(pageTitles()).toEqual(["Кадры"]);
     await navigate("Рабочее окно ИИ"); expect(proposal().props.presentation).toBe("ai-task"); expect(proposal().props.active).toBe(true);
+    expect(pageTitles()).toEqual(["Коммерческое предложение"]); expect(pageSubtitle()).toEqual(["Документ текущей задачи"]);
     expect(wrapper(Proposals).key).toBe(receiverKey); expect(workbench().props.taskDocumentSessions).toHaveLength(1);
     proposal().props.onReturnToTask!(); await flush(); workbench().props.onTransfer(request); await flush();
+    expect(pageTitles()).toEqual(["Коммерческое предложение"]);
     expect(wrapper(Proposals).key).toBe(receiverKey); expect(text(tree)).not.toContain("Открываем выбранный результат задачи");
+  });
+
+  it("uses the visible document context for help and restores workbench help after returning", async () => {
+    const initial = await openHelp("Рабочее окно ИИ");
+    expect(initial.props.title).toBe("Справка: Рабочее окно ИИ"); expect(text(initial.props.children)).toContain("Добавьте материал и задачу");
+    initial.props.onClose(); await flush();
+    const request = handoff(); workbench().props.onTransfer(request); await flush();
+    const documentHelp = await openHelp("Коммерческое предложение");
+    expect(documentHelp.props.title).toBe("Справка: Коммерческое предложение");
+    expect(text(documentHelp.props.children)).toContain("Создавайте предложение по шагам");
+    expect(text(documentHelp.props.children)).not.toContain("Добавьте материал и задачу");
+    expect(workbench().props.taskDocumentSessions).toEqual([]); expect(nodes().filter((node) => node.type === Proposals)).toHaveLength(1);
+    documentHelp.props.onClose(); await flush(); proposal().props.onTaskSessionChange!(accepted(request)); await flush();
+    proposal().props.onReturnToTask!(); await flush();
+    const returned = await openHelp("Рабочее окно ИИ");
+    expect(returned.props.title).toBe("Справка: Рабочее окно ИИ"); expect(text(returned.props.children)).toContain("Добавьте материал и задачу");
+    expect(text(returned.props.children)).not.toContain("Создавайте предложение по шагам");
+  });
+
+  it("keeps the proposal heading while B is pending without replacing or acknowledging owned A", async () => {
+    const first = handoff(); first.data.title = "Принятый документ A"; workbench().props.onTransfer(first); await flush();
+    const owned = accepted(first); proposal().props.onTaskSessionChange!(owned); await flush(); const receiverKey = wrapper(Proposals).key;
+    const next = handoff("resultB"); next.data.title = "Ещё не принятый документ B"; workbench().props.onTransfer(next); await flush();
+    expect(pageTitles()).toEqual(["Коммерческое предложение"]); expect(pageSubtitle()).toEqual(["Документ текущей задачи"]);
+    expect(workbench().props.taskDocumentSessions).toEqual([owned.session]); expect(proposal().props.handoff?.id).toBe(next.id);
+    expect(wrapper(Proposals).key).toBe(receiverKey); expect(nodes().filter((node) => node.type === Proposals)).toHaveLength(1);
+    expect(text(tree)).toContain("Открываем выбранный результат задачи");
+    proposal().props.onHandoffConsumed!(); await flush(); expect(workbench().props.taskDocumentSessions).toEqual([owned.session]);
   });
 
   it("does not let consumed A clear a later B handoff", async () => {

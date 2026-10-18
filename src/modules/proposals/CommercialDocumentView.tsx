@@ -7,8 +7,10 @@ const groups = (block: CommercialBlock): CommercialInline[][] => block.kind === 
 
 /** The receiver's controlled working document, not a second proposal store or
  * a rendered PDF. Only temporary, unapplied text lives in this component. */
-export function CommercialDocumentView({ value, onChange, readOnly = false, renderQuestion, onPendingEditChange }: {
+export function CommercialDocumentView({ value, onChange, documentTitle, readOnly = false, renderQuestion, onPendingEditChange }: {
   value: ProposalCommercialDocumentV1;
+  /** Display-only title from the current proposal owner, never source metadata. */
+  documentTitle?: string;
   /** Synchronous acceptance by the sole state owner, not persistence/approval.
    * A silent rejection or an async callback must not discard the local draft. */
   onChange: (next: ProposalCommercialDocumentV1) => boolean;
@@ -81,8 +83,8 @@ export function CommercialDocumentView({ value, onChange, readOnly = false, rend
   let draftOrdinal = "";
   if (editing) editing.document.body.sections.forEach((section, si) => section.blocks.forEach((block, bi) => { if (block.id === editing.blockId) draftOrdinal = `${si + 1}.${bi + 1}`; }));
   return <section className="commercial-document" aria-label="Документ коммерческого предложения">
-    <header className="commercial-document-heading"><div><h2>Проект для согласования</h2><p>Читайте документ по разделам. Текст можно изменить на месте; спорные условия уточняются рядом с соответствующим разделом.</p></div><small>Редакция документа: {value.revision}</small></header>
-    <p className="notice warning">Это рабочий проект, не готовый к отправке файл. Изменение текста не подтверждает его исходным документом и может сделать прежние решения неактуальными.</p>
+    <header className="commercial-document-heading"><div><h2>{documentTitle?.trim() || "Коммерческое предложение"}</h2><p>Рабочий проект · не готов к отправке</p></div><small>Редакция документа: {value.revision}</small></header>
+    <details><summary>Как проверить проект</summary><p>Читайте документ по разделам. Текст можно изменить на месте; спорные условия уточняются рядом с соответствующим разделом.</p><p>Это рабочий проект, не готовый к отправке файл. Изменение текста не подтверждает его исходным документом и может сделать прежние решения неактуальными.</p></details>
     {error && <p className="notice error" role="alert">{error}</p>}
     {detached && <aside className="commercial-detached-draft" aria-label="Неприменённые правки предыдущего документа"><h3>Документ изменился — правки сохранены в поле</h3><p>Этот текст относится к предыдущей редакции. Скопируйте нужные фрагменты, затем отмените правки и откройте актуальный пункт. Автоматически заменять новый документ этим текстом нельзя.</p>{editor(editing, draftOrdinal)}</aside>}
     {value.body.sections.map((section, si) => {

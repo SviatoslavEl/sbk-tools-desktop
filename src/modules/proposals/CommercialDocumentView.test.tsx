@@ -9,8 +9,11 @@ vi.mock("react", async (original) => ({ ...await original<typeof import("react")
   if (!(index in hooks.values)) hooks.values[index] = initial;
   return [hooks.values[index], (next: unknown) => { hooks.values[index] = typeof next === "function" ? next(hooks.values[index]) : next; }];
 } }));
-type Props = { children?: ReactNode; disabled?: boolean; value?: unknown; href?: string; id?: string; "data-question-id"?: string; "aria-label"?: string; role?: string; onClick?: () => void; onChange?: (event: { target: { value: string } }) => void };
+type Props = { children?: ReactNode; disabled?: boolean; open?: boolean; value?: unknown; href?: string; id?: string; "data-question-id"?: string; "aria-label"?: string; role?: string; onClick?: () => void; onChange?: (event: { target: { value: string } }) => void };
 const text = (node: ReactNode): string => Array.isArray(node) ? node.map(text).join("") : isValidElement<Props>(node) ? text(node.props.children) : typeof node === "string" || typeof node === "number" ? String(node) : "";
+const visibleText = (node: ReactNode): string => Array.isArray(node) ? node.map(visibleText).join("") : isValidElement<Props>(node)
+  ? node.type === "details" && node.props.open !== true ? text(find(node.props.children, (type) => type === "summary")?.children) : visibleText(node.props.children)
+  : typeof node === "string" || typeof node === "number" ? String(node) : "";
 function find(node: ReactNode, check: (type: unknown, props: Props) => boolean): Props | undefined {
   if (Array.isArray(node)) { for (const child of node) { const result = find(child, check); if (result) return result; } }
   else if (isValidElement<Props>(node)) { if (check(node.type, node.props)) return node.props; return find(node.props.children, check); }
@@ -30,17 +33,43 @@ async function fixture(): Promise<ProposalCommercialDocumentV1> {
   };
 }
 async function setup() {
-  let value = await fixture(), readOnly = false;
+  let value = await fixture(), readOnly = false, documentTitle: string | undefined;
   const onChange = vi.fn((next: ProposalCommercialDocumentV1) => { value = next; return true; });
-  const render = () => { hooks.index = 0; return CommercialDocumentView({ value, onChange, readOnly }); };
+  const render = () => { hooks.index = 0; return CommercialDocumentView({ value, onChange, readOnly, documentTitle }); };
   const field = (label: string) => find(render(), (_type, props) => props["aria-label"] === label)!;
   const button = (label: string) => find(render(), (type, props) => type === "button" && text(props.children) === label)!;
   const begin = (ordinal = "1.1") => field(`Изменить текст пункта ${ordinal}`).onClick!();
   const change = (label: string, next: string) => field(label).onChange!({ target: { value: next } });
-  return { get value() { return value; }, set value(next: ProposalCommercialDocumentV1) { value = next; }, set readOnly(next: boolean) { readOnly = next; }, render, field, button, begin, change, onChange };
+  return { get value() { return value; }, set value(next: ProposalCommercialDocumentV1) { value = next; }, set readOnly(next: boolean) { readOnly = next; }, set documentTitle(next: string | undefined) { documentTitle = next; }, render, field, button, begin, change, onChange };
 }
 
 describe("controlled working commercial document", () => {
+  it("shows the current proposal title and working status while keeping general guidance collapsed", async () => {
+    const ui = await setup(), original = structuredClone(ui.value);
+    ui.documentTitle = "  Сервисное сопровождение предприятия  "; const rendered = ui.render();
+    expect(text(find(rendered, (type) => type === "h2")?.children)).toBe("Сервисное сопровождение предприятия");
+    expect(visibleText(rendered)).toContain("Рабочий проект · не готов к отправке");
+    const help = find(rendered, (type, props) => type === "details" && text(find(props.children, (childType) => childType === "summary")?.children) === "Как проверить проект");
+    expect(help).toBeDefined(); expect(help?.open).not.toBe(true);
+    expect(text(help?.children)).toContain("Читайте документ по разделам");
+    expect(text(help?.children)).toContain("может сделать прежние решения неактуальными");
+    expect(visibleText(rendered)).not.toContain("Читайте документ по разделам");
+    expect(visibleText(rendered)).not.toContain("Изменение текста не подтверждает");
+    expect(ui.value).toEqual(original); expect(ui.onChange).not.toHaveBeenCalled();
+  });
+  it.each([undefined, "", "   "])("uses a neutral title fallback for %s without reading private source metadata", async (title) => {
+    const ui = await setup(); ui.documentTitle = title;
+    expect(text(find(ui.render(), (type) => type === "h2")?.children)).toBe("Коммерческое предложение");
+    expect(visibleText(ui.render())).not.toContain("source-document"); expect(ui.onChange).not.toHaveBeenCalled();
+  });
+  it("updates only the displayed title without discarding an unapplied text draft", async () => {
+    const ui = await setup(), original = structuredClone(ui.value); ui.begin();
+    ui.change("Текст пункта 1.1, группа 1, фрагмент 1", "Неприменённый текст"); ui.documentTitle = "Уточнённый предмет КП";
+    expect(text(find(ui.render(), (type) => type === "h2")?.children)).toBe("Уточнённый предмет КП");
+    expect(ui.field("Текст пункта 1.1, группа 1, фрагмент 1").value).toBe("Неприменённый текст");
+    expect(visibleText(ui.render())).toContain("Правки пока только в этом поле");
+    expect(ui.value).toEqual(original); expect(ui.onChange).not.toHaveBeenCalled();
+  });
   it("keeps distinct questions with identical wording addressable beside their original section", async () => {
     const ui = await setup(), fingerprint = ui.value.privateAppendix.sourceSnapshotKey;
     ui.value.questions = ["intro", "list"].map((blockId, index) => ({ id: `question-source-reference-${index}`, kind: "source-reference", sectionId: "scope", targetBlockIds: [blockId], sourceClauseIds: ["clause"], sourceReferenceIds: [], message: "Нужно проверить исходную ссылку.", material: true, dependencyFingerprint: fingerprint }));
@@ -76,7 +105,7 @@ describe("controlled working commercial document", () => {
   it("refuses to overwrite a newer document but keeps the old draft available for recovery", async () => {
     const ui = await setup(); ui.begin(); ui.change("Текст пункта 1.1, группа 1, фрагмент 1", "Моя правка");
     ui.value = { ...structuredClone(ui.value), revision: 4 }; ui.button("Применить текст").onClick!();
-    expect(ui.onChange).not.toHaveBeenCalled(); expect(text(ui.render())).toContain("Документ изменился");
+    expect(ui.onChange).not.toHaveBeenCalled(); expect(visibleText(ui.render())).toContain("Документ изменился");
     expect(ui.field("Текст пункта 1.1, группа 1, фрагмент 1").value).toBe("Моя правка");
   });
   it("does not grant write access when the controlled receiver becomes read-only", async () => {
@@ -94,6 +123,7 @@ describe("controlled working commercial document", () => {
     ui.value = next;
     expect(ui.field("Текст пункта 1.1, группа 1, фрагмент 1").value).toBe("Не потерять при переключении");
     expect(find(ui.render(), (_type, props) => props["aria-label"] === "Неприменённые правки предыдущего документа")).toBeDefined();
+    expect(visibleText(ui.render())).toContain("Документ изменился — правки сохранены в поле");
     expect(ui.button("Применить текст").disabled).toBe(true); ui.button("Применить текст").onClick!(); expect(ui.onChange).not.toHaveBeenCalled();
     ui.button("Отменить правки").onClick!(); expect(ui.field("Изменить текст пункта 1.1").disabled).toBe(false);
   });
@@ -105,11 +135,13 @@ describe("controlled working commercial document", () => {
   });
   it("retains text and reports validation errors instead of silently truncating it", async () => {
     const ui = await setup(); ui.begin(); const tooLong = "я".repeat(20001); ui.change("Текст пункта 1.1, группа 1, фрагмент 1", tooLong); ui.button("Применить текст").onClick!();
-    expect(ui.onChange).not.toHaveBeenCalled(); expect(ui.field("Текст пункта 1.1, группа 1, фрагмент 1").value).toBe(tooLong); expect(find(ui.render(), (_type, props) => props.role === "alert")).toBeDefined();
+    expect(ui.onChange).not.toHaveBeenCalled(); expect(ui.field("Текст пункта 1.1, группа 1, фрагмент 1").value).toBe(tooLong);
+    const alert = find(ui.render(), (_type, props) => props.role === "alert"); expect(alert).toBeDefined();
+    expect(visibleText(ui.render())).toContain(text(alert?.children));
   });
   it("keeps an unapplied draft when the parent refuses the update", async () => {
     const ui = await setup(); ui.onChange.mockImplementationOnce(() => { throw new Error("Сессия изменилась"); }); ui.begin(); ui.change("Текст пункта 1.1, группа 1, фрагмент 1", "Сохранить для переноса"); ui.button("Применить текст").onClick!();
-    expect(ui.value.revision).toBe(3); expect(ui.field("Текст пункта 1.1, группа 1, фрагмент 1").value).toBe("Сохранить для переноса"); expect(text(ui.render())).toContain("Сессия изменилась");
+    expect(ui.value.revision).toBe(3); expect(ui.field("Текст пункта 1.1, группа 1, фрагмент 1").value).toBe("Сохранить для переноса"); expect(visibleText(ui.render())).toContain("Сессия изменилась");
   });
   it("does not discard a draft after a silent owner rejection", async () => {
     const ui = await setup(); ui.onChange.mockImplementationOnce(() => false); ui.begin(); ui.change("Текст пункта 1.1, группа 1, фрагмент 1", "Непринятый текст"); ui.button("Применить текст").onClick!();
