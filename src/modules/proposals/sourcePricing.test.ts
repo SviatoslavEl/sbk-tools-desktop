@@ -21,6 +21,33 @@ describe("explicit private source price application", () => {
     expect(priceProposal(next.lines).totals).toMatchObject({ netMinor: "100000", vatMinor: "22000", grossMinor: "122000" });
     expect(proposalSourcePricingIssues(next)).toEqual([]); expect(data).toEqual(before);
   });
+  it("preserves the explicit single source-derived service title and exact raw scope instead of naming the priced row after the КП heading", () => {
+    const data = proposal({ quote: "Стоимость услуг составляет 1220 рублей, включая НДС 22% — 220 рублей." });
+    data.title = "КП по проверке учебной системы";
+    const title = "Услуги по проверке учебной системы", rawScope = "  Состав работ по исходному документу:\nПроверка двух модулей.\n\nРезультаты по исходному документу:\nОтчёт в DOCX и PDF.\n";
+    data.lines = [{ ...createProposalLine(), title, description: rawScope, quantity: "", unit: "" }];
+    const before = structuredClone(data), next = applyProposalSourcePrice(data, "price-a", confirmed);
+    expect(next.title).toBe(data.title); expect(next.lines).toHaveLength(1);
+    expect(next.lines[0]).toMatchObject({ title, description: rawScope, quantity: "1", unit: "комплекс", unitPrice: "1220", priceBasis: "gross", tax: { kind: "vat", rate: 22 } });
+    expect(priceProposal(next.lines).totals).toMatchObject({ netMinor: "100000", vatMinor: "22000", grossMinor: "122000" });
+    expect(proposalSourcePricingIssues(sortedObjectRoundTrip(next))).toEqual([]); expect(data).toEqual(before);
+    const reapplied = applyProposalSourcePrice(next, "price-a", { ...confirmed, replaceExistingPrices: true });
+    expect(reapplied.lines[0].title).toBe(title); expect(reapplied.lines[0].description).toBe(rawScope); expect(proposalSourcePricingIssues(reapplied)).toEqual([]);
+    const edited = structuredClone(next); edited.lines[0].title += " и новые работы"; expect(proposalSourcePricingIssues(edited)).not.toEqual([]);
+  });
+  it("does not infer service naming for goods, unrelated titles or multi-position aggregates", () => {
+    for (const [heading, lineTitle, quote] of [
+      ["КП по поставке оборудования", "Оборудование учебное", "Стоимость оборудования составляет 1220 рублей с НДС 22%."],
+      ["КП по проверке учебной системы", "Услуги по другой системе", "Стоимость услуг составляет 1220 рублей с НДС 22%."],
+      ["Проверка учебной системы", "Услуги по проверке учебной системы", "Стоимость услуг составляет 1220 рублей с НДС 22%."],
+    ]) {
+      const data = proposal({ quote }); data.title = heading; data.lines = [{ ...createProposalLine(), title: lineTitle, description: "Полный исходный состав" }];
+      const next = applyProposalSourcePrice(data, "price-a", confirmed);
+      expect(next.lines[0].title).toBe(heading); expect(next.lines[0].description).toBe(`${lineTitle}\nПолный исходный состав`);
+    }
+    const multiple = proposal({ quote: "Стоимость услуг составляет 1220 рублей с НДС 22%." }); multiple.title = "КП по проверке учебной системы"; multiple.lines[0].title = "Услуги по проверке учебной системы";
+    const next = applyProposalSourcePrice(multiple, "price-a", confirmed); expect(next.lines[0].title).toBe(multiple.title); expect(next.lines[0].description).toContain("Отчёт\nРезультат DOCX/PDF");
+  });
   it("requires same-project, one-complex and replacement confirmations independently", () => {
     const data = proposal(); expect(() => applyProposalSourcePrice(data, "price-a", { sameProject: false, aggregateAsSingleLine: true })).toThrow(/тому же проекту/u);
     expect(() => applyProposalSourcePrice(data, "price-a", { sameProject: true })).toThrow(/сводную/u);

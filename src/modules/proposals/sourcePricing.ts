@@ -119,11 +119,19 @@ export function applyProposalSourcePrice(data: ProposalData, candidateId: string
   let lines: ProposalLine[];
   if (candidate.scope === "aggregate") {
     if (!confirmation.aggregateAsSingleLine) throw new Error("Подтвердите одну сводную позицию: цена дана на весь комплекс, а не на каждый блок.");
+    // The source completion already distinguishes the document heading
+    // “КП по …” from its offered service “Услуги по …”. Applying a package
+    // price must not overwrite that explicit service name with the heading.
+    // This is a narrow preservation rule, not a way to name arbitrary goods.
+    const sourceService = data.lines.length === 1 && candidate.sourceKind === "contract"
+      && /(?:стоимост[ьи]|цен[аыуе])[^.;\n]{0,100}(?:услуг|работ)(?=$|[^\p{L}])/iu.test(candidate.quote)
+      && /^КП\s+по\s+\S/iu.test(data.title.trim())
+      && key(data.lines[0].title) === key(data.title.trim().replace(/^КП\s+по\s+/iu, "Услуги по "));
     const alreadyAggregate = data.lines.length === 1 && data.lines[0].unit === "комплекс" && data.lines[0].quantity === "1" && key(data.lines[0].title) === key(data.title);
-    const completeScope = alreadyAggregate ? data.lines[0].description.trim() : data.lines.map((line) => [line.title.trim(), line.description.trim()].filter(Boolean).join("\n")).filter(Boolean).join("\n\n");
-    if (!completeScope || !data.title.trim()) throw new Error("Сначала заполните предмет и полный состав работ. Цена не заменяет описание услуги.");
+    const completeScope = sourceService ? data.lines[0].description : alreadyAggregate ? data.lines[0].description.trim() : data.lines.map((line) => [line.title.trim(), line.description.trim()].filter(Boolean).join("\n")).filter(Boolean).join("\n\n");
+    if (!completeScope.trim() || !data.title.trim()) throw new Error("Сначала заполните предмет и полный состав работ. Цена не заменяет описание услуги.");
     if (completeScope.length > 20_000) throw new Error("Полный состав работ не помещается в одну позицию. Сократите его вручную без потери условий.");
-    lines = [priceLine(candidate, { ...createProposalLine(), title: data.title.trim(), description: completeScope })];
+    lines = [priceLine(candidate, { ...createProposalLine(), title: sourceService ? data.lines[0].title : data.title.trim(), description: completeScope })];
   } else {
     const matching = data.lines.filter((line) => candidate.positionName && key(line.title) === key(candidate.positionName));
     if (matching.length !== 1) throw new Error("Исходная цена не сопоставлена с единственной неизменённой позицией КП.");
