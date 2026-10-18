@@ -11,7 +11,7 @@ const wholeFields = ['title', 'introduction', 'lines', 'lineDescriptions', 'deli
  * provider answer. Unknown extraction completeness cannot become authority. */
 export function assertSourceContractSources(sources: unknown): asserts sources is IntelligenceSource[] {
   assertResponsePreparationSources(sources);
-  if (!sources.length || sources.some(source => source.coverage?.complete !== true || source.coverage.requiresOcr
+  if (!sources.length || sources.some(source => source.coverage?.complete !== true || source.coverage.requiresOcr || source.coverage.pagesWithoutText?.length
     || source.fragments?.some(fragment => fragment.includedByUser === false || (fragment.sheetState === 'hidden' || fragment.sheetState === 'veryHidden') && fragment.includedByUser !== true))) {
     throw new Error('Нужен полностью извлечённый договор без нераспознанных или исключённых фрагментов. Полнота неизвестна либо выбран только фрагмент; локальный проект не создан.');
   }

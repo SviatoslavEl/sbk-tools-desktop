@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createContractProposalProver } from './contractProposalCompletion';
 import { startSourceContractPreparation, ResponsePreparationCancelled, responsePreparationTimeoutMilliseconds, startResponsePreparation } from './responsePreparation';
 import { runResponsePreparation, validResponsePreparationReply } from './responsePreparationWorker';
-import { assertPreparedSourceContract, type SourceContractPreparationWireRequest } from './sourceContractPreparation';
+import { assertPreparedSourceContract, assertSourceContractSources, type SourceContractPreparationWireRequest } from './sourceContractPreparation';
 import { buildIntelligenceHandoff } from './workbenchModel';
 import type { IntelligenceSource } from './workbenchTypes';
 
@@ -34,6 +34,23 @@ class LocalWorker {
 afterEach(() => { vi.unstubAllGlobals(); vi.useRealTimers(); LocalWorker.instances = []; });
 
 describe('explicit local source-contract preparation', () => {
+  it('rejects contradictory complete coverage with a page without text at admission, before creating any local project', () => {
+    const input = request();
+    input.sources[0].coverage = { complete: true, requiresOcr: false, pagesWithoutText: [2] };
+    const captured = freeze(input), before = structuredClone(captured);
+    expect(() => assertSourceContractSources(captured.sources)).toThrow(/без нераспознанных/);
+    const reply = runResponsePreparation(captured);
+    expect(reply).toEqual({ revision: 9, origin: 'source-contract', failed: expect.stringMatching(/без нераспознанных/) });
+    expect(reply.prepared).toBeUndefined(); expect(reply.empty).toBeUndefined(); expect(captured).toEqual(before);
+  });
+  it('still admits an explicitly empty pages-without-text list without altering authoritative fragments', () => {
+    const input = request(); input.sources[0].coverage!.pagesWithoutText = [];
+    const captured = freeze(input), before = structuredClone(captured), reply = runResponsePreparation(captured);
+    expect(() => assertSourceContractSources(captured.sources)).not.toThrow();
+    expect(reply.failed).toBeUndefined(); expect(reply.prepared!.items).toHaveLength(1);
+    expect(() => assertPreparedSourceContract(reply.prepared!.items, captured.sources)).not.toThrow();
+    expect(captured).toEqual(before);
+  });
   it('prepares one fresh complete canonical project and identifies local origin without approvals or invented fields', () => {
     const input = freeze(request()), before = structuredClone(input), reply = runResponsePreparation(input), item = reply.prepared!.items[0];
     expect(reply.origin).toBe('source-contract'); expect(reply.prepared!.sourcePreparation!.origin).toBe('source-contract'); expect(reply.failed).toBeUndefined();
