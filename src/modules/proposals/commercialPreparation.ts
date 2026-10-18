@@ -1,4 +1,4 @@
-import { collectContractProposalFacts, type ContractProposalFact, type ContractProposalInventory } from "../intelligence/contractProposalFacts";
+import { collectContractProposalFacts, priceApplicabilityRestriction, type ContractProposalFact, type ContractProposalInventory } from "../intelligence/contractProposalFacts";
 import { taskSourceSnapshotKey } from "../intelligence/taskSourceIdentity";
 import type { SourcePreparationProvenance } from "../intelligence/sourcePreparedFacts";
 import type { IntelligenceFragment, IntelligenceSource } from "../intelligence/workbenchTypes";
@@ -86,6 +86,7 @@ async function sourceAppendix(sources: readonly IntelligenceSource[], inventory:
       clause.roles = [...new Set(facts.filter((fact) => fact.role !== "aggregate-price").map(factSection))];
       if (!selected(fragment)) { clause.classification = "excluded-material"; clause.classificationReason = "Фрагмент не выбран пользователем. Он сохранён частно и не считается проверенным публичным условием."; }
       else if (facts.some((fact) => fact.role === "aggregate-price")) clause.classification = "financial";
+      else if (priceApplicabilityRestriction(fragment.text)) { clause.classification = "commercial"; clause.roles = ["exclusions"]; }
       else if (facts.length) clause.classification = "commercial";
       else if (inlineScope(fragment.text)) { clause.classification = "commercial"; clause.roles = ["scope"]; }
       else if (!fragment.text.trim() || isCommercialStructuralHeading(fragment.text) || taskHeading(fragment.text) || /^(?:к\s+договору|№\s*[_«"\d]|рег\.?\s*№|от\s*[«"_]|возмездного\s+оказания\s+услуг$)/iu.test(fragment.text.trim()) || /колонтитул/iu.test(fragment.locator) || /^(?:г\.\s*[\p{L} .-]+\s*\t+)?\s*[«"][_\s]*[»"]\s*[_\s]*\d{4}\s*г\.?\s*$/iu.test(fragment.text)) clause.classification = "structural";
@@ -277,7 +278,7 @@ export function validateCommercialSourceProjection(document: ProposalCommercialD
     return { id, name: owned[0]?.sourceName || "", text: owned.map((clause) => clause.quote).join("\n"), fragments: owned.map((clause) => ({ ...(clause.fragmentId ? { id: clause.fragmentId } : {}), locator: clause.locator, text: clause.quote })), coverage: { complete: appendix.extraction.complete, requiresOcr: appendix.extraction.requiresOcr } };
   }));
   if (inventory.limited) issues.push(review("commercial-projection-inventory", "Полный исходный состав не проверен в пределах разбора; классификация не подтверждает полноту."));
-  const materialClauseIds = new Set(appendix.clauses.filter((clause) => inlineScope(clause.quote)).map((clause) => clause.id));
+  const materialClauseIds = new Set(appendix.clauses.filter((clause) => inlineScope(clause.quote) || priceApplicabilityRestriction(clause.quote)).map((clause) => clause.id));
   for (const fact of inventory.facts) {
     const clause = appendix.clauses.find((part) => sameProof(part, fact)); if (clause) materialClauseIds.add(clause.id);
   }

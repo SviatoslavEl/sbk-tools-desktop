@@ -4,6 +4,7 @@ import { taskSourceSnapshotKey } from "../intelligence/taskSourceIdentity";
 import { commercialFingerprint, validateCommercialDocument, validateCommercialQuoteHashes, type CommercialBlock, type ProposalCommercialDocumentV1 } from "./commercialDocument";
 import { collectCommercialReferences, collectCommercialStageCatalog, isCommercialStructuralHeading, prepareCommercialDocument, validateCommercialSourceProjection } from "./commercialPreparation";
 import { projectReadiness } from "./commercialDecisions";
+import { projectCommercialBodyPublic } from "./commercialPublic";
 
 function source(): IntelligenceSource {
   const texts = [
@@ -52,6 +53,49 @@ function inlineScopeSource(lastClause: string): IntelligenceSource {
 }
 
 describe("source-derived commercial review draft", () => {
+  it("preserves a complete source price restriction only in the structured review body, without price approval", async () => {
+    const input = source(), quote = "10.2. Стоимость услуг по настоящему Договору определена только для исполнения настоящего Договора и не может служить прецедентом при заключении аналогичных договоров в будущем.", boilerplate = "10.1. Споры по настоящему Договору разрешаются в суде по месту нахождения ответчика.";
+    input.fragments!.splice(11, 0, ...["10. Прочие условия", boilerplate, quote].map((text, index) => ({ id: `price-restriction-${index}`, locator: `Отдельный пункт ${index + 1}`, text })));
+    const original = structuredClone(input), result = await prepare([input]);
+    expect(result.document).toBeDefined(); const document = result.document!, appendix = document.privateAppendix;
+    const clause = appendix.clauses.find((entry) => entry.quote === quote)!, coverage = appendix.coverage.find((entry) => entry.sourceClauseId === clause.id)!;
+    expect(clause).toMatchObject({ classification: "commercial", roles: ["exclusions"], quote, quoteHash: await commercialFingerprint(quote) });
+    expect(coverage.kind).toBe("projected");
+    const section = document.body.sections.find((entry) => entry.kind === "exclusions")!;
+    // Only the old numeric label is removed for presentation. Every source
+    // word remains, and the private quote remains byte-for-byte unchanged.
+    expect(section.blocks.map(text)).toContain(quote.replace(/^10\.2\.\s/u, ""));
+    const publicBody = projectCommercialBodyPublic(document.body);
+    expect(JSON.stringify(publicBody.sections)).toContain(quote.replace(/^10\.2\.\s/u, ""));
+    expect(JSON.stringify(publicBody.sections)).not.toContain(clause.id);
+    const question = document.questions.find((entry) => entry.kind === "source-reference" && entry.sourceClauseIds.includes(clause.id))!;
+    expect(question).toBeDefined(); expect(question.material).toBe(true); expect(question.sourceReferenceIds.length).toBeGreaterThan(0);
+    const price = appendix.clauses.find((entry) => /^3\.1\. Стоимость/u.test(entry.quote))!;
+    expect(appendix.coverage.find((entry) => entry.sourceClauseId === price.id)).toEqual({ sourceClauseId: price.id, kind: "external-field", field: "pricing" });
+    expect(JSON.stringify(document.body)).not.toContain("1000,00"); expect(JSON.stringify(document.body)).not.toContain(boilerplate);
+    const privateClause = appendix.clauses.find((entry) => entry.quote === boilerplate)!;
+    expect(privateClause.classification).toBe("legal-context"); expect(appendix.coverage.find((entry) => entry.sourceClauseId === privateClause.id)?.kind).toBe("private-context");
+    expect(await validateCommercialQuoteHashes(document)).toEqual([]); expect(validateCommercialSourceProjection(document)).toEqual([]);
+    const hidden = structuredClone(document);
+    hidden.privateAppendix.clauses.find((entry) => entry.id === clause.id)!.classification = "legal-context";
+    hidden.privateAppendix.clauses.find((entry) => entry.id === clause.id)!.roles = [];
+    hidden.privateAppendix.coverage[hidden.privateAppendix.coverage.findIndex((entry) => entry.sourceClauseId === clause.id)] = { sourceClauseId: clause.id, kind: "private-context", reason: "Правовой заголовок не означает разрешение исключить условие." };
+    expect(validateCommercialSourceProjection(hidden).some((issue) => issue.code === "commercial-source-projection" && issue.path.endsWith(clause.id))).toBe(true);
+    const readiness = await projectReadiness(document);
+    expect(readiness.canFinalize).toBe(false); expect(readiness.activeDecisionIds).toEqual([]); expect(document.decisions).toEqual([]);
+    expect(readiness.questions.find((state) => state.question.id === question.id)?.activeDecision).toBeUndefined(); expect(input).toEqual(original);
+  });
+  it("never promotes an unselected source price restriction into the structured body", async () => {
+    const input = source(), quote = "Цена услуг действует только для данного проекта.";
+    input.fragments!.push({ id: "hidden-price-restriction", locator: "Скрытый пункт", text: quote, sheetState: "hidden" });
+    const result = await prepare([input]);
+    expect(result.document).toBeDefined(); const document = result.document!;
+    const clause = document.privateAppendix.clauses.find((entry) => entry.quote === quote)!;
+    expect(clause.classification).toBe("excluded-material");
+    expect(JSON.stringify(document.body)).not.toContain(quote);
+    expect(document.privateAppendix.coverage.find((entry) => entry.sourceClauseId === clause.id)?.kind).toBe("unmapped");
+    expect((await projectReadiness(document)).canFinalize).toBe(false);
+  });
   it("keeps an explicit conditional lead and both whole alternatives adjacent in one section", async () => {
     const input = alternativeSource(), before = JSON.stringify(input), document = (await prepare([input])).document!;
     const group = [alternativeLead, alternativeFirst, alternativeSecond].map((quote) => placement(document, quote));

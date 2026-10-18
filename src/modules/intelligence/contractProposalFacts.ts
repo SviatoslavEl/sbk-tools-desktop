@@ -82,10 +82,11 @@ function tableRole(row: Row): ContractProposalFactRole | undefined {
 const payment = (value: string) => /(?:(?:аванс|предоплат)[^.]{0,100}(?:\d\s*%|процент)|(?:окончательн|итогов)[\p{L}\s]+(?:расч[её]т|плат[её]ж|оплат)|(?:оплат|плат[её]ж)[\p{L}\s]{0,60}(?:дн|подписан|при[её]мк)|расч[её]т[\p{L}\s]{0,40}(?:акт|отказ))/iu.test(value);
 const duration = (value: string) => /(?:\d|один|двух|трех|пяти|десяти|сорок)[^\n.]{0,60}(?:рабоч|календарн)[^\n.]{0,25}дн/iu.test(value);
 const schedule = (value: string) => /(?:срок|приступает|начина[ею]|старт|этап|параллельн|продлен|продлева|ожидани)/iu.test(value) && (duration(value) || /(?:аванс|материал|документ|доступ|разрешени|согласован|параллельн|последовательн|задержк)/iu.test(value));
-/** A complete source price restriction is material even under a legal heading.
- * This only preserves its words; it neither finds an amount nor approves its
- * applicability to a new proposal. No context is borrowed from adjacent rows. */
-function priceApplicabilityRestriction(value: string): boolean {
+/** A complete source price restriction is material in a structured review draft,
+ * even under a legal heading. Keep it out of the general/legacy fact inventory:
+ * preserving its words neither approves disclosure nor a new proposal's price.
+ * No context is borrowed from adjacent rows. */
+export function priceApplicabilityRestriction(value: string): boolean {
   const text = normalized(unnumbered(value));
   const subject = /^(?:(?:общая|указанная|согласованная)\s+)?(?:стоимость\s+(?:услуг|работ|(?:настоящего|данного)\s+договора)|цена(?:\s+(?:услуг|работ))?)(?=\s|[:,])/u.exec(text);
   if (!subject) return false;
@@ -94,7 +95,7 @@ function priceApplicabilityRestriction(value: string): boolean {
   return /^(?:(?:определена|установлена|применяется|действует|действительна|рассчитана)\s+)?(?:только|исключительно)\s+(?:для(?:\s+(?:исполнения|выполнения))?|в\s+рамках|к)\s+(?:настоящ(?:его|ему|ем)|данн(?:ого|ому|ом)|эт(?:ого|ому|ом)|текущ(?:его|ему|ем))\s+(?:договор|контракт|проект)(?:а|у|е|ом)?(?=$|[^\p{L}])/u.test(restriction)
     || /^(?:не\s+может\s+служить|не\s+служит|не\s+является)\s+прецедентом(?=$|[^\p{L}])/u.test(restriction);
 }
-const exclusion = (value: string) => priceApplicabilityRestriction(value) || /(?:не\s+вход(?:ит|ят)|не\s+проводит|не\s+являются\s+обязательными|без\s+(?:изменения|воздействия|действий)|(?:только|исключительно)\s+в\s+[^.]{0,80}границ|по\s+отдельному\s+(?:письменному\s+)?согласованию|при\s+(?:отсутствии|наличии)\s+доступа)/iu.test(value);
+const exclusion = (value: string) => /(?:не\s+вход(?:ит|ят)|не\s+проводит|не\s+являются\s+обязательными|без\s+(?:изменения|воздействия|действий)|(?:только|исключительно)\s+в\s+[^.]{0,80}границ|по\s+отдельному\s+(?:письменному\s+)?согласованию|при\s+(?:отсутствии|наличии)\s+доступа)/iu.test(value);
 const dependency = (value: string) => /(?:заказчик[^.]{0,70}(?:предостав|обеспеч)|(?:исходн|входн)[\p{L}\s]{0,25}(?:материал|данн)|(?:репозитор|sbom|разрешени|учетны[ех]\s+запис)[^.]{0,80}(?:при\s+наличии|предостав|согласован)|при\s+условии\s+предоставления)/iu.test(value);
 const aggregatePrice = (value: string) => /(?:стоимость|цена|общая\s+сумма|итого)[^.]{0,160}\d[\d\s]*[,.]\d{2}/iu.test(value) && /(?:ндс|рубл|₽|RUB)/iu.test(value) && !/(?:штраф|неустойк|лимит\s+ответственности)/iu.test(value);
 // An explicit choice introducer owns only its adjacent marked alternatives.
