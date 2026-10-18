@@ -85,6 +85,14 @@ const schedule = (value: string) => /(?:срок|приступает|начин
 const exclusion = (value: string) => /(?:не\s+вход(?:ит|ят)|не\s+проводит|не\s+являются\s+обязательными|без\s+(?:изменения|воздействия|действий)|(?:только|исключительно)\s+в\s+[^.]{0,80}границ|по\s+отдельному\s+(?:письменному\s+)?согласованию|при\s+(?:отсутствии|наличии)\s+доступа)/iu.test(value);
 const dependency = (value: string) => /(?:заказчик[^.]{0,70}(?:предостав|обеспеч)|(?:исходн|входн)[\p{L}\s]{0,25}(?:материал|данн)|(?:репозитор|sbom|разрешени|учетны[ех]\s+запис)[^.]{0,80}(?:при\s+наличии|предостав|согласован)|при\s+условии\s+предоставления)/iu.test(value);
 const aggregatePrice = (value: string) => /(?:стоимость|цена|общая\s+сумма|итого)[^.]{0,160}\d[\d\s]*[,.]\d{2}/iu.test(value) && /(?:ндс|рубл|₽|RUB)/iu.test(value) && !/(?:штраф|неустойк|лимит\s+ответственности)/iu.test(value);
+// An explicit choice introducer owns only its adjacent marked alternatives.
+// This is not general paragraph inheritance: a new clause, unmarked paragraph,
+// table, selection gap or document/sheet boundary closes it immediately.
+const alternativeIntroduction = (value: string) => /(?:одно|один|одну|любое|любой|любую)\s+из\s+следующих\s+(?:решений|вариантов|действий)\s*:\s*$/iu.test(value);
+// Numeric markers can be a new contract clause rather than a list option;
+// do not borrow a preceding condition across that ambiguous boundary.
+const alternativeBranch = (value: string) => /^\s*(?:[-‐‑–—•▪◦]|[а-яa-z]\))\s+\S/iu.test(value);
+const conditionalRoles = new Set<ContractProposalFactRole>(["payment", "schedule", "dependency", "exclusion"]);
 
 function countWord(value: string): number | undefined {
   const number = /^\d{1,3}$/u.test(value) ? Number(value) : ({ один: 1, два: 2, три: 3, четыре: 4, пять: 5, шесть: 6, семь: 7, восемь: 8, девять: 9, десять: 10, одиннадцать: 11, двенадцать: 12 } as Record<string, number>)[value];
@@ -140,23 +148,33 @@ export function collectContractProposalFacts(sources: readonly IntelligenceSourc
       };
       let section: { role: ContractProposalFactRole; heading: Row } | undefined;
       let table: { role: ContractProposalFactRole; header: Row; last: Row } | undefined;
+      let alternatives: { roles: ContractProposalFactRole[]; heading: Row } | undefined;
       let previous: Row | undefined;
       for (const row of owned) {
-        if (previous && (row.index !== previous.index + 1 || row.fragment.sheetId !== previous.fragment.sheetId)) { section = undefined; table = undefined; }
+        if (previous && (row.index !== previous.index + 1 || row.fragment.sheetId !== previous.fragment.sheetId)) { section = undefined; table = undefined; alternatives = undefined; }
         previous = row;
-        if (row === heading || taskHeading.test(row.quote.trim()) || /^приложение\s*№/iu.test(row.quote.trim())) { section = undefined; table = undefined; continue; }
+        if (row === heading || taskHeading.test(row.quote.trim()) || /^приложение\s*№/iu.test(row.quote.trim())) { section = undefined; table = undefined; alternatives = undefined; continue; }
         const role = headingRole(row.quote);
-        if (role) { section = { role, heading: row }; table = undefined; continue; }
+        if (role) { section = { role, heading: row }; table = undefined; alternatives = undefined; continue; }
         const headerRole = tableRole(row);
-        if (headerRole) { table = { role: headerRole, header: row, last: row }; continue; }
+        if (headerRole) { table = { role: headerRole, header: row, last: row }; alternatives = undefined; continue; }
         if (table) {
           const sameTable = table.last.table && row.table ? table.last.table === row.table && row.tableRow === (table.last.tableRow || 0) + 1 : !table.last.table && !row.table && /\t/u.test(row.quote);
-          if (sameTable && row.index === table.last.index + 1) { add(row, table.role, table.header); table.last = row; continue; }
+          if (sameTable && row.index === table.last.index + 1) { add(row, table.role, table.header); table.last = row; alternatives = undefined; continue; }
           table = undefined;
         }
         // A new top-level section closes the prior scope even when its label
         // is not understood. Never inherit "subject" through legal boilerplate.
         if (/^\d{1,3}[.)]\s+\S/u.test(row.quote.trim()) && row.quote.length <= 180 && !/[.;]\s+\S/u.test(unnumbered(row.quote))) section = undefined;
+        if (alternatives) {
+          if (!row.table && !/\t/u.test(row.quote) && alternativeBranch(row.quote)) {
+            // Preserve each WHOLE branch, including its own agreement/payment
+            // qualifiers. The source introducer is evidence of the inherited
+            // role, not permission to choose or combine the alternatives.
+            const choice = alternatives;
+            choice.roles.forEach((role) => add(row, role, choice.heading));
+          } else alternatives = undefined;
+        }
         if (section) {
           if (section.role === "subject") {
             const text = unnumbered(row.quote);
@@ -172,10 +190,16 @@ export function collectContractProposalFacts(sources: readonly IntelligenceSourc
         }
         // Operational clauses frequently live under combined headings. Whole
         // clauses retain alternative events, conditions, units and exclusions.
-        if (payment(row.quote)) add(row, "payment", section?.heading);
-        if (schedule(row.quote)) add(row, "schedule", section?.heading);
-        if (dependency(row.quote)) add(row, "dependency", section?.heading);
-        if (exclusion(row.quote)) add(row, "exclusion", section?.heading);
+        const explicitRoles: ContractProposalFactRole[] = [];
+        if (payment(row.quote)) explicitRoles.push("payment");
+        if (schedule(row.quote)) explicitRoles.push("schedule");
+        if (dependency(row.quote)) explicitRoles.push("dependency");
+        if (exclusion(row.quote)) explicitRoles.push("exclusion");
+        explicitRoles.forEach((role) => add(row, role, section?.heading));
+        if (!row.table && !/\t/u.test(row.quote) && alternativeIntroduction(row.quote)) {
+          const roles = [...new Set([...(section ? [section.role] : []), ...explicitRoles])].filter((role) => conditionalRoles.has(role));
+          if (roles.length) alternatives = { roles, heading: row };
+        }
       }
       const facts = result.facts.filter((fact) => fact.documentId === documentId);
       document.eligible = !ambiguousOwner && facts.some((fact) => fact.role === "subject" || fact.role === "scope");
