@@ -12,6 +12,7 @@ import { normalizeCompanyDirectory, type CompanyCard, type CompanyDirectoryData 
 import { BUILTIN_TEMPLATES, cloneProposal, createProposal, emptyContact, nextProposalRevision } from "./defaults";
 import { buildProposalDocumentPublic, proposalExportAssets, proposalHasFullWidthScope, proposalHasStructuredScopePriceReference, proposalPrivateSourceQuestions, safeProposalFileName, validateProposal } from "./exportPublic";
 import { CommercialProposalEditor } from "./CommercialProposalEditor";
+import { ProposalFinalReview } from "./ProposalFinalReview";
 import { validateCommercialDocument } from "./commercialDocument";
 import { formatMoneyMinor, priceProposal, taxLabel } from "./pricing";
 import { ProposalContactFields, ProposalLinesEditor, ProposalPartyFields } from "./ProposalFields";
@@ -838,6 +839,22 @@ export function Proposals({ active = true, openRecordId, onRecordOpened, handoff
             target?.focus(); target?.scrollIntoView({ block: "nearest" });
         });
     };
+    const goToCommercial = (questionId?: string, sectionId?: string) => {
+        const current = latest.current, doc = current?.data.commercialDocument;
+        if (!current || !doc || questionId && !doc.questions.some(question => question.id === questionId)
+            || sectionId && !doc.body.sections.some(section => section.id === sectionId)) return;
+        const owner = current.writeId;
+        setStep(2);
+        requestAnimationFrame(() => {
+            if (latest.current?.writeId !== owner || latest.current.data.commercialDocument !== doc) return;
+            const target = document.getElementById(questionId ? `commercial-question-${questionId}` : sectionId ? `commercial-${sectionId}` : "proposal-commercial-document");
+            if (!target) return;
+            for (let parent = target.parentElement; parent; parent = parent.parentElement) {
+                if (parent.tagName === "DETAILS") (parent as HTMLDetailsElement).open = true;
+            }
+            target.setAttribute("tabindex", "-1"); target.focus(); target.scrollIntoView({ block: "start" });
+        });
+    };
     const field = (label: string, key: "number" | "documentDate" | "title" | "validUntil", type = "text") => <label>{key === "validUntil" ? `${label} *` : label}<input id={`proposal-${key}`} type={type} value={data?.[key] || ""} onChange={(event) => update(key, event.target.value)} disabled={fieldsDisabled}/>{type === "date" && !data?.[key] && <small>Дата не указана — заполните перед созданием файла.</small>}</label>;
     const signerAttachment = selectedSigner?.document;
     const validSignerAttachment = signerAttachment?.relativePath && signerAttachment.fileName && signerAttachment.sha256 && signerAttachment.mimeType && signerAttachment.sizeBytes != null ? signerAttachment as AttachmentInfo : null;
@@ -866,7 +883,7 @@ export function Proposals({ active = true, openRecordId, onRecordOpened, handoff
       {hasPendingCommercialEdit && <p className="notice warning" role="status">Есть неприменённые правки текста или условий. Они остаются в полях, но пока не входят в сохранение и выгрузку. Примените или отмените их в документе.</p>}
       {Boolean(sourceQuestions.length) && <details id="proposal-sourceQuestions" tabIndex={-1} className="notice warning proposal-source-questions" open={!data!.commercialDocument}><summary>Дополнительные вопросы источника ({sourceQuestions.length})</summary><p>Это частные вопросы по условиям источника, а не подтверждённые решения. Они сохраняются с черновиком и не включаются в клиентский файл.</p>{sourceQuestions.map((question) => <div key={question.id}><p>{question.message}</p><details><summary>Показать в источнике</summary>{question.evidence.map((proof, index) => <div key={index}><small>{proof.sourceName} · {proof.locator}</small><blockquote style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{proof.quote}</blockquote></div>)}</details></div>)}</details>}
       <div className="proposal-workarea" aria-busy={Boolean(busy)}>
-        {data!.commercialDocument && <div hidden={step !== 2}><CommercialProposalEditor key={session.writeId} sessionKey={session.writeId} value={data!} disabled={fieldsDisabled} onPendingChange={(pending) => {
+        {data!.commercialDocument && <div id="proposal-commercial-document" hidden={step !== 2}><CommercialProposalEditor key={session.writeId} sessionKey={session.writeId} value={data!} disabled={fieldsDisabled} onPendingChange={(pending) => {
           if (latest.current?.writeId !== session.writeId) return;
           const next = { writeId: session.writeId, pending };
           pendingCommercialRef.current = next;
@@ -897,7 +914,8 @@ export function Proposals({ active = true, openRecordId, onRecordOpened, handoff
         {step === 4 && <>
           <h2>Проверьте перед отправкой</h2><p>Экспорт содержит клиентские реквизиты, позиции и условия. Внутренние заметки, источники, себестоимость и история не включаются.</p>
           {proposalHasFullWidthScope(data!) && <p className="help-text">Подробный состав комплекса услуг будет выведен целиком в полноширинном разделе «Состав работ и результаты». В ценовой таблице останутся одна позиция и ссылка на этот раздел; цена и условия не изменятся.</p>}
-          {issues.length ? <ul className="proposal-issues">{issues.map((issue, index) => <li key={`${issue.field}-${index}`} className={issue.severity}><button type="button" onClick={() => goToIssue(issue)}>{issue.severity === "error" ? "Исправить" : "Проверить"}: {issue.message}</button></li>)}</ul> : <p className="notice success">Обязательные данные заполнены.</p>}
+          {issues.length ? <ul className="proposal-issues">{issues.map((issue, index) => <li key={`${issue.field}-${index}`} className={issue.severity}><button type="button" onClick={() => goToIssue(issue)}>{issue.severity === "error" ? "Исправить" : "Проверить"}: {issue.message}</button></li>)}</ul> : <p className={data!.commercialDocument ? "notice" : "notice success"}>{data!.commercialDocument ? "Обязательные реквизиты и расчёты заполнены. Вопросы документа проверяются отдельно ниже." : "Обязательные данные заполнены."}</p>}
+          {data!.commercialDocument && <ProposalFinalReview key={session.writeId} sessionKey={session.writeId} value={data!} proposalIssueCount={issues.length} onOpenQuestion={(id) => goToCommercial(id)} onOpenSection={(id) => goToCommercial(undefined, id)} onOpenIssue={goToIssue}/>}
           {pricing?.totals.grossMinor === "0" && <label className="proposal-check"><input type="checkbox" checked={allowZero} onChange={(event) => setAllowZero(event.target.checked)}/>Подтверждаю предложение с нулевой итоговой ценой.</label>}
           <h3>Приложения к ZIP: {data!.attachments.length}</h3><p className="help-text">Не прикрепляются к отдельным DOCX/PDF. В ZIP включаются только перечисленные здесь файлы.</p>
           {data!.attachments.map((file) => <div className="proposal-attachment" key={file.relativePath}><span>{file.fileName} · {file.sizeBytes.toLocaleString("ru-RU")} байт</span><button type="button" disabled={fieldsDisabled} onClick={() => update("attachments", data!.attachments.filter((entry) => entry.relativePath !== file.relativePath))}>Исключить</button></div>)}

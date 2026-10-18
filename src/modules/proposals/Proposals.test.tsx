@@ -12,6 +12,7 @@ import type { StoredRecord } from '../../lib/storage';
 import { createTaskDocumentOrigin, projectTaskDocumentSession, taskDocumentDraftKey } from '../intelligence/taskDocumentSession';
 import type { ProposalTaskSessionChange } from './proposalTaskBridge';
 import { CommercialProposalEditor } from './CommercialProposalEditor';
+import { ProposalFinalReview } from './ProposalFinalReview';
 import { commercialFingerprint } from './commercialDocument';
 
 // Real component callbacks/effects with persistent hook slots. DOM layout and
@@ -367,6 +368,38 @@ describe('structured conditions in the existing proposal receiver', () => {
     expect(nodes().some((node) => node.type === 'label' && text(node.props.children) === 'Вступление')).toBe(false);
     await click('1. Стороны'); expect(editor().key).toBe(initial.key); expect(editor().props.value.commercialDocument).toEqual(initial.props.value.commercialDocument);
     await click('3. Документ и условия'); expect(editor().key).toBe(initial.key);
+  });
+  it('adds the complete final question overview beside existing financial warnings and navigates to its exact question without replacing the editor', async () => {
+    const data = await structured(), doc = data.commercialDocument!;
+    doc.questions = [{ id: 'specific-question', kind: 'advance-days', sectionId: 'scope', targetBlockIds: ['scope-text'], sourceClauseIds: ['clause'], sourceReferenceIds: [], message: 'Уточнить вид дней', material: true, dependencyFingerprint: await commercialFingerprint('question') }];
+    data.documentDate = 'not-a-date';
+    const focus = vi.fn(), scrollIntoView = vi.fn(), setAttribute = vi.fn(), parent = { tagName: 'DETAILS', open: false, parentElement: null };
+    const target = { focus, scrollIntoView, setAttribute, parentElement: parent }, getElementById = vi.fn().mockReturnValue(target), frames: FrameRequestCallback[] = [];
+    vi.stubGlobal('document', { getElementById }); vi.stubGlobal('requestAnimationFrame', (frame: FrameRequestCallback) => { frames.push(frame); return frames.length; });
+    await seed(data); const originalEditor = editor(); await click('5. Проверка и экспорт');
+    const overview = nodes().find(node => node.type === ProposalFinalReview) as unknown as ReactElement<Parameters<typeof ProposalFinalReview>[0]>;
+    expect(overview).toBeDefined(); expect(overview.props.value.commercialDocument!.questions).toEqual(doc.questions);
+    expect(overview.props.proposalIssueCount).toBeGreaterThan(0); expect(text()).toContain('Укажите корректную дату КП');
+    overview.props.onOpenQuestion('specific-question'); await flush(); frames.splice(0).forEach(frame => frame(0));
+    expect(button('3. Документ и условия').props).toHaveProperty('aria-current', 'step');
+    expect(getElementById).toHaveBeenCalledExactlyOnceWith('commercial-question-specific-question'); expect(parent.open).toBe(true);
+    expect(setAttribute).toHaveBeenCalledWith('tabindex', '-1'); expect(focus).toHaveBeenCalledOnce(); expect(scrollIntoView).toHaveBeenCalledWith({ block: 'start' });
+    expect(editor().key).toBe(originalEditor.key); expect(editor().props.value.commercialDocument!.decisions).toEqual([]);
+    expect(runtime.store.save).not.toHaveBeenCalled(); expect(renderCalls()).toEqual([]);
+  });
+  it('ignores a delayed final-summary focus callback after a different proposal is installed', async () => {
+    const data = await structured(), doc = data.commercialDocument!;
+    doc.questions = [{ id: 'old-question', kind: 'advance-days', sectionId: 'scope', targetBlockIds: ['scope-text'], sourceClauseIds: ['clause'], sourceReferenceIds: [], message: 'Уточнить дни', material: true, dependencyFingerprint: await commercialFingerprint('question') }];
+    const getElementById = vi.fn(), frames: FrameRequestCallback[] = [];
+    vi.stubGlobal('document', { getElementById }); vi.stubGlobal('requestAnimationFrame', (frame: FrameRequestCallback) => { frames.push(frame); return frames.length; });
+    await seed(data); await click('5. Проверка и экспорт');
+    const overview = nodes().find(node => node.type === ProposalFinalReview) as unknown as ReactElement<Parameters<typeof ProposalFinalReview>[0]>;
+    overview.props.onOpenQuestion('old-question'); await flush();
+    const oldEditorKey = editor().key;
+    await seed(await structured()); await click('Заменить без сохранения');
+    expect(editor().key).not.toBe(oldEditorKey);
+    frames.splice(0).forEach(frame => frame(0)); expect(getElementById).not.toHaveBeenCalled();
+    expect(runtime.store.save).not.toHaveBeenCalled(); expect(renderCalls()).toEqual([]);
   });
   it('changes the structured document appearance without rewriting its body or inactive legacy text', async () => {
     const data = await structured();

@@ -37,7 +37,7 @@ vi.mock("./connectionApi", async (original) => ({ ...await original<typeof impor
 // async boundary controllable without running child components or native IO.
 vi.mock("./taskSourceIdentity", () => ({ taskSourceSnapshotKey: runtime.sourceKey }));
 
-interface NodeProps { children?: ReactNode; value?: unknown; checked?: boolean; id?: string; type?: string; disabled?: boolean; className?: string; open?: boolean; readOnly?: boolean; ref?: { current: { focus: () => void } | null }; "aria-label"?: string; onClick?: () => unknown; onChange?: (event: { target: { value: string; checked: boolean } }) => unknown; onConfirm?: () => unknown; onClose?: () => void; }
+interface NodeProps { children?: ReactNode; value?: unknown; checked?: boolean; id?: string; title?: string; type?: string; disabled?: boolean; className?: string; open?: boolean; readOnly?: boolean; ref?: { current: { focus: () => void } | null }; "aria-label"?: string; onClick?: (event?: { currentTarget: Pick<HTMLElement, "focus"> }) => unknown; onChange?: (event: { target: { value: string; checked: boolean } }) => unknown; onConfirm?: () => unknown; onClose?: () => void; }
 let tree: ReactNode;
 let props: Parameters<typeof IntelligenceWorkbench>[0];
 let localValues: Map<string, string>;
@@ -57,17 +57,38 @@ function control(id: string) { const found = nodes().find((node) => node.props.i
 function labeled(label: string) { const found = nodes().find((node) => node.props["aria-label"] === label); if (!found) throw new Error(`Элемент не найден: ${label}`); return found; }
 function sourceId(name: string) { const found = nodes().find((node) => node.type === "li" && text(node.props.children).includes(name)); if (!found?.key) throw new Error(`Источник не найден: ${name}`); return String(found.key); }
 function field(key: string) { const found = nodes().find((node) => typeof node.props.id === "string" && /^iw-[0-9a-f]{8}-/.test(node.props.id) && node.props.id.endsWith(`-${key}`)); if (!found) throw new Error(`Поле карточки не найдено: ${key}`); return found; }
-async function click(label: string) { button(label).props.onClick!(); await flush(); }
+async function selectPreparationMethod(method: "model" | "source-contract") { labeled(method === "model" ? "Подготовка с ИИ" : "Локальная подготовка по полному договору").props.onChange!({ target: { value: method, checked: true } }); await flush(); }
+async function click(label: string) { if (label === "Подготовить по договору без модели") await selectPreparationMethod("source-contract"); button(label).props.onClick!(); await flush(); }
 function goalPicker(): TaskGoalPickerProps { return nodes().find((node) => node.type === TaskGoalPicker)!.props as unknown as TaskGoalPickerProps; }
 async function selectGoals(...selected: IntelligenceDestination[]) { goalPicker().onChange(selected); await flush(); }
 function preparationButton() { const task = nodes().find((node) => node.props.className === "surface iw-task")!; return nodes(task).find((node) => node.type === "button" && node.props.className === "primary")!; }
-async function prepare() { preparationButton().props.onClick!(); await flush(); }
+async function prepare() { await selectPreparationMethod("model"); preparationButton().props.onClick!(); await flush(); }
 async function edit(id: string, value: string) { control(id).props.onChange!({ target: { value, checked: false } }); await flush(); }
 async function editLabeled(label: string, value: string) { labeled(label).props.onChange!({ target: { value, checked: false } }); await flush(); }
 async function toggle(label: string, checked: boolean) { const found = nodes().find((node) => node.props["aria-label"] === label); if (!found) throw new Error(`Чекбокс не найден: ${label}`); found.props.onChange!({ target: { value: "", checked } }); await flush(); }
 async function reviewVisibleFindings(resultIndex?: number) { const checks = nodes().filter((node) => /^Проверено замечание /.test(node.props["aria-label"] || "") && (resultIndex === undefined || node.props["aria-label"]?.endsWith(`результата ${resultIndex}`))); for (const check of checks) check.props.onChange!({ target: { value: "", checked: true } }); await flush(); }
 async function confirm() { nodes().find((node) => node.type === ConfirmDialog)!.props.onConfirm!(); await flush(); }
 function deferred<T>() { let resolve!: (value: T) => void; const promise = new Promise<T>((yes) => { resolve = yes; }); return { promise, resolve }; }
+async function openConfirmationWithoutBrowserFocus(opener: ReactElement<NodeProps>, title: string, alreadyFocused = false) {
+  // There is no browser DOM here: pointer activation deliberately does NOT
+  // focus a button. Verify the actual callback establishes the opener before
+  // any state update can create/register ConfirmDialog. The shared stack's
+  // separate tests cover restoration, disposal and Tab handling afterwards.
+  let active: unknown = alreadyFocused ? opener : "unrelated connection control";
+  const target = { focus: vi.fn((options?: FocusOptions) => {
+    expect(options).toEqual({ preventScroll: true });
+    expect(runtime.changed).toBe(false);
+    expect(nodes().some((node) => node.type === ConfirmDialog)).toBe(false);
+    active = opener;
+  }) };
+  opener.props.onClick!({ currentTarget: target });
+  expect(target.focus).toHaveBeenCalledExactlyOnceWith({ preventScroll: true });
+  expect(active).toBe(opener); expect(runtime.changed).toBe(true);
+  await flush();
+  const dialog = nodes().find((node) => node.type === ConfirmDialog)!;
+  expect(dialog.props.title).toBe(title); expect(active).toBe(opener);
+  return dialog;
+}
 const result = (items: unknown[]) => JSON.stringify({ items });
 const procurementSubject = "Проверка информационной системы";
 const procurement = { destination: "procurement", title: "Тендер", fields: { name: "Тестовая закупка", subject: procurementSubject, customer: "Заказчик", nmc: 1000 } };
@@ -125,6 +146,28 @@ beforeEach(() => {
 });
 afterEach(() => { for (const slot of runtime.slots) slot.cleanup?.(); vi.unstubAllGlobals(); vi.useRealTimers(); });
 
+describe("explicit confirmation opener focus", () => {
+  it.each(["reset", "analysis", "parse", "remove-source", "remove-result", "remove-profile"] as const)("focuses the actual %s button before confirmation even when prior focus is elsewhere", async (action) => {
+    await selectGoals("procurement"); await addText("Сохранённый источник");
+    await click("Добавить карточку вручную");
+    const before = nodes().filter((node) => node.props.className === "iw-card").map((node) => node.key);
+    let opener: ReactElement<NodeProps>, title: string;
+    if (action === "reset") { opener = button("Новая задача"); title = "Очистить окно ИИ?"; }
+    else if (action === "analysis") { await configureModel(); await selectPreparationMethod("model"); opener = preparationButton(); title = "Подготовить новый результат?"; }
+    else if (action === "parse") { await edit("iw-response", result([procurement])); opener = button("Разобрать ответ"); title = "Заменить подготовленные карточки?"; }
+    else if (action === "remove-source") { opener = labeled("Удалить источник Сохранённый источник"); title = "Удалить источник?"; }
+    else if (action === "remove-result") { opener = button("Удалить результат"); title = "Удалить результат?"; }
+    else { await configureModel(); await click("Сохранить подключение"); opener = button("Удалить подключение"); title = "Удалить подключение?"; }
+    expect(opener.props.disabled).not.toBe(true);
+    const dialog = await openConfirmationWithoutBrowserFocus(opener, title);
+    expect(runtime.analyze).not.toHaveBeenCalled(); expect(transfer).not.toHaveBeenCalled();
+    dialog.props.onClose!(); await flush();
+    expect(nodes().some((node) => node.type === ConfirmDialog)).toBe(false);
+    expect(nodes().filter((node) => node.props.className === "iw-card").map((node) => node.key)).toEqual(before);
+    expect(labeled("Удалить источник Сохранённый источник")).toBeDefined();
+  });
+});
+
 describe("explicit local proposal preparation from a complete contract", () => {
   const localAction = "Подготовить по договору без модели";
   const unchangedRaw = "PRIVATE-RAW-MODEL-RESPONSE: deliberately not JSON";
@@ -144,6 +187,8 @@ describe("explicit local proposal preparation from a complete contract", () => {
     runtime.chooseOpen.mockResolvedValueOnce("/qa/contract.docx");
     runtime.invoke.mockResolvedValueOnce({ fileName: input.name, extractedText: input.text, sha256: "b".repeat(64), fragments: input.fragments, coverage: input.coverage, warnings: [] });
     await click("Добавить PDF, DOCX или XLSX");
+    // Explicit method choice is scenario setup, not a default in the real UI.
+    await selectPreparationMethod("source-contract");
   }
   async function oldCards() {
     await edit("iw-new-destination", "proposals"); await click("Добавить карточку вручную");
@@ -151,6 +196,84 @@ describe("explicit local proposal preparation from a complete contract", () => {
     await edit("iw-new-destination", "staff"); await click("Добавить карточку вручную");
     field("fullName").props.onChange!({ target: { value: "Сотрудник до локальной подготовки", checked: false } }); await flush();
   }
+  it("requires a visible method choice and never opens connection or silently runs the local route when AI has no model", async () => {
+    await selectGoals("proposals"); await addContract();
+    await selectGoals("staff"); await selectGoals("proposals");
+    expect(labeled("Подготовка с ИИ").props.checked).toBe(false); expect(labeled("Локальная подготовка по полному договору").props.checked).toBe(false);
+    expect(preparationButton().props.disabled).toBe(true); expect(text(preparationButton())).toBe("Выберите способ подготовки");
+    preparationButton().props.onClick!(); await flush();
+    expect(text()).toContain("Выберите способ подготовки: с ИИ или локально");
+    await selectPreparationMethod("model"); expect(preparationButton().props.disabled).toBe(true);
+    expect(text()).toContain("сначала выберите модель"); expect(button("Настроить модель для ИИ")).toBeDefined();
+    preparationButton().props.onClick!(); await flush();
+    expect(nodes().some((node) => node.props.id === "iw-model")).toBe(false);
+    expect(cards()).toHaveLength(0); expect(runtime.analyze).not.toHaveBeenCalled(); expect(runtime.testConnection).not.toHaveBeenCalled();
+    expect(text()).not.toContain("Локальный проект по тексту договора");
+    await selectPreparationMethod("source-contract"); expect(preparationButton().props.disabled).toBe(false);
+    expect(text(preparationButton())).toBe(localAction); expect(text()).toContain("уточнение задания и ответ модели не применяются");
+  });
+  it("opens and focuses model configuration only through the explicit setup action", async () => {
+    await selectGoals("proposals"); await selectPreparationMethod("model"); await click("Настроить подключение");
+    const focus = vi.fn(); control("iw-model").props.ref!.current = { focus };
+    await click("Свернуть подключение"); expect(focus).not.toHaveBeenCalled();
+    await click("Настроить модель для ИИ");
+    expect(control("iw-model")).toBeDefined(); expect(focus).toHaveBeenCalledOnce();
+    expect(runtime.analyze).not.toHaveBeenCalled(); expect(cards()).toHaveLength(0);
+  });
+  it("focuses a compact subject and the same guarded Open CTA beside preparation after success, not while replacement is pending", async () => {
+    await selectGoals("proposals"); await addContract(); await oldCards(); await edit("iw-response", unchangedRaw);
+    const focus = vi.fn(); labeled("Подготовленные КП — следующий шаг").props.ref!.current = { focus };
+    const jobs = holdPreparations(); await click(localAction); await confirm();
+    expect(focus).not.toHaveBeenCalled(); jobs[0].reply(); await flush(); expect(focus).toHaveBeenCalledOnce();
+    const task = nodes().find((node) => node.props.className === "surface iw-task")!;
+    const compact = nodes(task).find((node) => node.props["aria-label"] === "Подготовленные КП — следующий шаг")!;
+    expect(compact).toBeDefined(); expect(text(compact)).toContain("КП:"); expect(text(compact)).toContain("без модели");
+    expect(text(compact)).toContain("Цена, полнота и спорные условия требуют проверки");
+    const footerOpen = incompleteButton("Коммерческие предложения");
+    expect(nodes(compact).find((node) => node.type === "button" && text(node) === text(footerOpen))?.props.disabled).toBe(footerOpen.props.disabled);
+    runtime.editor = false; render(); await flush();
+    expect(nodes(labeled("Подготовленные КП — следующий шаг")).filter((node) => node.type === "button").every((node) => node.props.disabled)).toBe(true);
+    expect(incompleteButton("Коммерческие предложения").props.disabled).toBe(true);
+    expect(control("iw-response").props.value).toBe(unchangedRaw); expect(transfer).not.toHaveBeenCalled(); expect(runtime.analyze).not.toHaveBeenCalled();
+    await edit("iw-instruction", "Уточнение после подготовки");
+    expect(text(labeled("Подготовленные КП — следующий шаг"))).toContain("Показан предыдущий результат"); expect(focus).toHaveBeenCalledOnce();
+  });
+  it("shows the existing meaningful proposal subject in the compact result and detailed card without rewriting fields", async () => {
+    await selectGoals("proposals"); await addText("Описание", "Проверка требований доступа к учебной системе.");
+    await paste([{ destination: "proposals", title: "Коммерческое предложение", fields: { title: "Проверка требований доступа к учебной системе" } }]);
+    expect(text(labeled("Подготовленные КП — следующий шаг"))).toContain("КП: Проверка требований доступа к учебной системе");
+    expect(text(nodes(cards()[0]).find((node) => node.type === "summary"))).toContain("КП: Проверка требований доступа к учебной системе");
+    expect(field("title").props.value).toBe("Проверка требований доступа к учебной системе"); expect(runtime.analyze).not.toHaveBeenCalled();
+  });
+  it("does not invent a subject or retain the method choice after starting a new task", async () => {
+    await selectGoals("proposals"); await selectPreparationMethod("model");
+    await edit("iw-new-destination", "proposals"); await click("Добавить карточку вручную");
+    expect(text(labeled("Подготовленные КП — следующий шаг"))).toContain("КП — предмет требует уточнения");
+    await click("Новая задача"); await confirm();
+    expect(labeled("Подготовка с ИИ").props.checked).toBe(false); expect(nodes().some((node) => node.props["aria-label"] === "Подготовленные КП — следующий шаг")).toBe(false);
+    expect(runtime.analyze).not.toHaveBeenCalled();
+  });
+  it("focuses the source-only replacement opener before creating its confirmation without starting preparation", async () => {
+    await selectGoals("proposals"); await addContract(); await oldCards();
+    const previous = cards().map((card) => card.key), jobs = holdPreparations();
+    const dialog = await openConfirmationWithoutBrowserFocus(button(localAction), "Подготовить локальный проект по всему договору?");
+    expect(jobs).toHaveLength(0); expect(cards().map((card) => card.key)).toEqual(previous);
+    dialog.props.onClose!(); await flush();
+    expect(cards().map((card) => card.key)).toEqual(previous); expect(runtime.analyze).not.toHaveBeenCalled();
+  });
+  it.each([false, true])("establishes the incomplete proposal opener before confirmation (already keyboard-focused: %s)", async (alreadyFocused) => {
+    await selectGoals("proposals"); await addContract(); await click(localAction); await reviewVisibleFindings();
+    const previous = cards().map((card) => card.key), opener = incompleteButton("Коммерческие предложения");
+    expect(opener.props.disabled).toBe(false); expect(text(opener)).toBe("Открыть КП — проверить цену и условия");
+    const dialog = await openConfirmationWithoutBrowserFocus(opener, "Открыть черновик с нерешёнными вопросами?", alreadyFocused);
+    expect(transfer).not.toHaveBeenCalled(); expect(runtime.analyze).not.toHaveBeenCalled();
+    dialog.props.onClose!(); await flush(); expect(cards().map((card) => card.key)).toEqual(previous);
+    // Existing eventless callback callers remain supported, without an implicit
+    // Apply or handoff; this is not a claim of native Escape/Tab acceptance.
+    incompleteButton("Коммерческие предложения").props.onClick!(); await flush();
+    nodes().find((node) => node.type === ConfirmDialog)!.props.onClose!(); await flush();
+    expect(transfer).not.toHaveBeenCalled(); expect(cards().map((card) => card.key)).toEqual(previous);
+  });
   it("labels a real all-null reply before local enrichment and does not credit its recovered fields to the model", async () => {
     await configureModel(); await selectGoals("proposals"); await addContract();
     const raw = result([{ destination: "proposals", title: "Коммерческое предложение", sourceIds: [sourceId(contract().name)], evidence: [], positions: null,
@@ -240,7 +363,7 @@ describe("explicit local proposal preparation from a complete contract", () => {
     for (const goals of [[], ["staff"], ["contracts"], ["procurement"], ["counterparties"], ["proposals", "contracts"]] as IntelligenceDestination[][]) {
       await selectGoals(...goals); expect(nodes().some((node) => node.type === "button" && text(node) === localAction)).toBe(false);
     }
-    await selectGoals("proposals"); expect(button(localAction).props.disabled).toBe(true);
+    await selectGoals("proposals"); await selectPreparationMethod("source-contract"); expect(button(localAction).props.disabled).toBe(true);
     await addContract(); expect(button(localAction).props.disabled).toBe(false);
     await selectGoals("proposals", "staff"); expect(nodes().some((node) => node.type === "button" && text(node) === localAction)).toBe(false);
   });
@@ -531,10 +654,10 @@ describe("single task goal selection in the workbench", () => {
   });
 
   it("labels the primary action by the actual selected goal and uses one multi-result action", async () => {
-    await addText();
+    await addText(); await configureModel();
     const labels: Array<[IntelligenceDestination, string]> = [["proposals", "Подготовить КП"], ["contracts", "Разобрать договоры"], ["procurement", "Подготовить карточку закупки"], ["staff", "Подготовить карточки сотрудников"], ["counterparties", "Подготовить карточки контрагентов"]];
-    for (const [destination, label] of labels) { await selectGoals(destination); expect(text(preparationButton())).toBe(label); expect(preparationButton().props.disabled).toBe(false); }
-    await selectGoals("proposals", "contracts"); expect(text(preparationButton())).toBe("Подготовить результаты");
+    for (const [destination, label] of labels) { await selectGoals(destination); await selectPreparationMethod("model"); expect(text(preparationButton())).toBe(label); expect(preparationButton().props.disabled).toBe(false); }
+    await selectGoals("proposals", "contracts"); await selectPreparationMethod("model"); expect(text(preparationButton())).toBe("Подготовить результаты");
     expect(runtime.analyze).not.toHaveBeenCalled();
   });
 
@@ -783,7 +906,7 @@ describe("unified intelligence workflow", () => {
     await click("Настроить ответ по схеме");
     expect(control("iw-output-mode").props.value).toBe("json"); expect(focus).toHaveBeenCalledTimes(1);
     expect(runtime.analyze).toHaveBeenCalledTimes(1); expect(runtime.testConnection).not.toHaveBeenCalled(); expect(runtime.invoke).not.toHaveBeenCalled(); expect(runtime.workspace).not.toHaveBeenCalled(); expect(localValues.size).toBe(0);
-    expect(text()).toContain("не отправляет документы"); expect(text()).toContain("не передаёт сервису схему с этими ограничениями");
+    expect(text()).toContain("не отправляет документы"); expect(text()).toContain("без принудительного ограничения ответа схемой на стороне сервиса");
   });
   it("keeps a metadata-only snapshot when the current document selection changes", async () => {
     await addText("Исходный документ QA", "PRIVATE-SOURCE-BODY"); const originalId = sourceId("Исходный документ QA");

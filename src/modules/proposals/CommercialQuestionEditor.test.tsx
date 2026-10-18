@@ -138,6 +138,24 @@ describe("concrete commercial question forms", () => {
     expect(ui.onApply.mock.calls[0][0]).toMatchObject({ kind: "stage-plan", maximum: { count: "20", dayKind: "business" }, stages: [{ title: "Этап 1. Анализ", duration: { count: "10", dayKind: "business" } }, { title: "Этап 2. Обсуждение", duration: { count: "5", dayKind: "business" } }] });
     expect(ui.onApply.mock.calls[0][0].kind === "stage-plan" && ui.onApply.mock.calls[0][0].stages).toHaveLength(2);
   });
+  it("shows an existing stage prefix only once while retaining the entire distinct source stage titles and qualifiers", async () => {
+    const seed = await stageFixture(), second = seed.doc.privateAppendix.clauses.find(clause => clause.id === "stage-clause-2")!;
+    second.quote = "Этап 2. Обсуждение при наличии материалов\tВстреча по результатам\t5 рабочих дней; параллельно с этапом 1\tПротокол";
+    second.quoteHash = await commercialFingerprint(second.quote);
+    const third = "Этап 3. Проверка только после разрешения\tПроверка\t7 рабочих дней; параллельно с этапом 2\tОтчёт";
+    seed.doc.privateAppendix.clauses.push({ ...second, id: "stage-clause-3", quote: third, quoteHash: await commercialFingerprint(third) });
+    seed.doc.privateAppendix.coverage.push({ sourceClauseId: "stage-clause-3", kind: "literal", targetBlockIds: ["stage-table"] });
+    const before = structuredClone(seed.doc), ui = await setup("stage-plan", seed);
+    const summaries = nodes(ui.render()).filter(node => node.type === "summary").map(node => text(node.props.children));
+    expect(summaries).toContain("Этап 1. Анализ — 10 рабочих дней");
+    expect(summaries.some(label => label.includes("Этап 2. Обсуждение при наличии материалов"))).toBe(true);
+    expect(summaries.some(label => label.includes("Этап 3. Проверка только после разрешения"))).toBe(true);
+    expect(summaries.join(" ")).not.toMatch(/Этап [123]: Этап [123]/);
+    expect(ui.field("Название этапа 2").value).toBe("Этап 2. Обсуждение при наличии материалов");
+    expect(ui.field("Название этапа 3").value).toBe("Этап 3. Проверка только после разрешения");
+    expect(ui.text()).toContain("5 рабочих дней; параллельно с этапом 1"); expect(ui.text()).toContain("7 рабочих дней; параллельно с этапом 2");
+    expect(seed.doc).toEqual(before); expect(ui.onApply).not.toHaveBeenCalled(); expect(ui.dirty).toHaveBeenLastCalledWith(false);
+  });
   it("prefills a maximum only from an explicit source clause and exposes its complete proof", async () => {
     const seed = await stageFixture(), quote = "Максимальный срок — 20 рабочих дней после получения всех исходных материалов.";
     seed.doc.privateAppendix.clauses.push({ id: "source-maximum", containerId: "container", sourceId: "source", sourceName: "Исходный план", locator: "Общий срок", quote, quoteHash: await commercialFingerprint(quote), roles: ["schedule"], classification: "commercial" });
