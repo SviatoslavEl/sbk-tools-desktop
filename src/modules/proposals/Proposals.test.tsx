@@ -9,6 +9,8 @@ import { resetProposalDraftPersistenceForTests } from './proposalDraftPersistenc
 import { buildProposalPublic, proposalExportAssets } from './exportPublic';
 import type { ProposalData, ProposalRenderResult, ProposalTemplateData } from './types';
 import type { StoredRecord } from '../../lib/storage';
+import { createTaskDocumentOrigin, projectTaskDocumentSession, taskDocumentDraftKey } from '../intelligence/taskDocumentSession';
+import type { ProposalTaskSessionChange } from './proposalTaskBridge';
 
 // Real component callbacks/effects with persistent hook slots. DOM layout and
 // child components are covered separately; storage and native rendering are boundaries.
@@ -33,6 +35,9 @@ vi.mock('../../lib/storage', () => ({ readDraft: runtime.readDraft, saveDraft: r
 vi.mock('../../lib/files', () => ({ chooseSavePath: runtime.chooseSave, chooseOpenPath: runtime.chooseOpen }));
 vi.mock('@tauri-apps/api/core', () => ({ invoke: runtime.invoke, convertFileSrc: (path: string) => `asset://${path}` }));
 vi.mock('@tauri-apps/plugin-opener', () => ({ openPath: vi.fn().mockResolvedValue(undefined) }));
+// The hash namespace itself is covered by taskDocumentSession tests. Keep this
+// component harness deterministic without waiting on native WebCrypto IO.
+vi.mock('../intelligence/taskDocumentSession', async (original) => ({ ...await original<typeof import('../intelligence/taskDocumentSession')>(), taskDocumentDraftKey: async (origin: { taskId: string; resultId: string; baseResultRevision: number }) => `task-document:v1:${origin.taskId}-${origin.resultId}-${origin.baseResultRevision}` }));
 
 type ComponentProps = Parameters<typeof Proposals>[0];
 type NodeProps = { children?: ReactNode; onClick?: () => unknown; onChange?: (event: { target: { value: string; checked?: boolean } }) => unknown; onRestore?: (value: unknown) => Promise<void>; onConfirm?: () => Promise<void>; onClose?: () => void; message?: string; value?: unknown; disabled?: boolean; id?: string; title?: string; type?: string; 'aria-label'?: string; src?: string; alt?: string };
@@ -75,6 +80,249 @@ beforeEach(() => {
   vi.stubGlobal('window', { __TAURI_INTERNALS__: {}, addEventListener: vi.fn(), removeEventListener: vi.fn() });
 });
 afterEach(() => { runtime.slots.forEach((slot) => slot.cleanup?.()); vi.clearAllTimers(); vi.useRealTimers(); vi.unstubAllGlobals(); });
+
+describe('existing proposal editor as a single AI-task receiver', () => {
+  const origin = (resultId = 'result-A') => createTaskDocumentOrigin({ taskId: 'task-one', resultId, workspaceRoot: '/tmp/qa-workspace', sourceSnapshotKey: 'sha256:source-set-one', baseResultRevision: 1 });
+  const changes: ProposalTaskSessionChange[] = [];
+  const changed = (value: ProposalTaskSessionChange) => { changes.push(value); };
+  const last = (id = 'result-A') => [...changes].reverse().find((value) => value.session.origin.resultId === id)!;
+  async function taskSeed(data = proposal(), resultId = 'result-A', extra: Partial<NonNullable<ComponentProps>> = {}) {
+    render({ ...props, presentation: 'ai-task', onTaskSessionChange: changed, ...extra, handoff: { id: `handoff-${resultId}-${changes.length}`, data, taskOrigin: origin(resultId) } }); await flush();
+  }
+  beforeEach(() => { changes.splice(0); });
+  it('queues the source, accepts only the installed editor, and hides registry-only controls', async () => {
+    await taskSeed();
+    expect(changes.map((value) => value.session.lastTransition.phase)).toEqual(['queued', 'accepted']);
+    expect(projectTaskDocumentSession(changes[0].session).acceptedForOrigin).toBe(false);
+    expect(projectTaskDocumentSession(last().session)).toMatchObject({ acceptedForOrigin: true, savedCurrent: false, exportedCurrent: false, semanticReadiness: 'separate-gate' });
+    expect(nodes().some((node) => node.type === 'button' && ['К списку', 'Новое КП'].includes(text(node.props.children)))).toBe(false);
+    expect(text()).not.toContain('Предложений:'); expect(button('Вернуться к результатам')).toBeTruthy();
+  });
+  it('returning to results changes visibility only and resumes the same edited proposal/write ID', async () => {
+    const back = vi.fn(); await taskSeed(proposal(), 'result-A', { onReturnToTask: back });
+    const writeId = last().writeId;
+    await edit('proposal-title', 'Не потерять правку'); await click('Вернуться к результатам');
+    expect(back).toHaveBeenCalledOnce(); expect(runtime.clearDraft).not.toHaveBeenCalled();
+    render({ ...props, active: false, handoff: undefined }); await flush(); render({ ...props, active: true }); await flush();
+    await taskSeed(proposal('Другой seed той же задачи'));
+    expect(input('proposal-title').props.value).toBe('Не потерять правку'); expect(last().writeId).toBe(writeId);
+    await vi.advanceTimersByTimeAsync(600); await flush();
+    const saved = runtime.saveDraft.mock.calls.find(([module]) => module === 'commercial-proposals')!;
+    expect(saved[2]).toBe(await taskDocumentDraftKey(origin())); expect(saved[1]).toMatchObject({ recordId: writeId, taskOrigin: origin(), data: { title: 'Не потерять правку' } });
+    expect(runtime.saveDraft.mock.calls.some(([, , key]) => key === 'proposal:new')).toBe(false);
+  });
+  it('keeps dirty A while B is merely queued, and cancellation cancels B without accepting it', async () => {
+    const back = vi.fn(); await taskSeed(proposal('A'), 'result-A', { onReturnToTask: back }); await edit('proposal-title', 'Правка A');
+    await taskSeed(proposal('B'), 'result-B');
+    expect(input('proposal-title').props.value).toBe('Правка A');
+    expect(last('result-B').data.title).toBe('B'); expect(projectTaskDocumentSession(last('result-B').session).acceptedForOrigin).toBe(false);
+    expect(nodes().some((node) => node.props.title === 'Есть несохранённые изменения КП')).toBe(true); await click('Отмена');
+    expect(last('result-B').session.lastTransition.phase).toBe('cancelled'); expect(back).toHaveBeenCalledOnce();
+    expect(input('proposal-title').props.value).toBe('Правка A'); expect(runtime.clearDraft).not.toHaveBeenCalled();
+    expect(changes.filter((value) => value.session.origin.resultId === 'result-B').some((value) => value.session.accepted)).toBe(false);
+  });
+  it('accepts B only after guarded replacement and reopens the receiver-owned A session without reseeding', async () => {
+    await taskSeed(proposal('A')); const firstId = last().writeId; await edit('proposal-title', 'Правка A');
+    await taskSeed(proposal('B'), 'result-B'); await click('Заменить без сохранения');
+    expect(input('proposal-title').props.value).toBe('B'); expect(last('result-B').session.lastTransition.phase).toBe('accepted');
+    expect(runtime.saveDraft.mock.calls.some(([, envelope, key]) => key === 'task-document:v1:task-one-result-A-1' && envelope.data.title === 'Правка A')).toBe(true);
+    await taskSeed(proposal('A, но seed устарел')); await click('Заменить без сохранения');
+    expect(input('proposal-title').props.value).toBe('Правка A'); expect(last().writeId).toBe(firstId);
+  });
+  it('requires a fresh accepted transition when returning to A while its delayed detach from B is unresolved', async () => {
+    await taskSeed(proposal('A')); const owner = last().writeId, acceptedAttempt = last().session.accepted!.attempt;
+    await click('Сохранить КП');
+    const detach = deferred<{ root: string; editor: boolean }>(); let delayed = false;
+    runtime.getWorkspace.mockImplementation(async () => {
+      if (!delayed && (new Error().stack || '').includes('at install')) { delayed = true; return detach.promise; }
+      return { root: '/tmp/qa-workspace', editor: true };
+    });
+    await taskSeed(proposal('B'), 'result-B');
+    expect(delayed).toBe(true); expect(input('proposal-title').props.value).toBe('B');
+    await taskSeed(proposal('Stale A seed'));
+    expect(input('proposal-title').props.value).toBe('B');
+    expect(last().session.pending?.operation).toBe('open');
+    expect(last().session.editorAttached).toBe(false);
+    await click('Заменить без сохранения');
+    expect(input('proposal-title').props.value).toBe('A'); expect(last().writeId).toBe(owner);
+    expect(last().session.lastTransition.phase).toBe('accepted'); expect(last().session.accepted!.attempt).toBeGreaterThan(acceptedAttempt);
+    detach.resolve({ root: '/tmp/qa-workspace', editor: true }); await flush();
+    expect(last().session.editorAttached).toBe(true); expect(last().session.lastTransition.phase).toBe('accepted');
+  });
+  it('restores only an exact-origin namespaced draft and refuses a foreign origin envelope', async () => {
+    const data = proposal('Свой черновик'), own = origin();
+    runtime.readDraft.mockImplementation(async (_module: string, key: string) => key.startsWith('task-document:') ? { kind: 'proposal-draft', schemaVersion: 1, recordId: 'draft-owner', taskOrigin: own, data } : null);
+    await taskSeed(); expect(input('proposal-title').props.value).toBe(data.title); expect(last().writeId).toBe('draft-owner');
+    await taskSeed(proposal('B'), 'result-B'); await click('Заменить без сохранения');
+    expect(input('proposal-title').props.value).toBe(data.title); expect(text()).toContain('Черновик относится к другому результату задачи');
+    expect(projectTaskDocumentSession(last('result-B').session).acceptedForOrigin).toBe(false);
+  });
+  it('tracks actual save and export separately; preview and path cancellation never count as exported', async () => {
+    await taskSeed(); await click('Сохранить КП');
+    expect(projectTaskDocumentSession(last().session)).toMatchObject({ savedCurrent: true, exportedCurrent: false });
+    expect(last().recordId).toBe(last().writeId);
+    await click('5. Проверка и экспорт'); await click('Предпросмотр PDF');
+    expect(projectTaskDocumentSession(last().session).exportedCurrent).toBe(false);
+    runtime.chooseSave.mockResolvedValueOnce(null); await click('Скачать DOCX');
+    expect(last().session.lastTransition.phase).toBe('cancelled'); expect(projectTaskDocumentSession(last().session).exportedCurrent).toBe(false);
+    await click('Скачать DOCX'); expect(projectTaskDocumentSession(last().session).exportedCurrent).toBe(true);
+    expect(last().session.exports.docx).toMatchObject({ outputPath: result.outputPath, outputBytes: result.outputBytes, sha256: result.sha256 });
+    await click('1. Стороны'); await edit('proposal-title', 'Правка после скачивания');
+    expect(projectTaskDocumentSession(last().session)).toMatchObject({ savedCurrent: false, exportedCurrent: false, hasStaleExports: true });
+  });
+  it('does not mark a failed database write or failed native render as successful', async () => {
+    await taskSeed(); runtime.store.save.mockRejectedValueOnce(new Error('Сбой записи')); await click('Сохранить КП');
+    expect(last().session.lastTransition.phase).toBe('failed'); expect(projectTaskDocumentSession(last().session).savedCurrent).toBe(false);
+    await click('5. Проверка и экспорт'); runtime.invoke.mockImplementationOnce(async () => { throw new Error('Сбой рендера'); }); await click('Скачать PDF');
+    expect(last().session.lastTransition.phase).toBe('failed'); expect(projectTaskDocumentSession(last().session).exportedCurrent).toBe(false);
+  });
+  it('rejects a workspace switch before queued replacement without deleting or replacing A', async () => {
+    await taskSeed(proposal('A')); await edit('proposal-title', 'Правка A'); await taskSeed(proposal('B'), 'result-B');
+    runtime.getWorkspace.mockResolvedValue({ root: '/tmp/other-workspace', editor: true }); await click('Заменить без сохранения');
+    expect(input('proposal-title').props.value).toBe('Правка A'); expect(runtime.clearDraft).not.toHaveBeenCalled();
+    expect(projectTaskDocumentSession(last('result-B').session).acceptedForOrigin).toBe(false); expect(text()).toContain('Рабочая папка или доступ изменились');
+  });
+  it('cancels a superseded in-flight open rather than acknowledging or leaving its old queue active', async () => {
+    const pending = deferred<null>(); runtime.readDraft.mockImplementationOnce(async () => null).mockImplementationOnce(() => pending.promise);
+    const a = { id: 'open-A', data: proposal('A'), taskOrigin: origin() };
+    render({ presentation: 'ai-task', onTaskSessionChange: changed, handoff: a }); await flush();
+    expect(last().session.lastTransition.phase).toBe('queued');
+    const b = { id: 'open-B', data: proposal('B'), taskOrigin: origin('result-B') };
+    render({ ...props, handoff: b }); await flush(); pending.resolve(null); await flush();
+    expect(last('result-A').session.lastTransition.phase).toBe('cancelled');
+    expect(projectTaskDocumentSession(last('result-A').session).acceptedForOrigin).toBe(false); expect(projectTaskDocumentSession(last('result-A').session).pendingOperation).toBeUndefined();
+    expect(input('proposal-title').props.value).toBe('B'); expect(projectTaskDocumentSession(last('result-B').session).acceptedForOrigin).toBe(true);
+  });
+  it('does not acknowledge late save/export callbacks after the workspace changes', async () => {
+    await taskSeed(); const pending = deferred<StoredRecord<ProposalData>>(); runtime.store.save.mockImplementationOnce(() => pending.promise);
+    button('Сохранить КП').props.onClick!(); await flush(); const writeId = last().writeId;
+    runtime.getWorkspace.mockResolvedValue({ root: '/tmp/other-workspace', editor: true }); pending.resolve(record(writeId, proposal())); await flush();
+    expect(projectTaskDocumentSession(last().session).savedCurrent).toBe(false); expect(input('proposal-title').props.value).toBe('Тестовое предложение');
+    expect(runtime.clearDraft).not.toHaveBeenCalled();
+  });
+  it('rejects a late export receipt and late editor revocation instead of reporting a successful task file', async () => {
+    await taskSeed(); await click('5. Проверка и экспорт'); const pending = deferred<ProposalRenderResult>();
+    runtime.invoke.mockImplementationOnce(() => pending.promise); button('Скачать DOCX').props.onClick!(); await flush();
+    runtime.editor = false; runtime.getWorkspace.mockResolvedValue({ root: '/tmp/qa-workspace', editor: false }); render(); await flush(); pending.resolve(result); await flush();
+    expect(projectTaskDocumentSession(last().session).exportedCurrent).toBe(false); expect(text()).not.toContain('Создан файл:');
+  });
+  it('saves the same record again after canonical serde round-trip and resumes its binding on another result switch', async () => {
+    await taskSeed(); const owner = last().writeId;
+    runtime.store.save.mockImplementation(async (_title: string, value: ProposalData, id: string) => {
+      const normalized = JSON.parse(JSON.stringify(value, (_key, nested) => nested && typeof nested === 'object' && !Array.isArray(nested) ? Object.fromEntries(Object.entries(nested).sort()) : nested));
+      const saved = record(id, normalized); runtime.store.records = [...runtime.store.records.filter((entry) => entry.id !== id), saved]; return saved;
+    });
+    await click('Сохранить КП'); expect(projectTaskDocumentSession(last().session).savedCurrent).toBe(true);
+    await taskSeed(proposal('B'), 'result-B'); await taskSeed(proposal('Seed A'), 'result-A'); await click('Заменить без сохранения');
+    expect(last().recordId).toBe(owner); await edit('proposal-title', 'Новая правка A'); await click('Сохранить КП');
+    expect(runtime.store.save.mock.calls.map(([, , id]) => id)).toEqual([owner, owner]); expect(last().recordId).toBe(owner); expect(projectTaskDocumentSession(last().session).savedCurrent).toBe(true);
+  });
+  it('allows a fresh save and export after edit-and-revert without reviving stale receipts', async () => {
+    await taskSeed(); const initialTitle = String(input('proposal-title').props.value); await click('Сохранить КП'); await click('5. Проверка и экспорт'); await click('Скачать DOCX');
+    await click('1. Стороны'); await edit('proposal-title', 'Временная правка'); await edit('proposal-title', initialTitle);
+    expect(projectTaskDocumentSession(last().session)).toMatchObject({ savedCurrent: false, exportedCurrent: false, hasStaleExports: true });
+    expect(button('Сохранить КП').props.disabled).toBe(false); await click('Сохранить КП'); expect(projectTaskDocumentSession(last().session).savedCurrent).toBe(true);
+    expect(projectTaskDocumentSession(last().session).exportedCurrent).toBe(false); await click('5. Проверка и экспорт'); await click('Скачать DOCX'); expect(projectTaskDocumentSession(last().session).exportedCurrent).toBe(true);
+  });
+  it('captures edit-and-revert revisions even while fresh workspace metadata is delayed', async () => {
+    await taskSeed(); const initialTitle = String(input('proposal-title').props.value); await click('Сохранить КП'); await click('5. Проверка и экспорт'); await click('Скачать DOCX'); await click('1. Стороны');
+    const baseline = last().session.current.revision, metadata = deferred<{ root: string; editor: boolean }>(); runtime.getWorkspace.mockImplementation(() => metadata.promise);
+    await edit('proposal-title', 'Промежуточная правка'); await edit('proposal-title', initialTitle);
+    metadata.resolve({ root: '/tmp/qa-workspace', editor: true }); await flush();
+    expect(last().session.current.revision).toBe(baseline + 2); expect(projectTaskDocumentSession(last().session)).toMatchObject({ savedCurrent: false, exportedCurrent: false, hasStaleExports: true });
+    expect(button('Сохранить КП').props.disabled).toBe(false);
+  });
+  it('retains the latest receiver-owned A edit when its metadata effect is delayed during a switch to B', async () => {
+    await taskSeed(proposal('A')); const metadata = deferred<{ root: string; editor: boolean }>(); runtime.getWorkspace.mockImplementationOnce(() => metadata.promise);
+    await edit('proposal-title', 'Последняя правка A'); await taskSeed(proposal('B'), 'result-B'); await click('Заменить без сохранения');
+    metadata.resolve({ root: '/tmp/qa-workspace', editor: true }); await flush();
+    await taskSeed(proposal('Seed A')); await click('Заменить без сохранения'); expect(input('proposal-title').props.value).toBe('Последняя правка A');
+  });
+  it('does not accept a queued B replacement that becomes superseded by C during persistence', async () => {
+    await taskSeed(proposal('A')); await edit('proposal-title', 'Правка A'); await taskSeed(proposal('B'), 'result-B');
+    const persisted = deferred<void>(); runtime.saveDraft.mockImplementationOnce(() => persisted.promise); button('Заменить без сохранения').props.onClick!(); await flush();
+    render({ ...props, handoff: { id: 'new-C-while-B-opening', data: proposal('C'), taskOrigin: origin('result-C') } }); await flush(); persisted.resolve(); await flush();
+    expect(changes.filter((value) => value.session.origin.resultId === 'result-B').some((value) => value.session.accepted)).toBe(false);
+    expect(input('proposal-title').props.value).toBe('Правка A'); expect(projectTaskDocumentSession(last('result-C').session).acceptedForOrigin).toBe(false);
+    await click('Заменить без сохранения'); expect(input('proposal-title').props.value).toBe('C'); expect(projectTaskDocumentSession(last('result-C').session).acceptedForOrigin).toBe(true);
+  });
+  it('does not accept an in-flight queued replacement after navigation hides the receiver', async () => {
+    await taskSeed(proposal('A')); await taskSeed(proposal('B'), 'result-B');
+    const persisted = deferred<void>(); runtime.saveDraft.mockImplementationOnce(() => persisted.promise); button('Заменить без сохранения').props.onClick!(); await flush();
+    render({ ...props, active: false }); await flush(); persisted.resolve(); await flush();
+    expect(changes.filter((value) => value.session.origin.resultId === 'result-B').some((value) => value.session.accepted)).toBe(false); expect(input('proposal-title').props.value).toBe('A');
+  });
+  it('rechecks handoff admission after the last delayed workspace read immediately before install', async () => {
+    const metadata = deferred<{ root: string; editor: boolean }>(); let delayed = false, directTargetReads = 0;
+    runtime.getWorkspace.mockImplementation(async () => {
+      const frames = (new Error().stack || '').split('\n'), freshIndex = frames.findIndex((frame) => frame.includes('at freshTaskWorkspace'));
+      if (freshIndex >= 0 && frames[freshIndex + 1]?.includes('performTarget')) directTargetReads += 1;
+      if (!delayed && directTargetReads === 2) { delayed = true; return metadata.promise; }
+      return { root: '/tmp/qa-workspace', editor: true };
+    });
+    const a = { id: 'late-guard-A', data: proposal('A'), taskOrigin: origin() }; render({ presentation: 'ai-task', onTaskSessionChange: changed, handoff: a }); await flush();
+    expect(delayed).toBe(true); render({ ...props, handoff: { id: 'late-guard-C', data: proposal('C'), taskOrigin: origin('result-C') } }); await flush();
+    metadata.resolve({ root: '/tmp/qa-workspace', editor: true }); await flush();
+    expect(changes.filter((value) => value.session.origin.resultId === 'result-A').some((value) => value.session.accepted)).toBe(false); expect(input('proposal-title').props.value).toBe('C');
+  });
+  it('uses promoted shared asset paths when Save and Continue accepts a task result, not removed staging paths', async () => {
+    const data = proposal('A'); data.attachments = [{ relativePath: 'attachment-staging/commercial-proposals/source/appendix.pdf', fileName: 'appendix.pdf', sizeBytes: 100, sha256: 'a'.repeat(64), mimeType: 'application/pdf' }];
+    await taskSeed(data); const b = structuredClone(last().data) as ProposalData; b.title = 'B';
+    let promoted = false;
+    runtime.copyAttachment.mockImplementation(async (path: string, _module: string, owner: string) => { if (promoted && path.includes('attachment-staging/')) throw new Error('Старый staging уже удалён'); return { ...data.attachments[0], relativePath: `attachment-staging/commercial-proposals/${owner}/appendix.pdf` }; });
+    runtime.store.save.mockImplementationOnce(async (_title: string, value: ProposalData, id: string) => { const saved = structuredClone(value); saved.attachments[0].relativePath = `attachments/commercial-proposals/${id}/appendix.pdf`; promoted = true; return record(id, saved); });
+    await taskSeed(b, 'result-B'); await click('Сохранить и продолжить'); await flush();
+    expect(input('proposal-title').props.value, text()).toBe('B'); expect(last('result-B').data.attachments[0].relativePath).toMatch(/^attachments\//u); expect(projectTaskDocumentSession(last('result-B').session).acceptedForOrigin).toBe(true);
+    expect(projectTaskDocumentSession(last('result-A').session).savedCurrent).toBe(true);
+  });
+  it('does not let a superseded queued result linger as accepted when a third result arrives', async () => {
+    await taskSeed(proposal('A')); await taskSeed(proposal('B'), 'result-B'); await taskSeed(proposal('C'), 'result-C');
+    expect(last('result-B').session.lastTransition.phase).toBe('cancelled'); expect(projectTaskDocumentSession(last('result-B').session).acceptedForOrigin).toBe(false);
+    await click('Заменить без сохранения'); expect(input('proposal-title').props.value).toBe('C'); expect(projectTaskDocumentSession(last('result-C').session).acceptedForOrigin).toBe(true);
+  });
+  it.each(['new', 'close', 'record', 'legacy-handoff'] as const)('cancels queued B when an actual legacy target supersedes it: %s', async (target) => {
+    await taskSeed(proposal('A')); await edit('proposal-title', 'Правка A'); await taskSeed(proposal('B'), 'result-B');
+    const staleReplaceB = button('Заменить без сохранения').props.onClick!;
+    render({ ...props, presentation: 'registry' }); await flush();
+    expect(last('result-B').session.lastTransition.phase).toBe('queued');
+    if (target === 'new') await click('Новое КП');
+    else if (target === 'close') await click('К списку');
+    else if (target === 'record') {
+      runtime.store.records = [record('legacy-record', proposal('Сохранённое КП'))];
+      render({ ...props, openRecordId: 'legacy-record' }); await flush();
+    } else {
+      render({ ...props, handoff: { id: 'legacy-seed', data: proposal('Обычный источник') } }); await flush();
+    }
+    expect(input('proposal-title').props.value).toBe('Правка A');
+    expect(last('result-B').session.lastTransition.phase).toBe('cancelled');
+    expect(projectTaskDocumentSession(last('result-B').session).acceptedForOrigin).toBe(false);
+    expect(projectTaskDocumentSession(last('result-B').session).pendingOperation).toBeUndefined();
+    staleReplaceB(); await flush();
+    expect(input('proposal-title').props.value).toBe('Правка A');
+    expect(last('result-B').session.lastTransition.phase).toBe('cancelled');
+    await click('Заменить без сохранения');
+    if (target === 'close') expect(nodes().some((node) => node.props.id === 'proposal-title')).toBe(false);
+    else expect(input('proposal-title').props.value).toBe(target === 'new' ? '' : target === 'record' ? 'Сохранённое КП' : 'Обычный источник');
+    expect(changes.filter((value) => value.session.origin.resultId === 'result-B').some((value) => value.session.accepted)).toBe(false);
+  });
+  it('does not let delayed cancellation of superseded B cancel a newer explicitly requested B attempt', async () => {
+    await taskSeed(proposal('A')); await taskSeed(proposal('B'), 'result-B');
+    render({ ...props, presentation: 'registry' }); await flush();
+    const oldAttempt = last('result-B').session.pending!.attempt, metadata = deferred<{ root: string; editor: boolean }>();
+    runtime.getWorkspace.mockImplementationOnce(() => metadata.promise); await click('Новое КП');
+    await taskSeed(proposal('Новый seed B'), 'result-B');
+    const newAttempt = last('result-B').session.pending!.attempt; expect(newAttempt).toBeGreaterThan(oldAttempt);
+    metadata.resolve({ root: '/tmp/qa-workspace', editor: true }); await flush();
+    expect(last('result-B').session.pending?.attempt).toBe(newAttempt); expect(last('result-B').session.lastTransition.phase).toBe('queued');
+    await click('Заменить без сохранения'); expect(input('proposal-title').props.value).toBe('B');
+    expect(last('result-B').session.accepted?.attempt).toBe(newAttempt);
+  });
+  it('keeps viewer task edits local without database/draft writes while still allowing an actual export receipt', async () => {
+    runtime.editor = false; runtime.getWorkspace.mockResolvedValue({ root: '/tmp/qa-workspace', editor: false }); await taskSeed();
+    await edit('proposal-title', 'Локальная правка'); await vi.advanceTimersByTimeAsync(1000); await flush(); await click('5. Проверка и экспорт'); await click('Скачать PDF');
+    expect(projectTaskDocumentSession(last().session).exportedCurrent).toBe(true); expect(runtime.store.save).not.toHaveBeenCalled(); expect(runtime.saveDraft).not.toHaveBeenCalled();
+  });
+});
 
 describe('proposal saving and viewer workflow', () => {
   it('restores an unfinished new draft on initial entry without overwriting its fields', async () => {

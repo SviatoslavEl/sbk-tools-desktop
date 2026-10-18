@@ -17,6 +17,10 @@ import { getItemTaskCompletion, type TaskCompletionReport } from "./taskCompleti
 import { ItemTaskCompletionSummary, TaskCompletionSummary } from "./TaskCompletionSummary";
 import { ProposalContentPreview } from "./ProposalContentPreview";
 import { SourceFactsDesk } from "./SourceFactsDesk";
+import { TaskGoalPicker } from "./TaskGoalPicker";
+import { normalizeTaskGoalSelection } from "./taskGoalSelection";
+import { createTaskDocumentOrigin, projectTaskDocumentSession, sameTaskDocumentOrigin, type TaskDocumentOrigin, type TaskDocumentSession } from "./taskDocumentSession";
+import { taskSourceSnapshotKey } from "./taskSourceIdentity";
 import { useSourceFactsInventory } from "./useSourceFactsInventory";
 import { ResponsePreparationCancelled, startResponsePreparation } from "./responsePreparation";
 import { assertResponsePreparationSources } from "./responsePreparationBounds";
@@ -36,14 +40,20 @@ export const evidenceAuditTimeoutMilliseconds = 60_000;
 const localAttributes = { "data-workspace-viewer-allowed": true, "data-network-offline-allowed": true } as const;
 const scopes: Record<ConnectionProfile["scope"], string> = { local: "На этом компьютере", network: "В локальной сети", external: "Внешний сервис" };
 const destinations: IntelligenceDestination[] = ["procurement", "contracts", "staff", "counterparties", "proposals"];
-const presetTasks: Array<{ label: string; destinations: IntelligenceDestination[]; text: string }> = [
-  { label: "Распределить всё", destinations, text: "Разбери выбранные источники и подготовь отдельные карточки закупок, опыта по договорам, сотрудников, контрагентов и коммерческих предложений. Создавай только карточки, для которых в источниках есть сведения. Не придумывай отсутствующие данные." },
-  { label: "Закупка", destinations: ["procurement"], text: "Извлеки сведения о закупке: наименование, заказчик, предмет, явно указанная НМЦ, сроки и все требования. Подготовь только карточку закупки. Если НМЦ не указана, пропусти поле nmc: нулевые цены строк спецификации не являются НМЦ. Дата редакции технического задания не является датой публикации закупки. Заполняй даты только по явно указанному событию в формате ГГГГ-ММ-ДД, а время и часовой пояс сохрани в примечаниях. Каждое обязательное условие, требование к участнику, срокам, составу работ и подтверждающим документам укажи отдельным пунктом requirements без сокращения важных ограничений. Не придумывай отсутствующие данные." },
-  { label: "Договоры", destinations: ["contracts"], text: "Выдели договоры и опыт выполненных работ: номер, заказчик, исполнитель, предмет, стоимость и сроки. Каждый договор — отдельная карточка опыта. Не придумывай отсутствующие данные." },
-  { label: "Кадры", destinations: ["staff"], text: "Выдели сотрудников, их должности, образование, навыки и сертификаты. Каждый сотрудник — отдельная карточка. Не придумывай отсутствующие данные." },
-  { label: "Контрагенты", destinations: ["counterparties"], text: "Выдели компании и их реквизиты, контактных лиц, телефоны и адреса электронной почты. Каждая компания — отдельная карточка. Не придумывай отсутствующие данные." },
-  { label: "КП", destinations: ["proposals"], text: "Подготовь проект коммерческого предложения по выбранным источникам: получатель, предмет, состав работ, сроки и условия оплаты. Не придумывай стоимость и реквизиты." },
-];
+const taskInstructions: Record<IntelligenceDestination, string> = {
+  procurement: "Извлеки сведения о закупке: наименование, заказчик, предмет, явно указанная НМЦ, сроки и все требования. Если НМЦ не указана, пропусти поле nmc: нулевые цены строк спецификации не являются НМЦ. Дата редакции технического задания не является датой публикации закупки. Заполняй даты только по явно указанному событию в формате ГГГГ-ММ-ДД, а время и часовой пояс сохрани в примечаниях. Каждое обязательное условие, требование к участнику, срокам, составу работ и подтверждающим документам укажи отдельным пунктом requirements без сокращения важных ограничений. Не придумывай отсутствующие данные.",
+  contracts: "Выдели существующие договоры и опыт выполненных работ: номер, заказчик, исполнитель, предмет, стоимость и сроки. Каждый договор — отдельная карточка опыта в реестре, не проект нового договора. Не придумывай отсутствующие данные.",
+  staff: "Выдели сотрудников, их должности, образование, навыки и сертификаты. Каждый сотрудник — отдельная карточка. Не придумывай отсутствующие данные.",
+  counterparties: "Выдели компании и их реквизиты, контактных лиц, телефоны и адреса электронной почты. Каждая компания — отдельная карточка. Не придумывай отсутствующие данные.",
+  proposals: "Подготовь проект коммерческого предложения по выбранным источникам: получатель, предмет, состав работ, сроки и условия оплаты. Не придумывай стоимость и реквизиты.",
+};
+const preparationLabels: Record<IntelligenceDestination, string> = {
+  procurement: "Подготовить карточку закупки", contracts: "Разобрать договоры", staff: "Подготовить карточки сотрудников",
+  counterparties: "Подготовить карточки контрагентов", proposals: "Подготовить КП",
+};
+function generatedInstruction(selected: readonly IntelligenceDestination[]): string {
+  return selected.map((destination) => taskInstructions[destination]).join("\n\n");
+}
 interface ExtractionSheet { id: string; name: string; state: "visible" | "hidden" | "veryHidden"; included: boolean; }
 type WorkbenchSource = IntelligenceSource & { selected: boolean; warnings: string[]; filePath?: string; sheets?: ExtractionSheet[] };
 interface ExtractionResult { fileName: string; sha256: string; extractedText: string; fragments: IntelligenceSource["fragments"]; warnings: string[]; sheets?: ExtractionSheet[]; coverage?: IntelligenceSource["coverage"]; }
@@ -91,7 +101,7 @@ function noteContainsCoverageText(note: string, quote: string) {
   return false;
 }
 
-export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer, onSettings, onRecognizeFile, ocrReturn, onOcrReturnConsumed }: {
+export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer, onSettings, onRecognizeFile, ocrReturn, onOcrReturnConsumed, taskDocumentSessions = [] }: {
   active?: boolean;
   workspaceRoot: string;
   onTransfer: (handoff: IntelligenceHandoff) => void;
@@ -99,6 +109,7 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
   onRecognizeFile?: (request: { id: string; inputPath: string }) => void;
   ocrReturn?: { id: string; outputPath: string; sha256: string };
   onOcrReturnConsumed?: () => void;
+  taskDocumentSessions?: readonly TaskDocumentSession[];
 }) {
   const access = useWorkspaceAccess();
   const network = useNetworkAccess();
@@ -116,9 +127,8 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
   const [sourceName, setSourceName] = useState("");
   const [sourceText, setSourceText] = useState("");
   const [extracting, setExtracting] = useState(false);
-  const [instruction, setInstruction] = useState(presetTasks[0].text);
-  const [taskDestinations, setTaskDestinations] = useState<IntelligenceDestination[]>([...destinations]);
-  const [activePreset, setActivePreset] = useState(presetTasks[0].label);
+  const [instruction, setInstruction] = useState("");
+  const [taskDestinations, setTaskDestinations] = useState<IntelligenceDestination[]>([]);
   const [analysisMode, setAnalysisMode] = useState<AnalysisMode>("combined");
   const [analysisProgress, setAnalysisProgress] = useState<{ index: number; total: number; label: string } | null>(null);
   const [analysisParts, setAnalysisParts] = useState<Array<AnalysisResponsePart & { model: string }>>([]);
@@ -132,6 +142,11 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
   const [manualDestination, setManualDestination] = useState<IntelligenceDestination>("procurement");
   const [items, setItems] = useState<IntelligenceItem[]>([]);
   const itemsRef = useRef<IntelligenceItem[]>([]); itemsRef.current = items;
+  const taskId = useRef("");
+  if (!taskId.current) taskId.current = crypto.randomUUID();
+  const baseResultRevision = useRef(0);
+  const itemResultRevisions = useRef(new Map<string, number>());
+  const proposalTransferOrigins = useRef(new Map<string, TaskDocumentOrigin>());
   const [resultSources, setResultSources] = useState<IntelligenceSource[]>([]);
   const [resultDestinations, setResultDestinations] = useState<IntelligenceDestination[]>([]);
   const [automaticConditions, setAutomaticConditions] = useState<Omit<AutoConditionResult, "items"> | null>(null);
@@ -211,11 +226,20 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
     // retained transfer callback. Coverage considers the complete snapshot, not
     // only each card's cited field sources, so all its cards may be affected.
     if (changedSourceId && evidenceCurrent.current.resultSources.some((source) => source.id === changedSourceId)) {
+      proposalTransferOrigins.current.clear();
       evidenceCurrent.current = { ...evidenceCurrent.current, reviewedFindings: {} };
       setReviewedFindings({});
     }
     if (itemsRef.current.length || rawResponse) setResultStale(true);
     setEmptyWarning(""); setError(""); setNotice("");
+  };
+  const selectTaskGoals = (selected: readonly IntelligenceDestination[]) => {
+    const next = normalizeTaskGoalSelection(selected);
+    if (next.length === taskDestinations.length && next.every((destination, index) => destination === taskDestinations[index])) return;
+    const previousGenerated = generatedInstruction(taskDestinations);
+    invalidateTask();
+    setInstruction((previous) => !previous.trim() || previous === previousGenerated ? generatedInstruction(next) : previous);
+    setTaskDestinations(next);
   };
   useEffect(() => {
     mounted.current = true;
@@ -376,6 +400,9 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
       return;
       }
       const prepared = reply.prepared!;
+      const revision = ++baseResultRevision.current;
+      itemResultRevisions.current = new Map(prepared.items.map((item) => [item.id, revision]));
+      proposalTransferOrigins.current.clear();
       itemsRef.current = prepared.items;
       setItems(prepared.items); setResultSources(snapshot); setResultDestinations([...requestedDestinations]); setAutomaticConditions({ changes: prepared.changes, skipped: prepared.skipped, limited: prepared.limited }); setSourcePreparation(prepared.sourcePreparation || null); setManualItemIds([]); setReviewedFindings({}); setOpenedItems([]); setResultStale(false); setError("");
       setEmptyWarning("");
@@ -395,12 +422,12 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
     if (pending.current || preparationPending.current) return;
     if (extractionPending.current !== null) { setError("Дождитесь чтения документа или отмените его перед отправкой источников."); return; }
     if (!selectedSources.length) { setError("Выберите хотя бы один источник."); return; }
-    if (!taskDestinations.length) { setError("Выберите хотя бы одно направление для подготовки карточек."); return; }
-    if (!instruction.trim()) { setError("Укажите, что нужно сделать с выбранными источниками."); return; }
+    if (!taskDestinations.length) { setError("Выберите хотя бы один результат для подготовки."); return; }
     if (!profile.model.trim()) { setConnectionOpen(true); setError("Укажите модель или выберите её после проверки подключения."); return; }
+    const instructionSnapshot = instruction.trim() ? instruction : generatedInstruction(taskDestinations);
     const destinationSnapshot = [...taskDestinations], snapshot = structuredClone(selectedSources), profileSnapshot = { ...profile }, keySnapshot = apiKey || undefined, modeSnapshot = analysisMode, rootSnapshot = workspaceRoot;
     let plan: ReturnType<typeof buildAnalysisPlan>;
-    try { plan = buildAnalysisPlan(instruction, snapshot, destinationSnapshot, modeSnapshot); } catch (reason) { setError(errorMessage(reason)); return; }
+    try { plan = buildAnalysisPlan(instructionSnapshot, snapshot, destinationSnapshot, modeSnapshot); } catch (reason) { setError(errorMessage(reason)); return; }
     const request = { id: crypto.randomUUID(), epoch: epoch.current }; pending.current = request;
     const current = () => mounted.current && pending.current === request && epoch.current === request.epoch && accessRef.current.workspaceRoot === rootSnapshot;
     const parts: Array<AnalysisResponsePart & { model: string }> = [];
@@ -435,23 +462,29 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
     finally { if (mounted.current && pending.current === request) { pending.current = null; setRunning(false); setAnalysisProgress(null); } }
   };
   const parseManualResponse = async () => {
+    if (!taskDestinations.length) { setError("Выберите хотя бы один результат для подготовки."); return; }
     cancelPending(); setNotice(""); setEmptyWarning("");
     const token = epoch.current;
     try { if (!rawResponse.trim()) throw new Error("Вставьте ответ модели в формате JSON."); if (bytes(rawResponse) > maxTextBytes) throw new Error("Ответ превышает 2 МБ."); await acceptResponse(rawResponse, structuredClone(selectedSources), [...taskDestinations]); if (mounted.current && epoch.current === token) setResponseDetails(null); }
     catch (reason) { if (mounted.current && epoch.current === token && !(reason instanceof ResponsePreparationCancelled)) setError(errorMessage(reason)); }
   };
   const requestAnalysis = () => {
+    if (!taskDestinations.length) { setError("Выберите хотя бы один результат для подготовки."); return; }
     const confirmationEpoch = epoch.current;
     if (items.length) setConfirm({ title: "Подготовить новый результат?", message: `${analysisMode === "by-destination" ? `Будет ${taskDestinations.length} последовательных запросов; выбранные материалы отправятся модели ${taskDestinations.length} раз. ` : ""}После успешного разбора ответа он заменит подготовленные здесь карточки, включая внесённые вручную исправления. Уже открытые карточки в других инструментах не изменятся.`, label: analysisMode === "by-destination" ? `Отправить запросы (${taskDestinations.length})` : "Отправить запрос", run: () => { setConfirm(null); if (epoch.current !== confirmationEpoch) { setError("Задача изменилась после открытия подтверждения. Проверьте материалы и отправьте запрос заново."); return; } void analyze(); } });
     else void analyze();
   };
   const requestParse = () => {
+    if (!taskDestinations.length) { setError("Выберите хотя бы один результат для подготовки."); return; }
     const confirmationEpoch = epoch.current;
     if (items.length) setConfirm({ title: "Заменить подготовленные карточки?", message: "После успешного разбора текущего ответа он заменит карточки в этом окне, включая внесённые вручную исправления.", label: "Разобрать и заменить", run: () => { setConfirm(null); if (epoch.current !== confirmationEpoch) { setError("Задача изменилась после открытия подтверждения. Повторите разбор актуального ответа."); return; } parseManualResponse(); } });
     else parseManualResponse();
   };
   const editItem = (id: string, patch: Partial<IntelligenceItem>) => {
+    if (!itemsRef.current.some((item) => item.id === id)) return;
     cancelPending(); const reviewed = { ...evidenceCurrent.current.reviewedFindings }; delete reviewed[id]; evidenceCurrent.current = { ...evidenceCurrent.current, reviewedFindings: reviewed }; setReviewedFindings(reviewed);
+    itemResultRevisions.current.set(id, ++baseResultRevision.current);
+    proposalTransferOrigins.current.delete(id);
     const next = itemsRef.current.map((item) => item.id === id ? { ...item, ...patch } : item); itemsRef.current = next; setItems(next);
     setOpenedItems((previous) => previous.filter((itemId) => itemId !== id)); setError("");
   };
@@ -472,26 +505,48 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
     const errors = validateIntelligenceItem(item);
     if (errors.length) { setError(errors.join(" ")); return; }
     transferPending.current = true; const taskEpoch = epoch.current; setTransferring(item.id); setError("");
-    try {
-      const fresh = await getWorkspaceInfo();
-      if (!mounted.current) return;
-      if (taskEpoch !== epoch.current) return;
+    const resultSnapshot = current.resultSources, ownerTaskId = taskId.current, ownerRevision = itemResultRevisions.current.get(item.id);
+    const checkLiveResult = () => {
       if (preparationPending.current) throw new Error("Подготавливается новый результат. Дождитесь завершения и проверьте текущую карточку.");
-      if (!fresh.editor || fresh.root !== workspaceRoot || accessRef.current.workspaceRoot !== workspaceRoot || !accessRef.current.access.editor || networkAccessIsPaused()) throw new Error("Доступ к редактированию изменился. Проверьте режим и рабочую папку.");
-      // A completed analysis can replace the result while the access check is
-      // still in flight. Never open a superseded card or reuse its old ACK.
-      if (itemsRef.current.find((entry) => entry.id === item.id) !== item) throw new Error("Результат заменён. Проверьте новую карточку и повторите передачу.");
+      if (itemsRef.current.find((entry) => entry.id === item.id) !== item || evidenceCurrent.current.resultSources !== resultSnapshot) throw new Error("Результат заменён. Проверьте новую карточку и повторите передачу.");
       const live = evidenceCurrent.current;
       const liveCompletion = live.evidenceState?.completion && getItemTaskCompletion(live.evidenceState.completion, item.id);
       if (!live.manualItemIds.includes(item.id) && (!live.evidenceState || live.evidenceState.items !== live.auditItems || live.evidenceState.sources !== live.resultSources || live.evidenceState.destinations !== live.resultDestinations || live.evidenceState.failed || !liveCompletion || !(incompleteDraft ? liveCompletion.canOpenIncompleteDraft : liveCompletion.canTransferPrepared) || getBlockingEvidenceFindings(live.evidenceState.report, item, live.reviewedFindings[item.id] || []).length)) throw new Error("Проверка результата изменилась. Повторно проверьте замечания перед передачей.");
-      onTransfer(buildIntelligenceHandoff(item, resultSources, workspaceRoot));
-      setOpenedItems((previous) => [...new Set([...previous, item.id])]); setNotice(`Открыт ${incompleteDraft ? "неполный " : ""}черновик: ${destinationLabels[item.destination]}. ${incompleteDraft ? "Оставшиеся вопросы не решены автоматически. " : ""}Сохраните его в карточке. Остальные результаты остаются в окне ИИ.`);
+      if (item.destination === "proposals" && (taskId.current !== ownerTaskId || itemResultRevisions.current.get(item.id) !== ownerRevision)) throw new Error("Редакция результата изменилась. Проверьте текущий черновик и повторите передачу.");
+    };
+    try {
+      let taskOrigin: TaskDocumentOrigin | undefined;
+      if (item.destination === "proposals") {
+        if (ownerRevision === undefined) throw new Error("Не удалось подтвердить редакцию результата задачи. Повторите подготовку карточки.");
+        const sourceSnapshotKey = await taskSourceSnapshotKey(resultSnapshot);
+        if (!mounted.current || taskEpoch !== epoch.current) return;
+        if (accessRef.current.workspaceRoot !== workspaceRoot || !accessRef.current.access.editor || accessRef.current.phase !== "connected" || networkAccessIsPaused()) throw new Error("Доступ к редактированию изменился. Проверьте режим и рабочую папку.");
+        checkLiveResult();
+        taskOrigin = createTaskDocumentOrigin({ taskId: ownerTaskId, resultId: item.id, workspaceRoot, sourceSnapshotKey, baseResultRevision: ownerRevision });
+      }
+      const fresh = await getWorkspaceInfo();
+      if (!mounted.current) return;
+      if (taskEpoch !== epoch.current) return;
+      if (!fresh.editor || fresh.root !== workspaceRoot || accessRef.current.workspaceRoot !== workspaceRoot || !accessRef.current.access.editor || networkAccessIsPaused()) throw new Error("Доступ к редактированию изменился. Проверьте режим и рабочую папку.");
+      // A completed analysis can replace the result while the access check is
+      // still in flight. Never open a superseded card or reuse its old ACK.
+      checkLiveResult();
+      const handoff = buildIntelligenceHandoff(item, resultSnapshot, workspaceRoot);
+      onTransfer(handoff.destination === "proposals" ? { ...handoff, taskOrigin } : handoff);
+      if (handoff.destination === "proposals" && taskOrigin) {
+        proposalTransferOrigins.current.set(item.id, taskOrigin);
+        setNotice("Запрошено открытие черновика КП. Открытие, сохранение и создание файла подтверждаются редактором отдельно; условия требуют проверки. Остальные результаты остаются в окне ИИ.");
+      } else {
+        setOpenedItems((previous) => [...new Set([...previous, item.id])]); setNotice(`Открыт ${incompleteDraft ? "неполный " : ""}черновик: ${destinationLabels[item.destination]}. ${incompleteDraft ? "Оставшиеся вопросы не решены автоматически. " : ""}Сохраните его в карточке. Остальные результаты остаются в окне ИИ.`);
+      }
     } catch (reason) { if (mounted.current) setError(errorMessage(reason)); }
     finally { transferPending.current = false; if (mounted.current) setTransferring(null); }
   };
   const reset = () => {
+    taskId.current = crypto.randomUUID(); itemResultRevisions.current.clear(); proposalTransferOrigins.current.clear();
     pendingOcr.current = null; setScanWithoutText(null);
     failedResponseRef.current = null; setFailedResponse(null); setFailedCopyMessage(""); setRawResponseOpen(false);
+    setTaskDestinations([]); setInstruction(""); setAnalysisMode("combined");
     cancelPending(); extractionEpoch.current++; extractionPending.current = null; setExtracting(false); updateSources(() => []); setSourceName(""); setSourceText(""); setRawResponse(""); setItems([]); setResultSources([]); setResultDestinations([]); setAutomaticConditions(null); setSourcePreparation(null); setSourceFactsRequested(false); setManualItemIds([]); setReviewedFindings({}); setOpenedItems([]); setResultStale(false); setEmptyWarning(""); setResponseDetails(null); setAnalysisParts([]); setError(""); setNotice(""); setConfirm(null);
   };
   const requestIncompleteTransfer = (item: IntelligenceItem) => {
@@ -503,11 +558,13 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
     } });
   };
   const requestReset = () => {
-    if (sources.length || sourceText || rawResponse || items.length || failedResponseRef.current) setConfirm({ title: "Очистить окно ИИ?", message: "Источники, ответ, сохранённая копия неразобранного ответа и подготовленные здесь карточки будут удалены из этого окна. Уже сохранённые карточки в других инструментах останутся.", run: reset });
+    if (sources.length || sourceText || rawResponse || items.length || failedResponseRef.current || instruction.trim() && instruction !== generatedInstruction(taskDestinations)) setConfirm({ title: "Очистить окно ИИ?", message: "Источники, задание, выбор результатов, ответ, сохранённая копия неразобранного ответа и подготовленные здесь карточки будут удалены из этого окна. Уже сохранённые карточки в других инструментах останутся.", run: reset });
     else reset();
   };
   const copyPrompt = async () => {
-    try { assertResponsePreparationSources(selectedSources); const input = buildGroundedAnalysisInput(instruction, selectedSources, taskDestinations); const prompt = `${input.prompt}\n\nJSON-схема с ограничениями по выбранным источникам: ${JSON.stringify(input.responseSchema)}`; if (bytes(prompt) > maxTextBytes) throw new Error("Запрос со схемой превышает 2 МБ. Разделите материалы."); if (!navigator.clipboard) throw new Error("Буфер обмена недоступен."); await navigator.clipboard.writeText(prompt); setNotice("Запрос с выбранными текстами и ограничениями фактов скопирован. Буфер обмена содержит тексты документов; передавайте их только выбранному вами сервису."); }
+    if (!taskDestinations.length) { setError("Выберите хотя бы один результат для подготовки."); return; }
+    const instructionSnapshot = instruction.trim() ? instruction : generatedInstruction(taskDestinations);
+    try { assertResponsePreparationSources(selectedSources); const input = buildGroundedAnalysisInput(instructionSnapshot, selectedSources, taskDestinations); const prompt = `${input.prompt}\n\nJSON-схема с ограничениями по выбранным источникам: ${JSON.stringify(input.responseSchema)}`; if (bytes(prompt) > maxTextBytes) throw new Error("Запрос со схемой превышает 2 МБ. Разделите материалы."); if (!navigator.clipboard) throw new Error("Буфер обмена недоступен."); await navigator.clipboard.writeText(prompt); setNotice("Запрос с выбранными текстами и ограничениями фактов скопирован. Буфер обмена содержит тексты документов; передавайте их только выбранному вами сервису."); }
     catch (reason) { setError(errorMessage(reason)); }
   };
   const copyFailedResponse = async () => {
@@ -523,6 +580,36 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
     cancelPending(); setError(""); const previous = evidenceCurrent.current.reviewedFindings; const next = { ...previous, [itemId]: checked ? [...new Set([...(previous[itemId] || []), findingId])] : (previous[itemId] || []).filter((id) => id !== findingId) }; evidenceCurrent.current = { ...evidenceCurrent.current, reviewedFindings: next }; setReviewedFindings(next);
   };
   const retryAudit = () => { evidenceCurrent.current = { ...evidenceCurrent.current, evidenceState: null }; setEvidenceState(null); setAuditAttempt((previous) => previous + 1); };
+  const proposalReceipt = (item: IntelligenceItem): { label: string; staleExport: boolean; operation?: { label: string; attempt?: number; pending: boolean } } | undefined => {
+    if (item.destination !== "proposals" || resultStale) return;
+    const origin = proposalTransferOrigins.current.get(item.id);
+    if (!origin || origin.taskId !== taskId.current || origin.resultId !== item.id || origin.workspaceRoot !== workspaceRoot || origin.baseResultRevision !== itemResultRevisions.current.get(item.id)) return;
+    const sessions = taskDocumentSessions.filter((session) => sameTaskDocumentOrigin(session.origin, origin));
+    if (sessions.length !== 1) return { label: "Открытие запрошено", staleExport: false };
+    const session = sessions[0], progress = projectTaskDocumentSession(session);
+    const staleExport = progress.hasStaleExports;
+    // Durable receipts and the last attempted operation are independent. A
+    // failed/cancelled retry neither erases a real earlier save/file nor makes
+    // an old file current after editing.
+    const label = progress.exportedCurrent ? progress.savedCurrent ? "Файл создан · Сохранено" : "Файл создан · Изменения не сохранены"
+      : progress.savedCurrent ? "Сохранено"
+      : progress.changedSinceAcceptance ? `Черновик изменён · Изменения не сохранены${session.saved ? " · Есть предыдущая сохранённая редакция" : ""}`
+      : progress.acceptedCurrent && progress.editorAttached ? "Черновик открыт"
+      : progress.phase === "released" ? "Черновик закрыт"
+      : ["failed", "cancelled"].includes(progress.phase) ? "Черновик не открыт" : "Открытие запрошено";
+    const last = session.lastTransition, pending = session.pending;
+    let operation: { label: string; attempt?: number; pending: boolean } | undefined;
+    if (pending) {
+      operation = { label: pending.operation === "save" ? "Сохраняем карточку" : pending.operation === "export" ? "Создаём файл" : "Открываем черновик", attempt: pending.attempt, pending: true };
+    } else if (last.phase === "failed" || last.phase === "cancelled") {
+      let action = last.phase === "failed"
+        ? last.operation === "save" ? "Не удалось сохранить изменения" : last.operation === "export" ? "Не удалось создать файл" : "Не удалось открыть черновик"
+        : last.operation === "save" ? "Сохранение карточки отменено" : last.operation === "export" ? "Создание файла отменено" : "Открытие черновика отменено";
+      if (last.phase === "failed" && session.saved) action += progress.savedCurrent ? "; сохранённая карточка не потеряна" : "; предыдущая сохранённая редакция не содержит этих правок";
+      operation = { label: action, attempt: last.attempt, pending: false };
+    }
+    return { label, staleExport, ...(operation ? { operation } : {}) };
+  };
   const evidenceQuotes = (quotes: EvidenceExcerpt[]) => quotes.length ? <details className="iw-evidence-quotes"><summary>Цитаты и расположение ({quotes.length})</summary>{quotes.map((quote, index) => <figure key={`${quote.sourceId}:${quote.fragmentId || ""}:${index}`}><figcaption>{quote.sourceName} · {quote.locator}</figcaption><blockquote>{quote.quote}</blockquote></figure>)}</details> : <p className="help-text">Подтверждающая цитата в выбранных источниках не найдена.</p>;
   const addCoverageText = (item: IntelligenceItem, check: CoverageCheck) => {
     // A retained callback may run twice or after a manual edit. Never rebuild
@@ -597,7 +684,7 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
           <label className="iw-full">Ключ доступа, если нужен<input id="iw-api-key" type="password" autoComplete="off" value={apiKey} placeholder="Хранится только до закрытия программы" onChange={(event) => { invalidateTask(); connectionEpoch.current++; connectionPending.current = null; setConnectionBusy(false); setApiKey(event.target.value); }} /></label>
         </div>
         <p className="help-text">Для сервиса на этом компьютере разрешён HTTP с адресом localhost. Для сети и внешнего сервиса нужен HTTPS. Сохраняются только адрес, модель и параметры подключения на этом компьютере; ключ и документы не сохраняются.</p>
-        <p className="help-text">«По схеме карточек» задаёт модели структуру карточек и допустимые ссылки на выбранные документы. «Обычный JSON» сохраняет совместимость с другими сервисами, но не передаёт сервису схему с этими ограничениями. Формат не переключается автоматически. После выбора отправьте запрос кнопкой «Отправить выбранные источники»; результат в любом режиме проверяется заново.</p>
+        <p className="help-text">«По схеме карточек» задаёт модели структуру карточек и допустимые ссылки на выбранные документы. «Обычный JSON» сохраняет совместимость с другими сервисами, но не передаёт сервису схему с этими ограничениями. Формат не переключается автоматически. После выбора подключения подготовьте результат основной кнопкой задания; результат в любом режиме проверяется заново.</p>
         <div className="iw-actions"><button type="button" className="secondary" disabled={connectionBusy} onClick={() => void testConnection()}>{connectionBusy ? "Проверяем…" : "Проверить подключение"}</button><button type="button" className="secondary" onClick={saveProfile}>Сохранить подключение</button>{profiles.some((entry) => entry.id === profile.id) && <button type="button" className="text-danger" onClick={() => setConfirm({ title: "Удалить подключение?", message: `Параметры «${profile.name}» будут удалены только с этого компьютера.`, run: () => { const next = profiles.filter((entry) => entry.id !== profile.id); try { window.localStorage.setItem(profilesKey, JSON.stringify(next)); setProfiles(next); editProfile(next[0] || defaultProfile()); setApiKey(""); setConfirm(null); } catch { setConnectionMessage("Не удалось удалить подключение."); setConfirm(null); } } })}>Удалить подключение</button>}</div>
         {connectionMessage && <p className="iw-connection-message" role="status">{connectionMessage}</p>}
       </div>}
@@ -612,7 +699,7 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
       <details open={Boolean(failedResponse.stage) && failedResponse.raw !== rawResponse}><summary>Исходный неразобранный ответ — без изменений</summary><textarea id="iw-failed-response" aria-label="Исходный неразобранный ответ" rows={6} readOnly value={failedResponse.raw} /></details>
       <div className="iw-actions"><button type="button" className="secondary" onClick={() => void copyFailedResponse()}>Скопировать исходный ответ</button><button type="button" className="secondary" onClick={() => { setConnectionOpen(true); setOutputFocusRequest((value) => value + 1); }}>Настроить ответ по схеме</button><button type="button" className="secondary" onClick={() => { failedResponseRef.current = null; setFailedResponse(null); setFailedCopyMessage(""); }}>Убрать сохранённую копию</button></div>
       {failedCopyMessage && <p role="status">{failedCopyMessage}</p>}
-      <p className="help-text">Настройка только открывает выбор формата, не меняет подключение и не отправляет документы. Для повтора проверьте отмеченные сейчас источники и нажмите «Отправить выбранные источники». Автоматической замены ссылок нет.</p>
+      <p className="help-text">Настройка только открывает выбор формата, не меняет подключение и не отправляет документы. Для повтора проверьте отмеченные сейчас источники и подготовьте результат основной кнопкой задания. Автоматической замены ссылок нет.</p>
     </section>}
     {scanWithoutText && <div className="notice warning iw-ocr-status" role="status" aria-label="Текст не найден"><div><strong>Текст не найден · {scanWithoutText.name}</strong><details><summary>Как работает распознавание</summary><p>Сохраните этот документ в сканере как полный PDF с OCR и верните текст сюда. Материалы задачи останутся; автоматической отправки модели не будет. После распознавания проверьте полноту текста.</p></details></div>{onRecognizeFile && <button type="button" className="secondary" disabled={extracting || network.phase !== "connected"} onClick={() => { if (networkAccessIsPaused() || extractionPending.current !== null) return; const request = { id: crypto.randomUUID(), inputPath: scanWithoutText.inputPath }; pendingOcr.current = { id: request.id, workspaceRoot }; try { onRecognizeFile(request); } catch (reason) { pendingOcr.current = null; setError(errorMessage(reason)); } }}>Распознать этот файл</button>}</div>}
     <div className="iw-workspace-grid">
@@ -629,20 +716,22 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
           <details><summary>Просмотреть текст</summary><textarea aria-label={`Текст источника ${source.name}`} maxLength={maxTextBytes} rows={5} value={source.text} onChange={(event) => editSourceText(source.id, event.target.value)} /></details>{source.warnings.length > 0 && <details className="iw-source-warning"><summary>Есть ограничения {source.warnings.some((warning) => /OCR|распознав/iu.test(warning)) ? "OCR и извлечения" : "извлечения"} · проверьте полноту текста ({source.warnings.length})</summary>{source.warnings.map((warning, index) => <p key={index}>{warning}</p>)}</details>}
         </li>)}</ul> : <div className="iw-empty">Добавьте документы или текст. Общая база автоматически в модель не передаётся.</div>}
       </section>
-      <section className="surface iw-task"><div className="iw-section-heading"><span className="iw-step">2</span><div><h3>Задача</h3><p>Выберите сценарий и уточните результат.</p></div></div><div className="iw-presets">{presetTasks.map((preset) => <button type="button" className={`secondary ${activePreset === preset.label ? "iw-preset-active" : ""}`} key={preset.label} onClick={() => { invalidateTask(); setActivePreset(preset.label); setTaskDestinations([...preset.destinations]); setInstruction(preset.text); }}>{preset.label}</button>)}</div>
-        <p className="help-text">Выбран результат: {taskDestinations.map((destination) => destinationLabels[destination]).join(", ") || "Не выбран"}</p>
-        <details className="iw-request-options"><summary>Уточнить задачу и выбрать несколько результатов</summary><fieldset className="iw-destinations"><legend>Какие карточки подготовить</legend>{destinations.map((destination) => <label key={destination}><input type="checkbox" aria-label={`Подготовить ${destinationLabels[destination]}`} checked={taskDestinations.includes(destination)} onChange={(event) => { invalidateTask(); setActivePreset(""); setTaskDestinations((previous) => event.target.checked ? [...new Set([...previous, destination])] : previous.filter((entry) => entry !== destination)); }} />{destinationLabels[destination]}</label>)}</fieldset>
+      <section className="surface iw-task"><div className="iw-section-heading"><span className="iw-step">2</span><div><h3>Задача</h3><p>Выберите, какой результат нужен по выбранным материалам.</p></div></div>
+        <TaskGoalPicker selected={taskDestinations} onChange={selectTaskGoals} />
+        <details className="iw-request-options"><summary>Уточнить задание</summary>
         <label>Что нужно сделать<textarea id="iw-instruction" rows={3} maxLength={20000} value={instruction} onChange={(event) => { if (event.target.value.length > 20000) { setError("Задание не должно превышать 20 000 символов."); return; } invalidateTask(); setInstruction(event.target.value); }} /></label>
+        </details>
+        <details className="iw-request-options iw-analysis-options"><summary>Технические параметры разбора</summary>
         <label className="iw-analysis-mode">Разбор<select id="iw-analysis-mode" value={analysisMode} onChange={(event) => { invalidateTask(); setAnalysisMode(event.target.value as AnalysisMode); }}><option value="combined">Одним запросом</option><option value="by-destination">Отдельно по направлениям</option></select></label>
         {analysisMode === "by-destination" && <p className="help-text iw-batch-disclosure" role="note">Будет {taskDestinations.length} последовательных запросов. Одни и те же выбранные материалы отправятся модели {taskDestinations.length} раз. Это дольше и может увеличить стоимость; точность и полнота не гарантируются. Карточки появятся только после завершения всех этапов.</p>}
         </details>
         <div className="iw-send-summary"><span>К отправке: {formatRussianCount(selectedSources.length, ["источник", "источника", "источников"])} · {formatRussianCount(sourceCharacters, ["символ", "символа", "символов"])}</span>{profile.scope !== "local" ? <div className="iw-disclosure" role="note"><strong>Тексты будут переданы {profile.scope === "external" ? "внешнему сервису" : "сервису в локальной сети"}:</strong><code>{profile.endpoint || "Адрес не указан"}</code></div> : <details><summary>Параметры запроса</summary><code>{profile.endpoint || "Адрес не указан"}</code><span>Формат: {profile.outputMode === "schema" ? "по схеме карточек" : "обычный JSON"}</span></details>}</div>
         {taskDestinations.includes("procurement") && <p className="help-text">В карточках закупок сертификаты и документы заявки автоматически дополнят результат из выбранных источников с сохранением чисел и оговорок. Неоднозначная принадлежность к карточке или лоту останется на проверке.</p>}
-        <div className="iw-actions"><button type="button" className="primary" disabled={running || preparingResponse || extracting || !selectedSources.length} onClick={requestAnalysis}>{preparingResponse ? "Дополняем результат из источников…" : running ? "Модель готовит ответ…" : "Отправить выбранные источники"}</button>{running && !preparingResponse && <button type="button" className="secondary" onClick={() => { cancelPending(); setNotice("Запрос отменён. Поздний ответ не будет добавлен."); }}>Остановить запрос</button>}</div>
+        <div className="iw-actions"><button type="button" className="primary" disabled={running || preparingResponse || extracting || !selectedSources.length || !taskDestinations.length} onClick={requestAnalysis}>{preparingResponse ? "Дополняем результат из источников…" : running ? "Модель готовит ответ…" : taskDestinations.length === 1 ? preparationLabels[taskDestinations[0]] : taskDestinations.length ? "Подготовить результаты" : "Выберите результат"}</button>{running && !preparingResponse && <button type="button" className="secondary" onClick={() => { cancelPending(); setNotice("Запрос отменён. Поздний ответ не будет добавлен."); }}>Остановить запрос</button>}</div>
         {running && !preparingResponse && analysisProgress && <p className="help-text" role="status">Этап {analysisProgress.index} из {analysisProgress.total}: {analysisProgress.label}</p>}
         {analysisMode === "by-destination" && analysisParts.length > 0 && <details className="iw-analysis-parts"><summary>Ответы по этапам ({analysisParts.length})</summary><p className="help-text">Диагностика отдельных запросов. Частичный результат не заменяет карточки. Поле готового ответа ниже содержит только полностью завершённый результат.</p>{analysisParts.map((part, index) => <details key={index}><summary>{index + 1}. {part.destinations.map((destination) => destinationLabels[destination]).join(" · ")} · {part.model}</summary><pre>{part.text}</pre></details>)}</details>}
-        {responseDetails && <div className="iw-response-metrics" role="status"><strong>Последний ответ: {responseDetails.model}</strong>{responseDetails.metrics && <><span>Время: {(responseDetails.metrics.elapsedMilliseconds / 1000).toLocaleString("ru", { maximumFractionDigits: 2 })} с</span>{responseDetails.metrics.inputTokens !== undefined && <span>На входе: {responseDetails.metrics.inputTokens.toLocaleString("ru")} токенов</span>}{responseDetails.metrics.outputTokens !== undefined && <span>На выходе: {responseDetails.metrics.outputTokens.toLocaleString("ru")} токенов</span>}{responseDetails.metrics.totalTokens !== undefined && <span>Всего: {responseDetails.metrics.totalTokens.toLocaleString("ru")} токенов</span>}{responseDetails.metrics.loadMilliseconds !== undefined && <span>Загрузка модели: {(responseDetails.metrics.loadMilliseconds / 1000).toLocaleString("ru", { maximumFractionDigits: 2 })} с</span>}</>}</div>}
-        <details className="iw-raw-response" open={Boolean(emptyWarning) || rawResponseOpen} onToggle={(event) => setRawResponseOpen(event.currentTarget.open)}><summary>Ответ модели / вставить готовый ответ</summary><p className="help-text">Можно использовать ответ другой модели. Нужен JSON с массивом items. Формат и названия полей включены в текст запроса.</p><textarea id="iw-response" rows={8} maxLength={maxTextBytes} value={rawResponse} placeholder={'{"items": [{"destination": "procurement", "title": "Закупка", "fields": {"name": "…"}}]}'} onChange={(event) => { if (bytes(event.target.value) > maxTextBytes) { setError("Ответ не должен превышать 2 МБ."); return; } cancelPending(); setRawResponse(event.target.value); setResultStale(true); setEmptyWarning(""); setResponseDetails(null); }} /><div className="iw-actions"><button type="button" className="secondary" disabled={preparingResponse || !rawResponse.trim()} onClick={requestParse}>Разобрать ответ</button><button type="button" className="secondary" onClick={() => void copyPrompt()}>Скопировать запрос для другой модели</button></div></details>
+        {responseDetails && <details className="iw-response-technical"><summary>Последний ответ · технические подробности</summary><div className="iw-response-metrics"><strong>Последний ответ: {responseDetails.model}</strong>{responseDetails.metrics && <><span>Время: {(responseDetails.metrics.elapsedMilliseconds / 1000).toLocaleString("ru", { maximumFractionDigits: 2 })} с</span>{responseDetails.metrics.inputTokens !== undefined && <span>На входе: {responseDetails.metrics.inputTokens.toLocaleString("ru")} токенов</span>}{responseDetails.metrics.outputTokens !== undefined && <span>На выходе: {responseDetails.metrics.outputTokens.toLocaleString("ru")} токенов</span>}{responseDetails.metrics.totalTokens !== undefined && <span>Всего: {responseDetails.metrics.totalTokens.toLocaleString("ru")} токенов</span>}{responseDetails.metrics.loadMilliseconds !== undefined && <span>Загрузка модели: {(responseDetails.metrics.loadMilliseconds / 1000).toLocaleString("ru", { maximumFractionDigits: 2 })} с</span>}</>}</div></details>}
+        <details className="iw-raw-response" open={Boolean(emptyWarning) || rawResponseOpen} onToggle={(event) => setRawResponseOpen(event.currentTarget.open)}><summary>Ответ модели / вставить готовый ответ</summary><p className="help-text">Можно использовать ответ другой модели. Нужен JSON с массивом items. Формат и названия полей включены в текст запроса.</p><textarea id="iw-response" rows={8} maxLength={maxTextBytes} value={rawResponse} placeholder={'{"items": [{"destination": "procurement", "title": "Закупка", "fields": {"name": "…"}}]}'} onChange={(event) => { if (bytes(event.target.value) > maxTextBytes) { setError("Ответ не должен превышать 2 МБ."); return; } cancelPending(); setRawResponse(event.target.value); setResultStale(true); setEmptyWarning(""); setResponseDetails(null); }} /><div className="iw-actions"><button type="button" className="secondary" disabled={preparingResponse || !rawResponse.trim() || !taskDestinations.length} onClick={requestParse}>Разобрать ответ</button><button type="button" className="secondary" disabled={!taskDestinations.length} onClick={() => void copyPrompt()}>Скопировать запрос для другой модели</button></div></details>
       </section>
     </div>
     <section className="surface iw-results"><div className="iw-section-heading"><span className="iw-step">3</span><div><h3>Проверка и распределение</h3><p>Отметьте нужные поля. Кнопка откроет новый черновик; сохранение выполняется в самой карточке.</p></div></div>
@@ -654,7 +743,7 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
       {auditItems.length > 0 && evidenceReady && evidenceState?.failed && <div className="notice error" role="alert">Локальную проверку фактов не удалось завершить. Результаты сохранены; передача ИИ-карточек пока недоступна.<button type="button" className="secondary" onClick={retryAudit}>Повторить проверку фактов</button></div>}
       {auditItems.length > 0 && evidenceReady && !evidenceState?.failed && <p className="help-text">Проверка сопоставляет выбранный текст, числа, роли и события. Она не гарантирует полноту понимания документа. Исправьте ошибки, исключите поля или явно проверьте каждое оставшееся замечание по источнику.</p>}
       {resultStale && items.length > 0 && <div className="notice warning" role="status">Задание, источники или ответ изменены. Ниже остаётся предыдущий разобранный результат со своим снимком источников. Повторите анализ или разбор ответа для новых данных.</div>}
-      <div className="iw-actions"><label>Новая карточка<select id="iw-new-destination" value={manualDestination} onChange={(event) => setManualDestination(event.target.value as IntelligenceDestination)}>{destinations.map((destination) => <option key={destination} value={destination}>{destinationLabels[destination]}</option>)}</select></label><button type="button" className="secondary" disabled={items.length >= 100} onClick={() => { if (itemsRef.current.length >= 100) { setError("В одной задаче допускается не более 100 карточек."); return; } cancelPending(); const created = emptyIntelligenceItem(manualDestination); const next = [...itemsRef.current, created]; itemsRef.current = next; setItems(next); setManualItemIds((previous) => [...previous, created.id]); if (!resultSources.length) setResultSources(structuredClone(selectedSources)); }}>Добавить карточку вручную</button></div>
+      <div className="iw-actions"><label>Новая карточка<select id="iw-new-destination" value={manualDestination} onChange={(event) => setManualDestination(event.target.value as IntelligenceDestination)}>{destinations.map((destination) => <option key={destination} value={destination}>{destinationLabels[destination]}</option>)}</select></label><button type="button" className="secondary" disabled={items.length >= 100} onClick={() => { if (itemsRef.current.length >= 100) { setError("В одной задаче допускается не более 100 карточек."); return; } cancelPending(); const created = emptyIntelligenceItem(manualDestination); itemResultRevisions.current.set(created.id, ++baseResultRevision.current); const next = [...itemsRef.current, created]; itemsRef.current = next; setItems(next); setManualItemIds((previous) => [...previous, created.id]); if (!resultSources.length) setResultSources(structuredClone(selectedSources)); }}>Добавить карточку вручную</button></div>
       {items.length ? <div className="iw-cards">{items.map((item, index) => {
         const errors = validateIntelligenceItem(item);
         const sourceNames = item.sourceIds.map((id) => resultSources.find((source) => source.id === id)?.name).filter(Boolean);
@@ -664,10 +753,13 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
         const cardFindings = evidenceReport.findings.filter((finding) => finding.itemId === item.id && (!finding.field || item.selectedFields.includes(finding.field)));
         const manuallyReviewed = cardFindings.filter((finding) => finding.severity === "blocking" && (reviewedFindings[item.id] || []).includes(finding.id)).length;
         const coverage = evidenceReport.coverage.filter((check) => check.itemIds.includes(item.id));
+        const receipt = proposalReceipt(item);
         return <details className="iw-card" key={item.id} open={items.length === 1}>
-          <summary><span className="iw-card-index">{index + 1}</span><span><strong>{item.title || destinationLabels[item.destination]}</strong><small>{destinationLabels[item.destination]} · полей: {item.selectedFields.length}{openedItems.includes(item.id) ? " · черновик открыт" : ""}</small></span></summary>
+          <summary><span className="iw-card-index">{index + 1}</span><span><strong>{item.title || destinationLabels[item.destination]}</strong><small role={receipt ? "status" : undefined} aria-live={receipt ? "polite" : undefined}>{destinationLabels[item.destination]} · полей: {item.selectedFields.length}{receipt ? ` · ${receipt.label}` : item.destination !== "proposals" && openedItems.includes(item.id) ? " · черновик открыт" : ""}</small></span></summary>
           <div className="iw-card-body"><label>Название результата<input aria-label={`Название результата ${index + 1}`} value={item.title} maxLength={200} onChange={(event) => editItem(item.id, { title: event.target.value })} /></label><p className="help-text">Источники: {sourceNames.join(", ") || "Не указаны"}</p>
           {!manual && <ItemTaskCompletionSummary report={evidenceReady ? evidenceState?.completion : undefined} item={taskCompletion} />}
+          {receipt && <p className="help-text iw-document-progress" aria-label="Условия и состояние документа КП">Условия требуют проверки. Сохранение и создание файла не означают готовность к отправке.{receipt.staleExport ? " Файл предыдущей редакции устарел." : ""}</p>}
+          {receipt?.operation && <p className={receipt.operation.pending ? "help-text iw-document-operation" : "notice warning iw-document-operation"} role="status" aria-live="polite" aria-label={`Последнее действие с документом КП результата ${index + 1}`}>{receipt.operation.label}{receipt.operation.attempt !== undefined ? ` · попытка ${receipt.operation.attempt}` : ""}.</p>}
           {item.destination === "proposals" && <ProposalContentPreview item={item} />}
           <details className="iw-cited-sources"><summary>Выбрать источники этой карточки</summary><p className="help-text">Связывайте карточку только с документами, к которым относятся её сведения. Проверка поля использует эти источники; перечень обязательных условий учитывает весь выбранный комплект.</p>{manuallyReviewed > 0 && <p className="notice warning" role="status" aria-label={`Предупреждение о сбросе подтверждений результата ${index + 1}`}>Изменение источников этой карточки сбросит ручные подтверждения: {manuallyReviewed}. Потребуется повторная сверка.</p>}{resultSources.length ? resultSources.map((source) => <label key={source.id}><input type="checkbox" aria-label={`Источник ${source.name} для результата ${index + 1}`} checked={item.sourceIds.includes(source.id)} onChange={(event) => editItem(item.id, { sourceIds: event.target.checked ? [...new Set([...item.sourceIds, source.id])] : item.sourceIds.filter((id) => id !== source.id) })} />{source.name}</label>) : <p className="help-text">Исходные документы для этой карточки не заданы.</p>}</details>
           {manual && <p className="help-text">Ручная карточка: сведения вводите и проверяете самостоятельно. Автоматические выводы ИИ сюда не подставляются.</p>}
@@ -710,7 +802,7 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
             </div>;
           })}</div>{item.destination === "proposals" && proposalPositions(item, index)}</details>{errors.length > 0 && <p className="iw-validation" role="status">{errors.join(" ")}</p>}<footer className="iw-card-actions"><button type="button" className="primary" disabled={preparingResponse || !canTransfer || Boolean(transferring) || Boolean(errors.length) || (!manual && (!evidenceReady || Boolean(evidenceState?.failed) || unreviewed.length > 0 || !taskCompletion?.canTransferPrepared))} onClick={() => void transfer(item)}>{transferring === item.id ? "Проверяем доступ…" : `Открыть черновик: ${destinationLabels[item.destination]}`}</button>
           {!manual && taskCompletion && !taskCompletion.canTransferPrepared && taskCompletion.canOpenIncompleteDraft && <button type="button" className="secondary" disabled={preparingResponse || !canTransfer || Boolean(transferring) || Boolean(errors.length) || !evidenceReady || Boolean(evidenceState?.failed) || unreviewed.length > 0} onClick={() => requestIncompleteTransfer(item)}>{taskCompletion.priceReviewRequired ? "Открыть КП — проверить цену и условия" : "Открыть неполный черновик"}</button>}
-          <button type="button" className="text-danger" onClick={() => setConfirm({ title: "Удалить результат?", message: "Эта подготовленная карточка будет удалена из окна ИИ. Данные в общей базе не изменятся.", run: () => { cancelPending(); setItems((previous) => previous.filter((entry) => entry.id !== item.id)); setManualItemIds((previous) => previous.filter((id) => id !== item.id)); setConfirm(null); } })}>Удалить результат</button></footer></div>
+          <button type="button" className="text-danger" onClick={() => setConfirm({ title: "Удалить результат?", message: "Эта подготовленная карточка будет удалена из окна ИИ. Данные в общей базе не изменятся.", run: () => { cancelPending(); itemResultRevisions.current.delete(item.id); proposalTransferOrigins.current.delete(item.id); setItems((previous) => previous.filter((entry) => entry.id !== item.id)); setManualItemIds((previous) => previous.filter((id) => id !== item.id)); setConfirm(null); } })}>Удалить результат</button></footer></div>
         </details>;
       })}</div> : <div className="iw-empty">Результаты появятся после анализа или разбора вставленного ответа. Также можно подготовить карточку вручную.</div>}
     </section>

@@ -5,6 +5,7 @@ import type { ProposalData } from "../proposals/types";
 import type { ProposalSourceFinancialCandidate } from "../proposals/sourcePricing";
 import type { ProposalSourcePartyCandidate } from "./proposalSourceParties";
 import type { StaffData } from "../staff/types";
+import type { TaskDocumentOrigin } from "./taskDocumentSession";
 
 export type IntelligenceDestination = "procurement" | "contracts" | "staff" | "counterparties" | "proposals";
 export type IntelligenceFieldValue = string | number | boolean | string[];
@@ -85,5 +86,5 @@ export type IntelligenceHandoff = { id: string; workspaceRoot: string; provenanc
   | { destination: "contracts"; data: ContractData }
   | { destination: "staff"; data: StaffData }
   | { destination: "counterparties"; data: CompanyCard }
-  | { destination: "proposals"; data: ProposalData }
+  | { destination: "proposals"; data: ProposalData; taskOrigin?: TaskDocumentOrigin }
 );

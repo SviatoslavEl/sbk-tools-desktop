@@ -3,17 +3,20 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ConfirmDialog } from "../../components/Dialog";
 import { IntelligenceWorkbench, evidenceAuditTimeoutMilliseconds } from "./IntelligenceWorkbench";
 import { SourceFactsDesk } from "./SourceFactsDesk";
+import { TaskGoalPicker, type TaskGoalPickerProps } from "./TaskGoalPicker";
+import { TASK_GOAL_OPTIONS } from "./taskGoalSelection";
 import { repairDateFromSource } from "./sourceRepairs";
 import { AutomaticConditionsSummary } from "./AutomaticConditionsSummary";
 import { runResponsePreparation, type ResponsePreparationRequest } from "./responsePreparationWorker";
 import { runEvidenceAudit, type EvidenceAuditRequest, type EvidenceAuditReply } from "./evidenceAuditWorker";
-import type { IntelligenceHandoff } from "./workbenchTypes";
+import type { IntelligenceDestination, IntelligenceHandoff } from "./workbenchTypes";
+import { createTaskDocumentSession, reduceTaskDocumentSession, taskDocumentOriginKey, type TaskDocumentOrigin, type TaskDocumentSession } from "./taskDocumentSession";
 
 // Exercise the real component's state, effects and callbacks. Native IO and
 // inference are mocked boundaries; the response schema and handoff model are real.
 const runtime = vi.hoisted(() => ({ cursor: 0, changed: false,
   slots: [] as Array<{ value?: unknown; deps?: readonly unknown[]; cleanup?: () => void }>, effects: [] as Array<() => void>,
-  editor: true, phase: "connected", chooseOpen: vi.fn(), invoke: vi.fn(), workspace: vi.fn(), testConnection: vi.fn(), analyze: vi.fn(), cancel: vi.fn(),
+  editor: true, phase: "connected", chooseOpen: vi.fn(), invoke: vi.fn(), workspace: vi.fn(), testConnection: vi.fn(), analyze: vi.fn(), cancel: vi.fn(), sourceKey: vi.fn(),
 }));
 vi.mock("react", async (original) => {
   const same = (a?: readonly unknown[], b?: readonly unknown[]) => a && b && a.length === b.length && a.every((value, index) => Object.is(value, b[index]));
@@ -29,6 +32,9 @@ vi.mock("../../lib/networkDiagnostics", () => ({ useNetworkAccess: () => ({ phas
 vi.mock("../../lib/files", () => ({ chooseOpenPath: runtime.chooseOpen }));
 vi.mock("../../lib/storage", () => ({ getWorkspaceInfo: runtime.workspace }));
 vi.mock("./connectionApi", async (original) => ({ ...await original<typeof import("./connectionApi")>(), testIntelligenceConnection: runtime.testConnection, runIntelligenceAnalysis: runtime.analyze, cancelIntelligenceRequest: runtime.cancel }));
+// The real SHA-256 implementation has its own actual-WebCrypto tests. Keep this
+// async boundary controllable without running child components or native IO.
+vi.mock("./taskSourceIdentity", () => ({ taskSourceSnapshotKey: runtime.sourceKey }));
 
 interface NodeProps { children?: ReactNode; value?: unknown; checked?: boolean; id?: string; type?: string; disabled?: boolean; className?: string; open?: boolean; readOnly?: boolean; ref?: { current: { focus: () => void } | null }; "aria-label"?: string; onClick?: () => unknown; onChange?: (event: { target: { value: string; checked: boolean } }) => unknown; onConfirm?: () => unknown; onClose?: () => void; }
 let tree: ReactNode;
@@ -51,6 +57,10 @@ function labeled(label: string) { const found = nodes().find((node) => node.prop
 function sourceId(name: string) { const found = nodes().find((node) => node.type === "li" && text(node.props.children).includes(name)); if (!found?.key) throw new Error(`Источник не найден: ${name}`); return String(found.key); }
 function field(key: string) { const found = nodes().find((node) => typeof node.props.id === "string" && /^iw-[0-9a-f]{8}-/.test(node.props.id) && node.props.id.endsWith(`-${key}`)); if (!found) throw new Error(`Поле карточки не найдено: ${key}`); return found; }
 async function click(label: string) { button(label).props.onClick!(); await flush(); }
+function goalPicker(): TaskGoalPickerProps { return nodes().find((node) => node.type === TaskGoalPicker)!.props as unknown as TaskGoalPickerProps; }
+async function selectGoals(...selected: IntelligenceDestination[]) { goalPicker().onChange(selected); await flush(); }
+function preparationButton() { const task = nodes().find((node) => node.props.className === "surface iw-task")!; return nodes(task).find((node) => node.type === "button" && node.props.className === "primary")!; }
+async function prepare() { preparationButton().props.onClick!(); await flush(); }
 async function edit(id: string, value: string) { control(id).props.onChange!({ target: { value, checked: false } }); await flush(); }
 async function editLabeled(label: string, value: string) { labeled(label).props.onChange!({ target: { value, checked: false } }); await flush(); }
 async function toggle(label: string, checked: boolean) { const found = nodes().find((node) => node.props["aria-label"] === label); if (!found) throw new Error(`Чекбокс не найден: ${label}`); found.props.onChange!({ target: { value: "", checked } }); await flush(); }
@@ -103,7 +113,8 @@ function holdAudits() {
 
 beforeEach(() => {
   runtime.cursor = 0; runtime.changed = false; runtime.slots = []; runtime.effects = []; runtime.editor = true; runtime.phase = "connected";
-  for (const mock of [runtime.chooseOpen, runtime.invoke, runtime.workspace, runtime.testConnection, runtime.analyze, runtime.cancel]) mock.mockReset();
+  for (const mock of [runtime.chooseOpen, runtime.invoke, runtime.workspace, runtime.testConnection, runtime.analyze, runtime.cancel, runtime.sourceKey]) mock.mockReset();
+  runtime.sourceKey.mockResolvedValue(`sha256:${"a".repeat(64)}`);
   runtime.workspace.mockResolvedValue({ root: "/qa-workspace", editor: true }); runtime.cancel.mockResolvedValue(undefined); runtime.chooseOpen.mockResolvedValue("/qa/source.pdf");
   runtime.invoke.mockResolvedValue({ fileName: "ТЗ.pdf", extractedText: "Документ закупки", sha256: "a".repeat(64), fragments: [{ locator: "Страница 1", text: "Документ закупки" }], warnings: [] });
   runtime.testConnection.mockResolvedValue({ models: ["qa-model"], message: "Соединение установлено" }); runtime.analyze.mockResolvedValue({ text: result([procurement]), model: "qa-model" });
@@ -113,7 +124,353 @@ beforeEach(() => {
 });
 afterEach(() => { for (const slot of runtime.slots) slot.cleanup?.(); vi.unstubAllGlobals(); vi.useRealTimers(); });
 
+describe("private proposal task origins", () => {
+  async function manualProposal() {
+    await edit("iw-new-destination", "proposals"); await click("Добавить карточку вручную");
+    field("title").props.onChange!({ target: { value: "Учебное КП", checked: false } }); await flush();
+  }
+  function latestOrigin(): TaskDocumentOrigin {
+    const handoff = transfer.mock.calls[transfer.mock.calls.length - 1]?.[0];
+    if (handoff?.destination !== "proposals" || !handoff.taskOrigin) throw new Error("Нет происхождения КП");
+    return handoff.taskOrigin;
+  }
+  function proposalSummary() { const card = nodes().find((node) => node.props.className === "iw-card" && text(node).includes("Коммерческие предложения"))!; return text(nodes(card).find((node) => node.type === "summary")); }
+  function sessionEvent(session: TaskDocumentSession, type: string, attempt: number, extra: Record<string, unknown> = {}) {
+    return { type, origin: session.origin, workspaceRoot: session.origin.workspaceRoot, attempt, snapshot: session.current, ...extra };
+  }
+  function acceptedSession(origin = latestOrigin()) {
+    const initial = createTaskDocumentSession(origin, '{"document":"initial"}');
+    const queued = reduceTaskDocumentSession(initial, sessionEvent(initial, "queued", 1, { operation: "open" }));
+    return reduceTaskDocumentSession(queued, sessionEvent(queued, "accepted", 1));
+  }
+  async function openIncompleteProposal() {
+    await reviewVisibleFindings(); incompleteButton("Коммерческие предложения").props.onClick!(); await flush(); await confirm();
+  }
+
+  it("reopens the same immutable result with the same origin rather than a new document identity", async () => {
+    await addText("Материал", "PRIVATE-ORIGIN-SOURCE"); await manualProposal(); await click("Открыть черновик: Коммерческие предложения");
+    const first = latestOrigin(), key = taskDocumentOriginKey(first);
+    await click("Открыть черновик: Коммерческие предложения");
+    expect(transfer).toHaveBeenCalledTimes(2); expect(taskDocumentOriginKey(latestOrigin())).toBe(key);
+    expect(first.taskId).toMatch(/^[a-f\d-]{36}$/u); expect(first.baseResultRevision).toBeGreaterThan(0);
+    expect(first.sourceSnapshotKey).toBe(`sha256:${"a".repeat(64)}`); expect(first.workspaceRoot).toBe("/qa-workspace");
+    expect(Object.keys(first).sort()).toEqual(["taskId", "resultId", "workspaceRoot", "sourceSnapshotKey", "baseResultRevision"].sort());
+    expect(JSON.stringify(first)).not.toContain("PRIVATE-ORIGIN-SOURCE");
+    expect(runtime.sourceKey).toHaveBeenCalledTimes(2);
+    expect(runtime.sourceKey.mock.calls[0][0]).toBe(runtime.sourceKey.mock.calls[1][0]);
+  });
+
+  it("changes only the edited item's base revision and starts a different task identity after reset", async () => {
+    await manualProposal(); await click("Открыть черновик: Коммерческие предложения"); const first = latestOrigin();
+    field("title").props.onChange!({ target: { value: "Исправленное КП", checked: false } }); await flush();
+    await click("Открыть черновик: Коммерческие предложения"); const edited = latestOrigin();
+    expect(edited.taskId).toBe(first.taskId); expect(edited.resultId).toBe(first.resultId); expect(edited.baseResultRevision).toBeGreaterThan(first.baseResultRevision);
+    await edit("iw-new-destination", "staff"); await click("Добавить карточку вручную");
+    field("fullName").props.onChange!({ target: { value: "Иванов Иван", checked: false } }); await flush();
+    await click("Открыть черновик: Коммерческие предложения"); expect(latestOrigin()).toEqual(edited);
+    await click("Новая задача"); await confirm(); await manualProposal(); await click("Открыть черновик: Коммерческие предложения");
+    expect(latestOrigin().taskId).not.toBe(first.taskId); expect(latestOrigin().baseResultRevision).toBeGreaterThan(edited.baseResultRevision);
+  });
+
+  it("assigns a new accepted-result revision even when a later preparation returns the same derived item ID", async () => {
+    await selectGoals("proposals"); await addText("Услуга", "Предлагается аудит учебной системы и подготовка отчёта.");
+    const wire = [{ destination: "proposals", title: "КП QA", fields: { title: "Аудит учебной системы", lines: ["Аудит учебной системы"], lineDescriptions: ["Проверка учебной системы и подготовка отчёта"] }, sourceIds: [sourceId("Услуга")] }];
+    const stable = "11111111-1111-4111-8111-111111111111", jobs = holdPreparations();
+    await paste(wire);
+    const firstReply = runResponsePreparation(jobs[0].request); firstReply.prepared!.items[0].id = stable; jobs[0].reply(firstReply); await flush();
+    await openIncompleteProposal(); const first = latestOrigin();
+    render({ ...props, taskDocumentSessions: [acceptedSession(first)] }); await flush(); expect(proposalSummary()).toContain("Черновик открыт");
+    await paste(wire); await confirm();
+    const secondReply = runResponsePreparation(jobs[1].request); secondReply.prepared!.items[0].id = stable; jobs[1].reply(secondReply); await flush();
+    expect(proposalSummary()).not.toContain("Черновик открыт");
+    await openIncompleteProposal(); const next = latestOrigin();
+    expect(proposalSummary()).toContain("Открытие запрошено"); expect(proposalSummary()).not.toContain("Черновик открыт");
+    expect(next.resultId).toBe(stable); expect(next.resultId).toBe(first.resultId); expect(next.taskId).toBe(first.taskId);
+    expect(next.baseResultRevision).toBeGreaterThan(first.baseResultRevision); expect(next.sourceSnapshotKey).toBe(first.sourceSnapshotKey);
+    expect(runtime.analyze).not.toHaveBeenCalled();
+  });
+
+  it("hashes the immutable result sources, not later edited text or the current source selection", async () => {
+    await addText("Материал", "ORIGINAL-RESULT-SOURCE"); await manualProposal(); await click("Открыть черновик: Коммерческие предложения");
+    const first = latestOrigin(), snapshot = runtime.sourceKey.mock.calls[0][0];
+    await editLabeled("Текст источника Материал", "LATER-SOURCE-EDIT"); await addText("Новый материал", "UNRELATED-SOURCE");
+    await click("Открыть черновик: Коммерческие предложения");
+    expect(runtime.sourceKey.mock.calls[1][0]).toBe(snapshot); expect(snapshot[0].text).toBe("ORIGINAL-RESULT-SOURCE");
+    expect(snapshot).toHaveLength(1); expect(latestOrigin()).toEqual(first);
+  });
+
+  it.each(["item-edit", "source-edit", "reset", "workspace-change", "viewer", "network-pause"])("rejects stale ownership before fresh workspace IO after a delayed digest and %s", async (change) => {
+    await addText("Материал", "Материал QA"); await manualProposal();
+    const digest = deferred<`sha256:${string}`>(); runtime.sourceKey.mockReturnValueOnce(digest.promise);
+    await click("Открыть черновик: Коммерческие предложения"); expect(runtime.sourceKey).toHaveBeenCalledOnce(); expect(runtime.workspace).not.toHaveBeenCalled();
+    if (change === "item-edit") { field("title").props.onChange!({ target: { value: "Новая редакция КП", checked: false } }); await flush(); }
+    if (change === "source-edit") await editLabeled("Текст источника Материал", "Новая редакция источника");
+    if (change === "reset") { await click("Новая задача"); await confirm(); }
+    if (change === "workspace-change") { render({ ...props, workspaceRoot: "/other-workspace" }); await flush(); }
+    if (change === "viewer") { runtime.editor = false; render(); await flush(); }
+    if (change === "network-pause") { runtime.phase = "disconnected"; render(); await flush(); }
+    digest.resolve(`sha256:${"b".repeat(64)}`); await flush();
+    expect(runtime.workspace).not.toHaveBeenCalled(); expect(transfer).not.toHaveBeenCalled();
+  });
+
+  it("keeps the post-workspace-await guard after the source digest has completed", async () => {
+    await manualProposal(); const workspace = deferred<{ root: string; editor: boolean }>(); runtime.workspace.mockReturnValueOnce(workspace.promise);
+    await click("Открыть черновик: Коммерческие предложения"); expect(runtime.sourceKey).toHaveBeenCalledOnce(); expect(runtime.workspace).toHaveBeenCalledOnce();
+    field("title").props.onChange!({ target: { value: "Правка во время проверки доступа", checked: false } }); await flush();
+    workspace.resolve({ root: "/qa-workspace", editor: true }); await flush(); expect(transfer).not.toHaveBeenCalled();
+  });
+
+  it("fails closed on a digest failure without reading shared workspace or emitting an origin", async () => {
+    await manualProposal(); runtime.sourceKey.mockRejectedValueOnce(new Error("WebCrypto недоступен"));
+    await click("Открыть черновик: Коммерческие предложения"); expect(text()).toContain("WebCrypto недоступен");
+    expect(runtime.workspace).not.toHaveBeenCalled(); expect(transfer).not.toHaveBeenCalled();
+  });
+
+  it("does not call a proposal opened, saved or exported until the matching receiver confirms it", async () => {
+    await manualProposal(); await click("Открыть черновик: Коммерческие предложения");
+    expect(text()).toContain("Запрошено открытие черновика КП"); expect(proposalSummary()).toContain("Открытие запрошено");
+    expect(proposalSummary()).not.toContain("Черновик открыт"); expect(proposalSummary()).not.toContain("Сохранено"); expect(proposalSummary()).not.toContain("Файл создан");
+    let session = acceptedSession(); render({ ...props, taskDocumentSessions: Object.freeze([session]) }); await flush();
+    expect(proposalSummary()).toContain("Черновик открыт"); expect(proposalSummary()).not.toContain("Сохранено");
+    session = reduceTaskDocumentSession(session, sessionEvent(session, "queued", 2, { operation: "save", recordId: "saved-record" }));
+    session = reduceTaskDocumentSession(session, sessionEvent(session, "saved", 2, { recordId: "saved-record" }));
+    render({ ...props, taskDocumentSessions: [session] }); await flush();
+    expect(proposalSummary()).toContain("Сохранено"); expect(proposalSummary()).not.toContain("Файл создан");
+    session = reduceTaskDocumentSession(session, sessionEvent(session, "queued", 3, { operation: "export", format: "pdf" }));
+    render({ ...props, taskDocumentSessions: [session] }); await flush(); expect(proposalSummary()).not.toContain("Файл создан");
+    session = reduceTaskDocumentSession(session, sessionEvent(session, "exported", 3, { format: "pdf", outputPath: "/private/tmp/qa/proposal.pdf", outputBytes: 128, sha256: "c".repeat(64) }));
+    render({ ...props, taskDocumentSessions: [session] }); await flush();
+    expect(proposalSummary()).toContain("Файл создан · Сохранено");
+    expect(text()).toContain("Условия требуют проверки"); expect(text()).toContain("не означают готовность к отправке");
+    const changed = reduceTaskDocumentSession(session, { type: "changed", origin: session.origin, workspaceRoot: session.origin.workspaceRoot, previous: session.current, next: { revision: session.current.revision + 1, fingerprint: '{"document":"edited"}' } });
+    render({ ...props, taskDocumentSessions: [changed] }); await flush();
+    expect(proposalSummary()).toContain("Черновик изменён · Изменения не сохранены");
+    expect(proposalSummary()).not.toContain("Файл создан"); expect(proposalSummary()).not.toContain("Сохранено");
+    expect(text()).toContain("Файл предыдущей редакции устарел");
+    expect(transfer).toHaveBeenCalledOnce(); expect(runtime.workspace).toHaveBeenCalledOnce(); expect(runtime.analyze).not.toHaveBeenCalled();
+  });
+  it("shows a failed export after a successful save independently of the durable saved receipt", async () => {
+    await manualProposal(); await click("Открыть черновик: Коммерческие предложения");
+    let session = acceptedSession();
+    session = reduceTaskDocumentSession(session, sessionEvent(session, "queued", 2, { operation: "save", recordId: "saved-record" }));
+    session = reduceTaskDocumentSession(session, sessionEvent(session, "saved", 2, { recordId: "saved-record" }));
+    const saved = session.saved;
+    session = reduceTaskDocumentSession(session, sessionEvent(session, "queued", 3, { operation: "export", format: "pdf" }));
+    render({ ...props, taskDocumentSessions: [session] }); await flush();
+    expect(proposalSummary()).toContain("Сохранено"); expect(proposalSummary()).not.toContain("Файл создан");
+    expect(text(labeled("Последнее действие с документом КП результата 1"))).toContain("Создаём файл · попытка 3");
+    session = reduceTaskDocumentSession(session, sessionEvent(session, "failed", 3, { operation: "export", message: "Ошибка генератора" }));
+    render({ ...props, taskDocumentSessions: [session] }); await flush();
+    expect(proposalSummary()).toContain("Сохранено"); expect(proposalSummary()).not.toContain("Файл создан");
+    expect(text(labeled("Последнее действие с документом КП результата 1"))).toContain("Не удалось создать файл; сохранённая карточка не потеряна · попытка 3");
+    expect(session.saved).toEqual(saved); expect(session.exports).toEqual({});
+    expect(text()).toContain("не означают готовность к отправке"); expect(runtime.analyze).not.toHaveBeenCalled();
+  });
+  it("keeps failed changed-save, previous saved data and stale export distinct without claiming current success", async () => {
+    await manualProposal(); await click("Открыть черновик: Коммерческие предложения");
+    let session = acceptedSession();
+    session = reduceTaskDocumentSession(session, sessionEvent(session, "queued", 2, { operation: "save", recordId: "saved-record" }));
+    session = reduceTaskDocumentSession(session, sessionEvent(session, "saved", 2, { recordId: "saved-record" }));
+    session = reduceTaskDocumentSession(session, sessionEvent(session, "queued", 3, { operation: "export", format: "pdf" }));
+    session = reduceTaskDocumentSession(session, sessionEvent(session, "exported", 3, { format: "pdf", outputPath: "/private/tmp/qa/old.pdf", outputBytes: 128, sha256: "c".repeat(64) }));
+    const previousSave = session.saved, previousFile = session.exports.pdf;
+    session = reduceTaskDocumentSession(session, { type: "changed", origin: session.origin, workspaceRoot: session.origin.workspaceRoot, previous: session.current, next: { revision: session.current.revision + 1, fingerprint: '{"document":"edited"}' } });
+    session = reduceTaskDocumentSession(session, sessionEvent(session, "queued", 4, { operation: "save", recordId: "saved-record" }));
+    render({ ...props, taskDocumentSessions: [session] }); await flush();
+    expect(text(labeled("Последнее действие с документом КП результата 1"))).toContain("Сохраняем карточку · попытка 4");
+    expect(proposalSummary()).toContain("Изменения не сохранены"); expect(text()).toContain("Файл предыдущей редакции устарел");
+    session = reduceTaskDocumentSession(session, sessionEvent(session, "failed", 4, { operation: "save", message: "Нет доступа к папке" }));
+    render({ ...props, taskDocumentSessions: [session] }); await flush();
+    expect(proposalSummary()).toContain("Есть предыдущая сохранённая редакция"); expect(proposalSummary()).toContain("Изменения не сохранены");
+    expect(proposalSummary()).not.toContain("Сохранено"); expect(proposalSummary()).not.toContain("Файл создан");
+    expect(text(labeled("Последнее действие с документом КП результата 1"))).toContain("Не удалось сохранить изменения; предыдущая сохранённая редакция не содержит этих правок · попытка 4");
+    expect(text()).toContain("Файл предыдущей редакции устарел"); expect(session.saved).toEqual(previousSave); expect(session.exports.pdf).toEqual(previousFile);
+  });
+  it.each(["save", "export"] as const)("shows pending and cancelled %s separately, never treating cancellation as a file or database success", async (operation) => {
+    await manualProposal(); await click("Открыть черновик: Коммерческие предложения");
+    let session = acceptedSession();
+    session = reduceTaskDocumentSession(session, sessionEvent(session, "queued", 2, { operation, ...(operation === "save" ? { recordId: "saved-record" } : { format: "docx" }) }));
+    render({ ...props, taskDocumentSessions: [session] }); await flush();
+    expect(proposalSummary()).toContain("Черновик открыт"); expect(proposalSummary()).not.toContain("Файл создан"); expect(proposalSummary()).not.toContain("Сохранено");
+    expect(text(labeled("Последнее действие с документом КП результата 1"))).toContain(operation === "save" ? "Сохраняем карточку · попытка 2" : "Создаём файл · попытка 2");
+    session = reduceTaskDocumentSession(session, sessionEvent(session, "cancelled", 2, { operation, reason: "Отмена диалога" }));
+    render({ ...props, taskDocumentSessions: [session] }); await flush();
+    expect(text(labeled("Последнее действие с документом КП результата 1"))).toContain(operation === "save" ? "Сохранение карточки отменено · попытка 2" : "Создание файла отменено · попытка 2");
+    expect(proposalSummary()).not.toContain("Файл создан"); expect(proposalSummary()).not.toContain("Сохранено");
+    expect(session.saved).toBeUndefined(); expect(session.exports).toEqual({});
+  });
+  it("does not erase a real current file when a later export is cancelled, or hide its later staleness after edits", async () => {
+    await manualProposal(); await click("Открыть черновик: Коммерческие предложения");
+    let session = acceptedSession();
+    session = reduceTaskDocumentSession(session, sessionEvent(session, "queued", 2, { operation: "export", format: "pdf" }));
+    session = reduceTaskDocumentSession(session, sessionEvent(session, "exported", 2, { format: "pdf", outputPath: "/private/tmp/qa/current.pdf", outputBytes: 128, sha256: "c".repeat(64) }));
+    const exported = session.exports.pdf;
+    session = reduceTaskDocumentSession(session, sessionEvent(session, "queued", 3, { operation: "export", format: "docx" }));
+    session = reduceTaskDocumentSession(session, sessionEvent(session, "cancelled", 3, { operation: "export", reason: "Отмена диалога сохранения" }));
+    render({ ...props, taskDocumentSessions: [session] }); await flush();
+    expect(proposalSummary()).toContain("Файл создан · Изменения не сохранены");
+    expect(text(labeled("Последнее действие с документом КП результата 1"))).toContain("Создание файла отменено · попытка 3");
+    expect(session.exports.pdf).toEqual(exported); expect(session.exports.docx).toBeUndefined();
+    session = reduceTaskDocumentSession(session, { type: "changed", origin: session.origin, workspaceRoot: session.origin.workspaceRoot, previous: session.current, next: { revision: session.current.revision + 1, fingerprint: '{"document":"edited"}' } });
+    render({ ...props, taskDocumentSessions: [session] }); await flush();
+    expect(proposalSummary()).not.toContain("Файл создан"); expect(text()).toContain("Файл предыдущей редакции устарел");
+    expect(nodes().some((node) => node.props["aria-label"] === "Последнее действие с документом КП результата 1")).toBe(false);
+  });
+
+  it.each(["task", "result", "workspace", "source-key", "base-revision"])("does not attach a receiver with a different %s", async (part) => {
+    await manualProposal(); await click("Открыть черновик: Коммерческие предложения");
+    const origin = { ...latestOrigin() };
+    if (part === "task") origin.taskId = "different-task";
+    if (part === "result") origin.resultId = "different-result";
+    if (part === "workspace") origin.workspaceRoot = "/other-workspace";
+    if (part === "source-key") origin.sourceSnapshotKey = `sha256:${"d".repeat(64)}`;
+    if (part === "base-revision") origin.baseResultRevision++;
+    render({ ...props, taskDocumentSessions: [acceptedSession(origin)] }); await flush();
+    expect(proposalSummary()).toContain("Открытие запрошено"); expect(proposalSummary()).not.toContain("Черновик открыт");
+    expect(proposalSummary()).not.toContain("Сохранено"); expect(proposalSummary()).not.toContain("Файл создан");
+  });
+
+  it.each(["item-edit", "source-edit", "reset"])("stops presenting a previous receipt after %s", async (change) => {
+    await addText("Материал", "Исходный текст QA"); await manualProposal(); await click("Открыть черновик: Коммерческие предложения");
+    const session = acceptedSession(); render({ ...props, taskDocumentSessions: [session] }); await flush(); expect(proposalSummary()).toContain("Черновик открыт");
+    if (change === "item-edit") { field("title").props.onChange!({ target: { value: "Новая редакция", checked: false } }); await flush(); }
+    if (change === "source-edit") await editLabeled("Текст источника Материал", "Изменённый исходный текст");
+    if (change === "reset") { await click("Новая задача"); await confirm(); await manualProposal(); }
+    render({ ...props, taskDocumentSessions: [session] }); await flush();
+    expect(proposalSummary()).not.toContain("Черновик открыт"); expect(proposalSummary()).not.toContain("Сохранено"); expect(proposalSummary()).not.toContain("Файл создан");
+  });
+});
+
+describe("single task goal selection in the workbench", () => {
+  it("starts without a hidden goal or instruction and exposes exactly one controlled picker", async () => {
+    expect(nodes().filter((node) => node.type === TaskGoalPicker)).toHaveLength(1);
+    expect(goalPicker().selected).toEqual([]);
+    expect(control("iw-instruction").props.value).toBe("");
+    expect(preparationButton().props.disabled).toBe(true);
+    expect(text(preparationButton())).toBe("Выберите результат");
+    expect(nodes().some((node) => node.props.className?.includes("iw-presets"))).toBe(false);
+    expect(nodes().some((node) => /^Подготовить /.test(node.props["aria-label"] || ""))).toBe(false);
+    expect(runtime.analyze).not.toHaveBeenCalled(); expect(runtime.invoke).not.toHaveBeenCalled(); expect(runtime.workspace).not.toHaveBeenCalled();
+    await addText(); expect(preparationButton().props.disabled).toBe(true);
+    expect(goalPicker().selected).toEqual([]); expect(localValues.size).toBe(0);
+  });
+
+  it("guards analysis, manual preparation and prompt copying even if disabled callbacks are invoked without a goal", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined); vi.stubGlobal("navigator", { clipboard: { writeText } });
+    await configureModel(); await addText(); await edit("iw-response", result([procurement]));
+    expect(button("Разобрать ответ").props.disabled).toBe(true);
+    expect(button("Скопировать запрос для другой модели").props.disabled).toBe(true);
+    await prepare(); expect(text()).toContain("Выберите хотя бы один результат");
+    await click("Разобрать ответ"); expect(text()).toContain("Выберите хотя бы один результат");
+    await click("Скопировать запрос для другой модели"); expect(text()).toContain("Выберите хотя бы один результат");
+    expect(nodes().filter((node) => node.props.className === "iw-card")).toHaveLength(0);
+    expect(runtime.analyze).not.toHaveBeenCalled(); expect(writeText).not.toHaveBeenCalled(); expect(runtime.workspace).not.toHaveBeenCalled();
+  });
+
+  it("updates generated instructions with the ordered goals but preserves a custom instruction exactly", async () => {
+    await selectGoals("procurement"); const procurementInstruction = String(control("iw-instruction").props.value);
+    expect(procurementInstruction).toContain("Извлеки сведения о закупке");
+    await selectGoals("staff", "contracts"); const next = String(control("iw-instruction").props.value);
+    expect(next).not.toContain("Извлеки сведения о закупке");
+    expect(next.indexOf("Выдели сотрудников")).toBeLessThan(next.indexOf("Выдели существующие договоры"));
+    expect(goalPicker().selected).toEqual(["staff", "contracts"]);
+    const custom = "  Только согласованные материалы.\nНе включать частные заметки.  ";
+    await edit("iw-instruction", custom); await selectGoals("proposals", "staff");
+    expect(control("iw-instruction").props.value).toBe(custom);
+    await selectGoals(); expect(control("iw-instruction").props.value).toBe(custom);
+    expect(preparationButton().props.disabled).toBe(true);
+    await selectGoals("counterparties"); expect(control("iw-instruction").props.value).toBe(custom);
+    expect(runtime.analyze).not.toHaveBeenCalled(); expect(runtime.invoke).not.toHaveBeenCalled(); expect(runtime.workspace).not.toHaveBeenCalled();
+  });
+
+  it("treats cleared or whitespace instruction as generated rather than custom when goals change", async () => {
+    await selectGoals("proposals"); await edit("iw-instruction", "");
+    await selectGoals("staff"); expect(control("iw-instruction").props.value).toContain("Выдели сотрудников");
+    await edit("iw-instruction", " \n\t "); await selectGoals("contracts");
+    expect(control("iw-instruction").props.value).toContain("Выдели существующие договоры");
+    expect(runtime.analyze).not.toHaveBeenCalled();
+    await edit("iw-instruction", " \n\t "); await click("Новая задача");
+    expect(nodes().some((node) => node.type === ConfirmDialog)).toBe(false);
+    expect(goalPicker().selected).toEqual([]); expect(control("iw-instruction").props.value).toBe("");
+  });
+
+  it.each(["", " \n\t "])("uses generated instructions for inference and prompt copy when optional clarification is %j", async (clarification) => {
+    const writeText = vi.fn().mockResolvedValue(undefined); vi.stubGlobal("navigator", { clipboard: { writeText } });
+    await configureModel(); await addText(); await selectGoals("procurement");
+    const generated = String(control("iw-instruction").props.value);
+    await edit("iw-instruction", clarification);
+    runtime.analyze.mockResolvedValueOnce({ text: result([]), model: "qa-model" }); await prepare();
+    expect(runtime.analyze).toHaveBeenCalledTimes(1); expect(runtime.analyze.mock.calls[0][1]).toContain(JSON.stringify(generated));
+    expect(control("iw-instruction").props.value).toBe(clarification);
+    await click("Скопировать запрос для другой модели");
+    expect(writeText).toHaveBeenCalledTimes(1); expect(writeText.mock.calls[0][0]).toContain(JSON.stringify(generated));
+    expect(control("iw-instruction").props.value).toBe(clarification); expect(text()).not.toContain("Укажите, что нужно сделать");
+    expect(runtime.workspace).not.toHaveBeenCalled(); expect(transfer).not.toHaveBeenCalled(); expect(localValues.size).toBe(0);
+  });
+
+  it("labels the primary action by the actual selected goal and uses one multi-result action", async () => {
+    await addText();
+    const labels: Array<[IntelligenceDestination, string]> = [["proposals", "Подготовить КП"], ["contracts", "Разобрать договоры"], ["procurement", "Подготовить карточку закупки"], ["staff", "Подготовить карточки сотрудников"], ["counterparties", "Подготовить карточки контрагентов"]];
+    for (const [destination, label] of labels) { await selectGoals(destination); expect(text(preparationButton())).toBe(label); expect(preparationButton().props.disabled).toBe(false); }
+    await selectGoals("proposals", "contracts"); expect(text(preparationButton())).toBe("Подготовить результаты");
+    expect(runtime.analyze).not.toHaveBeenCalled();
+  });
+
+  it("returns to a genuinely unselected new task and warns before losing a custom instruction", async () => {
+    await selectGoals("staff", "contracts"); await edit("iw-instruction", "Ручное задание без источников"); await edit("iw-analysis-mode", "by-destination");
+    await click("Новая задача"); expect(nodes().some((node) => node.type === ConfirmDialog)).toBe(true);
+    nodes().find((node) => node.type === ConfirmDialog)!.props.onClose!(); await flush();
+    expect(control("iw-instruction").props.value).toBe("Ручное задание без источников"); expect(goalPicker().selected).toEqual(["staff", "contracts"]);
+    await click("Новая задача"); await confirm();
+    expect(goalPicker().selected).toEqual([]); expect(control("iw-instruction").props.value).toBe("");
+    expect(control("iw-analysis-mode").props.value).toBe("combined"); expect(preparationButton().props.disabled).toBe(true);
+  });
+
+  it("keeps instruction, analysis modes and returned metrics in separate collapsed disclosures", async () => {
+    const instruction = nodes().find((node) => node.type === "details" && text(node.props.children).startsWith("Уточнить задание"))!;
+    const technical = nodes().find((node) => node.props.className === "iw-request-options iw-analysis-options")!;
+    expect(instruction.props.open).not.toBe(true); expect(technical.props.open).not.toBe(true);
+    expect(nodes(instruction).some((node) => node.props.id === "iw-instruction")).toBe(true);
+    expect(nodes(instruction).some((node) => node.props.id === "iw-analysis-mode")).toBe(false);
+    expect(nodes(technical).some((node) => node.props.id === "iw-analysis-mode")).toBe(true);
+    expect(nodes(technical).some((node) => node.type === TaskGoalPicker || node.type === "input" && node.props.type === "checkbox")).toBe(false);
+    await configureModel(); await addText(); await selectGoals("procurement");
+    runtime.analyze.mockResolvedValueOnce({ text: result([procurement]), model: "qa-model", metrics: { elapsedMilliseconds: 700, inputTokens: 15, outputTokens: 8 } });
+    await prepare();
+    const response = nodes().find((node) => node.props.className === "iw-response-technical")!;
+    expect(response.props.open).not.toBe(true); expect(text(response)).toContain("Последний ответ: qa-model"); expect(text(response)).toContain("15 токенов");
+  });
+
+  const allGoals = TASK_GOAL_OPTIONS.map((goal) => goal.destination);
+  const subsets = Array.from({ length: (1 << allGoals.length) - 1 }, (_, index) => allGoals.filter((_, bit) => (index + 1) & (1 << bit)).reverse());
+  const planCases = subsets.flatMap((goals, index) => (["combined", "by-destination"] as const).map((mode) => ({ name: `${index + 1}: ${goals.join(", ")} / ${mode}`, goals, mode })));
+  it.each(planCases)("passes the one ordered selection and all selected sources through the actual plan: $name", async ({ goals, mode }) => {
+    await configureModel(); await addText("Первый материал", "FIRST-SELECTED-SOURCE-QA"); await addText("Второй материал", "SECOND-SELECTED-SOURCE-QA");
+    await addText("Не отправлять", "EXCLUDED-SOURCE-QA"); await toggle("Отправить источник Не отправлять", false);
+    await selectGoals(...goals); await edit("iw-analysis-mode", mode);
+    const instruction = String(control("iw-instruction").props.value);
+    const jobs = holdPreparations(); runtime.analyze.mockResolvedValue({ text: result([]), model: "qa-model" });
+    await prepare();
+    expect(planCases).toHaveLength(62); expect(goalPicker().selected).toEqual(goals);
+    expect(runtime.analyze).toHaveBeenCalledTimes(mode === "combined" ? 1 : goals.length);
+    for (const [index, call] of runtime.analyze.mock.calls.entries()) {
+      expect(call[1]).toContain("FIRST-SELECTED-SOURCE-QA"); expect(call[1]).toContain("SECOND-SELECTED-SOURCE-QA"); expect(call[1]).not.toContain("EXCLUDED-SOURCE-QA");
+      expect(call[1]).toContain(JSON.stringify(instruction));
+      type Variant = { properties: { destination: { enum: IntelligenceDestination[] } } };
+      const schema = call[4] as { properties: { items: { items: Variant & { anyOf?: Variant[] } } } };
+      const variants = schema.properties.items.items.anyOf || [schema.properties.items.items];
+      expect(variants.flatMap((variant) => variant.properties.destination.enum)).toEqual(mode === "combined" ? goals : [goals[index]]);
+    }
+    expect(jobs).toHaveLength(1); expect(jobs[0].request.destinations).toEqual(goals);
+    expect(jobs[0].request.sources.map((source) => source.name)).toEqual(["Первый материал", "Второй материал"]);
+    expect(runtime.workspace).not.toHaveBeenCalled(); expect(transfer).not.toHaveBeenCalled();
+  });
+});
+
 describe("unified intelligence workflow", () => {
+  // Legacy regression scenarios explicitly request all five destinations;
+  // this is test setup, not a hidden selection in a newly opened task.
+  beforeEach(async () => { await selectGoals("procurement", "contracts", "staff", "counterparties", "proposals"); });
   it("never treats a generic or source-free model card as prepared after acknowledging its facts", async () => {
     await paste([{ destination: "procurement", title: "Модельная карточка", fields: { name: "Аудит приложения" } }]);
     await reviewVisibleFindings(); expect(button("Открыть черновик: Закупки").props.disabled).toBe(true);
@@ -145,9 +502,9 @@ describe("unified intelligence workflow", () => {
   it("automatically includes all nine certificates and eight application documents when accepting the actual model boundary response", async () => {
     const certificates = [["OSCP", 5], ["OSEP", 2], ["BSCP", 3], ["OSWE", 3], ["OSWP", 3], ["KLCP", 1], ["eJPT", 1], ["CompTIA Pentest+", 1], ["HTB CPTS", 3]].map(([label, minimum]) => `o\tСертификат ${label} — не менее ${minimum};`);
     const documents = Array.from({ length: 8 }, (_, index) => `${index + 1}. Копия документа заявки ${index + 1}, если применимо.`);
-    await configureModel(); await click("Закупка"); await addText("Извещение QA", ["Закупка QA", `Предмет закупки: ${procurementSubject}`, ...certificates, ...documents].join("\n"));
+    await configureModel(); await selectGoals("procurement"); await addText("Извещение QA", ["Закупка QA", `Предмет закупки: ${procurementSubject}`, ...certificates, ...documents].join("\n"));
     const raw = result([{ destination: "procurement", title: "Закупка QA", fields: { name: "Закупка QA", subject: procurementSubject, requirements: [] } }]);
-    runtime.analyze.mockResolvedValueOnce({ text: raw, model: "qa-model" }); await click("Отправить выбранные источники");
+    runtime.analyze.mockResolvedValueOnce({ text: raw, model: "qa-model" }); await prepare();
     expect(field("requirements").props.value).toBe([...certificates, ...documents].join("\n"));
     expect(text()).toContain("Из источников автоматически добавлено пунктов: 17"); expect(control("iw-response").props.value).toBe(raw);
     const receipt = nodes().find((node) => node.type === AutomaticConditionsSummary)!.props as unknown as Parameters<typeof AutomaticConditionsSummary>[0];
@@ -212,13 +569,13 @@ describe("unified intelligence workflow", () => {
     expect(nodes().filter((node) => /^Проверено замечание /.test(node.props["aria-label"] || "")).every((node) => !node.props.checked)).toBe(true);
     expect(() => applyStale(patch)).toThrow("Карточка изменилась");
     expect(runtime.invoke).not.toHaveBeenCalled(); expect(runtime.analyze).not.toHaveBeenCalled(); expect(transfer).not.toHaveBeenCalled();
-    await click("Новая задача"); await confirm(); await addText(); await paste();
+    await click("Новая задача"); await confirm(); await selectGoals("procurement"); await addText(); await paste();
     expect(desk().inventory).toBeUndefined(); // A new task remains lazy again.
   });
   it("passes source-bound date choices to the model without allowing a relative duration to become validity date", async () => {
-    await configureModel(); await click("КП"); await addText("КП", "Дата КП: 02.10.2026. Срок действия предложения: 14 дней.");
+    await configureModel(); await selectGoals("proposals"); await addText("КП", "Дата КП: 02.10.2026. Срок действия предложения: 14 дней.");
     runtime.analyze.mockResolvedValueOnce({ text: result([{ destination: "proposals", title: "КП", fields: { title: "Поставка" }, positions: [] }]), model: "qa-model" });
-    await click("Отправить выбранные источники");
+    await prepare();
     const schema = runtime.analyze.mock.calls[0][4] as { properties: { items: { items: { properties: { fields: { properties: Record<string, { enum?: unknown[] }> } } } } } };
     const fields = schema.properties.items.items.properties.fields.properties;
     expect(fields.documentDate.enum).toEqual(["2026-10-02", null]); expect(fields.validUntil.enum).toEqual([null]);
@@ -230,7 +587,7 @@ describe("unified intelligence workflow", () => {
   });
   it("copies the same bounded facts and source-bound schema for a manually connected model", async () => {
     const writeText = vi.fn().mockResolvedValue(undefined); vi.stubGlobal("navigator", { clipboard: { writeText } });
-    await click("КП"); await addText("КП", "Дата КП: 02.10.2026. Срок действия предложения: 14 дней.");
+    await selectGoals("proposals"); await addText("КП", "Дата КП: 02.10.2026. Срок действия предложения: 14 дней.");
     await click("Скопировать запрос для другой модели");
     const prompt = writeText.mock.calls[0][0] as string;
     const schema = JSON.parse(prompt.split("JSON-схема с ограничениями по выбранным источникам: ")[1]);
@@ -243,10 +600,10 @@ describe("unified intelligence workflow", () => {
     expect(runtime.analyze).not.toHaveBeenCalled(); expect(runtime.invoke).not.toHaveBeenCalled();
   });
   it("keeps a rejected unknown-source reply separate from prior cards and opens its exact raw bytes", async () => {
-    await configureModel(); await click("Закупка"); await addText(); await paste(); await reviewVisibleFindings();
+    await configureModel(); await selectGoals("procurement"); await addText(); await paste(); await reviewVisibleFindings();
     const checksBefore = nodes().filter((node) => /^Проверено замечание /.test(node.props["aria-label"] || "")).map((node) => node.props.checked);
     const raw = result([{ ...procurement, fields: { name: "PRIVATE-MODEL-FIELD" }, sourceIds: ["unknown-source-qa"] }]);
-    runtime.analyze.mockResolvedValueOnce({ text: raw, model: "qa-model" }); await click("Отправить выбранные источники"); await confirm();
+    runtime.analyze.mockResolvedValueOnce({ text: raw, model: "qa-model" }); await prepare(); await confirm();
     expect(control("iw-response").props.value).toBe(raw); expect(control("iw-failed-response").props.value).toBe(raw); expect(control("iw-failed-response").props.readOnly).toBe(true);
     expect(nodes().find((node) => node.props.className === "iw-raw-response")?.props.open).toBe(true);
     const alert = nodes().find((node) => node.props.className === "notice error")!;
@@ -267,12 +624,12 @@ describe("unified intelligence workflow", () => {
     expect(runtime.analyze).not.toHaveBeenCalled(); expect(runtime.workspace).not.toHaveBeenCalled();
   });
   it("preserves the first failed reply through later failures, successful replies, manual text edits and navigation", async () => {
-    await configureModel(); await click("Закупка"); await addText();
+    await configureModel(); await selectGoals("procurement"); await addText();
     const first = result([{ ...procurement, sourceIds: ["first-unknown"] }]), second = result([{ ...procurement, sourceIds: ["second-unknown"] }]);
-    runtime.analyze.mockResolvedValueOnce({ text: first, model: "qa-model" }); await click("Отправить выбранные источники");
-    runtime.analyze.mockResolvedValueOnce({ text: second, model: "qa-model" }); await click("Отправить выбранные источники");
+    runtime.analyze.mockResolvedValueOnce({ text: first, model: "qa-model" }); await prepare();
+    runtime.analyze.mockResolvedValueOnce({ text: second, model: "qa-model" }); await prepare();
     expect(control("iw-response").props.value).toBe(second); expect(control("iw-failed-response").props.value).toBe(first);
-    runtime.analyze.mockResolvedValueOnce({ text: result([procurement]), model: "qa-model" }); await click("Отправить выбранные источники");
+    runtime.analyze.mockResolvedValueOnce({ text: result([procurement]), model: "qa-model" }); await prepare();
     expect(field("name").props.value).toBe("Тестовая закупка"); expect(control("iw-failed-response").props.value).toBe(first);
     await edit("iw-response", "edited response"); render({ ...props, active: false }); await flush(); render({ ...props, active: true }); await flush();
     expect(control("iw-failed-response").props.value).toBe(first); expect(control("iw-response").props.value).toBe("edited response");
@@ -294,7 +651,7 @@ describe("unified intelligence workflow", () => {
     await configureModel(); await edit("iw-output-mode", "json"); const modeRef = control("iw-output-mode").props.ref!;
     const focus = vi.fn(); modeRef.current = { focus }; await click("Свернуть подключение"); await addText();
     runtime.analyze.mockResolvedValueOnce({ text: result([{ ...procurement, sourceIds: ["unknown-json-source"] }]), model: "qa-model" });
-    await click("Отправить выбранные источники"); expect(text()).toContain("Формат этой попытки: обычный JSON");
+    await prepare(); expect(text()).toContain("Формат этой попытки: обычный JSON");
     await click("Настроить ответ по схеме");
     expect(control("iw-output-mode").props.value).toBe("json"); expect(focus).toHaveBeenCalledTimes(1);
     expect(runtime.analyze).toHaveBeenCalledTimes(1); expect(runtime.testConnection).not.toHaveBeenCalled(); expect(runtime.invoke).not.toHaveBeenCalled(); expect(runtime.workspace).not.toHaveBeenCalled(); expect(localValues.size).toBe(0);
@@ -319,18 +676,18 @@ describe("unified intelligence workflow", () => {
     expect(runtime.analyze).not.toHaveBeenCalled(); expect(transfer).not.toHaveBeenCalled();
   });
   it("retains an unparseable direction response even after a later batch clears its diagnostic parts", async () => {
-    await configureModel(); await click("Закупка"); await addText(); await paste(); await edit("iw-analysis-mode", "by-destination");
+    await configureModel(); await selectGoals("procurement"); await addText(); await paste(); await edit("iw-analysis-mode", "by-destination");
     const bad = result([{ ...procurement, sourceIds: ["unknown-stage-source"] }]);
-    runtime.analyze.mockResolvedValueOnce({ text: bad, model: "qa-model" }); await click("Отправить выбранные источники"); await confirm();
+    runtime.analyze.mockResolvedValueOnce({ text: bad, model: "qa-model" }); await prepare(); await confirm();
     expect(control("iw-failed-response").props.value).toBe(bad); expect(text()).toContain("этап «Закупки»"); expect(field("name").props.value).toBe("Тестовая закупка");
     expect(text()).toContain("предыдущий разобранный результат");
-    runtime.analyze.mockResolvedValueOnce({ text: result([procurement]), model: "qa-model" }); await click("Отправить выбранные источники"); await confirm();
+    runtime.analyze.mockResolvedValueOnce({ text: result([procurement]), model: "qa-model" }); await prepare(); await confirm();
     expect(control("iw-failed-response").props.value).toBe(bad); expect(control("iw-response").props.value).not.toBe(bad);
     expect(runtime.analyze).toHaveBeenCalledTimes(2); expect(transfer).not.toHaveBeenCalled();
   });
   it("does not retain a late failed reply after cancellation or resurrect copy feedback after a new task", async () => {
     await configureModel(); await addText(); const pending = deferred<{ text: string; model: string }>(); runtime.analyze.mockReturnValueOnce(pending.promise);
-    await click("Отправить выбранные источники"); await click("Остановить запрос"); pending.resolve({ text: result([{ ...procurement, sourceIds: ["late-unknown"] }]), model: "qa-model" }); await flush();
+    await prepare(); await click("Остановить запрос"); pending.resolve({ text: result([{ ...procurement, sourceIds: ["late-unknown"] }]), model: "qa-model" }); await flush();
     expect(nodes().some((node) => node.props.id === "iw-failed-response")).toBe(false);
     const copy = deferred<void>(), writeText = vi.fn().mockReturnValue(copy.promise); vi.stubGlobal("navigator", { clipboard: { writeText } });
     await edit("iw-response", result([{ ...procurement, sourceIds: ["unknown-copy"] }])); await click("Разобрать ответ"); await click("Скопировать исходный ответ");
@@ -373,16 +730,16 @@ describe("unified intelligence workflow", () => {
   });
   it("sends only selected sources on explicit request and exposes the destination before sending", async () => {
     await configureModel(); await addText(); await addText("Не отправлять", "CONFIDENTIAL-UNSELECTED"); await toggle("Отправить источник Не отправлять", false);
-    expect(text()).toContain("http://127.0.0.1:11434"); expect(runtime.analyze).not.toHaveBeenCalled(); await click("Отправить выбранные источники");
+    expect(text()).toContain("http://127.0.0.1:11434"); expect(runtime.analyze).not.toHaveBeenCalled(); await prepare();
     expect(runtime.analyze).toHaveBeenCalledTimes(1); expect(runtime.analyze.mock.calls[0][1]).toContain("Открытый текст закупки"); expect(runtime.analyze.mock.calls[0][1]).not.toContain("CONFIDENTIAL-UNSELECTED");
     expect(text()).toContain("Получено черновиков: 1"); expect(transfer).not.toHaveBeenCalled();
   });
   it("runs optional narrow directions sequentially and accepts only the completed combined result", async () => {
-    await configureModel(); await addText(); await click("Договоры"); await toggle("Подготовить Закупки", true); await edit("iw-analysis-mode", "by-destination");
+    await configureModel(); await addText(); await selectGoals("contracts"); await selectGoals(...goalPicker().selected, "procurement"); await edit("iw-analysis-mode", "by-destination");
     expect(text()).toContain("Будет 2 последовательных запросов");
     const first = deferred<{ text: string; model: string }>(), second = deferred<{ text: string; model: string }>();
     runtime.analyze.mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
-    await click("Отправить выбранные источники"); expect(runtime.analyze).toHaveBeenCalledTimes(1); expect(text()).toContain("Этап 1 из 2");
+    await prepare(); expect(runtime.analyze).toHaveBeenCalledTimes(1); expect(text()).toContain("Этап 1 из 2");
     first.resolve({ text: result([{ destination: "contracts", title: "Договор QA", fields: { number: "QA-7" } }]), model: "qa-model" }); await flush();
     expect(runtime.analyze).toHaveBeenCalledTimes(2); expect(text()).toContain("Этап 2 из 2"); expect(nodes().filter((node) => node.props.className === "iw-card")).toHaveLength(0);
     expect(JSON.stringify(runtime.analyze.mock.calls[0][4])).not.toContain('"procurement"');
@@ -397,7 +754,7 @@ describe("unified intelligence workflow", () => {
     const reviewsBefore = nodes().filter((node) => /^Проверено замечание /.test(node.props["aria-label"] || "")).map((node) => node.props.checked);
     await edit("iw-analysis-mode", "by-destination");
     runtime.analyze.mockResolvedValueOnce({ text: "not JSON", model: "qa-model" });
-    await click("Отправить выбранные источники"); await confirm();
+    await prepare(); await confirm();
     expect(runtime.analyze).toHaveBeenCalledTimes(1); expect(text()).toContain("Разбор по направлениям остановлен");
     expect(field("name").props.value).toBe("Тестовая закупка");
     expect(nodes().filter((node) => /^Проверено замечание /.test(node.props["aria-label"] || "")).map((node) => node.props.checked)).toEqual(reviewsBefore);
@@ -405,24 +762,24 @@ describe("unified intelligence workflow", () => {
   it("cancels the current narrow request and never starts the remaining directions after a late answer", async () => {
     await configureModel(); await addText(); await edit("iw-analysis-mode", "by-destination");
     const first = deferred<{ text: string; model: string }>(); runtime.analyze.mockReturnValueOnce(first.promise);
-    await click("Отправить выбранные источники"); const requestId = runtime.analyze.mock.calls[0][3]; await click("Остановить запрос");
+    await prepare(); const requestId = runtime.analyze.mock.calls[0][3]; await click("Остановить запрос");
     expect(runtime.cancel).toHaveBeenCalledWith(requestId);
     first.resolve({ text: result([procurement]), model: "qa-model" }); await flush();
     expect(runtime.analyze).toHaveBeenCalledTimes(1); expect(control("iw-response").props.value).toBe(""); expect(text()).not.toContain("Получено черновиков:");
   });
   it("keeps old results after all-empty narrow replies and accepts an empty part followed by valid cards", async () => {
-    await configureModel(); await addText(); await paste(); await click("Договоры"); await toggle("Подготовить Закупки", true); await edit("iw-analysis-mode", "by-destination");
+    await configureModel(); await addText(); await paste(); await selectGoals("contracts"); await selectGoals(...goalPicker().selected, "procurement"); await edit("iw-analysis-mode", "by-destination");
     runtime.analyze.mockResolvedValue({ text: result([]), model: "qa-model" });
-    await click("Отправить выбранные источники"); await confirm();
+    await prepare(); await confirm();
     expect(runtime.analyze).toHaveBeenCalledTimes(2); expect(field("name").props.value).toBe("Тестовая закупка"); expect(text()).toContain("Модель не подготовила ни одной карточки");
     runtime.analyze.mockResolvedValueOnce({ text: result([]), model: "qa-model" }).mockResolvedValueOnce({ text: result([procurement]), model: "qa-model" });
-    await click("Отправить выбранные источники"); await confirm(); expect(text()).toContain("Получено черновиков: 1");
+    await prepare(); await confirm(); expect(text()).toContain("Получено черновиков: 1");
   });
   it("stops further narrow calls after source, profile, scope or workspace changes", async () => {
     await configureModel(); await addText(); await edit("iw-analysis-mode", "by-destination");
     for (const change of [() => edit("iw-instruction", "Уточнённая задача"), () => edit("iw-model", "different-model"), () => toggle("Отправить источник ТЗ", false), async () => { render({ ...props, workspaceRoot: "/another-root" }); await flush(); }]) {
       const first = deferred<{ text: string; model: string }>(); runtime.analyze.mockReturnValueOnce(first.promise);
-      await click("Отправить выбранные источники"); const calls = runtime.analyze.mock.calls.length; await change();
+      await prepare(); const calls = runtime.analyze.mock.calls.length; await change();
       first.resolve({ text: result([procurement]), model: "qa-model" }); await flush(); expect(runtime.analyze).toHaveBeenCalledTimes(calls);
       expect(text()).not.toContain("Получено черновиков:");
       await toggle("Отправить источник ТЗ", true);
@@ -443,6 +800,8 @@ describe("unified intelligence workflow", () => {
       render({ ...props, active: false }); render({ ...props, active: true }); await flush();
     }
     expect(transfer.mock.calls.map(([handoff]) => handoff.destination)).toEqual(["procurement", "contracts", "staff", "counterparties", "proposals"]);
+    expect(runtime.sourceKey).toHaveBeenCalledOnce();
+    for (const [handoff] of transfer.mock.calls) if (handoff.destination !== "proposals") expect(handoff).not.toHaveProperty("taskOrigin");
     const first = transfer.mock.calls[0][0]; expect(first.workspaceRoot).toBe("/qa-workspace"); expect(first.destination === "procurement" && first.data.customer).toBe("");
     expect(text()).toContain("черновик открыт"); expect(text()).toContain("Остальные результаты остаются"); expect(text()).not.toContain("успешно сохранена");
   });
@@ -454,7 +813,7 @@ describe("unified intelligence workflow", () => {
   it("keeps inference usable with RAM texts while paused, but blocks file IO and transfer", async () => {
     await configureModel(); await addText(); runtime.phase = "disconnected"; render(); await flush();
     expect(button("Добавить PDF, DOCX или XLSX").props.disabled).toBe(true); expect(button("Проверить подключение").props.disabled).toBe(false);
-    await click("Отправить выбранные источники"); await reviewVisibleFindings(); expect(runtime.analyze).toHaveBeenCalledTimes(1); expect(button("Открыть черновик: Закупки").props.disabled).toBe(true);
+    await prepare(); await reviewVisibleFindings(); expect(runtime.analyze).toHaveBeenCalledTimes(1); expect(button("Открыть черновик: Закупки").props.disabled).toBe(true);
     button("Добавить PDF, DOCX или XLSX").props.onClick!(); await flush(); expect(runtime.chooseOpen).not.toHaveBeenCalled();
   });
   it("rechecks real access and workspace root before transfer and serializes a double click", async () => {
@@ -465,7 +824,7 @@ describe("unified intelligence workflow", () => {
   it("does not open a superseded card when a new analysis completes during its access check", async () => {
     await configureModel(); await addText(); await paste(); await reviewVisibleFindings();
     const answer = deferred<{ text: string; model: string }>(); runtime.analyze.mockReturnValueOnce(answer.promise);
-    await click("Отправить выбранные источники"); await confirm();
+    await prepare(); await confirm();
     const accessCheck = deferred<{ root: string; editor: boolean }>(); runtime.workspace.mockReturnValueOnce(accessCheck.promise);
     await click("Открыть черновик: Закупки");
     answer.resolve({ text: result([{ ...procurement, title: "Новый результат" }]), model: "qa-model" }); await flush();
@@ -474,19 +833,19 @@ describe("unified intelligence workflow", () => {
   });
   it("rejects a retained analysis confirmation after its source or connection snapshot changes", async () => {
     await configureModel(); await addText(); await paste(); await edit("iw-analysis-mode", "by-destination");
-    await click("Отправить выбранные источники"); const previousConfirm = nodes().find((node) => node.type === ConfirmDialog)!.props.onConfirm!;
+    await prepare(); const previousConfirm = nodes().find((node) => node.type === ConfirmDialog)!.props.onConfirm!;
     await edit("iw-model", "replacement-model"); previousConfirm(); await flush();
     expect(runtime.analyze).not.toHaveBeenCalled(); expect(text()).toContain("Задача изменилась после открытия подтверждения");
   });
   it("invalidates an inference reply after source/task edits and sends a real cancellation", async () => {
     await configureModel(); await addText(); const answer = deferred<{ text: string; model: string }>(); runtime.analyze.mockReturnValueOnce(answer.promise);
-    await click("Отправить выбранные источники"); expect(button("Модель готовит ответ…").props.disabled).toBe(true);
+    await prepare(); expect(button("Модель готовит ответ…").props.disabled).toBe(true);
     await edit("iw-instruction", "Новая задача"); expect(runtime.cancel).toHaveBeenCalledWith(runtime.analyze.mock.calls[0][3]);
     answer.resolve({ text: result([procurement]), model: "qa-model" }); await flush(); expect(text()).not.toContain("Получено черновиков: 1"); expect(control("iw-response").props.value).toBe("");
   });
   it("protects corrected cards from a late replacement response", async () => {
     await configureModel(); await addText(); await paste(); const answer = deferred<{ text: string; model: string }>(); runtime.analyze.mockReturnValueOnce(answer.promise);
-    await click("Отправить выбранные источники"); expect(runtime.analyze).not.toHaveBeenCalled(); await confirm();
+    await prepare(); expect(runtime.analyze).not.toHaveBeenCalled(); await confirm();
     field("customer").props.onChange!({ target: { value: "Исправленный заказчик", checked: false } }); await flush();
     answer.resolve({ text: result([{ ...procurement, fields: { name: "Поздний результат" } }]), model: "qa-model" }); await flush();
     expect(field("customer").props.value).toBe("Исправленный заказчик"); expect(text()).not.toContain("Поздний результат");
@@ -526,7 +885,7 @@ describe("unified intelligence workflow", () => {
   });
   it("marks retained cards as a previous snapshot after a malformed inference reply", async () => {
     await configureModel(); await addText(); await paste(); runtime.analyze.mockResolvedValueOnce({ text: "not JSON", model: "qa-model" });
-    await click("Отправить выбранные источники"); await confirm(); expect(field("name").props.value).toBe("Тестовая закупка");
+    await prepare(); await confirm(); expect(field("name").props.value).toBe("Тестовая закупка");
     expect(text()).toContain("предыдущий разобранный результат"); expect(text()).toContain("карточки не разобраны");
   });
   it("never resurrects a removed or unselected source when another source is added", async () => {
@@ -568,33 +927,33 @@ describe("unified intelligence workflow", () => {
   });
   it("treats empty answers as warnings and preserves existing corrected cards and raw answer", async () => {
     await configureModel(); await addText(); await paste(); field("customer").props.onChange!({ target: { value: "Проверенный заказчик", checked: false } }); await flush();
-    runtime.analyze.mockResolvedValueOnce({ text: '{"items":[]}', model: "qa-model" }); await click("Отправить выбранные источники"); await confirm();
+    runtime.analyze.mockResolvedValueOnce({ text: '{"items":[]}', model: "qa-model" }); await prepare(); await confirm();
     expect(text()).toContain("Модель не подготовила ни одной карточки"); expect(text()).not.toContain("Получено черновиков: 0");
     expect(field("customer").props.value).toBe("Проверенный заказчик"); expect(control("iw-response").props.value).toBe('{"items":[]}');
     expect(nodes().find((node) => node.props.className === "iw-raw-response")?.props.open).toBe(true); expect(text()).toContain("предыдущий разобранный результат");
   });
-  it("keeps preset scope after instruction edits and sends a matching schema, independent of words in the instruction", async () => {
-    await configureModel(); await addText(); await click("Закупка"); await edit("iw-instruction", "Дополнительно проверь имена сотрудников и компании, но подготовь результат текущего сценария.");
-    expect(button("Закупка").props.className).toContain("iw-preset-active");
-    expect(nodes().find((node) => node.props["aria-label"] === "Подготовить Закупки")?.props.checked).toBe(true);
-    expect(nodes().find((node) => node.props["aria-label"] === "Подготовить Кадры")?.props.checked).toBe(false);
-    await click("Отправить выбранные источники"); const schema = runtime.analyze.mock.calls[0][4] as Record<string, unknown>;
+  it("keeps the selected goals after instruction edits and sends a matching schema, independent of words in the instruction", async () => {
+    await configureModel(); await addText(); await selectGoals("procurement"); await edit("iw-instruction", "Дополнительно проверь имена сотрудников и компании, но подготовь результат текущего сценария.");
+    expect(goalPicker().selected).toEqual(["procurement"]);
+    expect(goalPicker().selected.includes("procurement")).toBe(true);
+    expect(goalPicker().selected.includes("staff")).toBe(false);
+    await prepare(); const schema = runtime.analyze.mock.calls[0][4] as Record<string, unknown>;
     expect(schema).toBeTruthy(); const encoded = JSON.stringify(schema); expect(encoded).toContain("procurement"); expect(encoded).not.toContain('"staff"');
     const prompt = runtime.analyze.mock.calls[0][1] as string; expect(prompt).toContain("Дополнительно проверь");
   });
   it("rejects cards outside the requested scope without overwriting old cards, and ignores late replies after changing scope", async () => {
-    await configureModel(); await addText(); await click("Закупка"); await paste();
+    await configureModel(); await addText(); await selectGoals("procurement"); await paste();
     runtime.analyze.mockResolvedValueOnce({ text: result([{ destination: "staff", title: "Не запрашивали", fields: { fullName: "Иванов" } }]), model: "qa-model" });
-    await click("Отправить выбранные источники"); await confirm(); expect(field("name").props.value).toBe("Тестовая закупка"); expect(text()).toContain("карточки не разобраны");
+    await prepare(); await confirm(); expect(field("name").props.value).toBe("Тестовая закупка"); expect(text()).toContain("карточки не разобраны");
     const late = deferred<{ text: string; model: string }>(); runtime.analyze.mockReturnValueOnce(late.promise);
-    await click("Отправить выбранные источники"); await confirm(); await click("Кадры");
+    await prepare(); await confirm(); await selectGoals("staff");
     late.resolve({ text: result([procurement]), model: "late-model" }); await flush();
-    expect(nodes().find((node) => node.props["aria-label"] === "Подготовить Кадры")?.props.checked).toBe(true); expect(text()).not.toContain("late-model"); expect(field("name").props.value).toBe("Тестовая закупка");
+    expect(goalPicker().selected).toEqual(["staff"]); expect(text()).not.toContain("late-model"); expect(field("name").props.value).toBe("Тестовая закупка");
   });
   it("defaults new Ollama profiles to schemas, keeps legacy profiles in JSON, and shows only returned metrics", async () => {
     await configureModel(); expect(control("iw-output-mode").props.value).toBe("schema"); await addText();
     runtime.analyze.mockResolvedValueOnce({ text: result([procurement]), model: "qa-model", metrics: { elapsedMilliseconds: 1250, inputTokens: 300, outputTokens: 120, totalTokens: 420, loadMilliseconds: 250 } });
-    await click("Отправить выбранные источники"); expect(text()).toContain("Время: 1,25 с"); expect(text()).toContain("На входе: 300 токенов"); expect(text()).toContain("На выходе: 120 токенов");
+    await prepare(); expect(text()).toContain("Время: 1,25 с"); expect(text()).toContain("На входе: 300 токенов"); expect(text()).toContain("На выходе: 120 токенов");
     await edit("iw-response", result([procurement])); expect(text()).not.toContain("На входе: 300 токенов");
     const legacy = { id: "legacy", name: "Старое подключение", scope: "local", protocol: "openai-compatible", endpoint: "http://localhost:1234/v1", model: "old-model", timeoutSeconds: 120 };
     localValues.set("sbk-intelligence-connections-v1", JSON.stringify([legacy])); for (const slot of runtime.slots) slot.cleanup?.(); runtime.slots = []; runtime.effects = []; render(); await flush(); await click("Настроить подключение");
@@ -673,7 +1032,7 @@ describe("unified intelligence workflow", () => {
     await toggle("Отправить источник Независимая заметка", false);
     await editLabeled("Текст источника Независимая заметка", "Изменение независимой заметки");
     await edit("iw-instruction", "Другая задача для будущего анализа");
-    await click("Кадры");
+    await selectGoals("staff");
     expect(decisions().filter((node) => node.props.checked)).toHaveLength(count);
     expect(button("Открыть черновик: Закупки").props.disabled).toBe(false);
     await click("Открыть черновик: Закупки");
@@ -737,9 +1096,9 @@ describe("unified intelligence workflow", () => {
   });
   it("only explains procurement auto-completion in task directions where it applies", async () => {
     expect(text()).toContain("В карточках закупок сертификаты и документы");
-    await click("Кадры"); expect(text()).not.toContain("В карточках закупок сертификаты и документы");
-    await click("КП"); expect(text()).not.toContain("В карточках закупок сертификаты и документы");
-    await click("Закупка"); expect(text()).toContain("В карточках закупок сертификаты и документы");
+    await selectGoals("staff"); expect(text()).not.toContain("В карточках закупок сертификаты и документы");
+    await selectGoals("proposals"); expect(text()).not.toContain("В карточках закупок сертификаты и документы");
+    await selectGoals("procurement"); expect(text()).toContain("В карточках закупок сертификаты и документы");
   });
   it("ignores late OCR results after a new task and ignores foreign request ids", async () => {
     const recognize = vi.fn(); const consumed = vi.fn(); render({ ...props, onRecognizeFile: recognize, onOcrReturnConsumed: consumed }); await flush();
@@ -960,7 +1319,7 @@ describe("unified intelligence workflow", () => {
   it("keeps hidden worksheets excluded by default and transmits warnings with selected material", async () => {
     await configureModel(); runtime.invoke.mockResolvedValueOnce({ fileName: "Расчёт.xlsx", sha256: "a".repeat(64), extractedText: "Текущая закупка", fragments: [{ id: "visible", locator: "Текущий лист", sheetId: "v", sheetState: "visible", text: "Текущая закупка" }], sheets: [{ id: "v", name: "Текущий", state: "visible", included: true }, { id: "h", name: "История", state: "hidden", included: false }], warnings: ["Скрытый лист исключён по умолчанию"] });
     await click("Добавить PDF, DOCX или XLSX"); expect(labeled("Лист История источника Расчёт.xlsx").props.checked).toBe(false);
-    await click("Отправить выбранные источники"); const prompt = runtime.analyze.mock.calls[0][1] as string; expect(prompt).toContain("Скрытый лист исключён по умолчанию"); expect(prompt).toContain("Текущая закупка"); expect(prompt).not.toContain("Старый заказчик");
+    await prepare(); const prompt = runtime.analyze.mock.calls[0][1] as string; expect(prompt).toContain("Скрытый лист исключён по умолчанию"); expect(prompt).toContain("Текущая закупка"); expect(prompt).not.toContain("Старый заказчик");
   });
   it("includes hidden worksheets only after explicit selection and ignores a late reread after manual text edits", async () => {
     const initial = { fileName: "Расчёт.xlsx", sha256: "a".repeat(64), extractedText: "Текущая закупка", fragments: [{ id: "visible", locator: "Текущий лист", sheetId: "v", sheetState: "visible", text: "Текущая закупка" }], sheets: [{ id: "v", name: "Текущий", state: "visible", included: true }, { id: "h", name: "История", state: "hidden", included: false }], warnings: [] };

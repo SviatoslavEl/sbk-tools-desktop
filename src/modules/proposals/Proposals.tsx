@@ -15,6 +15,8 @@ import { formatMoneyMinor, priceProposal, taxLabel } from "./pricing";
 import { ProposalContactFields, ProposalLinesEditor, ProposalPartyFields } from "./ProposalFields";
 import { ProposalSourcePricingReview } from "./ProposalSourcePricingReview";
 import { hasPendingProposalDraftPersistence, queueProposalDraftMutation, settleProposalDraftPersistence } from "./proposalDraftPersistence";
+import { createTaskDocumentOrigin, projectTaskDocumentSession, sameTaskDocumentOrigin, taskDocumentDraftKey, type TaskDocumentOrigin } from "../intelligence/taskDocumentSession";
+import { ProposalTaskBridge, proposalTaskFingerprint, type ProposalTaskAttempt, type ProposalTaskEditorBinding, type ProposalTaskEntry, type ProposalTaskSessionChange } from "./proposalTaskBridge";
 import type { ProposalData, ProposalIssue, ProposalRenderFormat, ProposalRenderResult, ProposalStatus, ProposalTemplateData } from "./types";
 import "./proposals.css";
 type ProposalRecord = ProposalData | ProposalTemplateData;
@@ -27,6 +29,7 @@ interface Session {
     local: boolean;
     draftKey: string;
     persistedStatus: ProposalStatus;
+    taskOrigin?: TaskDocumentOrigin;
 }
 type Target = {
     kind: "new";
@@ -39,22 +42,30 @@ type Target = {
     kind: "seed";
     data: ProposalData;
     local?: boolean;
+    taskOrigin?: TaskDocumentOrigin;
+    taskAttempt?: ProposalTaskAttempt;
+    handoffId?: string;
 };
 const steps = ["Стороны", "Позиции и цена", "Условия и подпись", "Оформление", "Проверка и экспорт"];
 const statuses: Record<ProposalStatus, string> = { draft: "Черновик", ready: "Готово", sent: "Отправлено", accepted: "Принято", rejected: "Отклонено" };
 const message = (reason: unknown) => reason instanceof Error ? reason.message : String(reason);
-const snapshot = (data: ProposalData) => JSON.stringify(data);
-type ProposalDraft = ProposalData | { kind: "proposal-draft"; schemaVersion: 1; recordId: string; data: ProposalData };
-const checkedDraft = (stored: ProposalDraft | null) => {
+const snapshot = proposalTaskFingerprint;
+type ProposalDraft = ProposalData | { kind: "proposal-draft"; schemaVersion: 1; recordId: string; data: ProposalData; taskOrigin?: TaskDocumentOrigin; savedRecordId?: string };
+const checkedDraft = (stored: ProposalDraft | null, expectedOrigin?: TaskDocumentOrigin) => {
     const value = stored?.kind === "proposal-draft" ? stored.data : stored;
     if (!value) return null;
+    const draftOrigin = stored?.kind === "proposal-draft" ? stored.taskOrigin : undefined;
+    if (expectedOrigin ? !sameTaskDocumentOrigin(draftOrigin, expectedOrigin) : draftOrigin !== undefined) throw new Error("Черновик относится к другому результату задачи. Запись поверх него остановлена.");
     try { if (value.kind !== "proposal" || value.schemaVersion !== 1 || !value.familyId || !Array.isArray(value.attachments)) throw new Error(); validateProposal(value); }
     catch { throw new Error("Черновик повреждён или имеет неизвестный формат. Запись поверх него остановлена; сохранённые карточки не изменены."); }
     const legacyOwners = [...new Set([...value.attachments, ...(value.template.logo ? [value.template.logo] : [])].map((file) => file.relativePath.match(/^attachment-staging\/commercial-proposals\/([^/]+)\//u)?.[1]).filter((id): id is string => Boolean(id)))];
     if (legacyOwners.length > 1) throw new Error("Черновик содержит временные вложения нескольких карточек. Сохранение остановлено, чтобы не потерять файлы.");
     const recordId = stored?.kind === "proposal-draft" ? stored.recordId : legacyOwners[0] || crypto.randomUUID();
     if (!/^[A-Za-z0-9_-]{1,128}$/u.test(recordId)) throw new Error("Некорректный идентификатор черновика. Запись остановлена.");
-    return { data: value, recordId };
+    if (expectedOrigin && legacyOwners.some((owner) => owner !== recordId)) throw new Error("Временные вложения черновика задачи принадлежат другой карточке. Запись остановлена.");
+    const savedRecordId = stored?.kind === "proposal-draft" ? stored.savedRecordId : undefined;
+    if (savedRecordId !== undefined && (!expectedOrigin || savedRecordId !== recordId)) throw new Error("Сохранённая карточка черновика задачи не совпадает с его владельцем.");
+    return { data: value, recordId, savedRecordId };
 };
 async function restageAsset(asset: AttachmentInfo, recordId: string, expectedRoot?: string): Promise<AttachmentInfo> {
     if (!asset.relativePath.startsWith("attachment-staging/")) return asset;
@@ -75,14 +86,18 @@ function remapPromotedAssets(target: ProposalData, before: ProposalData, saved: 
 export interface ProposalHandoff {
     id: string;
     data: ProposalData;
+    taskOrigin?: TaskDocumentOrigin;
 }
 /** Workspace owns the component lifetime, keeping an open proposal while switching tools. */
-export function Proposals({ active = true, openRecordId, onRecordOpened, handoff, onHandoffConsumed }: {
+export function Proposals({ active = true, openRecordId, onRecordOpened, handoff, onHandoffConsumed, presentation = "registry", onReturnToTask, onTaskSessionChange }: {
     active?: boolean;
     openRecordId?: string;
     onRecordOpened?: () => void;
     handoff?: ProposalHandoff;
     onHandoffConsumed?: () => void;
+    presentation?: "registry" | "ai-task";
+    onReturnToTask?: () => void;
+    onTaskSessionChange?: (change: ProposalTaskSessionChange) => void;
 } = {}) {
     const access = useWorkspaceAccess();
     const store = useRecords<ProposalRecord>("commercial-proposals");
@@ -92,6 +107,8 @@ export function Proposals({ active = true, openRecordId, onRecordOpened, handoff
     const [companies, setCompanies] = useState<CompanyCard[]>([]);
     const [directoryError, setDirectoryError] = useState("");
     const [pendingTarget, setPendingTarget] = useState<Target | null>(null);
+    const pendingTargetRef = useRef<Target | null>(null);
+    pendingTargetRef.current = pendingTarget;
     const [failedHandoff, setFailedHandoff] = useState<string | null>(null);
     const [archiving, setArchiving] = useState<ArchivingProposal | null>(null);
     const [busy, setBusy] = useState("");
@@ -114,6 +131,7 @@ export function Proposals({ active = true, openRecordId, onRecordOpened, handoff
     const operation = useRef(false);
     const generation = useRef(0);
     const jobId = useRef<string | null>(null);
+    const renderTaskAttempt = useRef<ProposalTaskAttempt | null>(null);
     const mounted = useRef(true);
     const draftTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
     const draftQueue = useRef<Promise<unknown>>(Promise.resolve());
@@ -128,6 +146,39 @@ export function Proposals({ active = true, openRecordId, onRecordOpened, handoff
     latest.current = session;
     const accessRef = useRef(access.editor);
     accessRef.current = access.editor;
+    const taskBridge = useRef(new ProposalTaskBridge());
+    const taskCallbacks = useRef({ onTaskSessionChange, onReturnToTask });
+    taskCallbacks.current = { onTaskSessionChange, onReturnToTask };
+    const notifyTask = (entry?: ProposalTaskEntry) => { if (entry && mounted.current) taskCallbacks.current.onTaskSessionChange?.({ session: entry.session, data: structuredClone(entry.data), writeId: entry.writeId, ...(entry.recordId ? { recordId: entry.recordId } : {}) }); };
+    const taskBinding = (current: Session): ProposalTaskEditorBinding => ({ data: current.data, writeId: current.writeId, recordId: current.id, draftKey: current.draftKey, savedJson: current.savedJson, local: current.local, persistedStatus: current.persistedStatus });
+    const syncTask = (current: Session, root: string) => {
+        if (!current.taskOrigin) return undefined;
+        const previous = taskBridge.current.get(current.taskOrigin);
+        const entry = taskBridge.current.update(current.taskOrigin, taskBinding(current), root);
+        if (entry && entry.session !== previous?.session) notifyTask(entry);
+        return entry;
+    };
+    const freshTaskWorkspace = async (origin: TaskDocumentOrigin, requireEditor = false) => {
+        const fresh = await getWorkspaceInfo();
+        if (!mounted.current || fresh.root !== origin.workspaceRoot || requireEditor && (!accessRef.current || !fresh.editor)) throw new Error("Рабочая папка или доступ изменились. Операция документа задачи не подтверждена.");
+        return fresh.root;
+    };
+    const sameTaskEditor = (current: Session) => Boolean(latest.current && latest.current.writeId === current.writeId && latest.current.data === current.data && sameTaskDocumentOrigin(latest.current.taskOrigin, current.taskOrigin));
+    const replacePendingTarget = (next: Target | null, knownRoot?: string) => {
+        const previous = pendingTargetRef.current;
+        pendingTargetRef.current = next;
+        setPendingTarget(next);
+        const ticket = previous?.kind === "seed" ? previous.taskAttempt : undefined;
+        if (!ticket || next?.kind === "seed" && next.taskAttempt === ticket) return;
+        const cancel = (root: string) => {
+            if (mounted.current) notifyTask(taskBridge.current.finish(ticket, { type: "cancelled", reason: "Выбрано другое действие редактора до принятия этого документа." }, root));
+        };
+        // This is cancellation of one superseded ticket, not navigation or a
+        // receiver reset. A delayed callback cannot cancel a newer attempt:
+        // the bridge/reducer checks its exact origin, snapshot and attempt.
+        if (knownRoot !== undefined) cancel(knownRoot);
+        else void freshTaskWorkspace(ticket.origin).then(cancel).catch(() => undefined);
+    };
     const ownerRoot = (knownRoot?: string): Promise<string> => {
         if (knownRoot !== undefined && draftOwnerRoot.current === null) draftOwnerRoot.current = knownRoot;
         if (knownRoot !== undefined && draftOwnerRoot.current !== knownRoot) return Promise.reject(new Error("Рабочая папка изменилась. Повторите открытие КП."));
@@ -155,6 +206,8 @@ export function Proposals({ active = true, openRecordId, onRecordOpened, handoff
     useEffect(() => { if (!access.editor) setArchiving(null); }, [access.editor]);
     const data = session?.data;
     const dirty = Boolean(session && snapshot(session.data) !== session.savedJson);
+    const currentTaskEntry = session?.taskOrigin ? taskBridge.current.get(session.taskOrigin) : undefined;
+    const taskRequiresSave = Boolean(currentTaskEntry?.session.accepted && !projectTaskDocumentSession(currentTaskEntry.session).savedCurrent);
     const immutable = session?.persistedStatus !== "draft";
     const canEdit = Boolean(session && !immutable && (access.editor || session.local));
     const proposals = store.records.filter((entry): entry is StoredRecord<ProposalData> => entry.payload.kind === "proposal");
@@ -212,7 +265,7 @@ export function Proposals({ active = true, openRecordId, onRecordOpened, handoff
         return () => window.removeEventListener("beforeunload", unload);
     }, []);
     useEffect(() => {
-        if (!access.editor || openRecordId || handoff) return;
+        if (!access.editor || openRecordId || handoff || presentation === "ai-task") return;
         let alive = true;
         const initialGeneration = generation.current;
         void readProposalDraft("proposal:new").then((stored) => {
@@ -232,7 +285,11 @@ export function Proposals({ active = true, openRecordId, onRecordOpened, handoff
         const task = queueProposalDraftMutation(root, current.draftKey, "write", () => {
             if (!mounted.current || !accessRef.current || current.local)
                 throw new Error("Режим редактора недоступен; данные остаются в форме.");
-            return saveDraft("commercial-proposals", { kind: "proposal-draft", schemaVersion: 1, recordId: current.id || current.writeId, data: current.data }, current.draftKey);
+            return (async () => {
+                if (current.taskOrigin) await freshTaskWorkspace(current.taskOrigin, true);
+                return saveDraft("commercial-proposals", { kind: "proposal-draft", schemaVersion: 1, recordId: current.id || current.writeId, data: current.data,
+                    ...(current.taskOrigin ? { taskOrigin: current.taskOrigin, ...(current.id ? { savedRecordId: current.id } : {}) } : {}) }, current.draftKey);
+            })();
         });
         draftQueue.current = task;
         return task;
@@ -295,20 +352,82 @@ export function Proposals({ active = true, openRecordId, onRecordOpened, handoff
                 setBusy("");
         }
     };
-    const install = (next: Session | null) => { generation.current += 1; setSession(next); setStep(0); setPreview(null); setAllowZero(false); setDraftStatus(""); setSavedStatus(""); };
+    useEffect(() => {
+        const current = session;
+        if (!current?.taskOrigin) return;
+        const previous = taskBridge.current.get(current.taskOrigin);
+        // Capture receiver-owned memory immediately, even if metadata IO is
+        // slow. This grants no access and emits no receipt. Otherwise a quick
+        // edit/revert or switching results can erase an observed revision.
+        const captured = taskBridge.current.update(current.taskOrigin, taskBinding(current), current.taskOrigin.workspaceRoot);
+        if (!captured || captured.session === previous?.session) return;
+        let alive = true;
+        void freshTaskWorkspace(current.taskOrigin).then(() => {
+            if (alive && latest.current === current) notifyTask(captured);
+        }).catch(() => undefined);
+        return () => { alive = false; };
+    }, [session]);
+    const install = (next: Session | null) => {
+        const previous = latest.current;
+        if (previous?.taskOrigin && !sameTaskDocumentOrigin(previous.taskOrigin, next?.taskOrigin)) {
+            // Observe the workspace at callback time. A delayed detach must not
+            // detach the same result if it has already been focused again.
+            void getWorkspaceInfo().then((fresh) => {
+                if (!sameTaskDocumentOrigin(latest.current?.taskOrigin, previous.taskOrigin)) notifyTask(taskBridge.current.release(previous.taskOrigin!, fresh.root));
+            }).catch(() => undefined);
+        }
+        generation.current += 1; latest.current = next; setSession(next); setStep(0); setPreview(null); setAllowZero(false); setDraftStatus(""); setSavedStatus("");
+    };
     const performTarget = async (target: Target, guard?: { check: () => Promise<void>; root: string }) => {
         if (target.kind === "close") {
             install(null);
             return;
         }
         if (target.kind === "seed") {
+            if (target.taskOrigin) {
+                const origin = createTaskDocumentOrigin(target.taskOrigin);
+                const root = await freshTaskWorkspace(origin, target.local === false);
+                if (!target.local) await ownerRoot(root);
+                const entry = taskBridge.current.get(origin);
+                if (!entry) throw new Error("Результат задачи ещё не поставлен в очередь редактора.");
+                let next: Session;
+                if (entry.session.accepted) {
+                    next = { id: entry.recordId, writeId: entry.writeId, data: structuredClone(entry.data), savedJson: entry.savedJson, local: entry.local, draftKey: entry.draftKey, persistedStatus: entry.persistedStatus, taskOrigin: origin };
+                } else {
+                    const draftKey = entry.draftKey;
+                    const draft = !entry.local ? checkedDraft(await readProposalDraft(draftKey), origin) : null;
+                    const savedRecord = draft?.savedRecordId ? proposals.find((record) => record.id === draft.savedRecordId) : undefined;
+                    if (draft?.savedRecordId && (store.loading || store.error || !savedRecord || savedRecord.payload.familyId !== draft.data.familyId)) throw new Error("Не удалось проверить сохранённую карточку черновика задачи. Дождитесь загрузки списка КП; новая карточка вместо неё не создана.");
+                    const value = structuredClone(draft?.data || entry.data), writeId = draft?.recordId || entry.writeId;
+                    if (!entry.local && !draft) {
+                        value.attachments = await Promise.all(value.attachments.map((file) => restageAsset(file, writeId, root)));
+                        if (value.template.logo) value.template.logo = await restageAsset(value.template.logo, writeId, root);
+                    }
+                    next = { id: draft?.savedRecordId, data: value, writeId, savedJson: savedRecord ? snapshot(savedRecord.payload) : "", local: entry.local, draftKey, persistedStatus: savedRecord?.payload.status || "draft", taskOrigin: origin };
+                }
+                await freshTaskWorkspace(origin, !next.local);
+                // Admission must be the last awaited guard. A newer handoff
+                // may arrive while the final workspace read is in flight.
+                await guard?.check();
+                const synced = syncTask(next, root)!;
+                // Restaging/resuming may change the exact snapshot. Never
+                // acknowledge the earlier queued source bytes as the editor.
+                let ticket = target.taskAttempt;
+                if (!ticket || ticket.snapshot.fingerprint !== synced.session.current.fingerprint || ticket.snapshot.revision !== synced.session.current.revision || !synced.session.pending) {
+                    ticket = taskBridge.current.queue(origin, "open", root);
+                    notifyTask(taskBridge.current.get(origin));
+                }
+                install(next);
+                if (ticket) notifyTask(taskBridge.current.finish(ticket, { type: "accepted" }, root));
+                return;
+            }
             if (access.editor && !target.local) await ownerRoot(guard?.root);
             if (!latest.current && access.editor && !target.local) {
                 const existing = checkedDraft(await readProposalDraft("proposal:new"));
                 await guard?.check();
                 if (existing) {
                     install({ data: existing.data, writeId: existing.recordId, savedJson: "", local: false, draftKey: "proposal:new", persistedStatus: "draft" });
-                    setPendingTarget(target);
+                    replacePendingTarget(target);
                     return;
                 }
             }
@@ -344,9 +463,11 @@ export function Proposals({ active = true, openRecordId, onRecordOpened, handoff
     };
     const requestTarget = (target: Target) => { if (operation.current)
         return; if (dirty)
-        setPendingTarget(target);
-    else
-        void run("Открываем…", async () => { await settleCurrentDraft(); await performTarget(target); }); };
+        replacePendingTarget(target);
+    else {
+        replacePendingTarget(null);
+        void run("Открываем…", async () => { await settleCurrentDraft(); await performTarget(target); });
+    } };
     const requestArchive = (record: ArchivingProposal) => {
         if (operation.current || !accessRef.current || record.archived) return;
         const current = latest.current;
@@ -382,13 +503,13 @@ export function Proposals({ active = true, openRecordId, onRecordOpened, handoff
         // never a loop caused by the busy-state effect rerendering.
         seenHandoff.current = incoming.id;
         setFailedHandoff(null);
-        const target: Target = { kind: "seed", data: structuredClone(incoming.data) };
+        let target: Extract<Target, { kind: "seed" }> = { kind: "seed", data: structuredClone(incoming.data), handoffId: incoming.id, ...(incoming.taskOrigin ? { taskOrigin: incoming.taskOrigin } : {}) };
         const currentGeneration = generation.current;
         const current = () => mounted.current && handoffContext.current.active && handoffContext.current.handoff === incoming && generation.current === currentGeneration;
-        if (dirty) {
+        if (dirty && !target.taskOrigin) {
             // The seed is now held by the repeatable replacement dialog, not
             // lost with the sender's transient handoff prop.
-            setPendingTarget(target);
+            replacePendingTarget(target);
             onHandoffConsumed?.();
             return;
         }
@@ -397,6 +518,37 @@ export function Proposals({ active = true, openRecordId, onRecordOpened, handoff
         const done = await run("Получаем КП из источника…", async () => {
             const workspace = await getWorkspaceInfo();
             if (!current()) throw new Error("Переход или источник КП изменился. Повторите получение текущего предложения.");
+            if (target.taskOrigin) {
+                const origin = createTaskDocumentOrigin(target.taskOrigin);
+                target = { ...target, taskOrigin: origin, local: !startedAsEditor };
+                if (workspace.root !== origin.workspaceRoot || startedAsEditor && !workspace.editor) throw new Error("Результат задачи относится к другой рабочей папке или доступ редактора изменился. КП не принято.");
+                const draftKey = await taskDocumentDraftKey(origin);
+                if (!current()) throw new Error("Переход или источник КП изменился. Повторите получение текущего предложения.");
+                taskBridge.current.ensure(origin, { data: target.data, writeId: crypto.randomUUID(), draftKey, savedJson: "", local: !startedAsEditor, persistedStatus: "draft" });
+                if (sameTaskDocumentOrigin(latest.current?.taskOrigin, origin)) syncTask(latest.current!, workspace.root);
+                else if (taskBridge.current.get(origin)?.session.editorAttached) {
+                    // A previous detach may still be waiting on metadata. This
+                    // is NOT the document currently in our single editor, so
+                    // require a new open/accepted attempt after installation;
+                    // its historical acknowledgement cannot accept the queue.
+                    notifyTask(taskBridge.current.release(origin, workspace.root));
+                }
+                const taskAttempt = taskBridge.current.queue(origin, "open", workspace.root);
+                if (!taskAttempt) throw new Error("Не удалось поставить документ задачи в очередь редактора.");
+                target = { ...target, taskAttempt };
+                notifyTask(taskBridge.current.get(origin));
+                if (sameTaskDocumentOrigin(latest.current?.taskOrigin, origin)) {
+                    // Reopening the same task result focuses the one existing
+                    // editor, preserving its current edits and stable write ID.
+                    accepted = true;
+                    return;
+                }
+                if (dirty) {
+                    replacePendingTarget(target, workspace.root);
+                    accepted = true; // legacy consumed, NOT receiver accepted
+                    return;
+                }
+            }
             const check = async () => {
                 if (!current()) throw new Error("Переход или источник КП изменился. Повторите получение текущего предложения.");
                 const fresh = await getWorkspaceInfo();
@@ -405,9 +557,19 @@ export function Proposals({ active = true, openRecordId, onRecordOpened, handoff
             await performTarget(target, { root: workspace.root, check });
             accepted = true;
         });
-        if (!mounted.current || handoffContext.current.handoff !== incoming) return;
+        if (!mounted.current || handoffContext.current.handoff !== incoming) {
+            if (mounted.current && target.taskAttempt) {
+                try { const fresh = await getWorkspaceInfo(); notifyTask(taskBridge.current.finish(target.taskAttempt, { type: "cancelled", reason: "Передача заменена другим результатом до принятия редактором." }, fresh.root)); } catch { /* No fresh workspace: no receipt. */ }
+            }
+            return;
+        }
         if (done && accepted) onHandoffConsumed?.();
-        else setFailedHandoff(incoming.id);
+        else {
+            if (target.taskAttempt) {
+                try { const fresh = await getWorkspaceInfo(); notifyTask(taskBridge.current.finish(target.taskAttempt, { type: "failed", message: "Получение КП редактором не завершено. Повторите открытие текущего результата." }, fresh.root)); } catch { /* No fresh workspace: no receipt. */ }
+            }
+            setFailedHandoff(incoming.id);
+        }
     };
     useEffect(() => {
         if (!active || !handoff || seenHandoff.current === handoff.id || operation.current) return;
@@ -442,12 +604,36 @@ export function Proposals({ active = true, openRecordId, onRecordOpened, handoff
         await draftQueue.current.catch(() => undefined);
         if (!current.id && (store.loading || store.error)) throw new Error("Дождитесь успешного чтения списка КП перед первым сохранением — нужно проверить, что ID карточки свободен.");
         if (!current.id && store.records.some((entry) => entry.id === current.writeId)) throw new Error("ID нового КП уже занят сохранённой карточкой. Запись остановлена, чтобы не перезаписать другую редакцию.");
+        let taskAttempt: ProposalTaskAttempt | undefined;
+        const currentGeneration = generation.current;
+        if (current.taskOrigin) {
+            const root = await freshTaskWorkspace(current.taskOrigin, true);
+            if (!sameTaskEditor(current)) throw new Error("Открытый документ задачи изменился. Повторите сохранение текущего документа.");
+            syncTask(current, root);
+            taskAttempt = taskBridge.current.queue(current.taskOrigin, "save", root);
+            if (!taskAttempt) throw new Error("Редактор ещё не принял документ задачи; сохранение не подтверждено.");
+            notifyTask(taskBridge.current.get(current.taskOrigin));
+        }
+        try {
         const saved = await store.save(`${current.data.number} · ${current.data.title || "Черновик КП"}`, current.data, current.id || current.writeId);
         // A failed draft cleanup must not report the successful record write as lost.
         // Saving promotes attachment-staging paths to permanent attachments.
         // Continue with the returned snapshot; the old form paths no longer exist.
         const savedData = saved.payload as ProposalData;
-        setSession({ ...current, id: saved.id, data: savedData, savedJson: snapshot(savedData), draftKey: `proposal:${saved.id}`, persistedStatus: savedData.status });
+        const next = { ...current, id: saved.id, data: savedData, savedJson: snapshot(savedData), draftKey: current.taskOrigin ? current.draftKey : `proposal:${saved.id}`, persistedStatus: savedData.status };
+        if (current.taskOrigin && taskAttempt) {
+            const root = await freshTaskWorkspace(current.taskOrigin, true);
+            if (generation.current !== currentGeneration || !sameTaskEditor(current) || saved.id !== (current.id || current.writeId)) throw new Error("Сохранение завершилось после смены документа или вернуло другой ID. Текущая форма и статус задачи не заменены; проверьте реестр КП.");
+            const entry = syncTask(next, root)!;
+            // The backend may promote attachment paths. A receipt belongs to
+            // the exact returned persisted snapshot, never the staging paths.
+            if (entry.session.current.fingerprint !== taskAttempt.snapshot.fingerprint) {
+                taskAttempt = taskBridge.current.queue(current.taskOrigin, "save", root);
+                notifyTask(taskBridge.current.get(current.taskOrigin));
+            }
+            if (taskAttempt) notifyTask(taskBridge.current.finish(taskAttempt, { type: "saved", recordId: saved.id }, root));
+        }
+        latest.current = next; setSession(next);
         try {
             await queueDraftCleanup(current);
             setSavedStatus("Все изменения сохранены в общей базе");
@@ -456,24 +642,62 @@ export function Proposals({ active = true, openRecordId, onRecordOpened, handoff
             setSavedStatus(`Карточка сохранена, но старый черновик не очищен: ${message(reason)}`);
         }
         return savedData;
+        } catch (reason) {
+            if (taskAttempt) {
+                try { const fresh = await getWorkspaceInfo(); notifyTask(taskBridge.current.finish(taskAttempt, { type: "failed", message: "Сохранение текущего документа задачи не подтверждено." }, fresh.root)); } catch { /* No fresh workspace: no receipt. */ }
+            }
+            throw reason;
+        }
     };
     const resolveTarget = async (save: boolean) => {
         if (!pendingTarget)
             return;
         let target = pendingTarget;
-        await run(save ? "Сохраняем…" : "Открываем…", async () => {
+        const requestedTarget = pendingTarget, currentGeneration = generation.current;
+        const done = await run(save ? "Сохраняем…" : "Открываем…", async () => {
+            const check = async () => {
+                if (target.kind !== "seed" || !target.taskOrigin) return;
+                const incoming = handoffContext.current.handoff;
+                if (!mounted.current || !handoffContext.current.active || pendingTargetRef.current !== requestedTarget || generation.current !== currentGeneration || incoming && incoming.id !== target.handoffId) throw new Error("Выбран другой результат задачи. Прежняя передача не принята; текущая форма сохранена.");
+                await freshTaskWorkspace(target.taskOrigin, target.local === false);
+                if (!mounted.current || !handoffContext.current.active || pendingTargetRef.current !== requestedTarget || generation.current !== currentGeneration || handoffContext.current.handoff && handoffContext.current.handoff.id !== target.handoffId) throw new Error("Выбран другой результат задачи. Прежняя передача не принята; текущая форма сохранена.");
+            };
+            await check();
             if (save) {
                 const before = latest.current!.data;
                 const saved = await saveCurrent();
-                if (target.kind === "seed") target = { ...target, data: remapPromotedAssets(target.data, before, saved) };
+                if (target.kind === "seed") {
+                    target = { ...target, data: remapPromotedAssets(target.data, before, saved) };
+                    if (target.taskOrigin) {
+                        await check();
+                        const entry = taskBridge.current.get(target.taskOrigin);
+                        if (entry && !entry.session.accepted) notifyTask(taskBridge.current.update(target.taskOrigin, { ...entry, data: target.data }, target.taskOrigin.workspaceRoot));
+                    }
+                }
             }
             else if (session && !session.local && access.editor && session.persistedStatus === "draft") {
                 await draftQueue.current.catch(() => undefined);
-                await queueDraftCleanup(session);
+                // A task result owns its namespace. Switching to another result
+                // must not erase its resumable state or cross into proposal:new.
+                if (session.taskOrigin) await queueDraft(session);
+                else await queueDraftCleanup(session);
             }
-            await performTarget(target);
+            await check();
+            await performTarget(target, target.kind === "seed" && target.taskOrigin ? { root: target.taskOrigin.workspaceRoot, check } : undefined);
             setPendingTarget(null);
         });
+        if (!done && target.kind === "seed" && target.taskAttempt) {
+            try { const fresh = await getWorkspaceInfo(); notifyTask(taskBridge.current.finish(target.taskAttempt, { type: "failed", message: "Замена документа не завершена; прежняя форма сохранена." }, fresh.root)); } catch { /* No fresh workspace: no receipt. */ }
+        }
+    };
+    const cancelPendingTarget = () => {
+        if (operation.current) return;
+        const target = pendingTarget;
+        setPendingTarget(null);
+        if (target?.kind === "seed" && target.taskAttempt) {
+            void getWorkspaceInfo().then((fresh) => notifyTask(taskBridge.current.finish(target.taskAttempt!, { type: "cancelled", reason: "Пользователь сохранил прежний открытый документ." }, fresh.root))).catch(() => undefined);
+            taskCallbacks.current.onReturnToTask?.();
+        }
     };
     const renderDocument = (format: ProposalRenderFormat) => void run(format === "preview" ? "Готовим PDF-предпросмотр…" : "Создаём документ…", async () => {
         const current = latest.current;
@@ -483,18 +707,46 @@ export function Proposals({ active = true, openRecordId, onRecordOpened, handoff
             throw new Error("DOCX и PDF создаются в установленном приложении. Веб-проверка не подменяет их HTML-файлами.");
         const document = buildProposalPublic(current.data, { allowZero });
         const assets = proposalExportAssets(current.data);
-        const outputPath = format === "preview" ? undefined : await chooseSavePath("Сохранить коммерческое предложение", safeProposalFileName(current.data, format), [format]);
-        if (format !== "preview" && !outputPath)
-            return;
         const currentGeneration = generation.current;
         const id = crypto.randomUUID();
-        jobId.current = id;
+        const taskNeedsEditor = !current.local && accessRef.current;
+        let taskAttempt: ProposalTaskAttempt | undefined;
         try {
+            if (current.taskOrigin) {
+                const root = await freshTaskWorkspace(current.taskOrigin, taskNeedsEditor);
+                if (!sameTaskEditor(current)) throw new Error("Документ задачи изменился. Повторите экспорт текущего документа.");
+                syncTask(current, root);
+                if (format !== "preview") {
+                    taskAttempt = taskBridge.current.queue(current.taskOrigin, "export", root, format);
+                    if (!taskAttempt) throw new Error("Редактор ещё не принял документ задачи; экспорт не подтверждён.");
+                    renderTaskAttempt.current = taskAttempt;
+                    notifyTask(taskBridge.current.get(current.taskOrigin));
+                }
+            }
+            const outputPath = format === "preview" ? undefined : await chooseSavePath("Сохранить коммерческое предложение", safeProposalFileName(current.data, format), [format]);
+            if (format !== "preview" && !outputPath) {
+                if (taskAttempt) { const root = await freshTaskWorkspace(taskAttempt.origin); notifyTask(taskBridge.current.finish(taskAttempt, { type: "cancelled", reason: "Сохранение файла отменено в диалоге выбора пути." }, root)); }
+                return;
+            }
+            if (current.taskOrigin) {
+                await freshTaskWorkspace(current.taskOrigin, taskNeedsEditor);
+                if (generation.current !== currentGeneration || !sameTaskEditor(current)) throw new Error("Документ задачи изменился до начала экспорта.");
+            }
+            jobId.current = id;
             const result = await trackedOperation(format === "preview" ? "Предпросмотр КП" : `Экспорт КП · ${format.toUpperCase()}`, () => invoke<ProposalRenderResult>("proposal_render", { jobId: id, document, assets, format, outputPath }));
             if (!mounted.current || generation.current !== currentGeneration || jobId.current !== id) {
                 if (format === "preview")
                     void invoke("proposal_cleanup_preview", { outputPath: result.outputPath }).catch(() => undefined);
                 return;
+            }
+            if (current.taskOrigin) {
+                const root = await freshTaskWorkspace(current.taskOrigin, taskNeedsEditor);
+                if (!sameTaskEditor(current) || generation.current !== currentGeneration) throw new Error("Файл создан после смены документа; экспорт текущей задачи не подтверждён.");
+                if (taskAttempt && format !== "preview") {
+                    const completed = taskBridge.current.finish(taskAttempt, { type: "exported", format, outputPath: result.outputPath, outputBytes: result.outputBytes, sha256: result.sha256 }, root);
+                    if (!completed) throw new Error("Генератор не вернул проверяемое подтверждение файла. Экспорт задачи не отмечен завершённым.");
+                    notifyTask(completed);
+                }
             }
             if (format === "preview") {
                 if (!result.previewPages?.length)
@@ -505,14 +757,22 @@ export function Proposals({ active = true, openRecordId, onRecordOpened, handoff
             else
                 setNotice(`Создан файл: ${result.outputPath} (${result.outputBytes.toLocaleString("ru-RU")} байт).`);
         }
+        catch (reason) {
+            if (taskAttempt) {
+                try { const fresh = await getWorkspaceInfo(); notifyTask(taskBridge.current.finish(taskAttempt, { type: "failed", message: "Создание файла текущего документа задачи не подтверждено." }, fresh.root)); } catch { /* No fresh workspace: no receipt. */ }
+            }
+            throw reason;
+        }
         finally {
             if (jobId.current === id)
                 jobId.current = null;
+            if (renderTaskAttempt.current === taskAttempt) renderTaskAttempt.current = null;
         }
     });
     const cancelRender = async () => { const id = jobId.current; if (!id)
-        return; generation.current += 1; jobId.current = null; try {
+        return; const taskAttempt = renderTaskAttempt.current; renderTaskAttempt.current = null; generation.current += 1; jobId.current = null; try {
         await invoke("scanner_cancel", { jobId: id });
+        if (taskAttempt) { const fresh = await getWorkspaceInfo(); notifyTask(taskBridge.current.finish(taskAttempt, { type: "cancelled", reason: "Создание файла отменено пользователем." }, fresh.root)); }
         setNotice("Создание документа отменено.");
     }
     catch (reason) {
@@ -565,25 +825,26 @@ export function Proposals({ active = true, openRecordId, onRecordOpened, handoff
     const signerAttachment = selectedSigner?.document;
     const validSignerAttachment = signerAttachment?.relativePath && signerAttachment.fileName && signerAttachment.sha256 && signerAttachment.mimeType && signerAttachment.sizeBytes != null ? signerAttachment as AttachmentInfo : null;
     return <section className="proposals-tool" aria-label="Подготовка коммерческих предложений" data-workspace-viewer-allowed data-workspace-managed-disabled="true" hidden={!active}>
-    <div className="proposal-toolbar"><small>Предложений: {proposals.length} · шаблонов: {templates.length}</small><button className="primary" type="button" disabled={Boolean(busy)} onClick={() => requestTarget({ kind: "new" })}>{access.editor ? "Новое КП" : "Новое локальное КП"}</button></div>
+    {presentation === "registry" && <div className="proposal-toolbar"><small>Предложений: {proposals.length} · шаблонов: {templates.length}</small><button className="primary" type="button" disabled={Boolean(busy)} onClick={() => requestTarget({ kind: "new" })}>{access.editor ? "Новое КП" : "Новое локальное КП"}</button></div>}
     {store.error && <div className="notice error" role="alert">Не удалось прочитать КП: {store.error}<button type="button" onClick={() => void store.reload()}>Повторить</button></div>}
     {error && <div className="notice error" role="alert">{error}</div>}{notice && <div className="notice" role="status">{notice}</div>}
     {handoff && failedHandoff === handoff.id && <div className="notice warning" role="status">Получение КП не завершено. Данные источника сохранены; после восстановления доступа повторите действие.<button type="button" className="secondary" disabled={Boolean(busy) || !active} onClick={() => void receiveHandoff(handoff)}>Повторить получение КП</button></div>}
-    {!session ? <><label className="proposal-search">Поиск по номеру, предмету или заказчику<input aria-label="Поиск КП" value={search} onChange={(event) => setSearch(event.target.value)}/></label>{store.loading ? <p role="status">Загружаем предложения…</p> : <div className="proposal-registry">{filtered.map((entry) => <article className="proposal-record-card" key={entry.id}><button className="proposal-record" type="button" aria-label={`Открыть КП ${entry.payload.number} · редакция ${entry.payload.revision}`} disabled={Boolean(busy)} onClick={() => requestTarget({ kind: "record", record: entry })}><span className="proposal-record-heading"><strong>{entry.payload.number} · ред. {entry.payload.revision}</strong><small className="proposal-record-status">{statuses[entry.payload.status]}</small></span><span className="proposal-record-subject">{entry.payload.title || "Без предмета"}</span><small>{entry.payload.recipient.name || "Заказчик не указан"}</small><span className="proposal-record-open">Открыть КП <span aria-hidden="true">→</span></span></button>{access.editor && <div className="proposal-record-actions"><button type="button" className="proposal-archive-action" disabled={Boolean(busy)} aria-label={`Архивировать КП ${entry.payload.number} · редакция ${entry.payload.revision}`} onClick={() => requestArchive(entry)}>Архивировать</button></div>}</article>)}{!filtered.length && <p className="empty-inline">{search ? "КП по этому запросу не найдены." : "Коммерческих предложений пока нет. Начните с нового КП или перенесите цену из калькулятора."}</p>}</div>}</> : <>
+    {!session ? presentation === "ai-task" ? <div role="status"><p>{busy || "Откройте результат задачи для подготовки КП."}</p><button type="button" className="secondary" disabled={Boolean(busy)} onClick={onReturnToTask}>Вернуться к результатам</button></div> : <><label className="proposal-search">Поиск по номеру, предмету или заказчику<input aria-label="Поиск КП" value={search} onChange={(event) => setSearch(event.target.value)}/></label>{store.loading ? <p role="status">Загружаем предложения…</p> : <div className="proposal-registry">{filtered.map((entry) => <article className="proposal-record-card" key={entry.id}><button className="proposal-record" type="button" aria-label={`Открыть КП ${entry.payload.number} · редакция ${entry.payload.revision}`} disabled={Boolean(busy)} onClick={() => requestTarget({ kind: "record", record: entry })}><span className="proposal-record-heading"><strong>{entry.payload.number} · ред. {entry.payload.revision}</strong><small className="proposal-record-status">{statuses[entry.payload.status]}</small></span><span className="proposal-record-subject">{entry.payload.title || "Без предмета"}</span><small>{entry.payload.recipient.name || "Заказчик не указан"}</small><span className="proposal-record-open">Открыть КП <span aria-hidden="true">→</span></span></button>{access.editor && <div className="proposal-record-actions"><button type="button" className="proposal-archive-action" disabled={Boolean(busy)} aria-label={`Архивировать КП ${entry.payload.number} · редакция ${entry.payload.revision}`} onClick={() => requestArchive(entry)}>Архивировать</button></div>}</article>)}{!filtered.length && <p className="empty-inline">{search ? "КП по этому запросу не найдены." : "Коммерческих предложений пока нет. Начните с нового КП или перенесите цену из калькулятора."}</p>}</div>}</> : <>
       <div className="proposal-context">
         <div><strong>{data!.number} · редакция {data!.revision}</strong><span role="status">{session.local ? "Локальная копия · не сохраняется в общую базу" : immutable ? "Сохранённая редакция защищена от изменения" : dirty ? draftStatus || "Изменения не сохранены в карточку" : savedStatus || "Карточка сохранена"}</span></div>
         <div className="button-row">
           {session.id && <VersionHistory module="commercial-proposals" id={session.id} title={data!.number} payload={data} onRestore={restoreHistory} />}
-          <button type="button" className="secondary small" disabled={Boolean(busy)} onClick={() => requestTarget({ kind: "close" })}>К списку</button>
-          <button type="button" className="secondary small" disabled={Boolean(busy)} onClick={() => requestTarget({ kind: "seed", data: cloneProposal(data!), local: !access.editor })}>{access.editor ? "Создать копию" : "Локальная копия"}</button>
-          {immutable && access.editor && <button type="button" className="secondary small" disabled={Boolean(busy)} onClick={revision}>Новая редакция</button>}
-          {session.id && !session.local && access.editor && <button type="button" className="secondary small" disabled={Boolean(busy) || dirty} title={dirty ? "Сначала сохраните изменения КП или вернитесь к списку без сохранения" : "Перенести сохранённую редакцию в архив с возможностью восстановления"} onClick={() => requestArchive({ id: session.id!, payload: data!, archived: false })}>Архивировать</button>}
+          {presentation === "ai-task" ? <button type="button" className="secondary small" disabled={Boolean(busy)} onClick={onReturnToTask}>Вернуться к результатам</button> : <button type="button" className="secondary small" disabled={Boolean(busy)} onClick={() => requestTarget({ kind: "close" })}>К списку</button>}
+          {presentation === "registry" && <button type="button" className="secondary small" disabled={Boolean(busy)} onClick={() => requestTarget({ kind: "seed", data: cloneProposal(data!), local: !access.editor })}>{access.editor ? "Создать копию" : "Локальная копия"}</button>}
+          {presentation === "registry" && immutable && access.editor && <button type="button" className="secondary small" disabled={Boolean(busy)} onClick={revision}>Новая редакция</button>}
+          {presentation === "registry" && session.id && !session.local && access.editor && <button type="button" className="secondary small" disabled={Boolean(busy) || dirty} title={dirty ? "Сначала сохраните изменения КП или вернитесь к списку без сохранения" : "Перенести сохранённую редакцию в архив с возможностью восстановления"} onClick={() => requestArchive({ id: session.id!, payload: data!, archived: false })}>Архивировать</button>}
         </div>
       </div>
       {session.id && !session.local && access.editor && dirty && <p className="help-text">Для архивации сначала сохраните изменения КП или вернитесь к списку без сохранения. Черновик не будет удалён при архивации.</p>}
       {!access.editor && !session.local && <p className="notice">Просмотр и экспорт доступны. Для изменения без записи в общую папку создайте локальную копию.</p>}
       {!access.editor && session.local && <p className="help-text">Данные находятся только в памяти окна. Новые вложения и общие шаблоны недоступны; экспорт использует уже прикреплённые файлы.</p>}
       {data!.source && <p className="help-text">Источник: {data!.source.tool === "calculator" ? "калькулятор" : "закупка"} · {data!.source.priceOrigin}{data!.source.wasUnsaved ? " · несохранённый снимок" : ""}. Себестоимость и внутренние заметки не переносились.</p>}
+      {presentation === "ai-task" && Boolean(data!.sourceQuestions?.length) && <p className="notice warning">Нужно проверить условия исходного документа. Сохранение карточки и создание файла не означают, что вопросы согласованы или КП готово к отправке.</p>}
       <nav className="proposal-steps" aria-label="Шаги подготовки КП">{steps.map((label, index) => <button key={label} type="button" aria-current={step === index ? "step" : undefined} className={step === index ? "active" : ""} onClick={() => setStep(index)}>{index + 1}. {label}</button>)}</nav>
       {Boolean(data!.sourceQuestions?.length) && <details className="notice warning proposal-source-questions" open><summary>Нерешённые вопросы исходного документа ({data!.sourceQuestions!.length})</summary><p>Это вопросы по условиям источника, а не подтверждённые решения. Они сохраняются с черновиком; в клиентский файл не включаются. Исходные условия в тексте КП проверьте до отправки.</p>{data!.sourceQuestions!.map((question) => <div key={question.id}><p>{question.message}</p><details><summary>Показать в источнике</summary>{question.evidence.map((proof, index) => <div key={index}><small>{proof.sourceName} · {proof.locator}</small><blockquote style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{proof.quote}</blockquote></div>)}</details></div>)}</details>}
       <div className="proposal-workarea" aria-busy={Boolean(busy)}>
@@ -613,11 +874,22 @@ export function Proposals({ active = true, openRecordId, onRecordOpened, handoff
           </section>}
         </>}
       </div>
-      <footer className="proposal-footer"><div>{pricing ? <><strong>Итого: {formatMoneyMinor(pricing.totals.grossMinor)}</strong><small>Без налога: {formatMoneyMinor(pricing.totals.netMinor)} · НДС: {formatMoneyMinor(pricing.totals.vatMinor)}</small>{pricing.totals.byTax.length > 1 && <small>{pricing.totals.byTax.map((group) => `${taxLabel(group.tax)}: ${formatMoneyMinor(group.vatMinor)}`).join(" · ")}</small>}</> : <span>Заполните корректные количества и цены для расчёта итога.</span>}</div><div className="button-row">{busy && <span role="status">{busy}</span>}{jobId.current && <button type="button" className="secondary" onClick={() => void cancelRender()}>Отменить создание</button>}<button className="secondary" type="button" disabled={step === 0} onClick={() => setStep((value) => value - 1)}>Назад</button>{step < 4 && <button className="secondary" type="button" onClick={() => setStep((value) => value + 1)}>Далее</button>}{!session.local && !immutable && <><label>Статус<select aria-label="Статус КП" disabled={fieldsDisabled} value={data!.status} onChange={(event) => update("status", event.target.value as ProposalStatus)}>{Object.entries(statuses).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label><button className="primary" type="button" disabled={Boolean(busy) || !access.editor || !dirty || (data!.status !== "draft" && (issues.some((issue) => issue.severity === "error") || zeroNeedsConsent))} onClick={() => void run("Сохраняем КП…", saveCurrent)}>Сохранить КП</button></>}</div></footer>
+      <footer className="proposal-footer">
+        <div>{pricing ? <><strong>Итого: {formatMoneyMinor(pricing.totals.grossMinor)}</strong><small>Без налога: {formatMoneyMinor(pricing.totals.netMinor)} · НДС: {formatMoneyMinor(pricing.totals.vatMinor)}</small>{pricing.totals.byTax.length > 1 && <small>{pricing.totals.byTax.map((group) => `${taxLabel(group.tax)}: ${formatMoneyMinor(group.vatMinor)}`).join(" · ")}</small>}</> : <span>Заполните корректные количества и цены для расчёта итога.</span>}</div>
+        <div className="button-row">
+          {busy && <span role="status">{busy}</span>}
+          {jobId.current && <button type="button" className="secondary" onClick={() => void cancelRender()}>Отменить создание</button>}
+          <button className="secondary" type="button" disabled={step === 0} onClick={() => setStep((value) => value - 1)}>Назад</button>
+          {step < 4 && <button className="secondary" type="button" onClick={() => setStep((value) => value + 1)}>Далее</button>}
+          {!session.local && !immutable && <>
+            <label>Статус<select aria-label="Статус КП" disabled={fieldsDisabled} value={data!.status} onChange={(event) => update("status", event.target.value as ProposalStatus)}>{Object.entries(statuses).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
+            <button className="primary" type="button" disabled={Boolean(busy) || !access.editor || (!dirty && !taskRequiresSave) || (data!.status !== "draft" && (issues.some((issue) => issue.severity === "error") || zeroNeedsConsent))} onClick={() => void run("Сохраняем КП…", saveCurrent)}>Сохранить КП</button>
+          </>}
+        </div>
+      </footer>
     </>}
     {archiving && <ConfirmDialog title="Архивировать КП?" message={`Перенести КП «${archiving.payload.number} · редакция ${archiving.payload.revision} · ${archiving.payload.title || "Без предмета"}» в архив? Оно исчезнет из рабочего списка. Данные, история и вложения сохранятся; восстановить КП можно в разделе «Архив» → «Коммерческие предложения». Другие редакции этого КП не изменятся.`} confirmLabel="Перенести в архив" onClose={() => { if (!operation.current) setArchiving(null); }} onConfirm={archiveProposal} />}
-    {pendingTarget && <Dialog title="Есть несохранённые изменения КП" onClose={() => { if (!busy)
-        setPendingTarget(null); }} closeDisabled={Boolean(busy)} width="540px"><div className="dialog-body"><p>Сохраните текущую карточку или явно замените её. При замене несохранённые изменения и их черновик будут отброшены.</p>{session?.local && <p>Локальная копия не записывается в общую папку. При необходимости сначала экспортируйте документ.</p>}</div><footer className="dialog-actions"><button type="button" className="secondary" disabled={Boolean(busy)} onClick={() => setPendingTarget(null)}>Отмена</button><button type="button" className="secondary" disabled={Boolean(busy)} onClick={() => void resolveTarget(false)}>Заменить без сохранения</button>{access.editor && !session?.local && !immutable && <button type="button" className="primary" disabled={Boolean(busy)} onClick={() => void resolveTarget(true)}>Сохранить и продолжить</button>}</footer></Dialog>}
+    {pendingTarget && <Dialog title="Есть несохранённые изменения КП" onClose={cancelPendingTarget} closeDisabled={Boolean(busy)} width="540px"><div className="dialog-body"><p>{session?.taskOrigin ? "Сохраните текущую карточку или переключитесь без записи в базу. Документ задачи останется в своей сессии; его можно открыть снова из результатов." : "Сохраните текущую карточку или явно замените её. При замене несохранённые изменения и их черновик будут отброшены."}</p>{session?.local && <p>Локальная копия не записывается в общую папку. При необходимости сначала экспортируйте документ.</p>}</div><footer className="dialog-actions"><button type="button" className="secondary" disabled={Boolean(busy)} onClick={cancelPendingTarget}>Отмена</button><button type="button" className="secondary" disabled={Boolean(busy)} onClick={() => void resolveTarget(false)}>Заменить без сохранения</button>{access.editor && !session?.local && !immutable && <button type="button" className="primary" disabled={Boolean(busy)} onClick={() => void resolveTarget(true)}>Сохранить и продолжить</button>}</footer></Dialog>}
     {templateName !== null && <Dialog title="Сохранить оформление как шаблон" onClose={() => { if (!busy)
         setTemplateName(null); }} closeDisabled={Boolean(busy)} width="540px"><div className="dialog-body"><p>Будут сохранены оформление, логотип, вступление, заключение, колонтитул и типовые условия. Стороны, подпись, цены, приложения и внутренние заметки не копируются.</p><label>Название шаблона<input autoFocus value={templateName} onChange={(event) => setTemplateName(event.target.value)}/></label></div><footer className="dialog-actions"><button type="button" className="secondary" disabled={Boolean(busy)} onClick={() => setTemplateName(null)}>Отмена</button><button type="button" className="primary" disabled={Boolean(busy) || !templateName.trim()} onClick={saveTemplate}>Сохранить шаблон</button></footer></Dialog>}
   </section>;

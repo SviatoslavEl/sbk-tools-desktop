@@ -9,6 +9,9 @@ import { GlobalSearch } from "./modules/search/GlobalSearch";
 import { StatusCenter } from "./modules/status/StatusCenter";
 import { StatusIndicator } from "./modules/status/StatusIndicator";
 import { Proposals, type ProposalHandoff } from "./modules/proposals/Proposals";
+import type { ProposalTaskSessionChange } from "./modules/proposals/proposalTaskBridge";
+import { createTaskPaneState, projectTaskPaneState, reduceTaskPaneState } from "./modules/intelligence/taskPaneState";
+import { createTaskDocumentOrigin, isTaskDocumentOrigin } from "./modules/intelligence/taskDocumentSession";
 import type { IntelligenceHandoff } from "./modules/intelligence/workbenchTypes";
 import type { ProposalData } from "./modules/proposals/types";
 import { clearActivities } from "./lib/activity";
@@ -320,11 +323,21 @@ function App() {
   const intelligenceOcrRequest = intelligenceOcrRouter.current.request;
   const intelligenceOcrReturn = intelligenceOcrRouter.current.result;
   const [proposalHandoff, setProposalHandoff] = useState<ProposalHandoff | undefined>();
+  const [taskPane, setTaskPane] = useState(() => createTaskPaneState(workspace?.root || null));
+  const taskPaneView = projectTaskPaneState(taskPane);
+  const taskDocumentVisible = activeTool === "intelligence" && taskPane.workspaceRoot === workspace?.root && taskPaneView.visibility === "document";
   const [showHelp, setShowHelp] = useState(false);
   const [showSearch, setShowSearch] = useState(false);
   const [openRecord, setOpenRecord] = useState<{ tool: ToolId; id: string } | null>(null);
   const contentRef = useRef<HTMLDivElement>(null);
-  useEffect(() => { setOpenRecord(null); setShowSearch(false); setProposalHandoff(undefined); setIntelligenceHandoff(undefined); clearActivities(); setViewStateWorkspace(workspace?.root || ""); }, [workspace?.root]);
+  const taskDocumentRef = useRef<HTMLDivElement>(null);
+  const previouslyShowingTaskDocument = useRef(false);
+  useEffect(() => {
+    if (taskDocumentVisible) taskDocumentRef.current?.focus({ preventScroll: true });
+    else if (previouslyShowingTaskDocument.current && activeTool === "intelligence") contentRef.current?.focus({ preventScroll: true });
+    previouslyShowingTaskDocument.current = taskDocumentVisible;
+  }, [taskDocumentVisible, activeTool]);
+  useEffect(() => { setOpenRecord(null); setShowSearch(false); setProposalHandoff(undefined); setIntelligenceHandoff(undefined); setTaskPane((current) => reduceTaskPaneState(current, { type: "workspace-changed", workspaceRoot: workspace?.root || null })); clearActivities(); setViewStateWorkspace(workspace?.root || ""); }, [workspace?.root]);
   useEffect(() => {
     const openSearch = (event: KeyboardEvent) => {
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k" && !document.querySelector('[role="dialog"]')) { event.preventDefault(); setShowSearch(true); }
@@ -337,7 +350,10 @@ function App() {
   const selectTool = (tool: ToolId, recordId?: string) => {
     if (tool === "scanner") setScannerOpened(true);
     if (tool === "calculator") setCalculatorOpened(true);
-    if (tool === "proposals") setProposalsOpened(true);
+    if (tool === "proposals") {
+      setProposalsOpened(true);
+      setTaskPane((current) => reduceTaskPaneState(current, { type: "return-results" }));
+    }
     if (tool === "intelligence") setIntelligenceOpened(true);
     setOpenRecord(recordId ? { tool, id: recordId } : null);
     setActiveTool(tool);
@@ -352,9 +368,26 @@ function App() {
   const intelligenceConsumed = () => setIntelligenceHandoff(undefined);
   const transferIntelligence = (handoff: IntelligenceHandoff) => {
     if (!workspace || handoff.workspaceRoot !== workspace.root || !workspace.editor || networkPaused) throw new Error("Для передачи данных подключите рабочую папку и войдите в режим редактора.");
+    if (handoff.destination === "proposals" && handoff.taskOrigin) {
+      if (!isTaskDocumentOrigin(handoff.taskOrigin) || handoff.taskOrigin.workspaceRoot !== workspace.root) throw new Error("Происхождение документа не совпадает с текущей рабочей папкой. Повторите открытие результата.");
+      const taskOrigin = createTaskDocumentOrigin(handoff.taskOrigin);
+      setProposalHandoff({ id: handoff.id, data: handoff.data, taskOrigin });
+      setTaskPane((current) => reduceTaskPaneState(current, { type: "request", origin: taskOrigin }));
+      setProposalsOpened(true);
+      selectTool("intelligence");
+      return;
+    }
     if (handoff.destination === "proposals") setProposalHandoff({ id: handoff.id, data: handoff.data });
     else setIntelligenceHandoff(handoff);
     selectTool(handoff.destination);
+  };
+  const returnToIntelligenceResults = () => setTaskPane((current) => reduceTaskPaneState(current, { type: "return-results" }));
+  // Proposals owns the editable data and observes the backend workspace before
+  // issuing this receipt. App holds only a read-only routing/progress snapshot;
+  // transport consumption is deliberately not editor/save/export acceptance.
+  const proposalTaskChanged = (change: ProposalTaskSessionChange) => {
+    if (!workspace || change.session.origin.workspaceRoot !== workspace.root) return;
+    setTaskPane((current) => reduceTaskPaneState(current, { type: "receiver-change", workspaceRoot: workspace.root, change }));
   };
   const recognizeIntelligenceFile = (request: IntelligenceOcrRequest) => {
     if (intelligenceOcrRoot.current !== workspace?.root) throw new Error("Рабочая папка изменилась. Повторите запрос OCR в окне ИИ.");
@@ -683,10 +716,10 @@ function App() {
           <div ref={contentRef} id="main-content" tabIndex={-1} className={`tool-content ${["contracts", "staff", "counterparties", "procurement"].includes(activeTool) ? "registry-content" : ""}`}>
             <NetworkOfflineNotice />
             <AdministrationNotice key={`notice-${workspace.root}`} message={workspace.administrationNotice} />
-            {intelligenceOpened && <div hidden={activeTool !== "intelligence"} key={`intelligence-${workspace.root}`}>
+            {intelligenceOpened && <div hidden={activeTool !== "intelligence" || taskDocumentVisible} key={`intelligence-${workspace.root}`}>
               <ReadOnlyWorkspaceBoundary allowMutations>
                 <Suspense fallback={<p className="notice" role="status">Открываем рабочее окно ИИ…</p>}>
-                  <IntelligenceWorkbench active={activeTool === "intelligence"} workspaceRoot={workspace.root} onTransfer={transferIntelligence} onRecognizeFile={recognizeIntelligenceFile} ocrReturn={intelligenceOcrReturn} onOcrReturnConsumed={consumeIntelligenceOcr} />
+                  <IntelligenceWorkbench active={activeTool === "intelligence" && !taskDocumentVisible} workspaceRoot={workspace.root} onTransfer={transferIntelligence} onRecognizeFile={recognizeIntelligenceFile} ocrReturn={intelligenceOcrReturn} onOcrReturnConsumed={consumeIntelligenceOcr} taskDocumentSessions={taskPane.receivers.map((entry) => entry.session)} />
                 </Suspense>
               </ReadOnlyWorkspaceBoundary>
             </div>}
@@ -699,7 +732,10 @@ function App() {
               {activeTool === "dashboard" && <div className="module-stack"><Dashboard onNavigate={selectTool} /><section className="dashboard-calendar" aria-label="Календарь тендеров"><h2>Календарь тендеров</h2><p className="help-text">Дважды щёлкните по дню, чтобы назначить закупку. С клавиатуры — Enter на выбранном дне.</p><TenderCalendar /></section></div>}
               {activeTool === "procurement" && <ProcurementRegistry key={`procurement-${workspace.root}`} onCreateProposal={createProposal} intelligenceHandoff={intelligenceHandoff?.destination === "procurement" ? intelligenceHandoff : undefined} onIntelligenceHandoffConsumed={intelligenceConsumed} openRecordId={openRecord?.tool === "procurement" ? openRecord.id : undefined} onRecordOpened={recordOpened} />}
               {calculatorOpened && <div hidden={activeTool !== "calculator"} key={`calculator-${workspace.root}`}><Calculator onCreateProposal={createProposal} active={activeTool === "calculator"} openRecordId={openRecord?.tool === "calculator" ? openRecord.id : undefined} onRecordOpened={recordOpened} /></div>}
-              {proposalsOpened && <div hidden={activeTool !== "proposals"} key={`proposals-${workspace.root}`}><Proposals active={activeTool === "proposals"} handoff={proposalHandoff} onHandoffConsumed={() => setProposalHandoff(undefined)} openRecordId={openRecord?.tool === "proposals" ? openRecord.id : undefined} onRecordOpened={recordOpened} /></div>}
+              {proposalsOpened && <div ref={taskDocumentRef} tabIndex={-1} role={taskDocumentVisible ? "region" : undefined} aria-label={taskDocumentVisible ? "КП текущей задачи" : undefined} hidden={activeTool !== "proposals" && !taskDocumentVisible} key={`proposals-${workspace.root}`}>
+                {taskDocumentVisible && taskPaneView.pendingOrigin && <p className="notice" role="status">Открываем выбранный результат задачи. Если уже есть несохранённые правки, сначала выберите, что с ними сделать.</p>}
+                <Proposals active={activeTool === "proposals" || taskDocumentVisible} handoff={proposalHandoff} presentation={taskDocumentVisible ? "ai-task" : "registry"} onReturnToTask={returnToIntelligenceResults} onTaskSessionChange={proposalTaskChanged} onHandoffConsumed={() => setProposalHandoff((current) => current?.id === proposalHandoff?.id ? undefined : current)} openRecordId={openRecord?.tool === "proposals" ? openRecord.id : undefined} onRecordOpened={recordOpened} />
+              </div>}
               {activeTool === "contracts" && <ContractsRegistry key={`contracts-${workspace.root}`} intelligenceHandoff={intelligenceHandoff?.destination === "contracts" ? intelligenceHandoff : undefined} onIntelligenceHandoffConsumed={intelligenceConsumed} openRecordId={openRecord?.tool === "contracts" ? openRecord.id : undefined} onRecordOpened={recordOpened} />}
               {activeTool === "counterparties" && <CounterpartiesRegistry key={`counterparties-${workspace.root}`} intelligenceHandoff={intelligenceHandoff?.destination === "counterparties" ? intelligenceHandoff : undefined} onIntelligenceHandoffConsumed={intelligenceConsumed} openRecordId={openRecord?.tool === "counterparties" ? openRecord.id : undefined} onRecordOpened={recordOpened} />}
               {activeTool === "staff" && <StaffRegistry key={`staff-${workspace.root}`} intelligenceHandoff={intelligenceHandoff?.destination === "staff" ? intelligenceHandoff : undefined} onIntelligenceHandoffConsumed={intelligenceConsumed} openRecordId={openRecord?.tool === "staff" ? openRecord.id : undefined} onRecordOpened={recordOpened} />}
