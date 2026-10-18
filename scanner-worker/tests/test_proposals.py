@@ -182,6 +182,143 @@ def test_public_v2_review_draft_marks_body_footer_and_question_at_own_section(tm
     assert body.index("2. Сроки и оплата") < body.index("Нужно проверить: Уточнить основание начала срока") < body.index("2.1.")
 
 
+def test_public_v2_short_heading_keeps_only_the_following_body_without_prose_keep_chain(tmp_path):
+    from lxml import etree
+    document = commercial_document_fixture()
+    section = document["commercial"]["sections"][0]
+    heading = "Информационная безопасность и пентест"
+    body = "Заказчик предоставляет материалы и разрешение для проверки. " * 30
+    section["blocks"].extend([
+        {"anchor": "s1b4", "kind": "paragraph", "style": "body", "content": [{"kind": "text", "text": heading}]},
+        {"anchor": "s1b5", "kind": "paragraph", "style": "body", "content": [{"kind": "text", "text": body}]},
+    ])
+    original = copy.deepcopy(document)
+    output = tmp_path / "heading-body.docx"
+    render_docx(document, output, {})
+    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+    with ZipFile(output) as archive:
+        xml = etree.fromstring(archive.read("word/document.xml"))
+        title = xml.xpath("//w:bookmarkStart[@w:name='s1b4']/parent::w:p", namespaces=ns)[0]
+        following = xml.xpath("//w:bookmarkStart[@w:name='s1b5']/parent::w:p", namespaces=ns)[0]
+        assert title.xpath("./w:pPr/w:keepNext[not(@w:val) or @w:val='1']", namespaces=ns)
+        assert title.xpath("./w:pPr/w:keepLines[not(@w:val) or @w:val='1']", namespaces=ns)
+        assert not following.xpath("./w:pPr/w:keepNext[not(@w:val) or @w:val='1']", namespaces=ns)
+        assert not following.xpath("./w:pPr/w:keepLines[not(@w:val) or @w:val='1']", namespaces=ns)
+        text = "".join(xml.xpath("//w:t/text()", namespaces=ns))
+        assert text.count(heading) == 1 and text.count(body) == 1
+        assert xml.xpath("//w:hyperlink/@w:anchor", namespaces=ns) == ["s2", "s1b3", "s2b1"]
+    assert document == original
+
+
+def test_public_v2_heading_hint_is_bounded_and_does_not_chain_short_paragraphs(tmp_path):
+    from lxml import etree
+    document = commercial_document_fixture()
+    candidates = [f"Доступы к учебной системе {index}" for index in range(16)]
+    texts = candidates + ["Основной текст с полным описанием условий. " * 10,
+                          "Слишком длинный заголовок " + "доступы " * 20,
+                          "Название\nВторая строка", "Обычное законченное предложение.", "Завершающий короткий заголовок"]
+    document["commercial"]["sections"].append({"anchor": "s3", "title": "Условия проверки", "blocks": [
+        {"anchor": f"s3b{index + 1}", "kind": "paragraph", "style": "body", "content": [{"kind": "text", "text": text}]}
+        for index, text in enumerate(texts)
+    ]})
+    original = copy.deepcopy(document)
+    output = tmp_path / "bounded-headings.docx"
+    render_docx(document, output, {})
+    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+    with ZipFile(output) as archive:
+        xml = etree.fromstring(archive.read("word/document.xml"))
+        for index, text in enumerate(texts, 1):
+            paragraph = xml.xpath(f"//w:bookmarkStart[@w:name='s3b{index}']/parent::w:p", namespaces=ns)[0]
+            keep = paragraph.xpath("./w:pPr/w:keepNext[not(@w:val) or @w:val='1']", namespaces=ns)
+            assert bool(keep) == (index == len(candidates))
+            assert text.replace("\n", "") in "".join(paragraph.xpath(".//w:t/text()", namespaces=ns))
+            if "\n" in text:
+                assert paragraph.xpath(".//w:br", namespaces=ns)
+    assert document == original
+
+
+def test_public_v2_short_heading_and_list_caption_do_not_keep_the_list_as_one_record(tmp_path):
+    from lxml import etree
+    document = commercial_document_fixture()
+    document["commercial"]["sections"].append({"anchor": "s3", "title": "Материалы", "blocks": [
+        {"anchor": "s3b1", "kind": "paragraph", "style": "body", "content": [
+            {"kind": "text", "text": "Доступы к учебной системе"}]},
+        {"anchor": "s3b2", "kind": "list", "style": "bullet", "items": [
+            [{"kind": "text", "text": f"Полный пункт предоставляемых материалов {index}."}]
+            for index in range(20)
+        ]},
+        {"anchor": "s3b3", "kind": "paragraph", "style": "body", "content": [
+            {"kind": "text", "text": "См. "}, {"kind": "local-ref", "target": "s2b1"}]},
+    ]})
+    original = copy.deepcopy(document)
+    output = tmp_path / "heading-list.docx"
+    render_docx(document, output, {})
+    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+    with ZipFile(output) as archive:
+        xml = etree.fromstring(archive.read("word/document.xml"))
+        for anchor in ("s3b1", "s3b2"):
+            paragraph = xml.xpath(f"//w:bookmarkStart[@w:name='{anchor}']/parent::w:p", namespaces=ns)[0]
+            assert paragraph.xpath("./w:pPr/w:keepNext[not(@w:val) or @w:val='1']", namespaces=ns)
+        items = xml.xpath("//w:body/w:p[w:pPr/w:numPr]", namespaces=ns)
+        assert len(items) == 23
+        for paragraph in items:
+            assert not paragraph.xpath("./w:pPr/w:keepNext[not(@w:val) or @w:val='1']", namespaces=ns)
+            assert not paragraph.xpath("./w:pPr/w:keepLines[not(@w:val) or @w:val='1']", namespaces=ns)
+        referenced = xml.xpath("//w:bookmarkStart[@w:name='s3b3']/parent::w:p", namespaces=ns)[0]
+        assert not referenced.xpath("./w:pPr/w:keepNext[not(@w:val) or @w:val='1']", namespaces=ns)
+        assert referenced.xpath("./w:hyperlink/@w:anchor", namespaces=ns) == ["s2b1"]
+    assert document == original
+
+
+def test_public_v2_structural_block_ordinals_have_bounded_captions_and_keep_their_bookmarks(tmp_path):
+    from lxml import etree
+    document = commercial_document_fixture()
+    original = copy.deepcopy(document)
+    output = tmp_path / "block-captions.docx"
+    render_docx(document, output, {})
+    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+    with ZipFile(output) as archive:
+        xml = etree.fromstring(archive.read("word/document.xml"))
+        captions = {}
+        for anchor in ("s1b2", "s1b3", "s2b2"):
+            paragraphs = xml.xpath(f"//w:bookmarkStart[@w:name='{anchor}']/parent::w:p", namespaces=ns)
+            assert len(paragraphs) == 1
+            captions[anchor] = "".join(paragraphs[0].xpath(".//w:t/text()", namespaces=ns))
+            assert paragraphs[0].xpath("./w:pPr/w:keepNext[not(@w:val) or @w:val='1']", namespaces=ns)
+            assert paragraphs[0].xpath("./w:bookmarkEnd", namespaces=ns)
+        assert captions["s1b2"] == "1.2. Перечень"
+        assert captions["s2b2"] == "2.2. Перечень"
+        assert captions["s1b3"] == "1.3. Таблица: Результат / Передаваемые материалы"
+        assert xml.xpath("//w:tbl[2]/w:tr[1]/w:tc/w:p/w:r/w:t/text()", namespaces=ns) == ["Результат", "Передаваемые материалы"]
+        assert xml.xpath("//w:hyperlink/@w:anchor", namespaces=ns) == ["s2", "s1b3", "s2b1"]
+        assert len(xml.xpath("//w:pPr/w:numPr", namespaces=ns)) == 3
+    assert document == original
+
+
+def test_public_v2_caption_fallback_never_truncates_original_columns_or_cells(tmp_path):
+    from lxml import etree
+    document = commercial_document_fixture()
+    block = document["commercial"]["sections"][0]["blocks"][2]
+    labels = ["Длинное исходное название " * 9, "Описание", "Результат"]
+    body = "Полное содержание ячейки. " * 20
+    block["columns"] = labels
+    block["rows"] = [[[{"kind": "text", "text": body}], [{"kind": "local-ref", "target": "s2b1"}], []]]
+    original = copy.deepcopy(document)
+    output = tmp_path / "caption-fallback.docx"
+    render_docx(document, output, {})
+    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+    with ZipFile(output) as archive:
+        xml = etree.fromstring(archive.read("word/document.xml"))
+        caption = xml.xpath("//w:bookmarkStart[@w:name='s1b3']/parent::w:p", namespaces=ns)[0]
+        assert "".join(caption.xpath(".//w:t/text()", namespaces=ns)) == "1.3. Таблица сведений"
+        text = "".join(xml.xpath("//w:t/text()", namespaces=ns))
+        assert text.count(labels[0]) == 1 and text.count(body) == 1
+        records = xml.xpath("//w:body/w:p[w:r/w:t[starts-with(., 'Длинное исходное название ')]]", namespaces=ns)
+        assert records and records[0].xpath("./w:pPr/w:keepNext/@w:val", namespaces=ns) == ["0"]
+        assert xml.xpath("//w:hyperlink/@w:anchor", namespaces=ns) == ["s2", "s1b3", "s2b1"]
+    assert document == original
+
+
 @pytest.mark.parametrize("mutation", [
     lambda d: d.update(terms={"delivery": "private"}),
     lambda d: d["commercial"].update(sourceSnapshotKey="private"),

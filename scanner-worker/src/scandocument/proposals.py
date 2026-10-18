@@ -674,6 +674,35 @@ def _commercial_narrative_records(doc, block, labels):
             _append_inlines(paragraph, content, labels)
 
 
+def _short_commercial_heading(block):
+    # A bounded pagination hint only: never rewrite/classify the source AST.
+    # References, multiline labels and ordinary punctuated prose are not hints.
+    if block["kind"] != "paragraph" or block["style"] == "caveat":
+        return False
+    if any(part["kind"] != "text" for part in block["content"]):
+        return False
+    text = "".join(part["text"] for part in block["content"]).strip()
+    return (
+        1 <= len(text) <= 100 and text[0].isupper()
+        and not re.search(r"[\r\n\t.!?;,]", text)
+        and 2 <= len(re.findall(r"[^\W\d_]+", text)) <= 12
+    )
+
+
+def _commercial_block_caption(block):
+    if block["kind"] == "list":
+        return "Перечень"
+    # A caption may reuse short source column labels, but must not repeat a
+    # huge header or silently abbreviate it. Full original headers/cells are
+    # rendered below unchanged in both compact and adaptive table layouts.
+    columns = block["columns"]
+    caption = "Таблица: " + " / ".join(columns)
+    if len(caption) <= 160 and all(not re.search(r"[\r\n\t]", title) for title in columns):
+        if any(character.isalpha() for title in columns for character in title):
+            return caption
+    return "Таблица сведений"
+
+
 def _render_commercial(doc, commercial, accent):
     labels = _commercial_labels(commercial)
     bookmark_ids = {anchor: index for index, anchor in enumerate(labels, 1)}
@@ -694,6 +723,12 @@ def _render_commercial(doc, commercial, accent):
             prefix.bold = block["kind"] != "paragraph" or block.get("style") in ("lead", "subheading")
             if block["kind"] == "paragraph":
                 _append_inlines(paragraph, block["content"], labels)
+                following = section["blocks"][block_index] if block_index < len(section["blocks"]) else None
+                if following and _short_commercial_heading(block) and not _short_commercial_heading(following):
+                    # Attach only this short label to the next body block, not
+                    # a sequence of short labels or an entire long record.
+                    paragraph.paragraph_format.keep_with_next = True
+                    paragraph.paragraph_format.keep_together = True
                 if block["style"] == "caveat":
                     for run in paragraph.runs:
                         run.italic = True
@@ -702,6 +737,7 @@ def _render_commercial(doc, commercial, accent):
                         run.bold = True
                 end()
             else:
+                paragraph.add_run(_commercial_block_caption(block)).bold = True
                 end()
                 paragraph.paragraph_format.keep_with_next = True
                 if block["kind"] == "list":
@@ -944,10 +980,11 @@ def _render(config: dict, stopped: threading.Event) -> dict:
         office_workdir.mkdir(mode=0o700)
         convert_with_office(docx_path, pdf, soffice, office_workdir, cancelled)
         check_cancelled()
-        # Strip automatic Office metadata and reconstruct pages without source paths or authors.
+        # Import pages in two passes so forward/self annotation destinations
+        # refer to the actual page tree, not orphan clones from add_page().
+        # A fresh writer still omits Office catalog/Info metadata and authors.
         reader, writer = PdfReader(pdf), PdfWriter()
-        for page in reader.pages:
-            writer.add_page(page)
+        writer.append(reader, import_outline=False)
         writer.add_metadata(
             {"/Title": document["title"], "/Subject": "Коммерческое предложение", "/Creator": "СБК Инструменты"}
         )
