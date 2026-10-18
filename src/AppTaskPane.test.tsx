@@ -103,6 +103,7 @@ describe("App task document routing", () => {
     expect(pageTitles()).toEqual(["Рабочее окно ИИ"]);
     const initialWorkbench = workbench(); const request = handoff(); initialWorkbench.props.onTransfer(request); await flush();
     expect(pageTitles()).toEqual(["Коммерческое предложение"]); expect(pageSubtitle()).toEqual(["Документ текущей задачи"]);
+    expect(nodes().find((node) => node.type === "main")?.props.className).toBe("workspace is-task-document");
     expect(nodes().some((node) => node.type === "button" && text(node.props.children) === "Рабочее окно ИИ")).toBe(true);
     expect(nodes().filter((node) => node.type === Proposals)).toHaveLength(1);
     expect(proposal().props.handoff?.taskOrigin).toEqual(request.taskOrigin);
@@ -118,6 +119,7 @@ describe("App task document routing", () => {
     expect(workbench().props.taskDocumentSessions).toHaveLength(1);
     proposal().props.onReturnToTask!(); await flush();
     expect(pageTitles()).toEqual(["Рабочее окно ИИ"]); expect(pageSubtitle()).toEqual(["Документы, анализ и подготовка карточек для всех разделов"]);
+    expect(nodes().find((node) => node.type === "main")?.props.className).toBe("workspace");
     expect(workbench().props.active).toBe(true); expect(proposal().props.active).toBe(false);
     expect(wrapper(Proposals).key).toBe(receiverKey); expect(nodes().filter((node) => node.type === Proposals)).toHaveLength(1);
     expect(wrapper(Proposals).props.hidden).toBe(true);

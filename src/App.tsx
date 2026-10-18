@@ -690,7 +690,7 @@ function App() {
             <ToolIcon name="folder" />
           </button>
         </aside>
-        <main className="workspace">
+        <main className={`workspace${taskDocumentVisible ? " is-task-document" : ""}`}>
           <header className="topbar">
             <div className="topbar-heading">
               <h1>{title}</h1>

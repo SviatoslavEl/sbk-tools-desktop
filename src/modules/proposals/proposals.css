@@ -46,4 +46,21 @@
 .proposal-preview img { display: block; width: 100%; max-width: 900px; height: auto; align-self: center; box-shadow: 0 2px 12px #1e322322; }
 .proposal-footer { position: static; }
 .proposal-footer .button-row { flex-wrap: wrap; }
+/* Only the in-task document gets compact chrome. All alerts stay in the same
+   vertical flow as the body and footer; no nested fixed-height scroll area. */
+@media (max-width: 1280px), (max-height: 800px) {
+  .proposals-tool.is-task-document { gap: 10px; }
+  .proposals-tool.is-task-document > .proposal-context,
+  .proposals-tool.is-task-document > .proposal-footer { gap: 8px; padding: 8px 12px; }
+  .proposals-tool.is-task-document > .proposal-context > div:first-child { gap: 2px; }
+  .proposals-tool.is-task-document > .proposal-steps { flex-wrap: nowrap; overflow-x: auto; padding: 4px; }
+  .proposals-tool.is-task-document > .proposal-steps button { flex: 1 0 auto; min-height: 36px; padding: 6px 10px; white-space: nowrap; }
+  .proposals-tool.is-task-document > .proposal-workarea { padding: 12px; gap: 12px; }
+  .proposals-tool.is-task-document > .proposal-source-questions,
+  .proposals-tool.is-task-document #proposal-commercial-document > details.notice { margin-block: 0; padding: 8px 12px; }
+  .proposals-tool.is-task-document .commercial-document-heading { gap: 6px; margin-bottom: 8px; }
+  .proposals-tool.is-task-document .commercial-document-heading h2 { margin-bottom: 3px; font-size: 18px; }
+  .proposals-tool.is-task-document .commercial-document > details { margin-top: 0; margin-bottom: 8px; }
+  .proposals-tool.is-task-document .commercial-section { padding: 14px 0; }
+}
 @media (max-width: 700px) { .proposal-workarea { padding: 12px; } .proposal-fields-grid, .proposal-party-columns, .proposal-line-grid { grid-template-columns: minmax(0, 1fr); } .proposal-footer > div { width: 100%; } }

@@ -85,6 +85,14 @@ input[aria-invalid="true"], select[aria-invalid="true"], textarea[aria-invalid="
 .help-button { display: grid; place-items: center; flex-shrink: 0; width: 34px; height: 34px; padding: 0; border: 1px solid var(--line); border-radius: 9px; color: var(--text-muted); background: var(--surface); font-weight: 650; }
 .help-button:hover { color: var(--primary); border-color: #c7cffc; background: var(--primary-soft); }
 .tool-content { min-width: 0; min-height: 0; max-width: 100%; overflow: auto; overscroll-behavior: contain; scroll-padding: 18px; padding: 22px 28px 28px; }
+/* Keep the existing main-content scroll owner; short windows need less chrome,
+   not a fixed-height document pane that can clip warnings or footer actions. */
+@media (max-width: 1280px), (max-height: 800px) {
+  .workspace.is-task-document > .topbar { min-height: 64px; padding: 10px 16px; gap: 12px; }
+  .workspace.is-task-document > .topbar h1 { font-size: 19px; }
+  .workspace.is-task-document > .topbar .topbar-actions { max-width: none; gap: 8px; }
+  .workspace.is-task-document > .tool-content { padding: 14px 16px 24px; scroll-padding: 14px; }
+}
 .module-stack { min-width: 0; max-width: 100%; display: grid; gap: 16px; }
 .table-surface, .table-scroll, [data-workspace-access] { min-width: 0; max-width: 100%; }
 .module-toolbar { display: flex; align-items: end; justify-content: space-between; gap: 12px; flex-wrap: wrap; }

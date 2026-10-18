@@ -43,7 +43,7 @@ vi.mock('@tauri-apps/plugin-opener', () => ({ openPath: vi.fn().mockResolvedValu
 vi.mock('../intelligence/taskDocumentSession', async (original) => ({ ...await original<typeof import('../intelligence/taskDocumentSession')>(), taskDocumentDraftKey: async (origin: { taskId: string; resultId: string; baseResultRevision: number }) => `task-document:v1:${origin.taskId}-${origin.resultId}-${origin.baseResultRevision}` }));
 
 type ComponentProps = Parameters<typeof Proposals>[0];
-type NodeProps = { children?: ReactNode; onClick?: () => unknown; onChange?: (event: { target: { value: string; checked?: boolean } }) => unknown; onRestore?: (value: unknown) => Promise<void>; onConfirm?: () => Promise<void>; onClose?: () => void; message?: string; value?: unknown; disabled?: boolean; id?: string; title?: string; type?: string; 'aria-label'?: string; src?: string; alt?: string };
+type NodeProps = { children?: ReactNode; onClick?: () => unknown; onChange?: (event: { target: { value: string; checked?: boolean } }) => unknown; onRestore?: (value: unknown) => Promise<void>; onConfirm?: () => Promise<void>; onClose?: () => void; message?: string; value?: unknown; disabled?: boolean; id?: string; title?: string; type?: string; className?: string; tabIndex?: number; 'aria-label'?: string; src?: string; alt?: string };
 let tree: ReactNode;
 let props: ComponentProps;
 let renderOverride: (() => ReactNode) | undefined;
@@ -100,6 +100,15 @@ describe('existing proposal editor as a single AI-task receiver', () => {
     expect(projectTaskDocumentSession(last().session)).toMatchObject({ acceptedForOrigin: true, savedCurrent: false, exportedCurrent: false, semanticReadiness: 'separate-gate' });
     expect(nodes().some((node) => node.type === 'button' && ['К списку', 'Новое КП'].includes(text(node.props.children)))).toBe(false);
     expect(text()).not.toContain('Предложений:'); expect(button('Вернуться к результатам')).toBeTruthy();
+    expect(nodes()[0].props.className).toBe('proposals-tool is-task-document');
+    const steps = nodes().find((node) => node.type === 'nav' && node.props['aria-label'] === 'Шаги подготовки КП');
+    expect(steps?.props.tabIndex).toBe(0);
+    expect(nodes(steps).filter((node) => node.type === 'button')).toHaveLength(5);
+  });
+  it('keeps the registry layout outside the task document presentation', async () => {
+    await seed();
+    expect(nodes()[0].props.className).toBe('proposals-tool');
+    expect(nodes().find((node) => node.type === 'nav' && node.props['aria-label'] === 'Шаги подготовки КП')?.props.tabIndex).toBeUndefined();
   });
   it('returning to results changes visibility only and resumes the same edited proposal/write ID', async () => {
     const back = vi.fn(); await taskSeed(proposal(), 'result-A', { onReturnToTask: back });
