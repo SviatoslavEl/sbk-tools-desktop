@@ -1,5 +1,6 @@
 import type { AttachmentInfo } from '../../lib/storage';
 import type { ProposalSourceFinancials } from './sourcePricing';
+import type { ProposalCommercialDocumentV1 } from './commercialDocument';
 
 export type DecimalText = string;
 export type ProposalStatus = 'draft' | 'ready' | 'sent' | 'accepted' | 'rejected';
@@ -41,6 +42,16 @@ export interface ProposalData {
   template: ProposalTemplate; source?: ProposalSource; internalNote: string;
   /** Private source candidates and explicit reviewer decision; never exported. */
   sourceFinancials?: ProposalSourceFinancials;
+  /** Additive, private working AST. When present it owns active conditions;
+   * legacy flat fields remain for old records, not a second editable copy. */
+  commercialDocument?: ProposalCommercialDocumentV1;
+  /** Private whole-field proof made only by the canonical source handoff.
+   * It identifies an inherited service-scope snapshot, not ordinary goods or
+   * a human price approval. Never accepted from model fields or exported. */
+  commercialScopeSnapshot?: {
+    version: 1; lineId: string; title: string; description: string;
+    sourceSnapshotKey: string; documentId: string;
+  };
   /** Unresolved source questions survive saving, never become model approvals
    * and are excluded from the public export allowlist. */
   sourceQuestions?: Array<{ id: string; message: string; evidence: Array<{ sourceId: string; sourceName: string; fragmentId?: string; locator: string; quote: string }> }>;

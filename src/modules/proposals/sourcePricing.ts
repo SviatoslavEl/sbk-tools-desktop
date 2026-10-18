@@ -1,4 +1,6 @@
 import { createProposalLine } from "./defaults";
+import { validateCommercialBody } from "./commercialDocument";
+import { hasFreshCommercialScopeSnapshot } from "./commercialScopeSnapshot";
 import { normalizeDecimal, priceProposalLine } from "./pricing";
 import { VAT_RATES, type ProposalData, type ProposalLine, type Tax } from "./types";
 
@@ -92,9 +94,22 @@ function canonicalJson(value: unknown): string {
 function fingerprint(data: ProposalData): string {
   // Exact private binding, not a hash/authentication mechanism. Editing price,
   // scope, parties or family invalidates the previous applicability decision.
+  const lines = data.lines.map(({ id, title, description, unit, quantity, unitPrice, priceBasis, discountPercent, tax }) => ({ id, title, description, unit, quantity, unitPrice, priceBasis, discountPercent, tax }));
+  if (data.commercialDocument !== undefined) {
+    const issue = validateCommercialBody(data.commercialDocument?.body).find((item) => item.severity === "error");
+    if (issue) throw new Error("Коммерческий состав КП повреждён. Проверьте документ перед применением исходной цены.");
+    // With the working AST present, it is the sole terms owner. Inactive flat
+    // terms and decisions about payment/definitions must not create a price
+    // approval cycle. Material text may also live in summary/other sections.
+    const scope = data.commercialDocument.body.sections.filter((section) => !["payment", "definitions", "requisites"].includes(section.kind));
+    return canonicalJson({ binding: "proposal-source-pricing/2", familyId: data.familyId, title: data.title,
+      issuer: [data.issuer.name, data.issuer.inn, data.issuer.kpp], recipient: [data.recipient.name, data.recipient.inn, data.recipient.kpp],
+      lines, candidates: data.sourceFinancials?.candidates, scope });
+  }
+  // Keep the exact legacy projection when there is no active working AST.
   return canonicalJson([data.familyId, data.title, [data.issuer.name, data.issuer.inn, data.issuer.kpp], [data.recipient.name, data.recipient.inn, data.recipient.kpp],
     data.introduction, data.deliveryTerms, data.paymentTerms, data.conclusion,
-    data.lines.map(({ id, title, description, unit, quantity, unitPrice, priceBasis, discountPercent, tax }) => ({ id, title, description, unit, quantity, unitPrice, priceBasis, discountPercent, tax })),
+    lines,
     data.sourceFinancials?.candidates]);
 }
 
@@ -102,7 +117,9 @@ function sameFingerprint(stored: string, data: ProposalData): boolean {
   if (typeof stored !== "string") return false;
   const current = fingerprint(data);
   // Also accept a genuine earlier insertion-ordered binding after comparing
-  // its complete parsed values. No DB migration or new approval is created.
+  // its complete parsed values. Active AST bindings are tagged separately:
+  // an older legacy-only receipt can never ignore a newly present AST.
+  // No DB migration or new approval is created.
   return stored === current || canonicalJson(JSON.parse(stored)) === current;
 }
 
@@ -123,7 +140,7 @@ export function applyProposalSourcePrice(data: ProposalData, candidateId: string
     // “КП по …” from its offered service “Услуги по …”. Applying a package
     // price must not overwrite that explicit service name with the heading.
     // This is a narrow preservation rule, not a way to name arbitrary goods.
-    const sourceService = data.lines.length === 1 && candidate.sourceKind === "contract"
+    const sourceService = hasFreshCommercialScopeSnapshot(data) || data.lines.length === 1 && candidate.sourceKind === "contract"
       && /(?:стоимост[ьи]|цен[аыуе])[^.;\n]{0,100}(?:услуг|работ)(?=$|[^\p{L}])/iu.test(candidate.quote)
       && /^КП\s+по\s+\S/iu.test(data.title.trim())
       && key(data.lines[0].title) === key(data.title.trim().replace(/^КП\s+по\s+/iu, "Услуги по "));
@@ -131,7 +148,7 @@ export function applyProposalSourcePrice(data: ProposalData, candidateId: string
     const completeScope = sourceService ? data.lines[0].description : alreadyAggregate ? data.lines[0].description.trim() : data.lines.map((line) => [line.title.trim(), line.description.trim()].filter(Boolean).join("\n")).filter(Boolean).join("\n\n");
     if (!completeScope.trim() || !data.title.trim()) throw new Error("Сначала заполните предмет и полный состав работ. Цена не заменяет описание услуги.");
     if (completeScope.length > 20_000) throw new Error("Полный состав работ не помещается в одну позицию. Сократите его вручную без потери условий.");
-    lines = [priceLine(candidate, { ...createProposalLine(), title: sourceService ? data.lines[0].title : data.title.trim(), description: completeScope })];
+    lines = [priceLine(candidate, { ...createProposalLine(), ...(sourceService ? { id: data.lines[0].id } : {}), title: sourceService ? data.lines[0].title : data.title.trim(), description: completeScope })];
   } else {
     const matching = data.lines.filter((line) => candidate.positionName && key(line.title) === key(candidate.positionName));
     if (matching.length !== 1) throw new Error("Исходная цена не сопоставлена с единственной неизменённой позицией КП.");

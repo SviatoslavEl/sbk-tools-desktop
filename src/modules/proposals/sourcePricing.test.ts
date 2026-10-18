@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import { cloneProposal, createProposal, createProposalLine } from "./defaults";
 import { buildProposalPublic } from "./exportPublic";
 import { priceProposal } from "./pricing";
+import { commercialFingerprint, commercialQuestionSourceFingerprint, type CommercialSectionKind, type ProposalCommercialDocumentV1 } from "./commercialDocument";
+import { applyTermDecision, validateTermAnswer } from "./commercialDecisions";
 import { applyProposalSourcePrice, createProposalSourceFinancials, dismissProposalSourcePricing, normalizeProposalSourceCandidate, proposalSourcePricingIssues, type ProposalSourceFinancialCandidate } from "./sourcePricing";
 
 const candidate = (patch: Partial<ProposalSourceFinancialCandidate> = {}): ProposalSourceFinancialCandidate => ({ id: "price-a", sourceId: "doc-a", sourceName: "Исходный договор", fragmentId: "p3", locator: "Абзац 3", quote: "Стоимость всего комплекса 1220 рублей с НДС 22%", sourceKind: "contract", scope: "aggregate", currency: "RUB", net: "1000", vatAmount: "220", gross: "1220", tax: { kind: "vat", rate: 22 }, issues: [], ...patch });
@@ -13,6 +15,12 @@ function proposal(patch: Partial<ProposalSourceFinancialCandidate> = {}) {
 const confirmed = { sameProject: true, aggregateAsSingleLine: true };
 const sortedObjectRoundTrip = <T,>(value: T): T => JSON.parse(JSON.stringify(value, (_property, entry: unknown) => entry && typeof entry === "object" && !Array.isArray(entry)
   ? Object.fromEntries(Object.entries(entry).sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)) : entry)) as T;
+function commercialDocument(): ProposalCommercialDocumentV1 {
+  const kinds: CommercialSectionKind[] = ["summary", "subject", "scope", "perimeter", "deliverables", "exclusions", "customer-inputs", "schedule", "acceptance", "other", "payment", "definitions", "requisites"];
+  return { version: 1, revision: 1, body: { version: 1, sections: kinds.map((kind) => ({ id: `section-${kind}`, kind, title: `Раздел ${kind}`,
+    blocks: [{ id: `block-${kind}`, kind: "paragraph", style: "body", content: [{ kind: "text", text: `Исходное условие ${kind}` }] }] })) },
+    privateAppendix: { version: 1, sourceSnapshotKey: `sha256:${"a".repeat(64)}`, documentId: "source-document", extraction: { complete: true, requiresOcr: false, visualAssessment: "unassessed" }, containers: [], clauses: [], references: [], coverage: [] }, questions: [], decisions: [] };
+}
 
 describe("explicit private source price application", () => {
   it("uses one aggregate without inventing five prices, preserving every scope block and original data", () => {
@@ -92,6 +100,89 @@ describe("explicit private source price application", () => {
     expect(proposalSourcePricingIssues(persisted)).toEqual([]); expect(persisted).toEqual(before);
     persisted.sourceFinancials!.candidates[0].quote += " Изменённое условие";
     expect(proposalSourcePricingIssues(persisted)).not.toEqual([]);
+  });
+  it("binds an active AST's material subject, scope, schedule and other semantic sections", () => {
+    const data = proposal(); data.commercialDocument = commercialDocument();
+    const reviewed = applyProposalSourcePrice(data, "price-a", confirmed);
+    expect(proposalSourcePricingIssues(reviewed)).toEqual([]);
+    for (const kind of ["summary", "subject", "scope", "perimeter", "deliverables", "exclusions", "customer-inputs", "schedule", "acceptance", "other"]) {
+      const edited = structuredClone(reviewed), block = edited.commercialDocument!.body.sections.find((section) => section.kind === kind)!.blocks[0];
+      if (block.kind !== "paragraph" || block.content[0].kind !== "text") throw new Error("fixture");
+      block.content[0].text += " Новое материальное условие";
+      expect(proposalSourcePricingIssues(edited), kind).not.toEqual([]);
+    }
+    const reordered = structuredClone(reviewed); reordered.commercialDocument!.body.sections.reverse();
+    expect(proposalSourcePricingIssues(reordered)).not.toEqual([]);
+  });
+  it("does not bind inactive flat terms, contacts, private metadata or payment/definition decisions to the AST price receipt", () => {
+    const data = proposal(); data.commercialDocument = commercialDocument();
+    for (const reviewed of [applyProposalSourcePrice(data, "price-a", confirmed), dismissProposalSourcePricing(data)]) {
+      const edited = structuredClone(reviewed);
+      edited.introduction = "Неактивное старое введение"; edited.deliveryTerms = "Неактивный старый срок";
+      edited.paymentTerms = "Неактивный старый платёж"; edited.conclusion = "Неактивное старое заключение";
+      edited.contact.fullName = "Другой контакт"; edited.issuer.contact = "Обновлённая почта"; edited.recipient.address = "Новый адрес";
+      edited.commercialDocument!.revision += 1;
+      edited.commercialDocument!.privateAppendix.sourceSnapshotKey = `sha256:${"b".repeat(64)}`;
+      edited.commercialDocument!.privateAppendix.extraction.visualAssessment = "reviewed-by-user";
+      for (const kind of ["payment", "definitions", "requisites"]) {
+        const block = edited.commercialDocument!.body.sections.find((section) => section.kind === kind)!.blocks[0];
+        if (block.kind !== "paragraph" || block.content[0].kind !== "text") throw new Error("fixture");
+        block.content[0].text += " Явное согласованное условие";
+      }
+      edited.commercialDocument!.decisions.push({ version: 1, id: "payment-decision", questionId: "payment-question", answer: { kind: "advance-days", dayKind: "calendar" }, origin: "user", appliedAt: "2035-01-01T12:00:00Z",
+        sourceSnapshotKey: `sha256:${"b".repeat(64)}`, dependencyFingerprint: `sha256:${"c".repeat(64)}`, sourceClauseIds: [], changedBlockIds: ["block-payment"], beforeFingerprint: `sha256:${"d".repeat(64)}`, afterFingerprint: `sha256:${"e".repeat(64)}` });
+      expect(proposalSourcePricingIssues(edited)).toEqual([]);
+    }
+  });
+  it("keeps AST price bindings stable after recursively sorted storage while preserving material invalidation", () => {
+    const data = proposal(); data.commercialDocument = commercialDocument();
+    const reviewed = applyProposalSourcePrice(data, "price-a", confirmed), persisted = sortedObjectRoundTrip(reviewed);
+    expect(proposalSourcePricingIssues(persisted)).toEqual([]);
+    expect(persisted.sourceFinancials!.decision!.fingerprint).toBe(reviewed.sourceFinancials!.decision!.fingerprint);
+    const block = persisted.commercialDocument!.body.sections.find((section) => section.kind === "scope")!.blocks[0];
+    if (block.kind !== "paragraph" || block.content[0].kind !== "text") throw new Error("fixture");
+    block.content[0].text += " Дополнительная система";
+    expect(proposalSourcePricingIssues(persisted)).not.toEqual([]);
+  });
+  it("keeps an actual explicit payment-day Apply from invalidating its already confirmed source price", async () => {
+    const data = proposal(), document = commercialDocument(), payment = document.body.sections.find((section) => section.kind === "payment")!;
+    const quote = "Аванс перечисляется не позднее 5 дней с момента подписания договора.";
+    payment.blocks = [{ id: "block-payment", kind: "paragraph", style: "body", content: [{ kind: "text", text: quote }] }];
+    document.privateAppendix.containers = [{ id: "container", sourceId: "source", kind: "contract", heading: "Договор" }];
+    document.privateAppendix.clauses = [{ id: "payment-clause", sourceId: "source", sourceName: "Синтетический договор", containerId: "container", locator: "Оплата", quote, quoteHash: await commercialFingerprint(quote), roles: ["payment"], classification: "commercial" }];
+    document.privateAppendix.coverage = [{ sourceClauseId: "payment-clause", kind: "literal", targetBlockIds: ["block-payment"] }];
+    const identity = { kind: "advance-days" as const, sourceClauseIds: ["payment-clause"], sourceReferenceIds: [] };
+    document.questions = [{ ...identity, id: "payment-question", sectionId: payment.id, targetBlockIds: ["block-payment"], message: "Уточнить вид дней", material: true,
+      dependencyFingerprint: await commercialQuestionSourceFingerprint(document.privateAppendix, identity) }];
+    data.commercialDocument = document;
+    const reviewed = applyProposalSourcePrice(data, "price-a", confirmed), answer = { kind: "advance-days" as const, dayKind: "business" as const };
+    const validation = await validateTermAnswer(reviewed.commercialDocument!, "payment-question", answer, { pricing: reviewed });
+    expect(validation.valid).toBe(true);
+    const applied = await applyTermDecision(reviewed.commercialDocument!, { questionId: "payment-question", answer, decisionId: "payment-applied", appliedAt: "2035-01-01T12:00:00Z",
+      expectedRevision: reviewed.commercialDocument!.revision, expectedDependencyFingerprint: validation.dependencyFingerprint }, { pricing: reviewed });
+    expect(JSON.stringify(applied.document.body)).toContain("5 рабочих дней");
+    expect(applied.document.decisions).toHaveLength(1);
+    expect(proposalSourcePricingIssues({ ...reviewed, commercialDocument: applied.document })).toEqual([]);
+    expect(priceProposal(reviewed.lines).totals).toMatchObject({ grossMinor: "122000", vatMinor: "22000" });
+  });
+  it("never reuses a legacy-only applicability receipt when an AST is present, or an AST receipt after it is removed", () => {
+    const legacy = applyProposalSourcePrice(proposal(), "price-a", confirmed), legacyFingerprint = legacy.sourceFinancials!.decision!.fingerprint;
+    const withAst = { ...legacy, commercialDocument: commercialDocument() };
+    expect(proposalSourcePricingIssues(withAst)).not.toEqual([]);
+    expect(legacy.sourceFinancials!.decision!.fingerprint).toBe(legacyFingerprint);
+    const reapplied = applyProposalSourcePrice(withAst, "price-a", { ...confirmed, replaceExistingPrices: true });
+    expect(proposalSourcePricingIssues(reapplied)).toEqual([]);
+    expect(reapplied.sourceFinancials!.decision!.fingerprint).not.toBe(legacyFingerprint);
+    const removed = structuredClone(reapplied); delete removed.commercialDocument;
+    expect(proposalSourcePricingIssues(removed)).not.toEqual([]);
+  });
+  it("fails closed for a present but structurally invalid AST rather than falling back to a legacy receipt", () => {
+    const reviewed = applyProposalSourcePrice(proposal(), "price-a", confirmed);
+    for (const malformed of [null, {}, { version: 1, body: { version: 1, sections: "not-an-array" } }]) {
+      const data = { ...reviewed, commercialDocument: malformed } as unknown as typeof reviewed;
+      expect(proposalSourcePricingIssues(data)).not.toEqual([]);
+      expect(() => applyProposalSourcePrice(data, "price-a", { ...confirmed, replaceExistingPrices: true })).toThrow(/состав КП повреждён/);
+    }
   });
   it("keeps all scalar changes and ordering of lines, candidates and issue arrays bound after key-sorted storage", () => {
     const data = proposal({ scope: "position", positionName: "Анализ", quantity: "2", unit: "час", unitPrice: "610", priceBasis: "gross" });
