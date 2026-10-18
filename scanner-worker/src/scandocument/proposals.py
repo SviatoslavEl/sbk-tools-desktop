@@ -662,13 +662,25 @@ def _commercial_narrative_budget(commercial):
 
 def _commercial_narrative_records(doc, block, labels):
     for row_index, row in enumerate(block["rows"]):
+        first_text = "".join(part["text"] for part in row[0] if part["kind"] == "text")
+        keep_first = bool(
+            len(row) > 1 and all(part["kind"] == "text" for part in row[0])
+            and first_text.strip() and len(first_text) <= 160
+            and len(block["columns"][0]) <= 160
+            and not re.search(r"[\r\n\t]", block["columns"][0] + first_text)
+            and any(
+                (part["text"] if part["kind"] == "text" else labels[part["target"]]).strip()
+                for part in row[1]
+            )
+        )
         for column_index, (title, content) in enumerate(zip(block["columns"], row, strict=True)):
             paragraph = doc.add_paragraph()
             paragraph.paragraph_format.space_before = Pt(8 if row_index and column_index == 0 else 0)
             paragraph.paragraph_format.space_after = Pt(5)
-            # Do not turn a whole long record into a heading/keep chain: prose
-            # must flow across page boundaries rather than leave half a page.
-            paragraph.paragraph_format.keep_with_next = False
+            # Attach only a short text-only record title to the immediately
+            # following nonempty cell. Every later cell remains breakable,
+            # so a long record never becomes a whole-page keep chain.
+            paragraph.paragraph_format.keep_with_next = column_index == 0 and keep_first
             paragraph.paragraph_format.keep_together = False
             paragraph.add_run(title + ": ").bold = True
             _append_inlines(paragraph, content, labels)

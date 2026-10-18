@@ -470,11 +470,65 @@ def test_public_v2_narrative_records_use_full_width_and_preserve_every_cell_and_
         assert xml.xpath("//w:hyperlink/@w:anchor", namespaces=ns) == ["s2", "s1b3", "s2b1", "s2"]
         records = xml.xpath("//w:body/w:p[w:r/w:t[starts-with(., 'Блок: ') or starts-with(., 'Что проверяем: ') or starts-with(., 'Состав действий: ') or starts-with(., 'Результат: ')]]", namespaces=ns)
         assert len(records) == 8
-        for paragraph in records:
-            assert paragraph.xpath("./w:pPr/w:keepNext/@w:val", namespaces=ns) == ["0"]
+        for index, paragraph in enumerate(records):
+            assert len(paragraph.xpath("./w:pPr/w:keepNext[not(@w:val) or @w:val='1']", namespaces=ns)) == (1 if index in (0, 4) else 0)
+            if index not in (0, 4):
+                assert paragraph.xpath("./w:pPr/w:keepNext/@w:val", namespaces=ns) == ["0"]
             assert paragraph.xpath("./w:pPr/w:keepLines/@w:val", namespaces=ns) == ["0"]
             assert paragraph.xpath("./w:r[1]/w:rPr/w:b", namespaces=ns)
     assert document == original
+
+
+@pytest.mark.parametrize("first,following,title,keep", [
+    ([{"kind": "text", "text": "2.1.4"}], [{"kind": "text", "text": "Содержание блока"}], "Блок", True),
+    ([{"kind": "text", "text": "Первая "}, {"kind": "text", "text": "услуга"}], [{"kind": "text", "text": "Действия"}], "Блок", True),
+    ([{"kind": "text", "text": "Я" * 160}], [{"kind": "text", "text": "Действия"}], "Блок", True),
+    ([{"kind": "text", "text": "Я" * 161}], [{"kind": "text", "text": "Действия"}], "Блок", False),
+    ([{"kind": "text", "text": "Первая\nуслуга"}], [{"kind": "text", "text": "Действия"}], "Блок", False),
+    ([{"kind": "text", "text": "Первая\rуслуга"}], [{"kind": "text", "text": "Действия"}], "Блок", False),
+    ([{"kind": "text", "text": "Первая\tуслуга"}], [{"kind": "text", "text": "Действия"}], "Блок", False),
+    ([], [{"kind": "text", "text": "Действия"}], "Блок", False),
+    ([{"kind": "text", "text": "  "}], [{"kind": "text", "text": "Действия"}], "Блок", False),
+    ([{"kind": "local-ref", "target": "s2b1"}], [{"kind": "text", "text": "Действия"}], "Блок", False),
+    ([{"kind": "text", "text": "См. "}, {"kind": "local-ref", "target": "s2b1"}], [{"kind": "text", "text": "Действия"}], "Блок", False),
+    ([{"kind": "text", "text": "Первая услуга"}], [], "Блок", False),
+    ([{"kind": "text", "text": "Первая услуга"}], [{"kind": "text", "text": ""}], "Блок", False),
+    ([{"kind": "text", "text": "Первая услуга"}], [{"kind": "text", "text": " \n\t"}], "Блок", False),
+    ([{"kind": "text", "text": "Первая услуга"}], [{"kind": "local-ref", "target": "s2b1"}], "Блок", True),
+    ([{"kind": "text", "text": "Первая услуга"}], [{"kind": "text", "text": "Действия"}], "Многострочный\nзаголовок", False),
+    ([{"kind": "text", "text": "Первая услуга"}], [{"kind": "text", "text": "Действия"}], "З" * 161, False),
+])
+def test_narrative_record_only_short_text_first_cell_keeps_immediate_following_paragraph(first, following, title, keep):
+    from lxml import etree
+    from scandocument.proposals import _append_inlines, _commercial_narrative_records
+
+    labels = {"s2b1": "пункт\u00a02.1"}
+    block = {"columns": [title, "Предмет", "Действия", "Результат"], "rows": [[
+        first, following,
+        [{"kind": "text", "text": "Сохранить полный состав действий. " * 30}],
+        [{"kind": "local-ref", "target": "s2b1"}],
+    ]]}
+    original = copy.deepcopy(block)
+    doc = Document()
+    _commercial_narrative_records(doc, block, labels)
+    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+    paragraphs = doc.element.xpath("./w:body/w:p")
+    assert len(paragraphs) == 4
+    for index, (paragraph, column, content) in enumerate(zip(paragraphs, block["columns"], block["rows"][0], strict=True)):
+        assert doc.paragraphs[index].paragraph_format.keep_with_next is (index == 0 and keep)
+        assert paragraph.xpath("./w:pPr/w:keepLines/@w:val") == ["0"]
+        # Rebuilding the expected paragraph independently of pagination must
+        # preserve every text run, reference and literal column label exactly.
+        expected = Document().add_paragraph()
+        expected.add_run(column + ": ").bold = True
+        _append_inlines(expected, content, labels)
+        assert [etree.tostring(child) for child in paragraph if child.tag != f"{{{ns['w']}}}pPr"] == [
+            etree.tostring(child) for child in expected._p
+        ]
+    assert doc.element.xpath("./w:body/w:p//w:hyperlink/@w:anchor") == [
+        part["target"] for cell in block["rows"][0] for part in cell if part["kind"] == "local-ref"
+    ]
+    assert block == original
 
 
 @pytest.mark.parametrize("length,columns,expected_tables", [(320, 4, 2), (321, 4, 1), (321, 3, 1), (1000, 2, 2)])
