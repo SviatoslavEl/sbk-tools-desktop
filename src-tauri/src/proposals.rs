@@ -113,21 +113,190 @@ fn tax_schema(value: &Value) -> Result<(), String> {
         Err("Некорректный НДС КП".into())
     }
 }
-pub(crate) fn validate_public(document: &Value) -> Result<(), String> {
-    if serde_json::to_vec(document)
-        .map_err(|e| e.to_string())?
-        .len()
-        > 8 * 1024 * 1024
-    {
-        return Err("Слишком большой документ КП (более 8 МБ текста)".into());
+const MAX_PUBLIC_BYTES: usize = 8 * 1024 * 1024;
+struct PublicSizeBudget(usize);
+impl Write for PublicSizeBudget {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self
+            .0
+            .checked_add(bytes.len())
+            .filter(|size| *size <= MAX_PUBLIC_BYTES)
+            .ok_or_else(|| {
+                std::io::Error::other("Слишком большой документ КП (более 8 МБ текста)")
+            })?;
+        Ok(bytes.len())
     }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+fn commercial_text(value: &Value, required: bool) -> Result<(), String> {
+    if value.as_str().is_none_or(|text| {
+        text.chars().take(20001).count() > 20000
+            || (required && text.trim().is_empty())
+            || text
+                .chars()
+                .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
+    }) {
+        return Err("Некорректный текст публичного раздела КП".into());
+    }
+    Ok(())
+}
+fn commercial_inline(value: &Value, references: &mut Vec<String>) -> Result<(), String> {
+    let parts = value
+        .as_array()
+        .filter(|parts| parts.len() <= 2000)
+        .ok_or("Не более 2000 частей текста КП")?;
+    for part in parts {
+        match part["kind"].as_str() {
+            Some("text") => {
+                object(part, "kind text", "")?;
+                commercial_text(&part["text"], false)?;
+            }
+            Some("local-ref") => {
+                object(part, "kind target", "")?;
+                let target = part["target"]
+                    .as_str()
+                    .filter(|target| target.len() <= 16)
+                    .ok_or("Некорректная локальная ссылка КП")?;
+                references.push(target.to_owned());
+            }
+            _ => return Err("Неподдерживаемая часть публичного текста КП".into()),
+        }
+    }
+    Ok(())
+}
+fn commercial_schema(value: &Value) -> Result<(), String> {
+    object(value, "version mode sections unresolved", "")?;
+    let mode = value["mode"]
+        .as_str()
+        .ok_or("Не указан режим документа КП")?;
+    if value["version"] != 1 || !matches!(mode, "review-draft" | "final") {
+        return Err("Неподдерживаемая версия разделов КП".into());
+    }
+    let sections = value["sections"]
+        .as_array()
+        .filter(|items| !items.is_empty() && items.len() <= 64)
+        .ok_or("В КП допустимо от 1 до 64 публичных разделов")?;
+    let mut anchors = HashSet::new();
+    let mut references = Vec::new();
+    let mut total_blocks = 0usize;
+    for (section_index, section) in sections.iter().enumerate() {
+        object(section, "anchor title blocks", "")?;
+        let anchor = format!("s{}", section_index + 1);
+        if section["anchor"] != anchor {
+            return Err("Нарушена последовательность разделов КП".into());
+        }
+        anchors.insert(anchor.clone());
+        commercial_text(&section["title"], true)?;
+        let blocks = section["blocks"]
+            .as_array()
+            .filter(|items| items.len() <= 2000)
+            .ok_or("Некорректный состав раздела КП")?;
+        total_blocks += blocks.len();
+        if total_blocks > 2000 {
+            return Err("Не более 2000 блоков в КП".into());
+        }
+        for (block_index, block) in blocks.iter().enumerate() {
+            let block_anchor = format!("{anchor}b{}", block_index + 1);
+            if block["anchor"] != block_anchor {
+                return Err("Нарушена последовательность блоков КП".into());
+            }
+            anchors.insert(block_anchor);
+            match block["kind"].as_str() {
+                Some("paragraph") => {
+                    object(block, "anchor kind style content", "")?;
+                    if !matches!(
+                        block["style"].as_str(),
+                        Some("body" | "lead" | "subheading" | "caveat")
+                    ) {
+                        return Err("Неподдерживаемый стиль абзаца КП".into());
+                    }
+                    commercial_inline(&block["content"], &mut references)?;
+                }
+                Some("list") => {
+                    object(block, "anchor kind style items", "")?;
+                    if !matches!(block["style"].as_str(), Some("bullet" | "ordered")) {
+                        return Err("Неподдерживаемый стиль списка КП".into());
+                    }
+                    let items = block["items"]
+                        .as_array()
+                        .filter(|items| items.len() <= 2000)
+                        .ok_or("В списке КП допустимо до 2000 пунктов")?;
+                    for item in items {
+                        commercial_inline(item, &mut references)?;
+                    }
+                }
+                Some("table") => {
+                    object(block, "anchor kind columns rows", "")?;
+                    let columns = block["columns"]
+                        .as_array()
+                        .filter(|items| !items.is_empty() && items.len() <= 8)
+                        .ok_or("В таблице КП допустимо от 1 до 8 столбцов")?;
+                    for column in columns {
+                        commercial_text(column, true)?;
+                    }
+                    let rows = block["rows"]
+                        .as_array()
+                        .filter(|items| items.len() <= 2000)
+                        .ok_or("Не более 2000 строк таблицы КП")?;
+                    for row in rows {
+                        let cells = row
+                            .as_array()
+                            .filter(|cells| cells.len() == columns.len())
+                            .ok_or("Число ячеек не совпадает со столбцами КП")?;
+                        for cell in cells {
+                            commercial_inline(cell, &mut references)?;
+                        }
+                    }
+                }
+                _ => return Err("Неподдерживаемый публичный блок КП".into()),
+            }
+        }
+    }
+    if total_blocks == 0 {
+        return Err("КП не содержит публичных блоков".into());
+    }
+    if references.iter().any(|target| !anchors.contains(target)) {
+        return Err("Локальная ссылка КП не имеет адресата".into());
+    }
+    let unresolved = value["unresolved"]
+        .as_array()
+        .filter(|items| items.len() <= 2000)
+        .ok_or("Не более 2000 вопросов для проверки КП")?;
+    if mode == "final" && !unresolved.is_empty() {
+        return Err("Итоговый документ КП содержит нерешённые вопросы".into());
+    }
+    for item in unresolved {
+        object(item, "section message", "")?;
+        if !sections
+            .iter()
+            .any(|section| section["anchor"] == item["section"])
+        {
+            return Err("Вопрос КП не имеет публичного раздела".into());
+        }
+        commercial_text(&item["message"], true)?;
+    }
+    Ok(())
+}
+pub(crate) fn validate_public(document: &Value) -> Result<(), String> {
+    serde_json::to_writer(&mut PublicSizeBudget(0), document).map_err(|e| e.to_string())?;
+    let version = document["schemaVersion"]
+        .as_u64()
+        .ok_or("Неподдерживаемая версия КП")?;
+    let body_field = match version {
+        1 => "terms",
+        2 => "commercial",
+        _ => return Err("Неподдерживаемая версия КП".into()),
+    };
     object(
         document,
-        "schemaVersion number revision documentDate title validUntil currency issuer recipient addressee contact lines totals terms layout attachments",
+        &format!(
+            "schemaVersion number revision documentDate title validUntil currency issuer recipient addressee contact lines totals {body_field} layout attachments"
+        ),
         "signer",
     )?;
-    if document["schemaVersion"] != 1
-        || document["currency"] != "RUB"
+    if document["currency"] != "RUB"
         || !document["revision"]
             .as_u64()
             .is_some_and(|r| (1..=100000).contains(&r))
@@ -193,15 +362,19 @@ pub(crate) fn validate_public(document: &Value) -> Result<(), String> {
         string_fields(group, "netMinor vatMinor grossMinor")?;
         tax_schema(&group["tax"])?;
     }
-    object(
-        &document["terms"],
-        "delivery payment introduction conclusion",
-        "",
-    )?;
-    string_fields(
-        &document["terms"],
-        "delivery payment introduction conclusion",
-    )?;
+    if version == 1 {
+        object(
+            &document["terms"],
+            "delivery payment introduction conclusion",
+            "",
+        )?;
+        string_fields(
+            &document["terms"],
+            "delivery payment introduction conclusion",
+        )?;
+    } else {
+        commercial_schema(&document["commercial"])?;
+    }
     object(&document["layout"], "style accentColor show footer", "logo")?;
     string_fields(&document["layout"], "style accentColor footer")?;
     let show = object(
@@ -736,6 +909,126 @@ pub(crate) fn proposal_open_output(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn public_fixture(version: u64) -> Value {
+        let party = json!({"name":"Компания","shortName":"","inn":"","kpp":"","ogrn":"","address":"","contact":"","paymentDetails":""});
+        let contact = json!({"fullName":"","position":"","phone":"","email":""});
+        let mut value = json!({
+            "schemaVersion":version,"number":"КП-1","revision":1,"documentDate":"2030-01-01","title":"Предложение","validUntil":"2030-02-01","currency":"RUB",
+            "issuer":party,"recipient":party,"addressee":contact,"contact":contact,
+            "lines":[{"title":"Услуга","description":"","unit":"комплекс","quantity":"1","unitPrice":"100","priceBasis":"net","discountPercent":"0","tax":{"kind":"none"},"netMinor":"10000","vatMinor":"0","grossMinor":"10000"}],
+            "totals":{"pricingVersion":"proposal-pricing/1","netMinor":"10000","vatMinor":"0","grossMinor":"10000","byTax":[{"tax":{"kind":"none"},"netMinor":"10000","vatMinor":"0","grossMinor":"10000"}]},
+            "layout":{"style":"standard","accentColor":"#245C48","show":{"address":true,"requisites":true,"contact":true,"signer":true},"footer":""},"attachments":[]
+        });
+        if version == 1 {
+            value["terms"] = json!({"delivery":"","payment":"","introduction":"","conclusion":""});
+        } else {
+            value["commercial"] = json!({"version":1,"mode":"final","sections":[{"anchor":"s1","title":"Состав","blocks":[
+                {"anchor":"s1b1","kind":"paragraph","style":"body","content":[{"kind":"text","text":"Объём работ: "},{"kind":"local-ref","target":"s1b2"}]},
+                {"anchor":"s1b2","kind":"list","style":"ordered","items":[[{"kind":"text","text":"Передача результата"}]]},
+                {"anchor":"s1b3","kind":"table","columns":["Результат","Срок"],"rows":[[[{"kind":"text","text":"Отчёт"}],[{"kind":"local-ref","target":"s1"}]]]}
+            ]}],"unresolved":[]});
+        }
+        value
+    }
+    #[test]
+    fn public_versions_keep_disjoint_closed_bodies() {
+        for version in [1, 2] {
+            assert!(validate_public(&public_fixture(version)).is_ok());
+        }
+        let mut v1 = public_fixture(1);
+        v1["commercial"] = public_fixture(2)["commercial"].clone();
+        assert!(validate_public(&v1).is_err());
+        let mut v2 = public_fixture(2);
+        v2["terms"] = public_fixture(1)["terms"].clone();
+        assert!(validate_public(&v2).is_err());
+    }
+    #[test]
+    fn commercial_rejects_private_keys_bad_anchors_and_foreign_refs() {
+        let mut v2 = public_fixture(2);
+        v2["commercial"]["sections"][0]["blocks"][0]["sourceId"] = json!("private-source");
+        assert!(validate_public(&v2).is_err());
+        for anchor in [
+            "source-clause",
+            "s01",
+            "s2",
+            "https://example.org",
+            "s1\" onclick",
+        ] {
+            let mut invalid = public_fixture(2);
+            invalid["commercial"]["sections"][0]["anchor"] = json!(anchor);
+            assert!(validate_public(&invalid).is_err());
+        }
+        let mut dangling = public_fixture(2);
+        dangling["commercial"]["sections"][0]["blocks"][0]["content"][1]["target"] = json!("s2b1");
+        assert!(validate_public(&dangling).is_err());
+        let mut remote = public_fixture(2);
+        remote["commercial"]["sections"][0]["blocks"][0]["content"][1]["url"] =
+            json!("https://example.org");
+        assert!(validate_public(&remote).is_err());
+    }
+    #[test]
+    fn commercial_review_questions_are_section_bound_and_never_final() {
+        let mut value = public_fixture(2);
+        value["commercial"]["unresolved"] = json!([{"section":"s1","message":"Уточнить срок"}]);
+        assert!(validate_public(&value).is_err());
+        value["commercial"]["mode"] = json!("review-draft");
+        assert!(validate_public(&value).is_ok());
+        value["commercial"]["unresolved"][0]["section"] = json!("s1b1");
+        assert!(validate_public(&value).is_err());
+        value["commercial"]["unresolved"] =
+            json!([{"sectionTitle":"Состав","message":"Уточнить срок"}]);
+        assert!(validate_public(&value).is_err());
+    }
+    #[test]
+    fn commercial_validates_text_shape_and_global_size_early() {
+        let mut value = public_fixture(2);
+        value["commercial"]["sections"][0]["title"] = json!("я".repeat(20000));
+        assert!(validate_public(&value).is_ok());
+        value["commercial"]["sections"][0]["title"] = json!("я".repeat(20001));
+        assert!(validate_public(&value).is_err());
+        let mut value = public_fixture(2);
+        value["commercial"]["sections"][0]["blocks"][2]["rows"][0] = json!([]);
+        assert!(validate_public(&value).is_err());
+        let mut value = public_fixture(2);
+        value["commercial"]["sections"][0]["blocks"][0]["content"] =
+            json!(vec![json!({"kind":"text","text":"x".repeat(20000)}); 500]);
+        assert!(validate_public(&value).unwrap_err().contains("8 МБ"));
+        let mut value = public_fixture(2);
+        value["commercial"]["sections"][0]["blocks"] = json!([]);
+        assert!(validate_public(&value).is_err());
+    }
+    #[test]
+    fn commercial_container_limits_accept_the_boundary_but_not_the_next_item() {
+        for count in [2000, 2001] {
+            let mut value = public_fixture(2);
+            value["commercial"]["sections"][0]["blocks"] = json!((1..=count).map(|index| json!({"anchor":format!("s1b{index}"),"kind":"paragraph","style":"body","content":[]})).collect::<Vec<_>>());
+            assert_eq!(validate_public(&value).is_ok(), count == 2000);
+            let mut value = public_fixture(2);
+            value["commercial"]["sections"][0]["blocks"][0]["content"] =
+                json!(vec![json!({"kind":"text","text":""}); count]);
+            assert_eq!(validate_public(&value).is_ok(), count == 2000);
+            let mut value = public_fixture(2);
+            value["commercial"]["sections"][0]["blocks"][1]["items"] =
+                json!(vec![json!([]); count]);
+            assert_eq!(validate_public(&value).is_ok(), count == 2000);
+            let mut value = public_fixture(2);
+            value["commercial"]["sections"][0]["blocks"][2]["rows"] =
+                json!(vec![json!([[], []]); count]);
+            assert_eq!(validate_public(&value).is_ok(), count == 2000);
+        }
+        for count in [64, 65] {
+            let mut value = public_fixture(2);
+            value["commercial"]["sections"] = json!((1..=count).map(|index| json!({"anchor":format!("s{index}"),"title":"Раздел","blocks":[{"anchor":format!("s{index}b1"),"kind":"paragraph","style":"body","content":[]}]})).collect::<Vec<_>>());
+            assert_eq!(validate_public(&value).is_ok(), count == 64);
+        }
+        for count in [8, 9] {
+            let mut value = public_fixture(2);
+            value["commercial"]["sections"][0]["blocks"][2]["columns"] =
+                json!(vec!["Столбец"; count]);
+            value["commercial"]["sections"][0]["blocks"][2]["rows"] = json!([]);
+            assert_eq!(validate_public(&value).is_ok(), count == 8);
+        }
+    }
     fn fixture_root() -> PathBuf {
         let root = std::env::temp_dir().join(format!("proposal-test-{}", Uuid::new_v4()));
         fs::create_dir(&root).unwrap();

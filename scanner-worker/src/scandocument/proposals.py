@@ -31,6 +31,7 @@ from scandocument.resources import find_soffice, resource_path
 from scandocument.errors import CancelledError
 
 MAX_MINOR = 9007199254740991
+MAX_PUBLIC_BYTES = 8 * 1024 * 1024
 RATES = (0, 5, 7, 10, 11, 20, 22)
 PROPOSAL_FONT = "SBK Proposal Sans"
 # Separate from the older scanner/OCR fonts. The pinned OFL derivatives change
@@ -88,7 +89,7 @@ def _font_slots(properties):
 def _embed_proposal_fonts(doc, document):
     fonts = _proposal_fonts(resource_path("proposals", "fonts").resolve())
     required = {ord(char) for text in _document_strings(document) for char in text if char not in "\n\r\t"}
-    required.update(map(ord, "Коммерческое предложение Страница № ₽ ·"))
+    required.update(map(ord, "Коммерческое предложение Страница № ₽ · • ЧЕРНОВИК ДЛЯ ПРОВЕРКИ Нужно проверить раздел пункт"))
     missing = sorted(set.union(*(required - coverage for _, _, _, coverage in fonts)))
     if missing:
         codes = ", ".join(f"U+{code:04X}" for code in missing[:12])
@@ -194,15 +195,169 @@ def _asset(value):
         raise ValueError("Некорректный хеш приложения КП")
 
 
+def _public_size_budget(document):
+    # Count compact JSON UTF-8 without serializing any whole text/node first.
+    # Even JSONEncoder.iterencode allocates an entire escaped string chunk.
+    size, ancestors = 0, set()
+
+    def consume(count):
+        nonlocal size
+        size += count
+        if size > MAX_PUBLIC_BYTES:
+            raise ValueError("Слишком большой документ КП (более 8 МБ текста)")
+
+    def string(value):
+        if not isinstance(value, str):
+            raise ValueError("Некорректный текст публичной схемы КП")
+        consume(2)
+        if len(value) > MAX_PUBLIC_BYTES - size:
+            raise ValueError("Слишком большой документ КП (более 8 МБ текста)")
+        for char in value:
+            code = ord(char)
+            if 0xD800 <= code <= 0xDFFF:
+                raise ValueError("Некорректный Unicode в публичной схеме КП")
+            consume(2 if char in '"\\\b\t\n\f\r' else 6 if code < 32 else 1 if code < 128 else 2 if code < 2048 else 3 if code < 65536 else 4)
+
+    # Iterator frames avoid copying even an oversized adversarial list/dict.
+    frames = [(iter((document,)), None, False)]
+    while frames:
+        iterator, container_id, is_dict = frames[-1]
+        try:
+            value = next(iterator)
+        except StopIteration:
+            frames.pop()
+            if container_id is not None:
+                ancestors.remove(container_id)
+            continue
+        if is_dict:
+            key, value = value
+            string(key)
+            consume(1)
+        if isinstance(value, (dict, list)):
+            if id(value) in ancestors or len(frames) > 32:
+                raise ValueError("Циклическая или слишком глубокая публичная схема КП")
+            consume(2 + max(0, len(value) - 1))
+            ancestors.add(id(value))
+            frames.append((iter(value.items()) if isinstance(value, dict) else iter(value), id(value), isinstance(value, dict)))
+        elif isinstance(value, str):
+            string(value)
+        elif value is None:
+            consume(4)
+        elif type(value) is bool:
+            consume(4 if value else 5)
+        elif type(value) is int:
+            consume(len(str(value)))
+        else:
+            raise ValueError("Некорректное значение публичной схемы КП")
+
+
+def _commercial_inline(value, references):
+    if not isinstance(value, list) or len(value) > 2000:
+        raise ValueError("Не более 2000 частей текста КП")
+    for part in value:
+        if not isinstance(part, dict):
+            raise ValueError("Некорректная часть публичного текста КП")
+        if part.get("kind") == "text":
+            _object(part, "kind text")
+            _commercial_text(part["text"])
+        elif part.get("kind") == "local-ref":
+            _object(part, "kind target")
+            _text(part["target"], 16, True)
+            references.append(part["target"])
+        else:
+            raise ValueError("Неподдерживаемая часть публичного текста КП")
+
+
+def _commercial_text(value, required=False):
+    _text(value, required=required)
+    if any(127 <= ord(char) <= 159 for char in value):
+        raise ValueError("Текст КП содержит недопустимые управляющие символы")
+
+
+def _commercial(value):
+    _object(value, "version mode sections unresolved")
+    if type(value["version"]) is not int or value["version"] != 1 or value["mode"] not in ("review-draft", "final"):
+        raise ValueError("Неподдерживаемая версия разделов КП")
+    sections = value["sections"]
+    if not isinstance(sections, list) or not 1 <= len(sections) <= 64:
+        raise ValueError("В КП допустимо от 1 до 64 публичных разделов")
+    anchors, section_anchors, references, total_blocks = set(), set(), [], 0
+    for section_index, section in enumerate(sections, 1):
+        _object(section, "anchor title blocks")
+        anchor = f"s{section_index}"
+        if section["anchor"] != anchor:
+            raise ValueError("Нарушена последовательность разделов КП")
+        anchors.add(anchor)
+        section_anchors.add(anchor)
+        _commercial_text(section["title"], required=True)
+        blocks = section["blocks"]
+        if not isinstance(blocks, list) or len(blocks) > 2000:
+            raise ValueError("Некорректный состав раздела КП")
+        total_blocks += len(blocks)
+        if total_blocks > 2000:
+            raise ValueError("Не более 2000 блоков в КП")
+        for block_index, block in enumerate(blocks, 1):
+            if not isinstance(block, dict) or block.get("anchor") != f"{anchor}b{block_index}":
+                raise ValueError("Нарушена последовательность блоков КП")
+            anchors.add(block["anchor"])
+            if block.get("kind") == "paragraph":
+                _object(block, "anchor kind style content")
+                if block["style"] not in ("body", "lead", "subheading", "caveat"):
+                    raise ValueError("Неподдерживаемый стиль абзаца КП")
+                _commercial_inline(block["content"], references)
+            elif block.get("kind") == "list":
+                _object(block, "anchor kind style items")
+                if block["style"] not in ("bullet", "ordered"):
+                    raise ValueError("Неподдерживаемый стиль списка КП")
+                if not isinstance(block["items"], list) or len(block["items"]) > 2000:
+                    raise ValueError("В списке КП допустимо до 2000 пунктов")
+                for item in block["items"]:
+                    _commercial_inline(item, references)
+            elif block.get("kind") == "table":
+                _object(block, "anchor kind columns rows")
+                columns = block["columns"]
+                if not isinstance(columns, list) or not 1 <= len(columns) <= 8:
+                    raise ValueError("В таблице КП допустимо от 1 до 8 столбцов")
+                for column in columns:
+                    _commercial_text(column, required=True)
+                if not isinstance(block["rows"], list) or len(block["rows"]) > 2000:
+                    raise ValueError("Не более 2000 строк таблицы КП")
+                for row in block["rows"]:
+                    if not isinstance(row, list) or len(row) != len(columns):
+                        raise ValueError("Число ячеек не совпадает со столбцами КП")
+                    for cell in row:
+                        _commercial_inline(cell, references)
+            else:
+                raise ValueError("Неподдерживаемый публичный блок КП")
+    if not total_blocks:
+        raise ValueError("КП не содержит публичных блоков")
+    if any(target not in anchors for target in references):
+        raise ValueError("Локальная ссылка КП не имеет адресата")
+    unresolved = value["unresolved"]
+    if not isinstance(unresolved, list) or len(unresolved) > 2000:
+        raise ValueError("Не более 2000 вопросов для проверки КП")
+    if value["mode"] == "final" and unresolved:
+        raise ValueError("Итоговый документ КП содержит нерешённые вопросы")
+    for item in unresolved:
+        _object(item, "section message")
+        if not isinstance(item["section"], str) or item["section"] not in section_anchors:
+            raise ValueError("Вопрос КП не имеет публичного раздела")
+        _commercial_text(item["message"], required=True)
+
+
 def validate_document(document: dict) -> dict:
+    _public_size_budget(document)
+    version = document.get("schemaVersion") if isinstance(document, dict) else None
+    if type(version) is not int or version not in (1, 2):
+        raise ValueError("Неподдерживаемая версия КП")
+    body_field = "terms" if version == 1 else "commercial"
     _object(
         document,
-        "schemaVersion number revision documentDate title validUntil currency issuer recipient addressee contact lines totals terms layout attachments",
+        f"schemaVersion number revision documentDate title validUntil currency issuer recipient addressee contact lines totals {body_field} layout attachments",
         "signer",
     )
     if (
-        document["schemaVersion"] != 1
-        or document["currency"] != "RUB"
+        document["currency"] != "RUB"
         or type(document["revision"]) is not int
         or not 1 <= document["revision"] <= 100000
     ):
@@ -281,9 +436,12 @@ def validate_document(document: dict) -> dict:
     ]
     if public_totals["byTax"] != expected_groups:
         raise ValueError("Разбивка НДС не совпадает с суммой строк")
-    terms = _object(document["terms"], "delivery payment introduction conclusion")
-    for value in terms.values():
-        _text(value)
+    if version == 1:
+        terms = _object(document["terms"], "delivery payment introduction conclusion")
+        for value in terms.values():
+            _text(value)
+    else:
+        _commercial(document["commercial"])
     layout = _object(document["layout"], "style accentColor show footer", "logo")
     if (
         layout["style"] not in ("standard", "compact")
@@ -351,6 +509,146 @@ def _party_text(party, show):
     return " · ".join(items)
 
 
+def _commercial_labels(commercial):
+    labels = {}
+    for section_index, section in enumerate(commercial["sections"], 1):
+        labels[section["anchor"]] = f"раздел\u00a0{section_index}"
+        for block_index, block in enumerate(section["blocks"], 1):
+            labels[block["anchor"]] = f"пункт\u00a0{section_index}.{block_index}"
+    return labels
+
+
+def _bookmark(paragraph, anchor, bookmark_id):
+    paragraph._p.append(_xml("w:bookmarkStart", **{"w:id": bookmark_id, "w:name": anchor}))
+    # Word bookmarks cover the complete visible number and content, not a
+    # stale source-contract number or a private clause identifier.
+    return lambda: paragraph._p.append(_xml("w:bookmarkEnd", **{"w:id": bookmark_id}))
+
+
+def _append_inlines(paragraph, content, labels):
+    for part in content:
+        if part["kind"] == "text":
+            paragraph.add_run(part["text"])
+        else:
+            link = _xml("w:hyperlink", **{"w:anchor": part["target"], "w:history": "1"})
+            run = _xml("w:r")
+            properties = _xml("w:rPr")
+            properties.append(_xml("w:color", **{"w:val": "245C48"}))
+            properties.append(_xml("w:u", **{"w:val": "single"}))
+            run.append(properties)
+            text = _xml("w:t")
+            text.text = labels[part["target"]]
+            run.append(text)
+            link.append(run)
+            paragraph._p.append(link)
+
+
+def _list_numbering(doc, style):
+    root = doc.part.numbering_part.element
+    abstract_id = max((int(item.get(qn("w:abstractNumId"))) for item in root.findall(qn("w:abstractNum"))), default=-1) + 1
+    num_id = max((int(item.get(qn("w:numId"))) for item in root.findall(qn("w:num"))), default=0) + 1
+    abstract = _xml("w:abstractNum", **{"w:abstractNumId": abstract_id})
+    abstract.append(_xml("w:multiLevelType", **{"w:val": "singleLevel"}))
+    level = _xml("w:lvl", **{"w:ilvl": "0"})
+    level.append(_xml("w:start", **{"w:val": "1"}))
+    level.append(_xml("w:numFmt", **{"w:val": "bullet" if style == "bullet" else "decimal"}))
+    level.append(_xml("w:lvlText", **{"w:val": "•" if style == "bullet" else "%1."}))
+    level.append(_xml("w:lvlJc", **{"w:val": "left"}))
+    properties = _xml("w:pPr")
+    properties.append(_xml("w:ind", **{"w:left": "360", "w:hanging": "240"}))
+    level.append(properties)
+    run_properties = _xml("w:rPr")
+    _font_slots(run_properties)
+    level.append(run_properties)
+    abstract.append(level)
+    root.insert_element_before(abstract, "w:num", "w:numIdMacAtCleanup")
+    num = _xml("w:num", **{"w:numId": num_id})
+    num.append(_xml("w:abstractNumId", **{"w:val": abstract_id}))
+    root.insert_element_before(num, "w:numIdMacAtCleanup")
+    return num_id
+
+
+def _commercial_table(doc, block, labels, accent):
+    table = doc.add_table(rows=1, cols=len(block["columns"]))
+    table.alignment, table.autofit = WD_TABLE_ALIGNMENT.CENTER, False
+    width = 174 / len(block["columns"])
+    for column in table.columns:
+        column.width = Mm(width)
+    properties = table._tbl.tblPr
+    borders = _xml("w:tblBorders")
+    for side in ("top", "left", "bottom", "right", "insideH", "insideV"):
+        borders.append(_xml(f"w:{side}", **{"w:val": "single", "w:sz": "4", "w:color": "D9D9D9"}))
+    properties.insert_element_before(borders, "w:shd", "w:tblLayout", "w:tblCellMar", "w:tblLook")
+    margins = _xml("w:tblCellMar")
+    for side in ("top", "left", "bottom", "right"):
+        margins.append(_xml(f"w:{side}", **{"w:w": "90", "w:type": "dxa"}))
+    properties.insert_element_before(margins, "w:tblLook")
+    table.rows[0]._tr.get_or_add_trPr().append(_xml("w:tblHeader"))
+    for cell, title in zip(table.rows[0].cells, block["columns"], strict=True):
+        cell.width, cell.vertical_alignment = Mm(width), WD_CELL_VERTICAL_ALIGNMENT.CENTER
+        cell.text = title
+        cell._tc.get_or_add_tcPr().append(_xml("w:shd", **{"w:fill": accent}))
+        for run in cell.paragraphs[0].runs:
+            run.bold, run.font.color.rgb = True, RGBColor(255, 255, 255)
+    for row_index, content in enumerate(block["rows"]):
+        row = table.add_row()
+        # Keep short rows intact, but let long legitimate deliverables flow
+        # across pages instead of forcing a fixed-height or unbreakable row.
+        if sum(len(part.get("text", labels.get(part.get("target"), ""))) for cell in content for part in cell) < 800:
+            row._tr.get_or_add_trPr().append(_xml("w:cantSplit"))
+        for cell, inlines in zip(row.cells, content, strict=True):
+            cell.width, cell.vertical_alignment = Mm(width), WD_CELL_VERTICAL_ALIGNMENT.CENTER
+            paragraph = cell.paragraphs[0]
+            paragraph.paragraph_format.space_after = Pt(3)
+            paragraph.paragraph_format.line_spacing = 1.08
+            _append_inlines(paragraph, inlines, labels)
+            if row_index % 2:
+                cell._tc.get_or_add_tcPr().append(_xml("w:shd", **{"w:fill": "F3F5F4"}))
+
+
+def _render_commercial(doc, commercial, accent):
+    labels = _commercial_labels(commercial)
+    bookmark_ids = {anchor: index for index, anchor in enumerate(labels, 1)}
+    for section_index, section in enumerate(commercial["sections"], 1):
+        heading = doc.add_paragraph(style="Heading 1")
+        end = _bookmark(heading, section["anchor"], bookmark_ids[section["anchor"]])
+        heading.add_run(f"{section_index}. {section['title']}")
+        end()
+        for question in commercial["unresolved"]:
+            if question["section"] == section["anchor"]:
+                paragraph = _paragraph(doc, "Нужно проверить: " + question["message"], bold=True)
+                paragraph.paragraph_format.keep_with_next = True
+        for block_index, block in enumerate(section["blocks"], 1):
+            ordinal = f"{section_index}.{block_index}"
+            paragraph = doc.add_paragraph(style="Heading 2" if block.get("style") == "subheading" and block["kind"] == "paragraph" else None)
+            end = _bookmark(paragraph, block["anchor"], bookmark_ids[block["anchor"]])
+            prefix = paragraph.add_run(ordinal + ". ")
+            prefix.bold = block["kind"] != "paragraph" or block.get("style") in ("lead", "subheading")
+            if block["kind"] == "paragraph":
+                _append_inlines(paragraph, block["content"], labels)
+                if block["style"] == "caveat":
+                    for run in paragraph.runs:
+                        run.italic = True
+                elif block["style"] == "lead":
+                    for run in paragraph.runs:
+                        run.bold = True
+                end()
+            else:
+                end()
+                paragraph.paragraph_format.keep_with_next = True
+                if block["kind"] == "list":
+                    num_id = _list_numbering(doc, block["style"])
+                    for item in block["items"]:
+                        item_paragraph = doc.add_paragraph(style="List Paragraph")
+                        numbering = _xml("w:numPr")
+                        numbering.append(_xml("w:ilvl", **{"w:val": "0"}))
+                        numbering.append(_xml("w:numId", **{"w:val": num_id}))
+                        item_paragraph._p.get_or_add_pPr().append(numbering)
+                        _append_inlines(item_paragraph, item, labels)
+                else:
+                    _commercial_table(doc, block, labels, accent)
+
+
 def render_docx(document: dict, output: Path, assets: dict[str, Path]) -> None:
     validate_document(document)
     doc = Document()
@@ -368,7 +666,7 @@ def render_docx(document: dict, output: Path, assets: dict[str, Path]) -> None:
     for name, size in (("Title", 20), ("Heading 1", 13), ("Heading 2", 11)):
         style = doc.styles[name]
         style.font.name, style.font.size = PROPOSAL_FONT, Pt(size)
-        style.font.color.rgb = RGBColor.from_string(document["layout"]["accentColor"][1:])
+        style.font.color.rgb = RGBColor(0, 0, 0) if document["schemaVersion"] == 2 else RGBColor.from_string(document["layout"]["accentColor"][1:])
         style.paragraph_format.keep_with_next = True
         if name == "Title":
             style.font.color.rgb = RGBColor(0, 0, 0)
@@ -382,6 +680,9 @@ def render_docx(document: dict, output: Path, assets: dict[str, Path]) -> None:
     footer = section.footer.paragraphs[0]
     footer.alignment = WD_ALIGN_PARAGRAPH.RIGHT
     footer.paragraph_format.space_after = Pt(0)
+    review_draft = document["schemaVersion"] == 2 and document["commercial"]["mode"] == "review-draft"
+    if review_draft:
+        footer.add_run("ЧЕРНОВИК ДЛЯ ПРОВЕРКИ\n").bold = True
     if document["layout"]["footer"]:
         footer.add_run(document["layout"]["footer"] + "\n")
     footer.add_run("Страница ")
@@ -409,6 +710,8 @@ def render_docx(document: dict, output: Path, assets: dict[str, Path]) -> None:
         doc.add_picture(str(clean_path), width=Mm(logo_width))
     show = document["layout"]["show"]
     _paragraph(doc, _party_text(document["issuer"], show), bold=True, keep=True)
+    if review_draft:
+        _paragraph(doc, "ЧЕРНОВИК ДЛЯ ПРОВЕРКИ", bold=True, keep=True)
     _paragraph(doc, "Коммерческое предложение", style="Title")
     _paragraph(
         doc, f"№ {document['number']} от {document['documentDate']} · Редакция {document['revision']}", keep=True
@@ -418,7 +721,7 @@ def render_docx(document: dict, output: Path, assets: dict[str, Path]) -> None:
     addressee = document["addressee"]
     if any(addressee.values()):
         _paragraph(doc, "Адресат: " + ", ".join(value for value in addressee.values() if value))
-    if document["terms"]["introduction"]:
+    if document["schemaVersion"] == 1 and document["terms"]["introduction"]:
         _paragraph(doc, document["terms"]["introduction"])
     table = doc.add_table(rows=1, cols=5)
     table.alignment = WD_TABLE_ALIGNMENT.CENTER
@@ -477,12 +780,15 @@ def render_docx(document: dict, output: Path, assets: dict[str, Path]) -> None:
         )
         _paragraph(doc, _tax_label(group["tax"]) + suffix, keep=True)
     _paragraph(doc, f"Итого к оплате: {_money(document['totals']['grossMinor'])} ₽", bold=True)
-    for label, key in (("Сроки работ и поставки", "delivery"), ("Условия оплаты", "payment")):
-        if document["terms"][key]:
-            _paragraph(doc, label, style="Heading 1")
-            _paragraph(doc, document["terms"][key])
+    if document["schemaVersion"] == 1:
+        for label, key in (("Сроки работ и поставки", "delivery"), ("Условия оплаты", "payment")):
+            if document["terms"][key]:
+                _paragraph(doc, label, style="Heading 1")
+                _paragraph(doc, document["terms"][key])
+    else:
+        _render_commercial(doc, document["commercial"], document["layout"]["accentColor"][1:])
     _paragraph(doc, "Предложение действительно до " + document["validUntil"])
-    if document["terms"]["conclusion"]:
+    if document["schemaVersion"] == 1 and document["terms"]["conclusion"]:
         _paragraph(doc, document["terms"]["conclusion"])
     if show["requisites"] and document["issuer"]["paymentDetails"]:
         _paragraph(doc, "Банковские реквизиты", style="Heading 1")

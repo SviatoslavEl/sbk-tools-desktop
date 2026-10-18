@@ -93,6 +93,255 @@ def document_fixture(count=1):
     }
 
 
+def commercial_document_fixture(mode="final"):
+    document = document_fixture()
+    document["schemaVersion"] = 2
+    del document["terms"]
+    document["commercial"] = {
+        "version": 1, "mode": mode,
+        "sections": [
+            {"anchor": "s1", "title": "Состав работ", "blocks": [
+                {"anchor": "s1b1", "kind": "paragraph", "style": "lead", "content": [
+                    {"kind": "text", "text": "Выполним обследование и передадим акт сдачи\u2011приемки. См. "},
+                    {"kind": "local-ref", "target": "s2"}, {"kind": "text", "text": " и "},
+                    {"kind": "local-ref", "target": "s1b3"}, {"kind": "text", "text": "."}]},
+                {"anchor": "s1b2", "kind": "list", "style": "ordered", "items": [
+                    [{"kind": "text", "text": "Согласовать исходные данные"}],
+                    [{"kind": "text", "text": "Передать отчёт и документы"}]]},
+                {"anchor": "s1b3", "kind": "table", "columns": ["Результат", "Передаваемые материалы"], "rows": [
+                    [[{"kind": "text", "text": "Обследование"}], [{"kind": "text", "text": "Отчёт и перечень замечаний"}]],
+                    [[{"kind": "text", "text": "Передача результата"}], [{"kind": "local-ref", "target": "s2b1"}]]]},
+            ]},
+            {"anchor": "s2", "title": "Сроки и оплата", "blocks": [
+                {"anchor": "s2b1", "kind": "paragraph", "style": "body", "content": [
+                    {"kind": "text", "text": "Срок исполнения 30 календарных дней. Оплата после приёмки результата."}]},
+                {"anchor": "s2b2", "kind": "list", "style": "bullet", "items": [
+                    [{"kind": "text", "text": "Передача в электронном виде"}]]},
+                {"anchor": "s2b3", "kind": "paragraph", "style": "caveat", "content": [
+                    {"kind": "text", "text": "Изменения состава работ согласуются письменно."}]},
+            ]},
+        ],
+        "unresolved": [{"section": "s2", "message": "Уточнить основание начала срока"}] if mode == "review-draft" else [],
+    }
+    return document
+
+
+def test_public_v2_has_real_sections_lists_tables_bookmarks_without_legacy_terms(tmp_path):
+    from lxml import etree
+    document = commercial_document_fixture()
+    original = copy.deepcopy(document)
+    output = tmp_path / "commercial.docx"
+    render_docx(document, output, {})
+    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+    with ZipFile(output) as archive:
+        xml = etree.fromstring(archive.read("word/document.xml"))
+        text = "".join(xml.xpath("//w:t/text()", namespaces=ns)).replace("\u00a0", " ")
+        assert text.count("Итого к оплате:") == 1
+        assert text.count("1. Состав работ") == 1 and "2. Сроки и оплата" in text
+        assert "1.1. Выполним обследование" in text and "раздел 2" in text and "пункт 1.3" in text
+        assert "Предлагаем выполнить следующие работы." not in text
+        assert "В течение 30 календарных дней с момента согласования задания." not in text
+        assert "Сроки работ и поставки" not in text and "Готовы ответить на вопросы" not in text
+        assert "ЧЕРНОВИК" not in text and "ЧЕРНОВИК" not in archive.read("word/footer1.xml").decode()
+        anchors = xml.xpath("//w:bookmarkStart/@w:name", namespaces=ns)
+        assert anchors == ["s1", "s1b1", "s1b2", "s1b3", "s2", "s2b1", "s2b2", "s2b3"]
+        assert xml.xpath("//w:hyperlink/@w:anchor", namespaces=ns) == ["s2", "s1b3", "s2b1"]
+        assert not xml.xpath("//w:hyperlink/@r:id", namespaces={**ns, "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships"})
+        assert len(xml.xpath("//w:pPr/w:numPr", namespaces=ns)) == 3
+        assert len(xml.xpath("//w:tbl", namespaces=ns)) == 2
+        assert len(xml.xpath("//w:tbl/w:tr[1]/w:trPr/w:tblHeader", namespaces=ns)) == 2
+        assert len(xml.xpath("//w:tbl[2]/w:tblPr/w:tblLayout", namespaces=ns)) == 1
+        assert not xml.xpath("//w:tbl[2]//w:trHeight", namespaces=ns)
+        assert len(xml.xpath("//w:tbl[2]//w:cantSplit", namespaces=ns)) == 2
+        numbering = etree.fromstring(archive.read("word/numbering.xml"))
+        assert numbering.xpath("//w:lvl/w:numFmt[@w:val='decimal']", namespaces=ns)
+        assert numbering.xpath("//w:lvl/w:numFmt[@w:val='bullet']", namespaces=ns)
+        new_levels = numbering.xpath("//w:abstractNum[last()-1]/w:lvl | //w:abstractNum[last()]/w:lvl", namespaces=ns)
+        assert len(new_levels) == 2
+        for level in new_levels:
+            slots = level.find("w:rPr/w:rFonts", namespaces=ns)
+            assert slots is not None
+            assert {slots.get(f"{{{ns['w']}}}{slot}") for slot in ("ascii", "hAnsi", "eastAsia", "cs")} == {"SBK Proposal Sans"}
+            assert list(level).index(level.find("w:pPr", namespaces=ns)) < list(level).index(level.find("w:rPr", namespaces=ns))
+        tags = [etree.QName(child).localname for child in numbering]
+        assert max(i for i, tag in enumerate(tags) if tag == "abstractNum") < min(i for i, tag in enumerate(tags) if tag == "num")
+        paragraphs = Document(output).paragraphs
+        assert [p.text for p in paragraphs if p.style.name == "Heading 1"] == ["1. Состав работ", "2. Сроки и оплата"]
+        assert str(Document(output).styles["Heading 1"].font.color.rgb) == "000000"
+    assert document == original
+
+
+def test_public_v2_review_draft_marks_body_footer_and_question_at_own_section(tmp_path):
+    document = commercial_document_fixture("review-draft")
+    output = tmp_path / "review.docx"
+    render_docx(document, output, {})
+    doc = Document(output)
+    body = "\n".join(p.text for p in doc.paragraphs)
+    assert body.count("ЧЕРНОВИК ДЛЯ ПРОВЕРКИ") == 1
+    assert "ЧЕРНОВИК ДЛЯ ПРОВЕРКИ" in doc.sections[0].footer.paragraphs[0].text
+    assert body.index("2. Сроки и оплата") < body.index("Нужно проверить: Уточнить основание начала срока") < body.index("2.1.")
+
+
+@pytest.mark.parametrize("mutation", [
+    lambda d: d.update(terms={"delivery": "private"}),
+    lambda d: d["commercial"].update(sourceSnapshotKey="private"),
+    lambda d: d["commercial"]["sections"][0].update(sourceId="private"),
+    lambda d: d["commercial"]["sections"][0]["blocks"][0].update(rawQuote="private"),
+    lambda d: d["commercial"]["sections"][0]["blocks"][0]["content"][1].update(url="https://example.org"),
+    lambda d: d["commercial"]["sections"][0]["blocks"][0]["content"][1].update(target="source-clause"),
+    lambda d: d["commercial"]["sections"][0].update(anchor="s01"),
+    lambda d: d["commercial"]["sections"][0]["blocks"][0].update(anchor="s1b2"),
+    lambda d: d["commercial"]["sections"][0]["blocks"][2]["rows"].append([]),
+    lambda d: d["commercial"]["sections"][0]["blocks"][0].update(style="html"),
+    lambda d: d["commercial"].update(unresolved=[{"section": "s1", "message": "Not final"}]),
+    lambda d: d["commercial"].update(mode="review-draft", unresolved=[{"section": "s1b1", "message": "No section"}]),
+    lambda d: d["commercial"].update(mode="review-draft", unresolved=[{"sectionTitle": "Состав работ", "message": "No alias"}]),
+    lambda d: d["commercial"]["sections"][0].update(title="x" * 20001),
+    lambda d: d["commercial"]["sections"][0].update(title="control\x7f"),
+])
+def test_public_v2_rejects_unknown_fields_broken_refs_and_unreviewed_final(tmp_path, mutation):
+    document = commercial_document_fixture()
+    mutation(document)
+    with pytest.raises(ValueError):
+        render_docx(document, tmp_path / "invalid-v2.docx", {})
+    assert not (tmp_path / "invalid-v2.docx").exists()
+
+
+def test_public_v2_limits_are_bounded_and_unicode_codepoint_based():
+    document = commercial_document_fixture()
+    document["commercial"]["sections"][0]["title"] = "я" * 20000
+    validate_document(document)
+    document["commercial"]["sections"][0]["blocks"][0]["content"] = [{"kind": "text", "text": "x" * 20000}] * 500
+    with pytest.raises(ValueError, match="8 МБ"):
+        validate_document(document)
+    for count in (0, 65):
+        document = commercial_document_fixture()
+        document["commercial"]["sections"] = [{"anchor": f"s{i + 1}", "title": "Раздел", "blocks": []} for i in range(count)]
+        with pytest.raises(ValueError):
+            validate_document(document)
+    document = commercial_document_fixture()
+    for section in document["commercial"]["sections"]:
+        section["blocks"] = []
+    with pytest.raises(ValueError, match="не содержит"):
+        validate_document(document)
+
+
+def test_public_v2_container_limits_accept_boundary_not_next_item():
+    for count in (2000, 2001):
+        for kind in ("blocks", "inline", "items", "rows", "unresolved"):
+            document = commercial_document_fixture("review-draft")
+            section = document["commercial"]["sections"][0]
+            if kind == "blocks":
+                document["commercial"]["sections"] = [section]
+                document["commercial"]["unresolved"] = []
+                section["blocks"] = [{"anchor": f"s1b{i + 1}", "kind": "paragraph", "style": "body", "content": []} for i in range(count)]
+            elif kind == "inline":
+                section["blocks"][0]["content"] = [{"kind": "text", "text": ""}] * count
+            elif kind == "items":
+                section["blocks"][1]["items"] = [[]] * count
+            elif kind == "rows":
+                section["blocks"][2]["rows"] = [[[], []]] * count
+            else:
+                document["commercial"]["unresolved"] = [{"section": "s1", "message": "Уточнить"}] * count
+            if count == 2000:
+                validate_document(document)
+            else:
+                with pytest.raises(ValueError):
+                    validate_document(document)
+    for count in (64, 65):
+        document = commercial_document_fixture()
+        document["commercial"]["sections"] = [{"anchor": f"s{i + 1}", "title": "Раздел", "blocks": [{"anchor": f"s{i + 1}b1", "kind": "paragraph", "style": "body", "content": []}]} for i in range(count)]
+        if count == 64:
+            validate_document(document)
+        else:
+            with pytest.raises(ValueError):
+                validate_document(document)
+    for count in (8, 9):
+        document = commercial_document_fixture()
+        block = document["commercial"]["sections"][0]["blocks"][2]
+        block.update(columns=["Столбец"] * count, rows=[])
+        if count == 8:
+            validate_document(document)
+        else:
+            with pytest.raises(ValueError):
+                validate_document(document)
+
+
+def test_public_size_preflight_counts_utf8_and_json_escapes_without_whole_serialization(monkeypatch):
+    from scandocument.proposals import _public_size_budget
+    data = {"кириллица": ["\"\\\n\t\x01", "abc", "😀"], "integer": 2, "bool": False, "null": None}
+    expected = len(json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+    monkeypatch.setattr("scandocument.proposals.MAX_PUBLIC_BYTES", expected)
+    _public_size_budget(data)
+    monkeypatch.setattr("scandocument.proposals.MAX_PUBLIC_BYTES", expected - 1)
+    with pytest.raises(ValueError, match="8 МБ"):
+        _public_size_budget(data)
+    cycle = []
+    cycle.append(cycle)
+    with pytest.raises(ValueError, match="Циклическая"):
+        _public_size_budget(cycle)
+
+
+def test_public_v2_long_table_rows_can_flow_and_plain_text_is_not_markup(tmp_path):
+    from lxml import etree
+    document = commercial_document_fixture()
+    long_text = "Материалы обследования и передаваемые результаты. " * 100
+    block = document["commercial"]["sections"][0]["blocks"][2]
+    block["rows"] = [[[{"kind": "text", "text": "Длинный результат"}], [{"kind": "text", "text": long_text}]]]
+    document["commercial"]["sections"][1]["blocks"][0]["content"] = [{"kind": "text", "text": '<script>alert("plain text")</script> & https://example.org'}]
+    output = tmp_path / "long-row.docx"
+    render_docx(document, output, {})
+    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+    with ZipFile(output) as archive:
+        xml = etree.fromstring(archive.read("word/document.xml"))
+        assert not xml.xpath("//w:tbl[2]//w:cantSplit | //w:tbl[2]//w:trHeight", namespaces=ns)
+        assert long_text in "".join(xml.xpath("//w:t/text()", namespaces=ns))
+        assert '<script>alert("plain text")</script> & https://example.org' in "".join(xml.xpath("//w:t/text()", namespaces=ns))
+        assert "TargetMode=\"External\"" not in archive.read("word/_rels/document.xml.rels").decode()
+
+
+@pytest.mark.skipif(not os.environ.get("SCANDOCUMENT_SOFFICE"), reason="Bundled office runtime required")
+@pytest.mark.parametrize("mode", ["final", "review-draft"])
+def test_actual_v2_pdf_preserves_full_width_content_and_draft_gate(tmp_path, mode):
+    from pypdf import PdfReader
+    document = commercial_document_fixture(mode)
+    table = document["commercial"]["sections"][0]["blocks"][2]
+    table["rows"] = [[[{"kind": "text", "text": f"Результат {index + 1}"}], [{"kind": "text", "text": "Описание передаваемых документов и результатов обследования."}]] for index in range(24)]
+    original = copy.deepcopy(document)
+    result = render({"document": document, "workdir": str(tmp_path), "format": "preview", "assets": []})
+    reader = PdfReader(result["outputPath"])
+    pages = [page.extract_text() or "" for page in reader.pages]
+    text = re.sub(r"\s+", " ", "\n".join(pages))
+    assert len(pages) >= 2 and len(result["previewPages"]) == len(pages)
+    assert text.count("Итого к оплате:") == 1 and text.count("12 000,00 ₽") == 1
+    assert "акт сдачи\u2011приемки" in text and "раздел 2" in text and "пункт 1.3" in text
+    assert "1.1. Выполним обследование" in text and "2.1. Срок исполнения 30" in text
+    assert "Результат 24" in text and text.count("Передаваемые материалы") >= 2
+    assert text.count("Описание передаваемых документов и результатов обследования.") == 24
+    assert "исходного договора" not in text and "sourceSnapshot" not in text and "sha256:" not in text
+    if mode == "review-draft":
+        assert all("ЧЕРНОВИК ДЛЯ ПРОВЕРКИ" in page for page in pages)
+        assert text.count("Нужно проверить: Уточнить основание начала срока") == 1
+    else:
+        assert "ЧЕРНОВИК" not in text and "Нужно проверить:" not in text
+    families = set()
+    internal_links = 0
+    for page in reader.pages:
+        for reference in page["/Resources"]["/Font"].get_object().values():
+            font = reference.get_object()
+            name = str(font["/BaseFont"]).split("+", 1)[-1]
+            families.add(name)
+            assert name.startswith("SBKProposalSans-") and "/FontFile2" in font["/FontDescriptor"].get_object()
+        for reference in page.get("/Annots", []):
+            annotation = reference.get_object()
+            if annotation.get("/Subtype") == "/Link":
+                assert "/URI" not in annotation.get("/A", {})
+                internal_links += 1
+    assert internal_links >= 2 and "SBKProposalSans-Italic" in families
+    assert document == original
+    print(f"PROPOSAL_V2_{mode}_QA: {tmp_path}")
+
+
 @pytest.mark.parametrize("count", [1, 20, 1000])
 def test_docx_layout_structure_and_prices(tmp_path, count):
     document = document_fixture(count)
