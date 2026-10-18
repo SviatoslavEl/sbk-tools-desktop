@@ -23,13 +23,13 @@ import { createTaskDocumentOrigin, projectTaskDocumentSession, sameTaskDocumentO
 import { taskSourceSnapshotKey } from "./taskSourceIdentity";
 import { prepareCommercialTaskProposal } from "../proposals/commercialTaskPreparation";
 import { useSourceFactsInventory } from "./useSourceFactsInventory";
-import { ResponsePreparationCancelled, startResponsePreparation } from "./responsePreparation";
+import { ResponsePreparationCancelled, startResponsePreparation, startSourceContractPreparation } from "./responsePreparation";
 import { assertResponsePreparationSources } from "./responsePreparationBounds";
 import type { AutoConditionResult } from "./automaticConditions";
 import { AutomaticConditionsSummary } from "./AutomaticConditionsSummary";
 import { SourcePreparationSummary } from "./SourcePreparationSummary";
 import { StaffCertificateSummary } from "./StaffCertificateSummary";
-import type { SourcePreparationReceipt } from "./responsePreparationWorker";
+import type { ResponsePreparationReply, SourcePreparationReceipt } from "./responsePreparationWorker";
 import { failedIntelligenceResponse, sourceReferenceMessage, type FailedIntelligenceResponse } from "./responseRecovery";
 import "./intelligence-workbench.css";
 
@@ -386,6 +386,18 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
     } catch (reason) { if (mounted.current && token === extractionEpoch.current) setError(errorMessage(reason)); }
     finally { if (extractionPending.current === token) extractionPending.current = null; if (mounted.current && token === extractionEpoch.current) setExtracting(false); }
   };
+  const installPreparedResult = (prepared: NonNullable<ResponsePreparationReply["prepared"]>, snapshot: IntelligenceSource[], requestedDestinations: IntelligenceDestination[]) => {
+    const revision = ++baseResultRevision.current;
+    itemResultRevisions.current = new Map(prepared.items.map((item) => [item.id, revision]));
+    proposalTransferOrigins.current.clear();
+    itemsRef.current = prepared.items;
+    setItems(prepared.items); setResultSources(snapshot); setResultDestinations([...requestedDestinations]); setAutomaticConditions({ changes: prepared.changes, skipped: prepared.skipped, limited: prepared.limited }); setSourcePreparation(prepared.sourcePreparation || null); setManualItemIds([]); setReviewedFindings({}); setOpenedItems([]); setResultStale(false); setError("");
+    setEmptyWarning("");
+    const added = prepared.changes.filter((change) => change.kind === "added").length;
+    setNotice(prepared.sourcePreparation?.origin === "source-contract"
+      ? "Проект КП подготовлен локально по полному тексту договора, без модели. Прежний ответ модели не использован и не изменён. Проверьте цену, спорные условия и полноту документа перед выпуском."
+      : `Получено черновиков: ${prepared.items.length}.${added ? ` Из источников автоматически добавлено пунктов: ${added}.` : ""} Идёт отдельная проверка содержания и достоверности. Заполненные поля ещё не означают, что задача выполнена.`);
+  };
   const acceptResponse = async (raw: string, snapshot: IntelligenceSource[], requestedDestinations: IntelligenceDestination[], format: FailedIntelligenceResponse["format"] = "manual") => {
     preparationPending.current?.cancel();
     const token = epoch.current, root = workspaceRoot;
@@ -400,15 +412,7 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
       setEmptyWarning(`Последняя попытка не дала результата для: ${requestedDestinations.map((destination) => destinationLabels[destination]).join(", ")}. Модель не подготовила ни одной карточки и автоматический разбор не смог восстановить результат. Проверьте источники или повторите анализ. Предыдущие карточки ниже, если они были, относятся к другой попытке и не подтверждают выполнение текущей задачи.`);
       return;
       }
-      const prepared = reply.prepared!;
-      const revision = ++baseResultRevision.current;
-      itemResultRevisions.current = new Map(prepared.items.map((item) => [item.id, revision]));
-      proposalTransferOrigins.current.clear();
-      itemsRef.current = prepared.items;
-      setItems(prepared.items); setResultSources(snapshot); setResultDestinations([...requestedDestinations]); setAutomaticConditions({ changes: prepared.changes, skipped: prepared.skipped, limited: prepared.limited }); setSourcePreparation(prepared.sourcePreparation || null); setManualItemIds([]); setReviewedFindings({}); setOpenedItems([]); setResultStale(false); setError("");
-      setEmptyWarning("");
-      const added = prepared.changes.filter((change) => change.kind === "added").length;
-      setNotice(`Получено черновиков: ${prepared.items.length}.${added ? ` Из источников автоматически добавлено пунктов: ${added}.` : ""} Идёт отдельная проверка содержания и достоверности. Заполненные поля ещё не означают, что задача выполнена.`);
+      installPreparedResult(reply.prepared!, snapshot, requestedDestinations);
     } catch (reason) {
       if (mounted.current && preparationPending.current === preparation && epoch.current === token && accessRef.current.workspaceRoot === root && !(reason instanceof ResponsePreparationCancelled)) {
         rememberFailedResponse(raw, snapshot, reason, format);
@@ -418,6 +422,36 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
     } finally {
       if (preparationPending.current === preparation) { preparationPending.current = null; if (mounted.current) setPreparingResponse(false); }
     }
+  };
+  const prepareSourceContract = async () => {
+    if (pending.current || preparationPending.current) return;
+    if (extractionPending.current !== null) { setError("Дождитесь чтения документа или отмените его перед подготовкой проекта."); return; }
+    if (taskDestinations.length !== 1 || taskDestinations[0] !== "proposals") { setError("Локальный проект по договору доступен только для одного результата — коммерческого предложения."); return; }
+    if (!selectedSources.length) { setError("Добавьте и выберите полный договор."); return; }
+    const token = epoch.current, root = workspaceRoot, snapshot = structuredClone(selectedSources);
+    const preparation = startSourceContractPreparation({ revision: ++preparationRevision.current, sources: snapshot });
+    preparationPending.current = preparation; setPreparingResponse(true); setError(""); setNotice("");
+    try {
+      const reply = await preparation.promise;
+      if (!mounted.current || preparationPending.current !== preparation || epoch.current !== token || accessRef.current.workspaceRoot !== root) return;
+      if (reply.failed) throw new Error(reply.failed);
+      if (reply.origin !== "source-contract" || reply.empty || !reply.prepared) throw new Error("Не удалось безопасно подготовить полный договор. Прежние карточки и ответ модели сохранены.");
+      installPreparedResult(reply.prepared, snapshot, ["proposals"]);
+    } catch (reason) {
+      if (mounted.current && preparationPending.current === preparation && epoch.current === token && accessRef.current.workspaceRoot === root && !(reason instanceof ResponsePreparationCancelled)) setError(errorMessage(reason));
+    } finally {
+      if (preparationPending.current === preparation) { preparationPending.current = null; if (mounted.current) setPreparingResponse(false); }
+    }
+  };
+  const requestSourceContract = () => {
+    if (pending.current || preparationPending.current) return;
+    const confirmationEpoch = epoch.current;
+    if (itemsRef.current.length) setConfirm({ title: "Подготовить локальный проект по всему договору?", message: "При успехе новый проект заменит карточки в этом окне, включая ручные правки. Используется весь состав договора: уточнённое задание и ответ модели не применяются. Прежний ответ модели остаётся доступен, уже открытые карточки и сохранённые записи не изменятся.", label: "Подготовить по договору без модели", run: () => {
+      setConfirm(null);
+      if (epoch.current !== confirmationEpoch) { setError("Материалы или задача изменились. Проверьте их и повторите подготовку."); return; }
+      void prepareSourceContract();
+    } });
+    else void prepareSourceContract();
   };
   const analyze = async () => {
     if (pending.current || preparationPending.current) return;
@@ -737,6 +771,7 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
         <div className="iw-send-summary"><span>К отправке: {formatRussianCount(selectedSources.length, ["источник", "источника", "источников"])} · {formatRussianCount(sourceCharacters, ["символ", "символа", "символов"])}</span>{profile.scope !== "local" ? <div className="iw-disclosure" role="note"><strong>Тексты будут переданы {profile.scope === "external" ? "внешнему сервису" : "сервису в локальной сети"}:</strong><code>{profile.endpoint || "Адрес не указан"}</code></div> : <details><summary>Параметры запроса</summary><code>{profile.endpoint || "Адрес не указан"}</code><span>Формат: {profile.outputMode === "schema" ? "по схеме карточек" : "обычный JSON"}</span></details>}</div>
         {taskDestinations.includes("procurement") && <p className="help-text">В карточках закупок сертификаты и документы заявки автоматически дополнят результат из выбранных источников с сохранением чисел и оговорок. Неоднозначная принадлежность к карточке или лоту останется на проверке.</p>}
         <div className="iw-actions"><button type="button" className="primary" disabled={running || preparingResponse || extracting || !selectedSources.length || !taskDestinations.length} onClick={requestAnalysis}>{preparingResponse ? "Дополняем результат из источников…" : running ? "Модель готовит ответ…" : taskDestinations.length === 1 ? preparationLabels[taskDestinations[0]] : taskDestinations.length ? "Подготовить результаты" : "Выберите результат"}</button>{running && !preparingResponse && <button type="button" className="secondary" onClick={() => { cancelPending(); setNotice("Запрос отменён. Поздний ответ не будет добавлен."); }}>Остановить запрос</button>}</div>
+        {taskDestinations.length === 1 && taskDestinations[0] === "proposals" && <details><summary>КП по полному договору без модели</summary><p className="help-text">Отдельный локальный способ для единственного полного договора. Используется весь его состав; уточнение задания и ответ модели не применяются. Цена и спорные условия останутся на проверку. Прежний ответ модели не изменится.</p><button type="button" className="secondary" disabled={running || preparingResponse || extracting || !selectedSources.length} onClick={requestSourceContract}>Подготовить по договору без модели</button></details>}
         {running && !preparingResponse && analysisProgress && <p className="help-text" role="status">Этап {analysisProgress.index} из {analysisProgress.total}: {analysisProgress.label}</p>}
         {analysisMode === "by-destination" && analysisParts.length > 0 && <details className="iw-analysis-parts"><summary>Ответы по этапам ({analysisParts.length})</summary><p className="help-text">Диагностика отдельных запросов. Частичный результат не заменяет карточки. Поле готового ответа ниже содержит только полностью завершённый результат.</p>{analysisParts.map((part, index) => <details key={index}><summary>{index + 1}. {part.destinations.map((destination) => destinationLabels[destination]).join(" · ")} · {part.model}</summary><pre>{part.text}</pre></details>)}</details>}
         {responseDetails && <details className="iw-response-technical"><summary>Последний ответ · технические подробности</summary><div className="iw-response-metrics"><strong>Последний ответ: {responseDetails.model}</strong>{responseDetails.metrics && <><span>Время: {(responseDetails.metrics.elapsedMilliseconds / 1000).toLocaleString("ru", { maximumFractionDigits: 2 })} с</span>{responseDetails.metrics.inputTokens !== undefined && <span>На входе: {responseDetails.metrics.inputTokens.toLocaleString("ru")} токенов</span>}{responseDetails.metrics.outputTokens !== undefined && <span>На выходе: {responseDetails.metrics.outputTokens.toLocaleString("ru")} токенов</span>}{responseDetails.metrics.totalTokens !== undefined && <span>Всего: {responseDetails.metrics.totalTokens.toLocaleString("ru")} токенов</span>}{responseDetails.metrics.loadMilliseconds !== undefined && <span>Загрузка модели: {(responseDetails.metrics.loadMilliseconds / 1000).toLocaleString("ru", { maximumFractionDigits: 2 })} с</span>}</>}</div></details>}
@@ -744,7 +779,8 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
       </section>
     </div>
     <section className="surface iw-results"><div className="iw-section-heading"><span className="iw-step">3</span><div><h3>Проверка и распределение</h3><p>Отметьте нужные поля. Кнопка откроет новый черновик; сохранение выполняется в самой карточке.</p></div></div>
-      {preparingResponse && <div className="iw-audit-progress" role="status"><span className="iw-spinner" aria-hidden="true" />Подготавливаем карточки, сертификаты и условия из источников…<button type="button" className="secondary" onClick={() => { cancelPending(); setNotice("Локальный разбор отменён. Предыдущие карточки сохранены; поздний результат не будет добавлен."); }}>Остановить разбор</button></div>}
+      {preparingResponse && <div className="iw-audit-progress" role="status"><span className="iw-spinner" aria-hidden="true" />Подготавливаем результат и проверяем исходные материалы…<button type="button" className="secondary" onClick={() => { cancelPending(); setNotice("Локальный разбор отменён. Предыдущие карточки сохранены; поздний результат не будет добавлен."); }}>Остановить разбор</button></div>}
+      {sourcePreparation?.origin === "source-contract" && <p className="notice" role="status">Локальный проект по тексту договора. Модель в его подготовке не использовалась; её прежний ответ, если был, оставлен в технических подробностях. Это не подтверждение готовности документа к отправке.</p>}
       {evidenceReady && !evidenceState?.failed && <TaskCompletionSummary report={evidenceState?.completion} previous={resultStale || Boolean(emptyWarning)} />}
       {(sourcePreparation?.limited || automaticConditions?.limited) && <p className="notice warning" role="status">Разбор источников выполнен не полностью. Проверьте журнал подготовки; такой результат не считается завершённым.</p>}
       {(automaticConditions || sourcePreparation) && <details><summary>Как подготовлен результат · технические подробности</summary><AutomaticConditionsSummary receipt={automaticConditions} items={items} /><SourcePreparationSummary receipt={sourcePreparation} items={items} /></details>}

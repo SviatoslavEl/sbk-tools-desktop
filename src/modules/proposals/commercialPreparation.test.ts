@@ -33,12 +33,71 @@ function text(block: CommercialBlock): string {
   return block.kind === "paragraph" ? inline(block.content) : block.kind === "list" ? block.items.map(inline).join("\n") : [block.columns.join("\t"), ...block.rows.map((row) => row.map(inline).join("\t"))].join("\n");
 }
 async function prepare(sources = [source()]) { return prepareCommercialDocument({ sources, sourceSnapshotKey: await taskSourceSnapshotKey(sources) }); }
+const alternativeLead = "Если задержка предоставления материалов превысит 12 рабочих дней, Исполнитель вправе принять одно из следующих решений:";
+const alternativeFirst = "- по согласованию сторон выдать результат по предоставленным материалам; услуги подлежат оплате в полном размере согласно п. 4.1.";
+const alternativeSecond = "- приостановить оказание услуг, уведомив заказчика за 4 рабочих дня. Срок возобновления согласуется отдельно. При отсутствии соглашения оплачиваются фактически выполненные работы.";
+function alternativeSource(): IntelligenceSource {
+  const texts = ["Договор", "1. Предмет договора", "1.1. Исполнитель оказывает комплекс услуг по анализу системы.", "4. Сроки оказания услуг", "4.1. Срок подготовки отчёта — 8 рабочих дней.", alternativeLead, alternativeFirst, alternativeSecond];
+  return { id: "conditional-source", name: "Исходные условия.docx", text: texts.join("\n"), fragments: texts.map((text, index) => ({ id: `conditional-${index}`, locator: `Абзац ${index + 1}`, text })), coverage: { complete: true, requiresOcr: false } };
+}
+function placement(document: ProposalCommercialDocumentV1, quote: string) {
+  const clause = document.privateAppendix.clauses.find((entry) => entry.quote === quote)!;
+  const receipt = document.privateAppendix.coverage.find((entry) => entry.sourceClauseId === clause.id)!;
+  const ids = receipt.kind === "literal" || receipt.kind === "projected" || receipt.kind === "deduplicated" ? receipt.targetBlockIds : receipt.kind === "split" ? receipt.parts.map((part) => part.targetBlockId) : [];
+  return { clause, receipt, ids, section: document.body.sections.find((section) => section.blocks.some((block) => ids.includes(block.id))) };
+}
 function inlineScopeSource(lastClause: string): IntelligenceSource {
   const texts = ["Договор", "1. Предмет договора", "1.1. Исполнитель оказывает комплекс услуг по анализу системы.", lastClause];
   return { id: "inline-scope", name: "Исходные условия.docx", text: texts.join("\n"), fragments: texts.map((text, index) => ({ id: `inline-${index}`, locator: `Абзац ${index + 1}`, text })), coverage: { complete: true, requiresOcr: false } };
 }
 
 describe("source-derived commercial review draft", () => {
+  it("keeps an explicit conditional lead and both whole alternatives adjacent in one section", async () => {
+    const input = alternativeSource(), before = JSON.stringify(input), document = (await prepare([input])).document!;
+    const group = [alternativeLead, alternativeFirst, alternativeSecond].map((quote) => placement(document, quote));
+    expect(group.every((entry) => entry.section?.id === group[0].section?.id)).toBe(true);
+    const order = group[0].section!.blocks.map((block) => block.id), start = order.indexOf(group[0].ids[0]);
+    expect(order.slice(start, start + 3)).toEqual(group.flatMap((entry) => entry.ids));
+    expect(group.map((entry) => entry.clause.fragmentId)).toEqual(["conditional-5", "conditional-6", "conditional-7"]);
+    expect(group.every((entry) => entry.ids.length === 1 && entry.ids[0] === `block-${entry.clause.id.slice(7)}`)).toBe(true);
+    expect(text(group[0].section!.blocks[start])).toBe(alternativeLead);
+    expect(text(group[0].section!.blocks[start + 2])).toBe(alternativeSecond);
+    const reference = document.privateAppendix.references.find((entry) => entry.sourceClauseId === group[1].clause.id && entry.kind === "clause")!;
+    expect(reference.localTargetIds).toEqual(placement(document, input.fragments![4].text).ids);
+    expect(text(group[0].section!.blocks[start + 1])).toBe(alternativeFirst.replace("4.1", `[${reference.localTargetIds![0]}]`));
+    expect(validateCommercialSourceProjection(document)).toEqual([]); expect(validateCommercialDocument(document)).toEqual([]);
+    expect(await validateCommercialQuoteHashes(document)).toEqual([]); expect(document.decisions).toEqual([]); expect(JSON.stringify(input)).toBe(before);
+    const changed = structuredClone(document), branch = blocks(changed).find((block) => block.id === group[2].ids[0])!;
+    if (branch.kind !== "paragraph") throw new Error("expected a complete branch paragraph");
+    branch.content = [{ kind: "text", text: "Оплачиваются все услуги без условий." }];
+    expect(validateCommercialSourceProjection(changed).some((issue) => issue.code === "commercial-source-projection")).toBe(true);
+  });
+  it.each(["heading", "marked-heading", "unrelated", "blank", "numbered-clause", "table", "table-marker", "sheet", "container"] as const)("does not attach a marked alternative through a %s boundary", async (boundary) => {
+    const input = alternativeSource(), tail = input.fragments![7];
+    if (boundary === "sheet") tail.sheetId = "second-sheet";
+    else if (boundary === "table-marker") tail.id = "table-3-row-1";
+    else {
+      const text = boundary === "heading" ? "5. Итоговые материалы" : boundary === "marked-heading" ? "- Условия оплаты" : boundary === "container" ? "ТЕХНИЧЕСКОЕ ЗАДАНИЕ" : boundary === "blank" ? "" : boundary === "table" ? "Параметр\tЗначение" : boundary === "numbered-clause" ? "4.8. Срок отдельной проверки составляет 2 рабочих дня." : "Организационные сведения предоставляются отдельно.";
+      input.fragments!.splice(7, 0, { id: "boundary", locator: "Граница", text });
+    }
+    input.text = input.fragments!.map((fragment) => fragment.text).join("\n");
+    const document = (await prepare([input])).document!;
+    const lead = placement(document, alternativeLead), first = placement(document, alternativeFirst), second = placement(document, alternativeSecond);
+    expect(first.section?.id).toBe(lead.section?.id);
+    expect(second.section?.id).not.toBe(lead.section?.id);
+    expect(second.ids).toHaveLength(1); expect(text(second.section!.blocks.find((block) => block.id === second.ids[0])!)).toBe(alternativeSecond);
+    expect(validateCommercialSourceProjection(document)).toEqual([]);
+  });
+  it("does not borrow an identical earlier outcome for a later conditional group", async () => {
+    const input = alternativeSource();
+    input.fragments!.splice(5, 0, { id: "earlier-outcome", locator: "Ранее", text: alternativeSecond }); input.text = input.fragments!.map((fragment) => fragment.text).join("\n");
+    const document = (await prepare([input])).document!, copies = document.privateAppendix.clauses.filter((clause) => clause.quote === alternativeSecond);
+    expect(copies).toHaveLength(2);
+    const receipts = copies.map((clause) => document.privateAppendix.coverage.find((entry) => entry.sourceClauseId === clause.id)!);
+    expect(receipts.every((entry) => entry.kind !== "deduplicated")).toBe(true);
+    expect(blocks(document).filter((block) => text(block) === alternativeSecond)).toHaveLength(2);
+    expect(validateCommercialSourceProjection(document)).toEqual([]);
+  });
   it.each(["Договор", "1. Предмет договора", "2. Состав оказываемых услуг", "ТЕХНИЧЕСКОЕ ЗАДАНИЕ", "Приложение № 1", "Стоимость услуг и порядок расчётов:", "Итоговые материалы и результат оказания услуг", "Входные данные и условия проведения работ", "Стороны"])("recognizes only a closed structural label: %s", (heading) => {
     expect(isCommercialStructuralHeading(heading)).toBe(true);
   });

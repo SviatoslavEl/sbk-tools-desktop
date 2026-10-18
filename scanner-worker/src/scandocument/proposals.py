@@ -526,10 +526,26 @@ def _bookmark(paragraph, anchor, bookmark_id):
 
 
 def _append_inlines(paragraph, content, labels):
+    # Source spans retain their grammatical qualifier. Only the link's
+    # generated label becomes numeric in that context; literal text is never
+    # rewritten. A qualified comma/"и" group keeps that qualifier for each
+    # following reference, but an unrelated sentence ends the group.
+    gap = ""
+    qualified_group = False
     for part in content:
         if part["kind"] == "text":
             paragraph.add_run(part["text"])
+            gap += part["text"]
         else:
+            explicit_qualifier = re.search(
+                r"(?<!\w)(?:п\.\s*п\.|пп\.|п\.|пункт(?:а|у|ом|е|ы|ов|ам|ами|ах)?|раздел(?:а|у|ом|е|ы|ов|ам|ами|ах)?)\s*$",
+                gap, re.IGNORECASE,
+            )
+            continued_group = qualified_group and re.fullmatch(r"[\s,;]*(?:(?:и|или)[\s,;]*)?", gap, re.IGNORECASE)
+            qualified_group = bool(explicit_qualifier or continued_group)
+            label = labels[part["target"]]
+            if qualified_group:
+                label = label.partition("\u00a0")[2] or label
             link = _xml("w:hyperlink", **{"w:anchor": part["target"], "w:history": "1"})
             run = _xml("w:r")
             properties = _xml("w:rPr")
@@ -537,10 +553,11 @@ def _append_inlines(paragraph, content, labels):
             properties.append(_xml("w:u", **{"w:val": "single"}))
             run.append(properties)
             text = _xml("w:t")
-            text.text = labels[part["target"]]
+            text.text = label
             run.append(text)
             link.append(run)
             paragraph._p.append(link)
+            gap = ""
 
 
 def _list_numbering(doc, style):
@@ -606,6 +623,30 @@ def _commercial_table(doc, block, labels, accent):
                 cell._tc.get_or_add_tcPr().append(_xml("w:shd", **{"w:fill": "F3F5F4"}))
 
 
+def _narrative_commercial_table(block, labels):
+    # At three or more equal columns a sustained prose cell becomes a narrow
+    # wall of text. Keep compact comparison matrices as tables; one long cell
+    # switches the WHOLE record block so its column relationships stay clear.
+    return len(block["columns"]) >= 3 and any(
+        sum(len(part["text"] if part["kind"] == "text" else labels[part["target"]]) for part in cell) > 320
+        for row in block["rows"] for cell in row
+    )
+
+
+def _commercial_narrative_records(doc, block, labels):
+    for row_index, row in enumerate(block["rows"]):
+        for column_index, (title, content) in enumerate(zip(block["columns"], row, strict=True)):
+            paragraph = doc.add_paragraph()
+            paragraph.paragraph_format.space_before = Pt(8 if row_index and column_index == 0 else 0)
+            paragraph.paragraph_format.space_after = Pt(5)
+            # Do not turn a whole long record into a heading/keep chain: prose
+            # must flow across page boundaries rather than leave half a page.
+            paragraph.paragraph_format.keep_with_next = False
+            paragraph.paragraph_format.keep_together = False
+            paragraph.add_run(title + ": ").bold = True
+            _append_inlines(paragraph, content, labels)
+
+
 def _render_commercial(doc, commercial, accent):
     labels = _commercial_labels(commercial)
     bookmark_ids = {anchor: index for index, anchor in enumerate(labels, 1)}
@@ -645,6 +686,8 @@ def _render_commercial(doc, commercial, accent):
                         numbering.append(_xml("w:numId", **{"w:val": num_id}))
                         item_paragraph._p.get_or_add_pPr().append(numbering)
                         _append_inlines(item_paragraph, item, labels)
+                elif _narrative_commercial_table(block, labels):
+                    _commercial_narrative_records(doc, block, labels)
                 else:
                     _commercial_table(doc, block, labels, accent)
 

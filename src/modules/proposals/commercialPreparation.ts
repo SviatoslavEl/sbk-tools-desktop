@@ -36,6 +36,9 @@ export function isCommercialStructuralHeading(text: string): boolean {
   return /^(?:(?:договор|контракт)(?:\s*№\s*[\p{L}\d/_-]+)?|техническое\s+задание(?:\s*№\s*[\p{L}\d/_-]+)?|приложение\s*№\s*[\p{L}\d/_-]+|исполнитель|заказчик|стороны|(?:исполнитель|заказчик)\s+(?:обязуется|имеет\s+право)|общие\s+положения|предмет\s+(?:договора|контракта|услуг|работ|технического\s+задания)|предмет\s+и\s+цель\s+(?:услуг|работ)|(?:состав|объ[её]м|перечень|содержание)\s+(?:(?:оказываемых|выполняемых|предлагаемых)\s+)?(?:услуг|работ)|функциональные\s+блоки|технический\s+периметр|границы\s+(?:работ|проверки)|итоговые\s+материалы(?:\s+и\s+результат\s+оказания\s+услуг)?|результаты?\s+(?:оказания\s+услуг|работ)|отч[её]тные\s+материалы|выходные\s+документы|(?:стоимость|цена)\s+(?:услуг|работ|договора|контракта)(?:\s+и\s+порядок\s+расч[её]тов)?|(?:условия|порядок)\s+(?:оплаты|расч[её]тов)|финансовые\s+условия|(?:этапы|сроки?)\s+(?:оказания\s+услуг|выполнения\s+работ|работ|поставки)|порядок\s+оказания\s+и\s+сдачи[-‑– ]при[её]мки\s+услуг|календарный\s+план|входные\s+(?:данные|материалы)(?:\s+и\s+условия\s+проведения\s+работ)?|исходные\s+данные|условия\s+проведения\s+работ|требования\s+к\s+(?:заказчику|исходным\s+данным)|допущения(?:\s+и\s+ограничения)?|ограничения|исключения|права\s+и\s+обязанности\s+сторон|ответственность(?:\s+сторон)?|обстоятельства\s+непреодолимой\s+силы|форс[- ]мажор|конфиденциальность|разрешение\s+споров|срок\s+действия\s+договора(?:\s+и\s+порядок\s+расторжения)?|(?:прочие|другие|иные|заключительные)\s+(?:положения|условия)|юридические\s+адреса(?:\s+и\s+реквизиты\s+сторон)?)$/iu.test(label);
 }
 const inlineScope = (text: string) => /^(?:состав|объ[её]м|перечень|содержание)\s+(?:(?:оказываемых|выполняемых|предлагаемых)\s+)?(?:услуг|работ)\s+(?:включает|включают|предусматривает|составляет|состоит\s+из)(?=$|[^\p{L}])\s*\S/iu.test(headingText(text));
+const alternativeIntroduction = (text: string) => /(?:одно|один|одну|любое|любой|любую)\s+из\s+следующих\s+(?:решений|вариантов|действий)\s*:\s*$/iu.test(text);
+const alternativeBranch = (text: string) => /^\s*(?:[-‐‑–—•▪◦]|[а-яa-z]\))\s+\S/iu.test(text);
+const plainParagraph = (fragment: IntelligenceFragment) => !fragment.pdfGrid && !/\t/u.test(fragment.text) && !/^(?:table(?:-\d+)?|sheet-\d+)-row-\d+$/u.test(fragment.id || "");
 const sameProof = (clause: CommercialSourceClause, proof: SourcePreparationProvenance) => clause.sourceId === proof.sourceId && clause.quote === proof.quote && (proof.fragmentId ? clause.fragmentId === proof.fragmentId : clause.locator === proof.locator);
 const review = (code: string, message: string, sectionId?: string): CommercialIssue => ({ code, message, path: "commercialDocument", severity: "review", ...(sectionId ? { sectionId } : {}) });
 const error = (code: string, message: string): CommercialIssue => ({ code, message, path: "commercialDocument", severity: "error" });
@@ -59,11 +62,12 @@ function factSection(fact: ContractProposalFact): CommercialSectionKind {
  * the public working body; unknown material remains a review issue. */
 async function sourceAppendix(sources: readonly IntelligenceSource[], inventory: ContractProposalInventory) {
   const containers: CommercialSourceContainer[] = [], clauses: CommercialSourceClause[] = [];
-  const matched = new Map<string, ContractProposalFact[]>();
+  const matched = new Map<string, ContractProposalFact[]>(), alternativeOwners = new Map<string, CommercialSourceClause>();
   for (const source of sources) {
     const sourceHash = (await commercialFingerprint([source.id])).slice(7, 31);
     const root: CommercialSourceContainer = { id: `container-${sourceHash}`, sourceId: source.id, kind: inventory.documents.some((document) => document.sourceIds.includes(source.id) && document.kind === "contract") ? "contract" : "unknown", heading: "Исходный документ" };
     containers.push(root); let current = root, child = 0, privateLegalSection = false;
+    let alternatives: { lead: CommercialSourceClause; sheetId?: string } | undefined;
     const fragments: IntelligenceFragment[] = source.fragments === undefined ? source.text.split(/\r?\n/u).map((text, index) => ({ id: `text-${index}`, locator: `Строка ${index + 1}`, text })) : source.fragments;
     for (const [index, fragment] of fragments.entries()) {
       if (taskHeading(fragment.text)) {
@@ -88,10 +92,18 @@ async function sourceAppendix(sources: readonly IntelligenceSource[], inventory:
       else if (inventory.documents.some((document) => Object.values(document.parties || {}).some((party) => party?.evidence.some((proof) => sameProof(clause, proof))))) clause.classification = "identity";
       else if (/^(?:\s*(?:Исполнитель|Заказчик|От\s+имени\s+Исполнителя|Генеральный\s+директор)\s*[\t\n])|(?:(?<![\p{L}])(?:ИНН|КПП|ОГРН)(?=$|[^\p{L}])|Расч[её]тный\s+сч[её]т|Корр(?:еспондентский)?\.?\s*сч[её]т|БИК\s*\d)/u.test(fragment.text)) clause.classification = "identity";
       else if (privateLegalSection) { clause.classification = "legal-context"; clause.classificationReason = "Контекст исходного правового раздела сохранён частно. Эта классификация не подтверждает применимость или допустимость исключения материального условия."; }
+      // A choice and its marked outcomes form one reading unit. Ownership is
+      // limited to immediately adjacent selected paragraphs, never inherited
+      // through a heading, table, sheet/container boundary or unrelated text.
+      if (alternatives && clause.classification === "commercial" && clause.containerId === alternatives.lead.containerId && fragment.sheetId === alternatives.sheetId && plainParagraph(fragment) && alternativeBranch(clause.quote) && !isCommercialStructuralHeading(clause.quote.replace(/^\s*(?:[-‐‑–—•▪◦]|[а-яa-z]\))\s+/iu, ""))) {
+        alternativeOwners.set(alternatives.lead.id, alternatives.lead);
+        alternativeOwners.set(clause.id, alternatives.lead);
+      } else alternatives = undefined;
+      if (clause.classification === "commercial" && plainParagraph(fragment) && alternativeIntroduction(clause.quote)) alternatives = { lead: clause, sheetId: fragment.sheetId };
       clauses.push(clause);
     }
   }
-  return { containers, clauses, matched };
+  return { containers, clauses, matched, alternativeOwners };
 }
 
 /** Numeric labels resolve inside a source container, never by number alone.
@@ -292,10 +304,13 @@ export async function prepareCommercialDocument(input: CommercialPreparationInpu
         coverage.push({ sourceClauseId: clause.id, kind: clause.classification === "structural" || clause.classification === "legal-context" ? "private-context" : "unmapped", reason });
         continue;
       }
-      const kind = clause.roles[0] || "other", destination = section(kind), key = JSON.stringify([clause.containerId, clause.quote]);
-      const prior = canonical.get(key);
+      const alternativeOwner = source.alternativeOwners.get(clause.id);
+      const kind = (alternativeOwner || clause).roles[0] || "other", destination = section(kind), key = JSON.stringify([clause.containerId, clause.quote]);
+      // Repeated outcomes under different conditions must remain at their
+      // source position rather than borrowing an earlier public block.
+      const prior = alternativeOwner ? undefined : canonical.get(key);
       if (prior) { const targets = blockForClause.get(prior.id)!; blockForClause.set(clause.id, targets); coverage.push({ sourceClauseId: clause.id, kind: "deduplicated", canonicalClauseId: prior.id, targetBlockIds: [...targets] }); continue; }
-      canonical.set(key, clause);
+      if (!alternativeOwner) canonical.set(key, clause);
       const deadline = clause.roles.includes("payment") && /(?:аванс|предоплат)/iu.test(clause.quote) ? /(?:не\s+позднее|в\s+течение)\s+\d+(?:\s*\([^)]{1,80}\))?\s*(?:(?:рабочих|календарных)\s+)?дн(?:я|ей)/iu.exec(clause.quote) : null;
       const declarationRule = clause.roles.includes("schedule") && /последовательн/iu.test(clause.quote) && /параллельн/iu.test(clause.quote) ? /;\s*(?=Этап[ыа]?\s+\d)/iu.exec(clause.quote) : null;
       if (deadline && deadline.index > 0 || declarationRule && declarationRule.index > 0) {

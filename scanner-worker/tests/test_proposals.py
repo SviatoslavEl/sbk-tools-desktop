@@ -300,6 +300,122 @@ def test_public_v2_long_table_rows_can_flow_and_plain_text_is_not_markup(tmp_pat
         assert "TargetMode=\"External\"" not in archive.read("word/_rels/document.xml.rels").decode()
 
 
+def test_public_v2_narrative_records_use_full_width_and_preserve_every_cell_and_link(tmp_path):
+    from lxml import etree
+    document = commercial_document_fixture()
+    block = document["commercial"]["sections"][0]["blocks"][2]
+    long_text = "Полный состав действий, ограничений и передаваемых результатов. " * 10
+    block["columns"] = ["Блок", "Что проверяем", "Состав действий", "Результат"]
+    block["rows"] = [
+        [[{"kind": "text", "text": "Первая услуга"}], [{"kind": "text", "text": long_text}],
+         [{"kind": "text", "text": "Условие первой услуги. См. "}, {"kind": "local-ref", "target": "s2b1"}],
+         [{"kind": "text", "text": "Первый точный результат"}]],
+        [[{"kind": "text", "text": "Вторая услуга"}], [{"kind": "text", "text": "Краткий второй объект"}],
+         [{"kind": "local-ref", "target": "s2"}, {"kind": "text", "text": " и самостоятельное условие"}], []],
+    ]
+    original = copy.deepcopy(document)
+    output = tmp_path / "narrative-records.docx"
+    render_docx(document, output, {})
+    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+    with ZipFile(output) as archive:
+        xml = etree.fromstring(archive.read("word/document.xml"))
+        assert len(xml.xpath("//w:tbl", namespaces=ns)) == 1  # only the independent price table
+        text = "".join(xml.xpath("//w:t/text()", namespaces=ns)).replace("\u00a0", " ")
+        expected = ["Блок: Первая услуга", "Что проверяем: " + long_text,
+                    "Состав действий: Условие первой услуги. См. пункт 2.1", "Результат: Первый точный результат",
+                    "Блок: Вторая услуга", "Что проверяем: Краткий второй объект",
+                    "Состав действий: раздел 2 и самостоятельное условие", "Результат: "]
+        position = text.index("1.3. ")
+        for cell in expected:
+            position = text.index(cell, position) + len(cell)
+        assert long_text in text and text.count("Первый точный результат") == 1
+        assert xml.xpath("//w:bookmarkStart[@w:name='s1b3']/@w:id", namespaces=ns)
+        assert xml.xpath("//w:hyperlink/@w:anchor", namespaces=ns) == ["s2", "s1b3", "s2b1", "s2"]
+        records = xml.xpath("//w:body/w:p[w:r/w:t[starts-with(., 'Блок: ') or starts-with(., 'Что проверяем: ') or starts-with(., 'Состав действий: ') or starts-with(., 'Результат: ')]]", namespaces=ns)
+        assert len(records) == 8
+        for paragraph in records:
+            assert paragraph.xpath("./w:pPr/w:keepNext/@w:val", namespaces=ns) == ["0"]
+            assert paragraph.xpath("./w:pPr/w:keepLines/@w:val", namespaces=ns) == ["0"]
+            assert paragraph.xpath("./w:r[1]/w:rPr/w:b", namespaces=ns)
+    assert document == original
+
+
+@pytest.mark.parametrize("length,columns,expected_tables", [(320, 4, 2), (321, 4, 1), (321, 3, 1), (1000, 2, 2)])
+def test_public_v2_narrative_threshold_leaves_compact_tables_unchanged(tmp_path, length, columns, expected_tables):
+    from lxml import etree
+    document = commercial_document_fixture()
+    block = document["commercial"]["sections"][0]["blocks"][2]
+    block["columns"] = [f"Столбец {index + 1}" for index in range(columns)]
+    block["rows"] = [[[{"kind": "text", "text": "X" * length}]] + [[{"kind": "text", "text": f"Значение {index}"}] for index in range(columns - 1)]]
+    original = copy.deepcopy(document)
+    output = tmp_path / "threshold.docx"
+    render_docx(document, output, {})
+    with ZipFile(output) as archive:
+        xml = etree.fromstring(archive.read("word/document.xml"))
+        ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+        assert len(xml.xpath("//w:tbl", namespaces=ns)) == expected_tables
+        assert "X" * length in "".join(xml.xpath("//w:t/text()", namespaces=ns))
+        if expected_tables == 2:
+            assert xml.xpath("//w:tbl[2]/w:tr[1]/w:trPr/w:tblHeader", namespaces=ns)
+            assert len(xml.xpath("//w:tbl[2]/w:tr[1]/w:tc", namespaces=ns)) == columns
+    assert document == original
+
+
+def test_public_v2_local_refs_respect_literal_inflection_and_qualified_groups(tmp_path):
+    from lxml import etree
+    document = commercial_document_fixture()
+    content = [
+        {"kind": "text", "text": "Срок определён пунктом "}, {"kind": "local-ref", "target": "s2b1"},
+        {"kind": "text", "text": ". См. п.п. "}, {"kind": "local-ref", "target": "s1b2"},
+        {"kind": "text", "text": ", "}, {"kind": "local-ref", "target": "s1b3"},
+        {"kind": "text", "text": " и "}, {"kind": "local-ref", "target": "s2b1"},
+        {"kind": "text", "text": ". Условия находятся в разделе "}, {"kind": "local-ref", "target": "s2"},
+        {"kind": "text", "text": ". Отдельная ссылка: "}, {"kind": "local-ref", "target": "s1b2"},
+        {"kind": "text", "text": "; дополнительная: "}, {"kind": "local-ref", "target": "s2"},
+    ]
+    document["commercial"]["sections"][0]["blocks"][0]["content"] = content
+    original = copy.deepcopy(document)
+    output = tmp_path / "qualified-refs.docx"
+    render_docx(document, output, {})
+    with ZipFile(output) as archive:
+        xml = etree.fromstring(archive.read("word/document.xml"))
+        ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+        text = "".join(xml.xpath("//w:t/text()", namespaces=ns)).replace("\u00a0", " ")
+        assert "Срок определён пунктом 2.1. См. п.п. 1.2, 1.3 и 2.1." in text
+        assert "в разделе 2. Отдельная ссылка: пункт 1.2; дополнительная: раздел 2" in text
+        assert "пунктом пункт" not in text and "п.п. пункт" not in text and "разделе раздел" not in text
+        assert xml.xpath("//w:hyperlink/@w:anchor", namespaces=ns) == ["s2b1", "s1b2", "s1b3", "s2b1", "s2", "s1b2", "s2", "s2b1"]
+    assert document == original
+
+
+@pytest.mark.skipif(not os.environ.get("SCANDOCUMENT_SOFFICE"), reason="Bundled office runtime required")
+def test_actual_v2_narrative_records_pdf_keeps_text_and_qualified_links(tmp_path):
+    from pypdf import PdfReader
+    document = commercial_document_fixture("review-draft")
+    block = document["commercial"]["sections"][0]["blocks"][2]
+    block["columns"] = ["Блок", "Предмет", "Действия", "Результат"]
+    first_scope = "Сохранить условие доступа и полный состав конкретной услуги. " * 8
+    block["rows"] = [
+        [[{"kind": "text", "text": "Первая услуга"}], [{"kind": "text", "text": first_scope}],
+         [{"kind": "text", "text": "Согласно пункту "}, {"kind": "local-ref", "target": "s2b1"}],
+         [{"kind": "text", "text": "Первый точный итог"}]],
+        [[{"kind": "text", "text": "Вторая услуга"}], [{"kind": "text", "text": "Второй точный предмет"}],
+         [{"kind": "text", "text": "Вторая самостоятельная проверка"}],
+         [{"kind": "text", "text": "Второй точный итог"}]],
+    ]
+    original = copy.deepcopy(document)
+    result = render({"document": document, "workdir": str(tmp_path), "format": "preview", "assets": []})
+    reader = PdfReader(result["outputPath"])
+    text = re.sub(r"\s+", " ", "\n".join(page.extract_text() or "" for page in reader.pages))
+    assert "Согласно пункту 2.1" in text and "пункту пункт" not in text
+    for value in ["Первая услуга", "Первый точный итог", "Вторая услуга", "Второй точный предмет", "Вторая самостоятельная проверка", "Второй точный итог"]:
+        assert text.count(value) == 1
+    assert text.count("Сохранить условие доступа и полный состав конкретной услуги.") == 8
+    assert len(result["previewPages"]) == len(reader.pages)
+    assert document == original
+    print(f"PROPOSAL_NARRATIVE_RECORDS_QA: {tmp_path}")
+
+
 @pytest.mark.skipif(not os.environ.get("SCANDOCUMENT_SOFFICE"), reason="Bundled office runtime required")
 @pytest.mark.parametrize("mode", ["final", "review-draft"])
 def test_actual_v2_pdf_preserves_full_width_content_and_draft_gate(tmp_path, mode):

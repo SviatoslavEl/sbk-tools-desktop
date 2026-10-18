@@ -10,7 +10,7 @@ import { repairDateFromSource } from "./sourceRepairs";
 import { AutomaticConditionsSummary } from "./AutomaticConditionsSummary";
 import { runResponsePreparation, type ResponsePreparationRequest } from "./responsePreparationWorker";
 import { runEvidenceAudit, type EvidenceAuditRequest, type EvidenceAuditReply } from "./evidenceAuditWorker";
-import type { IntelligenceDestination, IntelligenceHandoff } from "./workbenchTypes";
+import type { IntelligenceDestination, IntelligenceHandoff, IntelligenceSource } from "./workbenchTypes";
 import { createTaskDocumentSession, reduceTaskDocumentSession, taskDocumentOriginKey, type TaskDocumentOrigin, type TaskDocumentSession } from "./taskDocumentSession";
 
 // Exercise the real component's state, effects and callbacks. Native IO and
@@ -124,6 +124,99 @@ beforeEach(() => {
   transfer = vi.fn(); props = { workspaceRoot: "/qa-workspace", onTransfer: transfer }; render();
 });
 afterEach(() => { for (const slot of runtime.slots) slot.cleanup?.(); vi.unstubAllGlobals(); vi.useRealTimers(); });
+
+describe("explicit local proposal preparation from a complete contract", () => {
+  const localAction = "Подготовить по договору без модели";
+  const unchangedRaw = "PRIVATE-RAW-MODEL-RESPONSE: deliberately not JSON";
+  const cards = () => nodes().filter((node) => node.props.className === "iw-card");
+  function contract(): IntelligenceSource {
+    const lines = ["Договор", "1. Предмет договора", "1.1. Исполнитель оказывает комплекс услуг по проверке учебной системы.",
+      "2. Состав оказываемых услуг", "2.1. Анализ документации с сохранением ограничений доступа.", "2.2. Проверка компонентов; SBOM при наличии.",
+      "3. Итоговые материалы и результат оказания услуг", "3.1. Отчёт с рисками и рекомендациями.", "3.2. Материалы в DOCX и PDF; встреча по результатам.",
+      "4. Стоимость услуг и порядок расчетов", "4.1. Стоимость услуг составляет 12 000,00 рублей, в том числе НДС 22%.",
+      "4.2. Аванс 25% в течение 4 календарных дней от подписания.", "4.3. Окончательный расчет в течение 6 рабочих дней от акта или истечения срока отказа.",
+      "5. Срок оказания услуг", "5.1. Максимальный срок — 16 рабочих дней после полного аванса или всех материалов, что наступит позднее.",
+      "6. Входные данные и условия проведения работ", "6.1. Заказчик предоставляет доступы и материалы; репозиторий при наличии.",
+      "7. Допущения и ограничения", "7.1. Восстановление архитектуры в объём работ не входит."];
+    return { id: "fixture-contract", name: "Учебный договор.docx", text: lines.join("\n"), fragments: lines.map((text, index) => ({ id: `contract-${index}`, locator: `Абзац ${index + 1}`, text })), coverage: { complete: true, requiresOcr: false } };
+  }
+  async function addContract(input = contract()) {
+    runtime.chooseOpen.mockResolvedValueOnce("/qa/contract.docx");
+    runtime.invoke.mockResolvedValueOnce({ fileName: input.name, extractedText: input.text, sha256: "b".repeat(64), fragments: input.fragments, coverage: input.coverage, warnings: [] });
+    await click("Добавить PDF, DOCX или XLSX");
+  }
+  async function oldCards() {
+    await edit("iw-new-destination", "proposals"); await click("Добавить карточку вручную");
+    field("title").props.onChange!({ target: { value: "Ручное КП до локальной подготовки", checked: false } }); await flush();
+    await edit("iw-new-destination", "staff"); await click("Добавить карточку вручную");
+    field("fullName").props.onChange!({ target: { value: "Сотрудник до локальной подготовки", checked: false } }); await flush();
+  }
+  it("uses the real no-worker local route without a configured model or provider call and leaves the raw model answer unchanged", async () => {
+    vi.stubGlobal("Worker", undefined);
+    await selectGoals("proposals"); await addContract(); await edit("iw-response", unchangedRaw);
+    await edit("iw-instruction", "Только краткая сводка: это уточнение не ограничивает отдельную локальную подготовку договора.");
+    expect(text()).toContain("Модель не выбрана"); expect(button(localAction).props.disabled).toBe(false);
+    await click(localAction);
+    expect(cards()).toHaveLength(1); expect(text()).toContain("Локальный проект по тексту договора");
+    const item = (nodes().find((node) => node.type === SourceFactsDesk)!.props as unknown as Parameters<typeof SourceFactsDesk>[0]).item;
+    expect(item.destination).toBe("proposals"); expect(item.fields.lineDescriptions).toEqual(expect.arrayContaining([expect.stringContaining("Анализ документации"), expect.stringContaining("Проверка компонентов")]));
+    expect(item.fields.paymentTerms).toContain("Аванс 25%"); expect(item.fields.deliveryTerms).toContain("что наступит позднее");
+    expect(control("iw-response").props.value).toBe(unchangedRaw);
+    expect(runtime.analyze).not.toHaveBeenCalled(); expect(runtime.testConnection).not.toHaveBeenCalled(); expect(runtime.workspace).not.toHaveBeenCalled(); expect(transfer).not.toHaveBeenCalled();
+    expect(runtime.invoke.mock.calls.map(([command]) => command)).toEqual(["scanner_run"]);
+  });
+  it("preserves both corrected cards when replacement is cancelled or pending, then replaces them together only after success", async () => {
+    await selectGoals("proposals"); await addContract(); await oldCards(); await edit("iw-response", unchangedRaw);
+    const previous = cards().map((card) => card.key), jobs = holdPreparations();
+    await click(localAction); expect(jobs).toHaveLength(0);
+    nodes().find((node) => node.type === ConfirmDialog)!.props.onClose!(); await flush();
+    expect(cards().map((card) => card.key)).toEqual(previous); expect(field("title").props.value).toBe("Ручное КП до локальной подготовки"); expect(control("iw-response").props.value).toBe(unchangedRaw);
+    await click(localAction); await confirm(); expect(jobs).toHaveLength(1);
+    expect(jobs[0].request).toHaveProperty("origin", "source-contract"); expect(jobs[0].request).not.toHaveProperty("raw"); expect(jobs[0].request).not.toHaveProperty("destinations");
+    expect(cards().map((card) => card.key)).toEqual(previous); expect(field("fullName").props.value).toBe("Сотрудник до локальной подготовки");
+    jobs[0].reply(); await flush();
+    expect(cards()).toHaveLength(1); expect(previous).not.toContain(cards()[0].key); expect(text()).toContain("Локальный проект по тексту договора");
+    expect(control("iw-response").props.value).toBe(unchangedRaw); expect(jobs[0].terminated).toBe(true); expect(runtime.analyze).not.toHaveBeenCalled(); expect(transfer).not.toHaveBeenCalled();
+  });
+  it.each(["unknown-coverage", "incomplete", "ocr", "multiple", "technical-task", "missing-payment"] as const)("keeps existing cards and the raw answer intact for unsupported %s input", async (variant) => {
+    await selectGoals("proposals"); const input = contract();
+    if (variant === "unknown-coverage") delete input.coverage;
+    if (variant === "incomplete") input.coverage!.complete = false;
+    if (variant === "ocr") input.coverage!.requiresOcr = true;
+    if (variant === "technical-task") { input.fragments![0].text = "Техническое задание"; input.text = input.fragments!.map((fragment) => fragment.text).join("\n"); }
+    if (variant === "missing-payment") { input.fragments = input.fragments!.filter((fragment) => !/расчетов|Стоимость услуг составляет|Аванс|Окончательный расчет/u.test(fragment.text)); input.text = input.fragments.map((fragment) => fragment.text).join("\n"); }
+    await addContract(input);
+    if (variant === "multiple") { const other = contract(); other.name = "Второй договор.docx"; await addContract(other); }
+    await oldCards(); await edit("iw-response", unchangedRaw); const previous = cards().map((card) => card.key);
+    await click(localAction); await confirm();
+    expect(cards().map((card) => card.key)).toEqual(previous); expect(field("title").props.value).toBe("Ручное КП до локальной подготовки"); expect(field("fullName").props.value).toBe("Сотрудник до локальной подготовки");
+    expect(control("iw-response").props.value).toBe(unchangedRaw); expect(text()).not.toContain("Локальный проект по тексту договора");
+    expect(nodes().some((node) => node.props.className === "notice error")).toBe(true); expect(runtime.analyze).not.toHaveBeenCalled(); expect(transfer).not.toHaveBeenCalled();
+  });
+  it.each(["source", "root", "goal", "reset", "cancel"] as const)("never installs a retained late source result after %s changes", async (change) => {
+    await selectGoals("proposals"); await addContract(); await oldCards(); await edit("iw-response", unchangedRaw);
+    const jobs = holdPreparations(); await click(localAction); await confirm();
+    expect(jobs).toHaveLength(1); const job = jobs[0], reply = runResponsePreparation(job.request), stale = job.onmessage!; expect(reply.prepared).toBeDefined();
+    if (change === "source") await editLabeled("Текст источника Учебный договор.docx", "Источник исправлен во время локальной подготовки.");
+    if (change === "root") { render({ ...props, workspaceRoot: "/other-workspace" }); await flush(); }
+    if (change === "goal") await selectGoals("staff");
+    if (change === "reset") { await click("Новая задача"); await confirm(); }
+    if (change === "cancel") await click("Остановить разбор");
+    const retained = cards().map((card) => card.key), raw = control("iw-response").props.value;
+    stale({ data: reply }); await flush();
+    expect(cards().map((card) => card.key)).toEqual(retained); expect(control("iw-response").props.value).toBe(raw);
+    expect(cards()).toHaveLength(change === "reset" ? 0 : 2); expect(text()).not.toContain("Локальный проект по тексту договора"); expect(job.terminated).toBe(true);
+    expect(runtime.analyze).not.toHaveBeenCalled(); expect(runtime.workspace).not.toHaveBeenCalled(); expect(transfer).not.toHaveBeenCalled();
+  });
+  it("offers the source-contract button only for the single proposals goal", async () => {
+    for (const goals of [[], ["staff"], ["contracts"], ["procurement"], ["counterparties"], ["proposals", "contracts"]] as IntelligenceDestination[][]) {
+      await selectGoals(...goals); expect(nodes().some((node) => node.type === "button" && text(node) === localAction)).toBe(false);
+    }
+    await selectGoals("proposals"); expect(button(localAction).props.disabled).toBe(true);
+    await addContract(); expect(button(localAction).props.disabled).toBe(false);
+    await selectGoals("proposals", "staff"); expect(nodes().some((node) => node.type === "button" && text(node) === localAction)).toBe(false);
+  });
+});
 
 describe("private proposal task origins", () => {
   async function manualProposal() {
@@ -528,11 +621,11 @@ describe("unified intelligence workflow", () => {
   it("keeps old cards and decisions until local preparation completes, and rejects its late reply after cancellation", async () => {
     await addText(); await paste(); await reviewVisibleFindings(); const oldName = field("name").props.value;
     const jobs = holdPreparations(); await edit("iw-response", result([{ ...procurement, title: "Новый ответ", fields: { name: "Новый ответ" } }])); await click("Разобрать ответ"); await confirm();
-    expect(jobs).toHaveLength(1); expect(text()).toContain("Подготавливаем карточки, сертификаты и условия"); expect(field("name").props.value).toBe(oldName);
+    expect(jobs).toHaveLength(1); expect(text()).toContain("Подготавливаем результат и проверяем исходные материалы…"); expect(field("name").props.value).toBe(oldName);
     expect(button("Открыть черновик: Закупки").props.disabled).toBe(true); button("Открыть черновик: Закупки").props.onClick!(); await flush(); expect(runtime.workspace).not.toHaveBeenCalled();
     const stale = jobs[0].onmessage!; await click("Остановить разбор"); expect(jobs[0].terminated).toBe(true);
     stale({ data: runResponsePreparation(jobs[0].request) }); await flush(); expect(field("name").props.value).toBe(oldName);
-    expect(text()).not.toContain("Подготавливаем карточки, сертификаты и условия из источников…");
+    expect(text()).not.toContain("Подготавливаем результат и проверяем исходные материалы…");
   });
   it.each(["failure", "empty", "malformed"] as const)("preserves the previous accepted result when local preparation returns %s", async (kind) => {
     await addText(); await paste(); await reviewVisibleFindings(); const oldName = field("name").props.value;

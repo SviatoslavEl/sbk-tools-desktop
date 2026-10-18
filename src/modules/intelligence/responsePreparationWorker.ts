@@ -12,10 +12,12 @@ import { createProposalSourceFinancials, type ProposalSourceFinancialCandidate }
 import { quarantineConflictingFields } from "./quarantineConflictingFields";
 import { buildIntelligenceResponseSchema, destinationLabels, fieldDefinitions, parseIntelligenceResult } from "./workbenchModel";
 import { assertResponsePreparationRaw, assertResponsePreparationSources, RESPONSE_PREPARATION_LIMITS } from "./responsePreparationBounds";
+import { assertPreparedSourceContract, assertSourceContractSources } from "./sourceContractPreparation";
 export { RESPONSE_PREPARATION_LIMITS } from "./responsePreparationBounds";
 import type { IntelligenceDestination, IntelligenceItem, IntelligenceSource } from "./workbenchTypes";
 
 export interface SourcePreparationReceipt {
+  origin?: "source-contract";
   changes: Array<SourcePreparationChange | RequirementDeduplication>;
   skipped: SourcePreparationSkipped[]; limited: boolean;
 }
@@ -24,6 +26,7 @@ export interface ResponsePreparationRequest {
   revision: number; raw: string; sources: IntelligenceSource[]; destinations: IntelligenceDestination[];
 }
 export interface ResponsePreparationReply {
+  origin?: "source-contract";
   revision: number; prepared?: ResponsePreparationResult; empty?: true; failed?: string;
 }
 const object = (value: unknown): value is Record<string, unknown> => Boolean(value && typeof value === "object" && !Array.isArray(value));
@@ -93,7 +96,7 @@ function provenance(value: Record<string, unknown>, required: boolean): boolean 
 }
 const fieldValue = (entry: unknown) => text(entry, 200_000) || typeof entry === "boolean" || typeof entry === "number" && Number.isFinite(entry) || array(entry, 100, (part) => text(part, 40_000));
 function sourceReceipt(value: unknown, items: IntelligenceItem[]): boolean {
-  if (!object(value) || !keys(value, ["changes", "skipped", "limited"]) || typeof value.limited !== "boolean") return false;
+  if (!object(value) || !keys(value, ["changes", "skipped", "limited", "origin"]) || typeof value.limited !== "boolean" || !optional(value, "origin", entry => entry === "source-contract")) return false;
   return array(value.changes, 500, (change) => {
     if (!object(change) || !keys(change, ["itemId", "field", "kind", "sourceId", "sourceName", "fragmentId", "locator", "quote", "previousValue", "value", "requiresReview"]) || change.requiresReview !== true) return false;
     const item = items.find((entry) => entry.id === change.itemId);
@@ -130,39 +133,28 @@ function validPrepared(value: unknown): value is ResponsePreparationResult {
 
 /** Structural protocol guard, not a substitute for the existing evidence audit.
  * Passing the expected revision also rejects a well-formed stale response. */
-export function validResponsePreparationReply(value: unknown, expectedRevision?: number): value is ResponsePreparationReply {
+export function validResponsePreparationReply(value: unknown, expectedRevision?: number, expectedOrigin?: "source-contract"): value is ResponsePreparationReply {
   try {
-    if (!object(value) || !keys(value, ["revision", "prepared", "empty", "failed"]) || !Number.isSafeInteger(value.revision)
+    if (!object(value) || !keys(value, ["revision", "prepared", "empty", "failed", "origin"]) || value.origin !== expectedOrigin || !Number.isSafeInteger(value.revision)
       || Number(value.revision) < -1 || expectedRevision !== undefined && value.revision !== expectedRevision) return false;
     const alternatives = [own(value, "prepared"), own(value, "empty"), own(value, "failed")];
     if (alternatives.filter(Boolean).length !== 1) return false;
     if (own(value, "failed")) return text(value.failed, errorLimit, true);
     if (Number(value.revision) < 0) return false;
-    return own(value, "empty") ? value.empty === true : validPrepared(value.prepared);
+    if (own(value, "empty")) return expectedOrigin === undefined && value.empty === true;
+    return validPrepared(value.prepared) && value.prepared.sourcePreparation?.origin === expectedOrigin;
   } catch { return false; }
 }
 
-/** Local, atomic preparation only: no model, filesystem, database or storage.
- * raw and sources remain untouched; malformed answers never yield partial cards. */
-export function runResponsePreparation(request: unknown): ResponsePreparationReply {
-  const revision = object(request) && Number.isSafeInteger(request.revision) && Number(request.revision) >= 0 ? Number(request.revision) : -1;
-  try {
-    if (revision < 0 || !object(request) || !keys(request, ["revision", "raw", "sources", "destinations"])
-      || !Array.isArray(request.destinations)) throw new Error("Некорректный запрос подготовки ответа.");
-    assertResponsePreparationRaw(request.raw);
-    assertResponsePreparationSources(request.sources);
-    // The normal schema guard rejects unknown, duplicate and empty directions.
-    buildIntelligenceResponseSchema(request.destinations as IntelligenceDestination[]);
-    const sources = request.sources, items = parseIntelligenceResult(request.raw, sources.map((source) => source.id), {
-      editableFields: true, destinations: request.destinations as IntelligenceDestination[],
-    });
+/** Shared pure source tail; neither caller can introduce acknowledgements. */
+function prepareItems(items: IntelligenceItem[], sources: IntelligenceSource[], destinations: IntelligenceDestination[]): ResponsePreparationResult | undefined {
     const deduplicated = deduplicateRequirements(items);
-    const sourcePrepared = prepareIntelligenceSourceFacts(deduplicated.items, sources, request.destinations as IntelligenceDestination[]);
-    const staffPrepared = completeSourceStaffCertificates(sourcePrepared.items, sources, request.destinations as IntelligenceDestination[]);
-    const contractPrepared = completeContractProposalFields(staffPrepared.items, sources, request.destinations as IntelligenceDestination[]);
+    const sourcePrepared = prepareIntelligenceSourceFacts(deduplicated.items, sources, destinations);
+    const staffPrepared = completeSourceStaffCertificates(sourcePrepared.items, sources, destinations);
+    const contractPrepared = completeContractProposalFields(staffPrepared.items, sources, destinations);
     if (!contractPrepared.items.length) {
       if (sourcePrepared.limited || staffPrepared.limited || contractPrepared.limited) throw new Error("Источники не разобраны полностью: достигнут предел подготовки. Разделите материалы и повторите анализ.");
-      return { revision, empty: true };
+      return undefined;
     }
     const textPrepared = completeSourceTextFields(contractPrepared.items, sources);
     const dated = completeSourceDates(textPrepared.items, sources);
@@ -190,10 +182,39 @@ export function runResponsePreparation(request: unknown): ResponsePreparationRep
     });
     const prepared: ResponsePreparationResult = { ...completed, items: financialItems, ...(receipt.changes.length || receipt.skipped.length || receipt.limited ? { sourcePreparation: receipt } : {}) };
     if (!validPrepared(prepared)) throw new Error("Результат подготовки ответа некорректен или превышает допустимый объём. Разделите материалы.");
-    return { revision, prepared };
+    return prepared;
+}
+
+/** Local, atomic preparation only: no model, filesystem, database or storage.
+ * The explicitly different source route accepts no raw/model items at all.
+ * Existing provider parsing, including its rejection rules, stays unchanged. */
+export function runResponsePreparation(request: unknown): ResponsePreparationReply {
+  const revision = object(request) && Number.isSafeInteger(request.revision) && Number(request.revision) >= 0 ? Number(request.revision) : -1;
+  const sourceOnly = object(request) && request.origin === "source-contract";
+  const origin = sourceOnly ? { origin: "source-contract" as const } : {};
+  try {
+    if (sourceOnly) {
+      if (revision < 0 || !object(request) || !keys(request, ["origin", "revision", "sources"])) throw new Error("Некорректный запрос локальной подготовки договора.");
+      assertSourceContractSources(request.sources);
+      const prepared = prepareItems([], request.sources, ["proposals"]);
+      if (!prepared || prepared.limited || !prepared.sourcePreparation || prepared.sourcePreparation.limited) throw new Error("Договор не подготовлен целиком в пределах допустимого объёма. Частичный результат не принят.");
+      assertPreparedSourceContract(prepared.items, request.sources);
+      prepared.sourcePreparation = { ...prepared.sourcePreparation, origin: "source-contract" };
+      if (!validPrepared(prepared)) throw new Error("Локальный проект договора превышает допустимый объём.");
+      return { revision, ...origin, prepared };
+    }
+    if (revision < 0 || !object(request) || !keys(request, ["revision", "raw", "sources", "destinations"])
+      || !Array.isArray(request.destinations)) throw new Error("Некорректный запрос подготовки ответа.");
+    assertResponsePreparationRaw(request.raw);
+    assertResponsePreparationSources(request.sources);
+    buildIntelligenceResponseSchema(request.destinations as IntelligenceDestination[]);
+    const items = parseIntelligenceResult(request.raw, request.sources.map(source => source.id), { editableFields: true, destinations: request.destinations as IntelligenceDestination[] });
+    const prepared = prepareItems(items, request.sources, request.destinations as IntelligenceDestination[]);
+    return prepared ? { revision, prepared } : { revision, empty: true };
   } catch (reason) {
-    const message = reason instanceof Error ? reason.message : "Не удалось подготовить ответ ИИ.";
-    return { revision, failed: message.slice(0, errorLimit) || "Не удалось подготовить ответ ИИ." };
+    const fallback = sourceOnly ? "Не удалось подготовить локальный проект договора." : "Не удалось подготовить ответ ИИ.";
+    const message = reason instanceof Error ? reason.message : fallback;
+    return { revision, ...origin, failed: message.slice(0, errorLimit) || fallback };
   }
 }
 
