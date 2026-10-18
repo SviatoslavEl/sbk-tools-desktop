@@ -154,3 +154,88 @@ describe("task pane callback races and integrity", () => {
     expect(a.apply(state)).toBe(state); expect(request(state).receivers).toEqual(state.receivers);
   });
 });
+
+describe("local edit invalidation is not workspace or operation authority", () => {
+  const applyLocal = (state: TaskPaneState, change: ProposalTaskSessionChange) => reduceTaskPaneState(state, { type: "local-change", change });
+  function savedAndExported() {
+    const { a, state: accepted } = opened(), entry = a.bridge.get(a.owner)!;
+    a.bridge.update(a.owner, { ...entry, recordId: entry.writeId }, root);
+    const saved = a.bridge.queue(a.owner, "save", root)!;
+    a.bridge.finish(saved, { type: "saved", recordId: entry.writeId }, root);
+    const exported = a.bridge.queue(a.owner, "export", root, "pdf")!;
+    a.bridge.finish(exported, { type: "exported", format: "pdf", outputPath: `${root}/offer.pdf`, outputBytes: 40, sha256: "a".repeat(64) }, root);
+    return { a, state: a.apply(accepted) };
+  }
+  it("immediately makes old saved/exported snapshots stale even on a quick return with no metadata receipt", () => {
+    const { a, state } = savedAndExported(), previous = state.receivers[0], callback = a.edit("Новые правки");
+    const changed = applyLocal(state, callback), returned = reduceTaskPaneState(changed, { type: "return-results" });
+    expect(returned.visibility).toBe("results"); expect(returned.openedOrigin).toEqual(a.owner);
+    expect(taskPaneDocumentProgress(returned.receivers[0])).toMatchObject({ savedCurrent: false, exportedCurrent: false, hasStaleExports: true, hasUnsavedChanges: true, semanticReadiness: "separate-gate" });
+    expect(returned.receivers[0].session.accepted).toEqual(previous.session.accepted);
+    expect(returned.receivers[0].session.saved).toEqual(previous.session.saved);
+    expect(returned.receivers[0].session.exports).toEqual(previous.session.exports);
+    expect(a.apply(returned, previous)).toBe(returned);
+    (callback.data as { title: string }).title = "Мутация снаружи";
+    expect(returned.receivers[0].data.title).toBe("Новые правки");
+  });
+  it("does not revive an old file or lose revisions when a local edit is immediately reverted", () => {
+    const { a, state } = savedAndExported(), baseline = state.receivers[0].session.current;
+    let changed = applyLocal(state, a.edit("Временная правка"));
+    const intermediate = a.change(); changed = applyLocal(changed, a.edit("Документ A"));
+    expect(changed.receivers[0].session.current).toEqual({ revision: baseline.revision + 2, fingerprint: baseline.fingerprint });
+    expect(taskPaneDocumentProgress(changed.receivers[0])).toMatchObject({ savedCurrent: false, exportedCurrent: false, hasStaleExports: true });
+    expect(applyLocal(changed, intermediate)).toBe(changed); expect(applyLocal(changed, a.change())).toBe(changed);
+  });
+  it("cannot introduce or refresh acceptance, saves, exports, attempts, attachment or record ownership", () => {
+    const { a, state } = savedAndExported(), edited = a.edit("Изменено"), snapshot = edited.session.current;
+    const forged = [
+      { ...edited, session: { ...edited.session, accepted: { attempt: edited.session.latestAttempt, snapshot } } },
+      { ...edited, session: { ...edited.session, saved: { ...edited.session.saved!, snapshot } } },
+      { ...edited, session: { ...edited.session, exports: { pdf: { ...edited.session.exports.pdf!, snapshot } } } },
+      { ...edited, session: { ...edited.session, latestAttempt: edited.session.latestAttempt + 1 } },
+      { ...edited, session: { ...edited.session, editorAttached: false } },
+      { ...edited, session: { ...edited.session, lastTransition: { phase: "saved" as const } } },
+      { ...edited, session: { ...edited.session, exports: {} } },
+      { ...edited, writeId: "other-record", recordId: "other-record", session: { ...edited.session, saved: undefined } },
+      { ...edited, recordId: undefined },
+    ];
+    for (const callback of forged) expect(applyLocal(state, callback)).toBe(state);
+  });
+  it("cannot open a requested or merely queued result and cannot restore an old workspace", () => {
+    const { a, state } = opened(), b = fixture(origin("B")), requested = request(state, b.owner);
+    const acceptedB = b.accept(), modifiedB = b.edit("Чужой локальный документ");
+    expect(applyLocal(requested, acceptedB)).toBe(requested); expect(applyLocal(requested, modifiedB)).toBe(requested);
+    const queued = fixture(origin("C")); queued.queue(); const queuedState = queued.apply(request(state, queued.owner));
+    expect(applyLocal(queuedState, queued.edit("Только queued"))).toBe(queuedState);
+    const changedRoot = reduceTaskPaneState(state, { type: "workspace-changed", workspaceRoot: "/private/tmp/new-workspace" });
+    expect(applyLocal(changedRoot, a.edit("Старая папка"))).toBe(changedRoot);
+    const released = a.bridge.release(a.owner, root)!;
+    const noEditor = a.apply(state, { session: released.session, data: released.data, writeId: released.writeId });
+    expect(applyLocal(noEditor, a.edit("После отсоединения"))).toBe(noEditor);
+  });
+  it("keeps pending B and all routing while locally invalidating the still-open A", () => {
+    const { a, state } = opened(), b = fixture(origin("B")); b.queue();
+    const queued = b.apply(request(state, b.owner)), next = applyLocal(queued, a.edit("Правка A до решения по B"));
+    expect(next).toMatchObject({ requestedOrigin: b.owner, pendingOrigin: b.owner, openedOrigin: a.owner, visibility: "document" });
+    expect(projectTaskPaneState(next).opened?.data.title).toBe("Правка A до решения по B");
+    expect(projectTaskPaneState(next).pending).toEqual(projectTaskPaneState(queued).pending);
+  });
+  it("requires contiguous revisions and exact data while ignoring object key order", () => {
+    const { a, state } = opened(), callback = a.edit("Правка");
+    const reordered = JSON.parse(JSON.stringify(callback, (_key, value: unknown) => value && typeof value === "object" && !Array.isArray(value)
+      ? Object.fromEntries(Object.entries(value).reverse()) : value)) as ProposalTaskSessionChange;
+    expect(applyLocal(state, reordered).receivers[0].data.title).toBe("Правка");
+    expect(applyLocal(state, { ...callback, data: { ...callback.data, title: "Подмена" } })).toBe(state);
+    a.edit("Вторая правка"); expect(applyLocal(state, a.change())).toBe(state);
+  });
+  it("still requires a later authoritative completion to mark a new revision saved/exported", () => {
+    const { a, state } = savedAndExported(), changed = applyLocal(state, a.edit("Новая редакция")), entry = a.bridge.get(a.owner)!;
+    const save = a.bridge.queue(a.owner, "save", root)!; a.bridge.finish(save, { type: "saved", recordId: entry.writeId }, root);
+    expect(applyLocal(changed, a.change())).toBe(changed);
+    const saved = a.apply(changed); expect(taskPaneDocumentProgress(saved.receivers[0])).toMatchObject({ savedCurrent: true, exportedCurrent: false, hasStaleExports: true });
+    const exportTicket = a.bridge.queue(a.owner, "export", root, "pdf")!;
+    a.bridge.finish(exportTicket, { type: "exported", format: "pdf", outputPath: `${root}/new.pdf`, outputBytes: 44, sha256: "b".repeat(64) }, root);
+    expect(applyLocal(saved, a.change())).toBe(saved);
+    expect(taskPaneDocumentProgress(a.apply(saved).receivers[0]).exportedCurrent).toBe(true);
+  });
+});

@@ -1,5 +1,5 @@
 import { proposalTaskFingerprint, type ProposalTaskSessionChange } from "../proposals/proposalTaskBridge";
-import { createTaskDocumentOrigin, isTaskDocumentOrigin, projectTaskDocumentSession, sameTaskDocumentOrigin, taskDocumentOriginKey, TASK_DOCUMENT_SESSION_LIMITS, type TaskDocumentAcceptance, type TaskDocumentOrigin, type TaskDocumentSession } from "./taskDocumentSession";
+import { createTaskDocumentOrigin, isTaskDocumentOrigin, projectTaskDocumentSession, reduceTaskDocumentSession, sameTaskDocumentOrigin, taskDocumentOriginKey, TASK_DOCUMENT_SESSION_LIMITS, type TaskDocumentAcceptance, type TaskDocumentOrigin, type TaskDocumentSession } from "./taskDocumentSession";
 
 /** Routing/projection only. The single existing proposal editor owns document
  * data; a request never installs a seed or approves semantic completeness. */
@@ -15,6 +15,8 @@ export interface TaskPaneState {
 export type TaskPaneEvent =
   | { readonly type: "request"; readonly origin: TaskDocumentOrigin }
   | { readonly type: "receiver-change"; readonly workspaceRoot: string; readonly change: ProposalTaskSessionChange }
+  /** Local data invalidation, not an authenticated workspace/I/O receipt. */
+  | { readonly type: "local-change"; readonly change: ProposalTaskSessionChange }
   | { readonly type: "handoff-consumed"; readonly origin: TaskDocumentOrigin }
   | { readonly type: "return-results" }
   | { readonly type: "workspace-changed"; readonly workspaceRoot: string | null };
@@ -95,6 +97,25 @@ function newer(previous: TaskPaneReceiverSnapshot, next: ProposalTaskSessionChan
   if (before.lastTransition.phase === "released" && after.latestAttempt === before.latestAttempt && after.current.revision === before.current.revision && after.lastTransition.phase !== "released") return false;
   return true;
 }
+const canonical = (value: unknown) => JSON.stringify(value, (_key, nested: unknown) => object(nested)
+  ? Object.fromEntries(Object.entries(nested).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)) : nested);
+
+/** A local edit can invalidate existing receipts, never invent or refresh them.
+ * Build its entire session from known state and compare the claimed projection
+ * to that exact pure transition. The origin root here is identity, not evidence
+ * of filesystem access; actual operation receipts use receiver-change. */
+function localChange(state: TaskPaneState, change: ProposalTaskSessionChange): TaskPaneState {
+  if (!state.workspaceRoot || !validChange(change, state.workspaceRoot)) return state;
+  const previous = receiver(state, change.session.origin);
+  if (!previous || !sameTaskDocumentOrigin(state.openedOrigin, change.session.origin) || !previous.session.editorAttached || !previous.session.accepted
+    || previous.writeId !== change.writeId || previous.recordId !== change.recordId || change.session.current.revision !== previous.session.current.revision + 1) return state;
+  const session = reduceTaskDocumentSession(previous.session, { type: "changed", origin: previous.session.origin,
+    workspaceRoot: state.workspaceRoot, previous: previous.session.current, next: change.session.current });
+  try { if (session === previous.session || canonical(session) !== canonical(change.session)) return state; }
+  catch { return state; }
+  const captured = freeze(structuredClone({ ...previous, data: change.data, session }));
+  return seal({ ...state, receivers: state.receivers.map((entry) => entry === previous ? captured : entry) });
+}
 
 /** Wrong-root/older callbacks are no-ops. A consumed handoff is transport only.
  * Leaving the tool is deliberately NOT a release/unload operation here. */
@@ -106,6 +127,7 @@ export function reduceTaskPaneState(state: TaskPaneState, event: TaskPaneEvent):
   }
   if (event.type === "return-results") return state.visibility === "results" ? state : seal({ ...state, visibility: "results" });
   if (event.type === "handoff-consumed") return state;
+  if (event.type === "local-change") return localChange(state, event.change);
   if (event.type === "request") {
     if (!isTaskDocumentOrigin(event.origin) || event.origin.workspaceRoot !== state.workspaceRoot) return state;
     const origin = createTaskDocumentOrigin(event.origin), existing = receiver(state, origin);

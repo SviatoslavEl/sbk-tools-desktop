@@ -389,6 +389,13 @@ function App() {
     if (!workspace || change.session.origin.workspaceRoot !== workspace.root) return;
     setTaskPane((current) => reduceTaskPaneState(current, { type: "receiver-change", workspaceRoot: workspace.root, change }));
   };
+  // Local edits can invalidate an older file immediately without a network
+  // permission probe. This separate channel cannot create an acceptance,
+  // persistence/export receipt, or any new authority in the task controller.
+  const proposalTaskLocalChanged = (change: ProposalTaskSessionChange) => {
+    if (!workspace || change.session.origin.workspaceRoot !== workspace.root) return;
+    setTaskPane((current) => reduceTaskPaneState(current, { type: "local-change", change }));
+  };
   const recognizeIntelligenceFile = (request: IntelligenceOcrRequest) => {
     if (intelligenceOcrRoot.current !== workspace?.root) throw new Error("Рабочая папка изменилась. Повторите запрос OCR в окне ИИ.");
     intelligenceOcrRouter.current.updateContext(intelligenceOcrRoot.current, networkAccessIsPaused());
@@ -734,7 +741,7 @@ function App() {
               {calculatorOpened && <div hidden={activeTool !== "calculator"} key={`calculator-${workspace.root}`}><Calculator onCreateProposal={createProposal} active={activeTool === "calculator"} openRecordId={openRecord?.tool === "calculator" ? openRecord.id : undefined} onRecordOpened={recordOpened} /></div>}
               {proposalsOpened && <div ref={taskDocumentRef} tabIndex={-1} role={taskDocumentVisible ? "region" : undefined} aria-label={taskDocumentVisible ? "КП текущей задачи" : undefined} hidden={activeTool !== "proposals" && !taskDocumentVisible} key={`proposals-${workspace.root}`}>
                 {taskDocumentVisible && taskPaneView.pendingOrigin && <p className="notice" role="status">Открываем выбранный результат задачи. Если уже есть несохранённые правки, сначала выберите, что с ними сделать.</p>}
-                <Proposals active={activeTool === "proposals" || taskDocumentVisible} handoff={proposalHandoff} presentation={taskDocumentVisible ? "ai-task" : "registry"} onReturnToTask={returnToIntelligenceResults} onTaskSessionChange={proposalTaskChanged} onHandoffConsumed={() => setProposalHandoff((current) => current?.id === proposalHandoff?.id ? undefined : current)} openRecordId={openRecord?.tool === "proposals" ? openRecord.id : undefined} onRecordOpened={recordOpened} />
+                <Proposals active={activeTool === "proposals" || taskDocumentVisible} handoff={proposalHandoff} presentation={taskDocumentVisible ? "ai-task" : "registry"} onReturnToTask={returnToIntelligenceResults} onTaskSessionChange={proposalTaskChanged} onTaskLocalChange={proposalTaskLocalChanged} onHandoffConsumed={() => setProposalHandoff((current) => current?.id === proposalHandoff?.id ? undefined : current)} openRecordId={openRecord?.tool === "proposals" ? openRecord.id : undefined} onRecordOpened={recordOpened} />
               </div>}
               {activeTool === "contracts" && <ContractsRegistry key={`contracts-${workspace.root}`} intelligenceHandoff={intelligenceHandoff?.destination === "contracts" ? intelligenceHandoff : undefined} onIntelligenceHandoffConsumed={intelligenceConsumed} openRecordId={openRecord?.tool === "contracts" ? openRecord.id : undefined} onRecordOpened={recordOpened} />}
               {activeTool === "counterparties" && <CounterpartiesRegistry key={`counterparties-${workspace.root}`} intelligenceHandoff={intelligenceHandoff?.destination === "counterparties" ? intelligenceHandoff : undefined} onIntelligenceHandoffConsumed={intelligenceConsumed} openRecordId={openRecord?.tool === "counterparties" ? openRecord.id : undefined} onRecordOpened={recordOpened} />}

@@ -87,7 +87,7 @@ describe('existing proposal editor as a single AI-task receiver', () => {
   const changed = (value: ProposalTaskSessionChange) => { changes.push(value); };
   const last = (id = 'result-A') => [...changes].reverse().find((value) => value.session.origin.resultId === id)!;
   async function taskSeed(data = proposal(), resultId = 'result-A', extra: Partial<NonNullable<ComponentProps>> = {}) {
-    render({ ...props, presentation: 'ai-task', onTaskSessionChange: changed, ...extra, handoff: { id: `handoff-${resultId}-${changes.length}`, data, taskOrigin: origin(resultId) } }); await flush();
+    render({ ...props, presentation: 'ai-task', onTaskSessionChange: changed, onTaskLocalChange: changed, ...extra, handoff: { id: `handoff-${resultId}-${changes.length}`, data, taskOrigin: origin(resultId) } }); await flush();
   }
   beforeEach(() => { changes.splice(0); });
   it('queues the source, accepts only the installed editor, and hides registry-only controls', async () => {
@@ -224,19 +224,48 @@ describe('existing proposal editor as a single AI-task receiver', () => {
     expect(button('Сохранить КП').props.disabled).toBe(false); await click('Сохранить КП'); expect(projectTaskDocumentSession(last().session).savedCurrent).toBe(true);
     expect(projectTaskDocumentSession(last().session).exportedCurrent).toBe(false); await click('5. Проверка и экспорт'); await click('Скачать DOCX'); expect(projectTaskDocumentSession(last().session).exportedCurrent).toBe(true);
   });
-  it('captures edit-and-revert revisions even while fresh workspace metadata is delayed', async () => {
-    await taskSeed(); const initialTitle = String(input('proposal-title').props.value); await click('Сохранить КП'); await click('5. Проверка и экспорт'); await click('Скачать DOCX'); await click('1. Стороны');
+  it('publishes immediate local stale state independently of blocked draft-cleanup metadata after edit-and-revert', async () => {
+    const local = vi.fn(), back = vi.fn(); await taskSeed(undefined, 'result-A', { onTaskLocalChange: local, onReturnToTask: back });
+    const initialTitle = String(input('proposal-title').props.value); await click('Сохранить КП'); await click('5. Проверка и экспорт'); await click('Скачать DOCX'); await click('1. Стороны');
     const baseline = last().session.current.revision, metadata = deferred<{ root: string; editor: boolean }>(); runtime.getWorkspace.mockImplementation(() => metadata.promise);
-    await edit('proposal-title', 'Промежуточная правка'); await edit('proposal-title', initialTitle);
-    metadata.resolve({ root: '/tmp/qa-workspace', editor: true }); await flush();
-    expect(last().session.current.revision).toBe(baseline + 2); expect(projectTaskDocumentSession(last().session)).toMatchObject({ savedCurrent: false, exportedCurrent: false, hasStaleExports: true });
+    runtime.getWorkspace.mockClear(); const authoritativeCount = changes.length;
+    await edit('proposal-title', 'Промежуточная правка'); expect(runtime.getWorkspace).not.toHaveBeenCalled();
+    await edit('proposal-title', initialTitle);
+    await click('Вернуться к результатам'); expect(back).toHaveBeenCalledOnce();
+    // Exact reversion still schedules the existing guarded draft cleanup. The
+    // edit receipts themselves must not add native requests or wait for it.
+    expect(runtime.getWorkspace).toHaveBeenCalledTimes(1); expect(changes).toHaveLength(authoritativeCount);
+    expect(local).toHaveBeenCalledTimes(2); const invalidated = local.mock.calls[1][0] as ProposalTaskSessionChange;
+    expect(invalidated.session.current.revision).toBe(baseline + 2); expect(projectTaskDocumentSession(invalidated.session)).toMatchObject({ savedCurrent: false, exportedCurrent: false, hasStaleExports: true });
+    expect(invalidated.session.exports).toEqual(last().session.exports); expect(invalidated.session.saved).toEqual(last().session.saved);
     expect(button('Сохранить КП').props.disabled).toBe(false);
-  });
-  it('retains the latest receiver-owned A edit when its metadata effect is delayed during a switch to B', async () => {
-    await taskSeed(proposal('A')); const metadata = deferred<{ root: string; editor: boolean }>(); runtime.getWorkspace.mockImplementationOnce(() => metadata.promise);
-    await edit('proposal-title', 'Последняя правка A'); await taskSeed(proposal('B'), 'result-B'); await click('Заменить без сохранения');
     metadata.resolve({ root: '/tmp/qa-workspace', editor: true }); await flush();
-    await taskSeed(proposal('Seed A')); await click('Заменить без сохранения'); expect(input('proposal-title').props.value).toBe('Последняя правка A');
+  });
+  it('keeps native workspace reads bounded independently of typing while autosave retains its fresh guard', async () => {
+    const local = vi.fn(); await taskSeed(undefined, 'result-A', { onTaskLocalChange: local });
+    runtime.getWorkspace.mockClear(); const baseline = last().session.current.revision;
+    for (let index = 0; index < 40; index += 1) await edit('proposal-title', `Правка ${index}`);
+    expect(local).toHaveBeenCalledTimes(40); expect(local.mock.calls[39][0].session.current.revision).toBe(baseline + 40);
+    expect(runtime.getWorkspace).not.toHaveBeenCalled(); expect(runtime.saveDraft).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(600); await flush();
+    expect(runtime.getWorkspace).toHaveBeenCalledTimes(1); expect(runtime.saveDraft).toHaveBeenCalledOnce();
+    expect(runtime.saveDraft.mock.calls[0][1].data.title).toBe('Правка 39');
+  });
+  it('retains the latest receiver-owned A edit while a later B admission metadata request is delayed', async () => {
+    await taskSeed(proposal('A')); const metadata = deferred<{ root: string; editor: boolean }>();
+    await edit('proposal-title', 'Последняя правка A'); await taskSeed(proposal('B'), 'result-B'); await click('Заменить без сохранения');
+    // Returning to A is still guarded by a new workspace observation; no
+    // earlier local invalidation may be used as proof of admission.
+    runtime.getWorkspace.mockImplementationOnce(() => metadata.promise); await taskSeed(proposal('Seed A'));
+    expect(input('proposal-title').props.value).toBe('B'); metadata.resolve({ root: '/tmp/qa-workspace', editor: true }); await flush();
+    await click('Заменить без сохранения'); expect(input('proposal-title').props.value).toBe('Последняя правка A');
+  });
+  it('does not use local edit invalidation as fresh save or export admission after revocation', async () => {
+    const local = vi.fn(); await taskSeed(undefined, 'result-A', { onTaskLocalChange: local });
+    await edit('proposal-title', 'Локальная правка'); expect(local).toHaveBeenCalledOnce();
+    runtime.getWorkspace.mockResolvedValue({ root: '/tmp/qa-workspace', editor: false });
+    await click('Сохранить КП'); expect(runtime.store.save).not.toHaveBeenCalled(); expect(projectTaskDocumentSession(last().session).savedCurrent).toBe(false);
+    await click('5. Проверка и экспорт'); await click('Скачать DOCX'); expect(renderCalls()).toHaveLength(0); expect(runtime.chooseSave).not.toHaveBeenCalled();
   });
   it('does not accept a queued B replacement that becomes superseded by C during persistence', async () => {
     await taskSeed(proposal('A')); await edit('proposal-title', 'Правка A'); await taskSeed(proposal('B'), 'result-B');

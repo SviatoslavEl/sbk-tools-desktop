@@ -126,6 +126,19 @@ describe("App task document routing", () => {
     expect(proposal().props.handoff?.id).toBe("handoff-resultB");
   });
 
+  it("publishes local invalidation immediately without a native metadata call or new authority", async () => {
+    const request = handoff(); workbench().props.onTransfer(request); await flush();
+    const opened = accepted(request); proposal().props.onTaskSessionChange!(opened); await flush();
+    const metadataCalls = runtime.workspace.mock.calls.length;
+    const data = { ...request.data, title: "Локальная правка" };
+    const session = reduceTaskDocumentSession(opened.session, { type: "changed", origin: opened.session.origin, workspaceRoot: request.workspaceRoot, previous: opened.session.current, next: { revision: 2, fingerprint: proposalTaskFingerprint(data) } });
+    proposal().props.onTaskLocalChange!({ ...opened, session, data }); await flush();
+    const current = workbench().props.taskDocumentSessions![0];
+    expect(current.current.revision).toBe(2); expect(current.accepted).toEqual(opened.session.accepted);
+    expect(current.saved).toBeUndefined(); expect(current.exports).toEqual({});
+    expect(runtime.workspace.mock.calls).toHaveLength(metadataCalls);
+  });
+
   it.each([
     ["contracts", ContractsRegistry], ["staff", StaffRegistry],
     ["counterparties", CounterpartiesRegistry], ["procurement", ProcurementRegistry],

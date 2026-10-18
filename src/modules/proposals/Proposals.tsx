@@ -89,7 +89,7 @@ export interface ProposalHandoff {
     taskOrigin?: TaskDocumentOrigin;
 }
 /** Workspace owns the component lifetime, keeping an open proposal while switching tools. */
-export function Proposals({ active = true, openRecordId, onRecordOpened, handoff, onHandoffConsumed, presentation = "registry", onReturnToTask, onTaskSessionChange }: {
+export function Proposals({ active = true, openRecordId, onRecordOpened, handoff, onHandoffConsumed, presentation = "registry", onReturnToTask, onTaskSessionChange, onTaskLocalChange }: {
     active?: boolean;
     openRecordId?: string;
     onRecordOpened?: () => void;
@@ -98,6 +98,8 @@ export function Proposals({ active = true, openRecordId, onRecordOpened, handoff
     presentation?: "registry" | "ai-task";
     onReturnToTask?: () => void;
     onTaskSessionChange?: (change: ProposalTaskSessionChange) => void;
+    /** Local edit invalidation only: never workspace, acceptance or I/O authority. */
+    onTaskLocalChange?: (change: ProposalTaskSessionChange) => void;
 } = {}) {
     const access = useWorkspaceAccess();
     const store = useRecords<ProposalRecord>("commercial-proposals");
@@ -147,8 +149,8 @@ export function Proposals({ active = true, openRecordId, onRecordOpened, handoff
     const accessRef = useRef(access.editor);
     accessRef.current = access.editor;
     const taskBridge = useRef(new ProposalTaskBridge());
-    const taskCallbacks = useRef({ onTaskSessionChange, onReturnToTask });
-    taskCallbacks.current = { onTaskSessionChange, onReturnToTask };
+    const taskCallbacks = useRef({ onTaskSessionChange, onTaskLocalChange, onReturnToTask });
+    taskCallbacks.current = { onTaskSessionChange, onTaskLocalChange, onReturnToTask };
     const notifyTask = (entry?: ProposalTaskEntry) => { if (entry && mounted.current) taskCallbacks.current.onTaskSessionChange?.({ session: entry.session, data: structuredClone(entry.data), writeId: entry.writeId, ...(entry.recordId ? { recordId: entry.recordId } : {}) }); };
     const taskBinding = (current: Session): ProposalTaskEditorBinding => ({ data: current.data, writeId: current.writeId, recordId: current.id, draftKey: current.draftKey, savedJson: current.savedJson, local: current.local, persistedStatus: current.persistedStatus });
     const syncTask = (current: Session, root: string) => {
@@ -356,16 +358,15 @@ export function Proposals({ active = true, openRecordId, onRecordOpened, handoff
         const current = session;
         if (!current?.taskOrigin) return;
         const previous = taskBridge.current.get(current.taskOrigin);
-        // Capture receiver-owned memory immediately, even if metadata IO is
-        // slow. This grants no access and emits no receipt. Otherwise a quick
-        // edit/revert or switching results can erase an observed revision.
+        // Capture every receiver-owned revision immediately, including a quick
+        // edit/revert. The separate local channel only makes older receipts
+        // stale; it cannot grant acceptance, saved/exported facts or access.
+        // Do not launch workspace_info per keystroke: it reads SMB lock/admin
+        // state under the global native command queue. Actual I/O receipts keep
+        // their fresh workspace guards at the operation's completion.
         const captured = taskBridge.current.update(current.taskOrigin, taskBinding(current), current.taskOrigin.workspaceRoot);
         if (!captured || captured.session === previous?.session) return;
-        let alive = true;
-        void freshTaskWorkspace(current.taskOrigin).then(() => {
-            if (alive && latest.current === current) notifyTask(captured);
-        }).catch(() => undefined);
-        return () => { alive = false; };
+        if (mounted.current && latest.current === current) taskCallbacks.current.onTaskLocalChange?.({ session: captured.session, data: structuredClone(captured.data), writeId: captured.writeId, ...(captured.recordId ? { recordId: captured.recordId } : {}) });
     }, [session]);
     const install = (next: Session | null) => {
         const previous = latest.current;
