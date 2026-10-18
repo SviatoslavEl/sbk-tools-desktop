@@ -11,6 +11,7 @@ import { extractProposalSourceParties } from "./proposalSourceParties";
 import { createProposalSourceFinancials, type ProposalSourceFinancialCandidate } from "../proposals/sourcePricing";
 import { quarantineConflictingFields } from "./quarantineConflictingFields";
 import { buildIntelligenceResponseSchema, destinationLabels, fieldDefinitions, parseIntelligenceResult } from "./workbenchModel";
+import { summarizeParsedModelContribution, validModelResponseContribution, type ModelResponseContribution } from "./modelContribution";
 import { assertResponsePreparationRaw, assertResponsePreparationSources, RESPONSE_PREPARATION_LIMITS } from "./responsePreparationBounds";
 import { assertPreparedSourceContract, assertSourceContractSources } from "./sourceContractPreparation";
 export { RESPONSE_PREPARATION_LIMITS } from "./responsePreparationBounds";
@@ -28,6 +29,9 @@ export interface ResponsePreparationRequest {
 export interface ResponsePreparationReply {
   origin?: "source-contract";
   revision: number; prepared?: ResponsePreparationResult; empty?: true; failed?: string;
+  /** Original parsed response before local supplementation; never a fact gate.
+   * Kept outside prepared cards and absent for source-only/empty/failed replies. */
+  modelContribution?: ModelResponseContribution;
 }
 const object = (value: unknown): value is Record<string, unknown> => Boolean(value && typeof value === "object" && !Array.isArray(value));
 const bytes = (value: string) => new TextEncoder().encode(value).byteLength;
@@ -135,10 +139,11 @@ function validPrepared(value: unknown): value is ResponsePreparationResult {
  * Passing the expected revision also rejects a well-formed stale response. */
 export function validResponsePreparationReply(value: unknown, expectedRevision?: number, expectedOrigin?: "source-contract"): value is ResponsePreparationReply {
   try {
-    if (!object(value) || !keys(value, ["revision", "prepared", "empty", "failed", "origin"]) || value.origin !== expectedOrigin || !Number.isSafeInteger(value.revision)
+    if (!object(value) || !keys(value, ["revision", "prepared", "empty", "failed", "origin", "modelContribution"]) || value.origin !== expectedOrigin || !Number.isSafeInteger(value.revision)
       || Number(value.revision) < -1 || expectedRevision !== undefined && value.revision !== expectedRevision) return false;
     const alternatives = [own(value, "prepared"), own(value, "empty"), own(value, "failed")];
     if (alternatives.filter(Boolean).length !== 1) return false;
+    if (own(value, "modelContribution") && (expectedOrigin !== undefined || !own(value, "prepared") || !validModelResponseContribution(value.modelContribution))) return false;
     if (own(value, "failed")) return text(value.failed, errorLimit, true);
     if (Number(value.revision) < 0) return false;
     if (own(value, "empty")) return expectedOrigin === undefined && value.empty === true;
@@ -209,8 +214,9 @@ export function runResponsePreparation(request: unknown): ResponsePreparationRep
     assertResponsePreparationSources(request.sources);
     buildIntelligenceResponseSchema(request.destinations as IntelligenceDestination[]);
     const items = parseIntelligenceResult(request.raw, request.sources.map(source => source.id), { editableFields: true, destinations: request.destinations as IntelligenceDestination[] });
+    const modelContribution = summarizeParsedModelContribution(items, request.destinations as IntelligenceDestination[]);
     const prepared = prepareItems(items, request.sources, request.destinations as IntelligenceDestination[]);
-    return prepared ? { revision, prepared } : { revision, empty: true };
+    return prepared ? { revision, prepared, modelContribution } : { revision, empty: true };
   } catch (reason) {
     const fallback = sourceOnly ? "Не удалось подготовить локальный проект договора." : "Не удалось подготовить ответ ИИ.";
     const message = reason instanceof Error ? reason.message : fallback;

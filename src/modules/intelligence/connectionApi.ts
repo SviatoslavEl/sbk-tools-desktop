@@ -22,7 +22,20 @@ export interface IntelligenceAnalysisMetrics {
   promptMilliseconds?: number;
   generationMilliseconds?: number;
 }
-export interface IntelligenceAnalysisResult { text: string; model: string; metrics?: IntelligenceAnalysisMetrics; }
+/** Observed transport facts, not effective provider context or output limits.
+ * Token/duration counters remain in metrics; no source or credential is copied. */
+export interface IntelligenceAnalysisDiagnostics {
+  protocol: ConnectionProfile["protocol"];
+  outputMode: "schema" | "json";
+  /** Null only for a legacy Ollama response that omitted the reason. */
+  completionReason: "stop" | null;
+  promptBytes: number;
+  schemaBytes: number | null;
+  requestBodyBytes: number;
+  /** Explicitly sent 0 for Ollama; omitted provider option is represented by null. */
+  sentTemperature: 0 | null;
+}
+export interface IntelligenceAnalysisResult { text: string; model: string; metrics?: IntelligenceAnalysisMetrics; diagnostics?: IntelligenceAnalysisDiagnostics; }
 
 export const intelligenceTransportLimitBytes = 2 * 1024 * 1024;
 export const intelligenceSchemaLimitBytes = 64 * 1024;

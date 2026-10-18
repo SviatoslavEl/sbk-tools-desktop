@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as automatic from "./automaticConditions";
 import { RESPONSE_PREPARATION_LIMITS, runResponsePreparation, validResponsePreparationReply, type ResponsePreparationRequest, type ResponsePreparationResult } from "./responsePreparationWorker";
+import { fieldDefinitions } from "./workbenchModel";
 import type { IntelligenceSource } from "./workbenchTypes";
 
 const source = (text = "1. Сертификат OSCP — не менее 5 специалистов.\n2. Копия доверенности, если подписывает представитель.", id = "source-a"): IntelligenceSource => ({ id, name: "Синтетический источник QA", text, fragments: [{ id: "page-1", locator: "Страница 1", text }] });
@@ -20,6 +21,9 @@ describe("atomic local response preparation worker", () => {
     expect(card.fields.name).toBe("Синтетическая закупка"); expect(card.fields.requirements).toContain("1. Сертификат OSCP — не менее 5 специалистов.");
     expect(card.fields.requirements).toContain("2. Копия доверенности, если подписывает представитель.");
     expect(reply.prepared!.changes.every((change) => change.requiresReview === true)).toBe(true);
+    expect(reply.modelContribution).toEqual({ items: 1, populatedItems: 1, fields: 1, evidence: 0,
+      destinations: [{ destination: "procurement", items: 1, fields: 1 }] });
+    expect(reply.prepared).not.toHaveProperty("modelContribution"); expect(card).not.toHaveProperty("modelContribution");
     expect(input).toEqual(before); expect(JSON.parse(input.raw).items[0].fields.requirements).toBeUndefined(); expect(fetch).not.toHaveBeenCalled();
     for (const method of Object.values(storage)) expect(method).not.toHaveBeenCalled();
   });
@@ -35,6 +39,26 @@ describe("atomic local response preparation worker", () => {
     const completion = vi.spyOn(automatic, "completeIntelligenceConditions");
     const reply = runResponsePreparation(request({ raw: "{\"items\":[]}" }));
     expect(reply).toEqual({ revision: 7, empty: true }); expect(validResponsePreparationReply(reply, 7)).toBe(true); expect(completion).not.toHaveBeenCalled();
+    expect(reply).not.toHaveProperty("modelContribution");
+  });
+
+  it("retains a zero-field original receipt even when local completion subsequently fills the card", () => {
+    const input = request({ raw: JSON.stringify({ items: [wire({ name: null, requirements: null }, { evidence: [] })] }) });
+    const reply = runResponsePreparation(input);
+    expect(reply.failed).toBeUndefined(); expect(validResponsePreparationReply(reply, 7)).toBe(true);
+    expect(reply.prepared!.items[0].fields.requirements).toContain("1. Сертификат OSCP — не менее 5 специалистов.");
+    expect(reply.modelContribution).toEqual({ items: 1, populatedItems: 0, fields: 0, evidence: 0,
+      destinations: [{ destination: "procurement", items: 1, fields: 0 }] });
+  });
+
+  it("records per-direction raw fields and evidence before supplementing them, including empty requested directions", () => {
+    const input = request({ destinations: ["staff", "procurement"], raw: JSON.stringify({ items: [wire({ nmc: 0 }, {
+      evidence: [{ field: "nmc", sourceId: "source-a", fragmentId: "page-1", quote: "Непроверенная цитата модели" }],
+    })] }) });
+    const reply = runResponsePreparation(input);
+    expect(reply.failed).toBeUndefined(); expect(validResponsePreparationReply(reply, 7)).toBe(true);
+    expect(reply.modelContribution).toEqual({ items: 1, populatedItems: 1, fields: 1, evidence: 1,
+      destinations: [{ destination: "staff", items: 0, fields: 0 }, { destination: "procurement", items: 1, fields: 1 }] });
   });
 
   it.each([null, undefined, 0, {}, { revision: -1 }, { revision: 1.5 }, { revision: Number.NaN }, { revision: Number.MAX_SAFE_INTEGER + 1 }])("fails closed for malformed revision/envelope %j", (input) => {
@@ -97,6 +121,7 @@ describe("atomic local response preparation worker", () => {
     tooLarge.changes = []; tooLarge.skipped = [];
     completion.mockReturnValueOnce(tooLarge); const rejected = runResponsePreparation(request());
     expect(rejected.failed).toBeTypeOf("string"); expect(rejected.prepared).toBeUndefined();
+    expect(rejected).not.toHaveProperty("modelContribution");
   });
 
   it("validates mutually exclusive reply variants, nested receipt safety and current revision", () => {
@@ -113,6 +138,57 @@ describe("atomic local response preparation worker", () => {
       (copy: ResponsePreparationResult) => { copy.changes = Array(RESPONSE_PREPARATION_LIMITS.receipts + 1).fill(copy.changes[0]); },
     ]) { const copy = structuredClone(prepared); mutate(copy); invalid.push({ revision: 7, prepared: copy }); }
     for (const value of invalid) expect(validResponsePreparationReply(value, 7)).toBe(false);
+  });
+
+  it("accepts only a closed, consistent diagnostic alongside normal prepared success, keeping legacy replies compatible", () => {
+    const reply = runResponsePreparation(request()), receipt = reply.modelContribution!;
+    const { modelContribution: _receipt, ...legacy } = reply;
+    expect(validResponsePreparationReply(legacy, 7)).toBe(true);
+    const invalid: unknown[] = [
+      { ...reply, modelContribution: undefined }, { ...reply, modelContribution: null },
+      { ...reply, modelContribution: { ...receipt, acknowledged: true } },
+      { ...reply, modelContribution: { ...receipt, fields: 2 } },
+      { ...reply, modelContribution: { ...receipt, evidence: 501 } },
+      { ...reply, modelContribution: { ...receipt, destinations: [{ ...receipt.destinations[0], items: 101 }] } },
+      { ...reply, modelContribution: { ...receipt, destinations: [{ ...receipt.destinations[0], fields: fieldDefinitions.procurement.length + 1 }] } },
+      { ...reply, modelContribution: { ...receipt, destinations: [receipt.destinations[0], receipt.destinations[0]] } },
+      { revision: 7, empty: true, modelContribution: receipt }, { revision: 7, failed: "Не готово", modelContribution: receipt },
+    ];
+    for (const value of invalid) expect(validResponsePreparationReply(value, 7)).toBe(false);
+  });
+
+  it("does not accept the worker diagnostic as model wire, request input or prepared card metadata", () => {
+    const reply = runResponsePreparation(request()), receipt = reply.modelContribution!;
+    for (const raw of [
+      JSON.stringify({ items: [wire()], modelContribution: receipt }),
+      JSON.stringify({ items: [wire({ name: "QA", modelContribution: receipt })] }),
+      JSON.stringify({ items: [{ ...wire(), modelContribution: receipt }] }),
+    ]) {
+      const rejected = runResponsePreparation(request({ raw }));
+      expect(rejected.failed).toBeTypeOf("string"); expect(rejected).not.toHaveProperty("modelContribution");
+    }
+    expect(runResponsePreparation({ ...request(), modelContribution: receipt }).failed).toBeTypeOf("string");
+    const prepared = { ...reply.prepared!, modelContribution: receipt };
+    expect(validResponsePreparationReply({ ...reply, prepared }, 7)).toBe(false);
+    const card = { ...reply.prepared!.items[0], modelContribution: receipt };
+    expect(validResponsePreparationReply({ ...reply, prepared: { ...reply.prepared!, items: [card] } }, 7)).toBe(false);
+  });
+
+  it("never includes or admits a model diagnostic in the explicit source-only route", () => {
+    const lines = ["Договор", "1. Предмет договора", "1.1. Исполнитель оказывает услуги по анализу учебной системы.",
+      "2. Состав оказываемых услуг", "2.1. Анализ документации с сохранением ограничений доступа.",
+      "3. Итоговые материалы и результат оказания услуг", "3.1. Отчёт с рисками и рекомендациями.",
+      "4. Стоимость услуг и порядок расчетов", "4.1. Стоимость услуг составляет 12 000,00 рублей, в том числе НДС 22%.",
+      "4.2. Аванс 25% в течение 4 календарных дней от подписания.", "4.3. Окончательный расчет в течение 6 рабочих дней от акта.",
+      "5. Срок оказания услуг", "5.1. Максимальный срок — 16 рабочих дней после аванса."];
+    const contract: IntelligenceSource = { id: "contract", name: "Учебный договор", text: lines.join("\n"),
+      fragments: lines.map((text, index) => ({ id: `p-${index}`, locator: `Абзац ${index}`, text })), coverage: { complete: true, requiresOcr: false } };
+    const local = runResponsePreparation({ origin: "source-contract", revision: 7, sources: [contract] });
+    expect(local.failed).toBeUndefined(); expect(local.prepared).toBeDefined(); expect(local).not.toHaveProperty("modelContribution");
+    expect(validResponsePreparationReply(local, 7, "source-contract")).toBe(true);
+    const receipt = runResponsePreparation(request()).modelContribution!;
+    expect(validResponsePreparationReply({ ...local, modelContribution: receipt }, 7, "source-contract")).toBe(false);
+    expect(validResponsePreparationReply({ ...local, modelContribution: undefined }, 7, "source-contract")).toBe(false);
   });
 
   it("preserves literal exception provenance when a document-specific exception is automatically included", () => {

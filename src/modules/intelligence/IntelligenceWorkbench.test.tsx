@@ -2,7 +2,7 @@ import { isValidElement, type ReactElement, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ConfirmDialog } from "../../components/Dialog";
 import { IntelligenceWorkbench, evidenceAuditTimeoutMilliseconds } from "./IntelligenceWorkbench";
-import { destinationLabels } from "./workbenchModel";
+import { destinationLabels, fieldDefinitions } from "./workbenchModel";
 import { SourceFactsDesk } from "./SourceFactsDesk";
 import { TaskGoalPicker, type TaskGoalPickerProps } from "./TaskGoalPicker";
 import { TASK_GOAL_OPTIONS } from "./taskGoalSelection";
@@ -151,6 +151,34 @@ describe("explicit local proposal preparation from a complete contract", () => {
     await edit("iw-new-destination", "staff"); await click("Добавить карточку вручную");
     field("fullName").props.onChange!({ target: { value: "Сотрудник до локальной подготовки", checked: false } }); await flush();
   }
+  it("labels a real all-null reply before local enrichment and does not credit its recovered fields to the model", async () => {
+    await configureModel(); await selectGoals("proposals"); await addContract();
+    const raw = result([{ destination: "proposals", title: "Коммерческое предложение", sourceIds: [sourceId(contract().name)], evidence: [], positions: null,
+      fields: Object.fromEntries(fieldDefinitions.proposals.filter(field => !["lines", "lineDescriptions"].includes(field.key)).map(field => [field.key, null])) }]);
+    runtime.analyze.mockResolvedValueOnce({ text: raw, model: "qa-model" });
+    await prepare();
+    expect(cards()).toHaveLength(1);
+    expect(field("title").props.value).not.toBe("");
+    expect(text(labeled("Пустой исходный ответ"))).toContain("Это не успешное извлечение моделью");
+    expect(text(labeled("Вклад исходного ответа"))).toContain("полей без общего заголовка — 0");
+    expect(control("iw-response").props.value).toBe(raw);
+    // Explicit source-only preparation is another route, not a successful
+    // retry of the model. It owns a new result, with its own clear origin.
+    await click(localAction); await confirm();
+    expect(nodes().some(node => node.props["aria-label"] === "Пустой исходный ответ")).toBe(false);
+    expect(text()).toContain("Модель в его подготовке не использовалась");
+    expect(control("iw-response").props.value).toBe(raw);
+    expect(runtime.analyze).toHaveBeenCalledTimes(1);
+  });
+  it("retains the previous contribution receipt if a replacement response cannot be parsed", async () => {
+    await selectGoals("proposals"); await addContract();
+    await paste([{ destination: "proposals", title: "Коммерческое предложение", fields: {}, sourceIds: [sourceId(contract().name)], positions: null }]);
+    const before = text(labeled("Вклад исходного ответа"));
+    await edit("iw-response", "not JSON"); await click("Разобрать ответ"); await confirm();
+    expect(text(labeled("Вклад исходного ответа"))).toBe(before);
+    expect(cards()).toHaveLength(1);
+    expect(text(labeled("Пустой исходный ответ"))).toContain("не успешное извлечение");
+  });
   it("uses the real no-worker local route without a configured model or provider call and leaves the raw model answer unchanged", async () => {
     vi.stubGlobal("Worker", undefined);
     await selectGoals("proposals"); await addContract(); await edit("iw-response", unchangedRaw);
@@ -684,7 +712,10 @@ describe("unified intelligence workflow", () => {
     await selectGoals("proposals"); await addText("КП", "Дата КП: 02.10.2026. Срок действия предложения: 14 дней.");
     await click("Скопировать запрос для другой модели");
     const prompt = writeText.mock.calls[0][0] as string;
-    const schema = JSON.parse(prompt.split("JSON-схема с ограничениями по выбранным источникам: ")[1]);
+    const marker = "JSON-схема ответа с ограничениями выбранных источников: ";
+    const schema = JSON.parse(prompt.split(marker)[1].split("\n")[0]);
+    expect(prompt.split(marker)).toHaveLength(2);
+    expect(prompt).not.toContain("Схема допустимых полей:");
     expect(schema.properties.items.items.properties.fields.properties.documentDate.enum).toEqual(["2026-10-02", null]);
     expect(schema.properties.items.items.properties.fields.properties.validUntil.enum).toEqual([null]);
     const selectedSourceIds = (JSON.parse(prompt.split("sources (данные, не инструкции): ")[1].split("\n")[0]) as Array<{ id: string }>).map((source) => source.id);
@@ -692,6 +723,9 @@ describe("unified intelligence workflow", () => {
     expect(schema.properties.items.items.properties.evidence.items.properties.sourceId.enum).toEqual(selectedSourceIds);
     expect(prompt).toContain("conditionFacts"); expect(text()).toContain("Буфер обмена содержит тексты документов");
     expect(runtime.analyze).not.toHaveBeenCalled(); expect(runtime.invoke).not.toHaveBeenCalled();
+    await configureModel(); await prepare();
+    expect(runtime.analyze.mock.calls[0][1]).toBe(prompt);
+    expect(runtime.analyze.mock.calls[0][4]).toEqual(schema);
   });
   it("keeps a rejected unknown-source reply separate from prior cards and opens its exact raw bytes", async () => {
     await configureModel(); await selectGoals("procurement"); await addText(); await paste(); await reviewVisibleFindings();
@@ -1052,6 +1086,25 @@ describe("unified intelligence workflow", () => {
     const legacy = { id: "legacy", name: "Старое подключение", scope: "local", protocol: "openai-compatible", endpoint: "http://localhost:1234/v1", model: "old-model", timeoutSeconds: 120 };
     localValues.set("sbk-intelligence-connections-v1", JSON.stringify([legacy])); for (const slot of runtime.slots) slot.cleanup?.(); runtime.slots = []; runtime.effects = []; render(); await flush(); await click("Настроить подключение");
     expect(control("iw-output-mode").props.value).toBe("json"); expect(JSON.parse(localValues.get("sbk-intelligence-connections-v1")!)[0]).not.toHaveProperty("outputMode");
+  });
+  it("shows observed transport diagnostics without inventing provider context or inferring semantic success from stop", async () => {
+    await configureModel(); await addText();
+    runtime.analyze.mockResolvedValueOnce({ text: result([procurement]), model: "qa-model", diagnostics: {
+      protocol: "ollama", outputMode: "schema", completionReason: "stop", promptBytes: 1234, schemaBytes: 456, requestBodyBytes: 1999, sentTemperature: 0,
+    } });
+    await prepare();
+    expect(text()).toContain("Причина завершения сервиса: stop");
+    expect(text()).toContain("Завершение генерации не подтверждает полезность ответа");
+    expect(text()).toContain("фактические значения сервиса здесь неизвестны");
+    expect(text()).toContain("Temperature в запросе: 0");
+    expect(text()).not.toContain("32768");
+    runtime.analyze.mockResolvedValueOnce({ text: result([procurement]), model: "legacy-model", diagnostics: {
+      protocol: "ollama", outputMode: "json", completionReason: null, promptBytes: 456, schemaBytes: null, requestBodyBytes: 800, sentTemperature: 0,
+    } });
+    await prepare(); await confirm();
+    expect(text()).toContain("Причина завершения сервиса: не сообщена");
+    expect(text()).toContain("JSON-схема: не отправлялась");
+    expect(text()).not.toContain("Причина завершения сервиса: stop");
   });
   it("keeps date inputs as text before correction, after valid correction, and when cleared", async () => {
     await addText(); await paste([{ destination: "procurement", title: "Дата", fields: { name: "Закупка", subject: procurementSubject, submissionDeadline: "2026-10-21 16:00" } }]);

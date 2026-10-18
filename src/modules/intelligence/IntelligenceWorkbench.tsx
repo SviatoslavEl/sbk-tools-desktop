@@ -10,6 +10,7 @@ import { cancelIntelligenceRequest, runIntelligenceAnalysis, testIntelligenceCon
 import { buildIntelligenceHandoff, destinationLabels, emptyIntelligenceItem, fieldDefinitions, fieldInputValue, intelligenceFieldError, parseFieldInput, validateIntelligenceItem } from "./workbenchModel";
 import { buildAnalysisPlan, mergeAnalysisResponses, type AnalysisMode, type AnalysisResponsePart } from "./analysisPlan";
 import { buildGroundedAnalysisInput } from "./groundedAnalysis";
+import type { ModelResponseContribution } from "./modelContribution";
 import type { IntelligenceDestination, IntelligenceFieldValue, IntelligenceHandoff, IntelligenceItem, IntelligenceSource } from "./workbenchTypes";
 import { getBlockingEvidenceFindings, type CoverageCheck, type EvidenceExcerpt, type IntelligenceEvidenceReport } from "./resultEvidence";
 import { runEvidenceAudit, type EvidenceAuditReply } from "./evidenceAuditWorker";
@@ -139,7 +140,8 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
   const failedResponseRef = useRef<FailedIntelligenceResponse | null>(null);
   const [failedCopyMessage, setFailedCopyMessage] = useState("");
   const [emptyWarning, setEmptyWarning] = useState("");
-  const [responseDetails, setResponseDetails] = useState<{ model: string; metrics?: IntelligenceAnalysisResult["metrics"] } | null>(null);
+  const [responseDetails, setResponseDetails] = useState<Omit<IntelligenceAnalysisResult, "text"> | null>(null);
+  const [modelContribution, setModelContribution] = useState<ModelResponseContribution | null>(null);
   const [manualDestination, setManualDestination] = useState<IntelligenceDestination>("procurement");
   const [items, setItems] = useState<IntelligenceItem[]>([]);
   const itemsRef = useRef<IntelligenceItem[]>([]); itemsRef.current = items;
@@ -386,10 +388,11 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
     } catch (reason) { if (mounted.current && token === extractionEpoch.current) setError(errorMessage(reason)); }
     finally { if (extractionPending.current === token) extractionPending.current = null; if (mounted.current && token === extractionEpoch.current) setExtracting(false); }
   };
-  const installPreparedResult = (prepared: NonNullable<ResponsePreparationReply["prepared"]>, snapshot: IntelligenceSource[], requestedDestinations: IntelligenceDestination[]) => {
+  const installPreparedResult = (prepared: NonNullable<ResponsePreparationReply["prepared"]>, snapshot: IntelligenceSource[], requestedDestinations: IntelligenceDestination[], contribution?: ModelResponseContribution) => {
     const revision = ++baseResultRevision.current;
     itemResultRevisions.current = new Map(prepared.items.map((item) => [item.id, revision]));
     proposalTransferOrigins.current.clear();
+    setModelContribution(contribution || null);
     itemsRef.current = prepared.items;
     setItems(prepared.items); setResultSources(snapshot); setResultDestinations([...requestedDestinations]); setAutomaticConditions({ changes: prepared.changes, skipped: prepared.skipped, limited: prepared.limited }); setSourcePreparation(prepared.sourcePreparation || null); setManualItemIds([]); setReviewedFindings({}); setOpenedItems([]); setResultStale(false); setError("");
     setEmptyWarning("");
@@ -412,7 +415,7 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
       setEmptyWarning(`Последняя попытка не дала результата для: ${requestedDestinations.map((destination) => destinationLabels[destination]).join(", ")}. Модель не подготовила ни одной карточки и автоматический разбор не смог восстановить результат. Проверьте источники или повторите анализ. Предыдущие карточки ниже, если они были, относятся к другой попытке и не подтверждают выполнение текущей задачи.`);
       return;
       }
-      installPreparedResult(reply.prepared!, snapshot, requestedDestinations);
+      installPreparedResult(reply.prepared!, snapshot, requestedDestinations, reply.modelContribution);
     } catch (reason) {
       if (mounted.current && preparationPending.current === preparation && epoch.current === token && accessRef.current.workspaceRoot === root && !(reason instanceof ResponsePreparationCancelled)) {
         rememberFailedResponse(raw, snapshot, reason, format);
@@ -475,7 +478,7 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
         const result = await runIntelligenceAnalysis(profileSnapshot, step.prompt, keySnapshot, request.id, step.responseSchema);
         if (!current()) return;
         if (modeSnapshot === "combined") setRawResponse(result.text);
-        setResponseDetails({ model: result.model, metrics: result.metrics });
+        setResponseDetails({ model: result.model, metrics: result.metrics, diagnostics: result.diagnostics });
         parts.push({ text: result.text, destinations: step.destinations, model: result.model });
         setAnalysisParts([...parts]);
         // Reject a malformed, wrong-direction or oversized part before the next
@@ -586,6 +589,7 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
     finally { transferPending.current = false; if (mounted.current) setTransferring(null); }
   };
   const reset = () => {
+    setModelContribution(null);
     taskId.current = crypto.randomUUID(); itemResultRevisions.current.clear(); proposalTransferOrigins.current.clear();
     pendingOcr.current = null; setScanWithoutText(null);
     failedResponseRef.current = null; setFailedResponse(null); setFailedCopyMessage(""); setRawResponseOpen(false);
@@ -607,7 +611,7 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
   const copyPrompt = async () => {
     if (!taskDestinations.length) { setError("Выберите хотя бы один результат для подготовки."); return; }
     const instructionSnapshot = instruction.trim() ? instruction : generatedInstruction(taskDestinations);
-    try { assertResponsePreparationSources(selectedSources); const input = buildGroundedAnalysisInput(instructionSnapshot, selectedSources, taskDestinations); const prompt = `${input.prompt}\n\nJSON-схема с ограничениями по выбранным источникам: ${JSON.stringify(input.responseSchema)}`; if (bytes(prompt) > maxTextBytes) throw new Error("Запрос со схемой превышает 2 МБ. Разделите материалы."); if (!navigator.clipboard) throw new Error("Буфер обмена недоступен."); await navigator.clipboard.writeText(prompt); setNotice("Запрос с выбранными текстами и ограничениями фактов скопирован. Буфер обмена содержит тексты документов; передавайте их только выбранному вами сервису."); }
+    try { assertResponsePreparationSources(selectedSources); const input = buildGroundedAnalysisInput(instructionSnapshot, selectedSources, taskDestinations); const prompt = input.prompt; if (bytes(prompt) > maxTextBytes) throw new Error("Запрос со схемой превышает 2 МБ. Разделите материалы."); if (!navigator.clipboard) throw new Error("Буфер обмена недоступен."); await navigator.clipboard.writeText(prompt); setNotice("Запрос с выбранными текстами и ограничениями фактов скопирован. Буфер обмена содержит тексты документов; передавайте их только выбранному вами сервису."); }
     catch (reason) { setError(errorMessage(reason)); }
   };
   const copyFailedResponse = async () => {
@@ -774,16 +778,34 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
         {taskDestinations.length === 1 && taskDestinations[0] === "proposals" && <details><summary>КП по полному договору без модели</summary><p className="help-text">Отдельный локальный способ для единственного полного договора. Используется весь его состав; уточнение задания и ответ модели не применяются. Цена и спорные условия останутся на проверку. Прежний ответ модели не изменится.</p><button type="button" className="secondary" disabled={running || preparingResponse || extracting || !selectedSources.length} onClick={requestSourceContract}>Подготовить по договору без модели</button></details>}
         {running && !preparingResponse && analysisProgress && <p className="help-text" role="status">Этап {analysisProgress.index} из {analysisProgress.total}: {analysisProgress.label}</p>}
         {analysisMode === "by-destination" && analysisParts.length > 0 && <details className="iw-analysis-parts"><summary>Ответы по этапам ({analysisParts.length})</summary><p className="help-text">Диагностика отдельных запросов. Частичный результат не заменяет карточки. Поле готового ответа ниже содержит только полностью завершённый результат.</p>{analysisParts.map((part, index) => <details key={index}><summary>{index + 1}. {part.destinations.map((destination) => destinationLabels[destination]).join(" · ")} · {part.model}</summary><pre>{part.text}</pre></details>)}</details>}
-        {responseDetails && <details className="iw-response-technical"><summary>Последний ответ · технические подробности</summary><div className="iw-response-metrics"><strong>Последний ответ: {responseDetails.model}</strong>{responseDetails.metrics && <><span>Время: {(responseDetails.metrics.elapsedMilliseconds / 1000).toLocaleString("ru", { maximumFractionDigits: 2 })} с</span>{responseDetails.metrics.inputTokens !== undefined && <span>На входе: {responseDetails.metrics.inputTokens.toLocaleString("ru")} токенов</span>}{responseDetails.metrics.outputTokens !== undefined && <span>На выходе: {responseDetails.metrics.outputTokens.toLocaleString("ru")} токенов</span>}{responseDetails.metrics.totalTokens !== undefined && <span>Всего: {responseDetails.metrics.totalTokens.toLocaleString("ru")} токенов</span>}{responseDetails.metrics.loadMilliseconds !== undefined && <span>Загрузка модели: {(responseDetails.metrics.loadMilliseconds / 1000).toLocaleString("ru", { maximumFractionDigits: 2 })} с</span>}</>}</div></details>}
+        {responseDetails && <details className="iw-response-technical">
+          <summary>Последний ответ · технические подробности</summary>
+          <div className="iw-response-metrics"><strong>Последний ответ: {responseDetails.model}</strong>
+            {responseDetails.metrics && <>
+              <span>Время: {(responseDetails.metrics.elapsedMilliseconds / 1000).toLocaleString("ru", { maximumFractionDigits: 2 })} с</span>
+              {responseDetails.metrics.inputTokens !== undefined && <span>На входе: {responseDetails.metrics.inputTokens.toLocaleString("ru")} токенов</span>}
+              {responseDetails.metrics.outputTokens !== undefined && <span>На выходе: {responseDetails.metrics.outputTokens.toLocaleString("ru")} токенов</span>}
+              {responseDetails.metrics.totalTokens !== undefined && <span>Всего: {responseDetails.metrics.totalTokens.toLocaleString("ru")} токенов</span>}
+              {responseDetails.metrics.loadMilliseconds !== undefined && <span>Загрузка модели: {(responseDetails.metrics.loadMilliseconds / 1000).toLocaleString("ru", { maximumFractionDigits: 2 })} с</span>}
+            </>}
+            {responseDetails.diagnostics && <>
+              <span>Протокол: {responseDetails.diagnostics.protocol} · формат: {responseDetails.diagnostics.outputMode}</span>
+              <span>Причина завершения сервиса: {responseDetails.diagnostics.completionReason || "не сообщена"}. Завершение генерации не подтверждает полезность ответа.</span>
+              <span>Текст запроса: {responseDetails.diagnostics.promptBytes.toLocaleString("ru")} байт · JSON-схема: {responseDetails.diagnostics.schemaBytes === null ? "не отправлялась" : `${responseDetails.diagnostics.schemaBytes.toLocaleString("ru")} байт`} · тело запроса: {responseDetails.diagnostics.requestBodyBytes.toLocaleString("ru")} байт</span>
+              <span>Temperature в запросе: {responseDetails.diagnostics.sentTemperature === null ? "не задавалась" : responseDetails.diagnostics.sentTemperature}. Размер контекста и лимит ответа приложение не задаёт; фактические значения сервиса здесь неизвестны.</span>
+            </>}
+          </div>
+        </details>}
         <details className="iw-raw-response" open={Boolean(emptyWarning) || rawResponseOpen} onToggle={(event) => setRawResponseOpen(event.currentTarget.open)}><summary>Ответ модели / вставить готовый ответ</summary><p className="help-text">Можно использовать ответ другой модели. Нужен JSON с массивом items. Формат и названия полей включены в текст запроса.</p><textarea id="iw-response" rows={8} maxLength={maxTextBytes} value={rawResponse} placeholder={'{"items": [{"destination": "procurement", "title": "Закупка", "fields": {"name": "…"}}]}'} onChange={(event) => { if (bytes(event.target.value) > maxTextBytes) { setError("Ответ не должен превышать 2 МБ."); return; } cancelPending(); setRawResponse(event.target.value); setResultStale(true); setEmptyWarning(""); setResponseDetails(null); }} /><div className="iw-actions"><button type="button" className="secondary" disabled={preparingResponse || !rawResponse.trim() || !taskDestinations.length} onClick={requestParse}>Разобрать ответ</button><button type="button" className="secondary" disabled={!taskDestinations.length} onClick={() => void copyPrompt()}>Скопировать запрос для другой модели</button></div></details>
       </section>
     </div>
     <section className="surface iw-results"><div className="iw-section-heading"><span className="iw-step">3</span><div><h3>Проверка и распределение</h3><p>Отметьте нужные поля. Кнопка откроет новый черновик; сохранение выполняется в самой карточке.</p></div></div>
       {preparingResponse && <div className="iw-audit-progress" role="status"><span className="iw-spinner" aria-hidden="true" />Подготавливаем результат и проверяем исходные материалы…<button type="button" className="secondary" onClick={() => { cancelPending(); setNotice("Локальный разбор отменён. Предыдущие карточки сохранены; поздний результат не будет добавлен."); }}>Остановить разбор</button></div>}
       {sourcePreparation?.origin === "source-contract" && <p className="notice" role="status">Локальный проект по тексту договора. Модель в его подготовке не использовалась; её прежний ответ, если был, оставлен в технических подробностях. Это не подтверждение готовности документа к отправке.</p>}
+      {modelContribution?.fields === 0 && <p className="notice warning" role="status" aria-label="Пустой исходный ответ">Исходный ответ не содержал заполненных полей, кроме возможного общего заголовка. Это не успешное извлечение моделью. Последующее локальное дополнение, ручные правки и покрытие текста ниже не меняют этот результат.</p>}
       {evidenceReady && !evidenceState?.failed && <TaskCompletionSummary report={evidenceState?.completion} previous={resultStale || Boolean(emptyWarning)} />}
       {(sourcePreparation?.limited || automaticConditions?.limited) && <p className="notice warning" role="status">Разбор источников выполнен не полностью. Проверьте журнал подготовки; такой результат не считается завершённым.</p>}
-      {(automaticConditions || sourcePreparation) && <details><summary>Как подготовлен результат · технические подробности</summary><AutomaticConditionsSummary receipt={automaticConditions} items={items} /><SourcePreparationSummary receipt={sourcePreparation} items={items} /></details>}
+      {(automaticConditions || sourcePreparation || modelContribution) && <details><summary>Как подготовлен результат · технические подробности</summary>{modelContribution && <div aria-label="Вклад исходного ответа"><p className="help-text">До локального дополнения: карточек в ответе — {modelContribution.items}, заполненных полей без общего заголовка — {modelContribution.fields}, записей evidence — {modelContribution.evidence}. Это счётчики ответа, а не проверка достоверности или полноты.</p>{modelContribution.destinations.length > 1 && modelContribution.destinations.map(entry => <p className="help-text" key={entry.destination}>{destinationLabels[entry.destination]}: карточек — {entry.items}, полей — {entry.fields}.</p>)}</div>}<AutomaticConditionsSummary receipt={automaticConditions} items={items} /><SourcePreparationSummary receipt={sourcePreparation} items={items} /></details>}
       {auditItems.length > 0 && !evidenceReady && <div className="iw-audit-progress" role="status"><span className="iw-spinner" aria-hidden="true" />Проверяем значения и обязательные условия по выбранным текстам. Передача результатов ИИ станет доступна после проверки.</div>}
       {auditItems.length > 0 && evidenceReady && evidenceState?.failed && <div className="notice error" role="alert">Локальную проверку фактов не удалось завершить. Результаты сохранены; передача ИИ-карточек пока недоступна.<button type="button" className="secondary" onClick={retryAudit}>Повторить проверку фактов</button></div>}
       {auditItems.length > 0 && evidenceReady && !evidenceState?.failed && <p className="help-text">Проверка сопоставляет выбранный текст, числа, роли и события. Она не гарантирует полноту понимания документа. Исправьте ошибки, исключите поля или явно проверьте каждое оставшееся замечание по источнику.</p>}

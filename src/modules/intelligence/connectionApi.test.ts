@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cancelIntelligenceRequest, intelligenceTransportLimitBytes, publicConnectionProfile,
-  intelligenceSchemaLimitBytes, runIntelligenceAnalysis, testIntelligenceConnection, validateConnectionProfile, type ConnectionProfile } from "./connectionApi";
+  intelligenceSchemaLimitBytes, runIntelligenceAnalysis, testIntelligenceConnection, validateConnectionProfile, type ConnectionProfile, type IntelligenceAnalysisDiagnostics, type IntelligenceAnalysisResult } from "./connectionApi";
 
 const ipc = vi.hoisted(() => vi.fn());
 vi.mock("@tauri-apps/api/core", () => ({ invoke: ipc }));
@@ -74,6 +74,21 @@ describe("explicit AI transport API", () => {
     await runIntelligenceAnalysis({ ...profile, outputMode: "json" }, "JSON: synthetic", undefined, requestId, { type: "object", unused: true });
     expect(ipc.mock.calls[0][1]).not.toHaveProperty("responseSchema");
     expect(() => validateConnectionProfile({ ...profile, outputMode: "automatic-fallback" } as unknown as ConnectionProfile)).toThrow("формат ответа");
+  });
+  it.each(["stop", null] as const)("retains observed diagnostics and provider counters without inventing context settings for completion %s", async (completionReason) => {
+    const diagnostics: IntelligenceAnalysisDiagnostics = { protocol: "ollama", outputMode: "json", completionReason, promptBytes: 15, schemaBytes: null, requestBodyBytes: 500, sentTemperature: 0 };
+    const response: IntelligenceAnalysisResult = { text: '{"items":[]}', model: "qwen", metrics: { elapsedMilliseconds: 100, inputTokens: 12, outputTokens: 8, totalTokens: 20 }, diagnostics };
+    ipc.mockResolvedValue(response);
+    const received = await runIntelligenceAnalysis(profile, "JSON: synthetic", "session-key", requestId);
+    expect(received).toBe(response); expect(received.diagnostics).toEqual(diagnostics); expect(received.metrics).toEqual(response.metrics);
+    expect(received.diagnostics).not.toHaveProperty("numCtx"); expect(received.diagnostics).not.toHaveProperty("effectiveContextTokens"); expect(received.diagnostics).not.toHaveProperty("maxOutputTokens");
+    expect(ipc).toHaveBeenCalledWith("run_intelligence_analysis", { profile, prompt: "JSON: synthetic", apiKey: "session-key", requestId });
+  });
+  it("keeps legacy analysis replies without diagnostics or metrics compatible", async () => {
+    const legacy: IntelligenceAnalysisResult = { text: '{"items":[]}', model: "qwen" };
+    ipc.mockResolvedValue(legacy);
+    expect(await runIntelligenceAnalysis(profile, "JSON: synthetic", undefined, requestId)).toBe(legacy);
+    expect(legacy).not.toHaveProperty("diagnostics"); expect(legacy).not.toHaveProperty("metrics");
   });
   it("requires a bounded serializable object schema before starting transport", async () => {
     const schemaProfile = { ...profile, outputMode: "schema" as const };
