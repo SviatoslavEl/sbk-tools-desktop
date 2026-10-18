@@ -135,7 +135,7 @@ export async function buildProposalDocumentPublic(data: ProposalData, options: {
   const mode = options.mode ?? 'review-draft';
   if (mode === 'final' && !readiness.canFinalize) throw new Error(readiness.issues[0]?.message || 'Остались нерешённые вопросы. Можно выгрузить только проект для проверки.');
   const common = buildPublicCommon(captured, options), projection = projectCommercialBodyPublic(captured.commercialDocument.body);
-  const { sections, unresolved } = projectCommercialReviewPublic(readiness, projection, mode);
+  const { sections, unresolved } = projectCommercialReviewPublic(readiness, projection, mode, captured.commercialDocument.privateAppendix);
   const { schemaVersion: _version, terms: _legacyTerms, ...publicMetadata } = common;
   const result: ProposalPublicDocumentV2 = { ...publicMetadata, schemaVersion: 2, commercial: { version: 1, mode, sections, unresolved } };
   assertPublicDocumentBudget(result);
