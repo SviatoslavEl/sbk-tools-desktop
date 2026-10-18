@@ -2,7 +2,7 @@ import { collectContractProposalFacts, type ContractProposalDocument, type Contr
 import type { SourcePreparationProvenance, SourcePreparationResult } from "./sourcePreparedFacts";
 import type { IntelligenceDestination, IntelligenceEvidence, IntelligenceFieldValue, IntelligenceItem, IntelligenceSource } from "./workbenchTypes";
 
-const LIMITS = Object.freeze({ items: 100, field: 20_000, evidence: 500, receipts: 500, bytes: 8 * 1024 * 1024, quote: 2000 });
+const LIMITS = Object.freeze({ items: 100, name: 200, field: 20_000, evidence: 500, receipts: 500, bytes: 8 * 1024 * 1024, quote: 2000 });
 const literal = (value: string) => value.replace(/\s+/gu, " ").trim();
 const bytes = (value: string) => new TextEncoder().encode(value).byteLength;
 const proof = (entry: SourcePreparationProvenance): SourcePreparationProvenance => ({ sourceId: entry.sourceId, sourceName: entry.sourceName, ...(entry.fragmentId ? { fragmentId: entry.fragmentId } : {}), locator: entry.locator, quote: entry.quote });
@@ -11,18 +11,26 @@ const absent = (value: unknown, field: string) => value === undefined || typeof 
 const claimKey = (claim: IntelligenceEvidence) => JSON.stringify([claim.field, claim.sourceId, claim.fragmentId, claim.quote]);
 
 interface CanonicalField { field: string; value: IntelligenceFieldValue; evidence: SourcePreparationProvenance[] }
-function titleFrom(facts: readonly ContractProposalFact[]): string | undefined {
+interface CanonicalTitles { title: string; line: string }
+function titleFrom(facts: readonly ContractProposalFact[]): CanonicalTitles | undefined {
   const subjects = facts.filter((fact) => fact.role === "subject");
   // Editorial shortening is limited to a printed subject phrase. Never use a
   // filename, a company name or a monetary total as the offered service.
   for (const fact of [...subjects.filter((entry) => /комплекс\s+услуг/iu.test(entry.quote)), ...subjects]) {
     const text = fact.quote.replace(/^\s*\d+(?:\.\d+)*[.)]\s*/u, "").trim();
-    const match = /(?:комплекс\s+услуг\s+по|услуг[аи]?\s+по|работ[ыа]?\s+по|(?:предмет|наименование)\s*[:—-])\s+([^.;]{5,450})/iu.exec(text);
-    const phrase = match?.[1].split(/,\s*(?:состав|перечень|определ[её]н|сформулирован|отраж[её]н)/iu)[0].trim();
-    if (phrase && phrase.length <= 190 && !/^(?:направлениям|техническому\s+заданию|приложению)\b/iu.test(phrase)) return `КП: ${phrase}`;
+    const match = /((?:комплекс\s+услуг\s+по|услуг[аи]?\s+по|работ[ыа]?\s+по)|(?:предмет|наименование)\s*[:—-])\s+([^.;]{5,450})/iu.exec(text);
+    const phrase = match?.[2].split(/,\s*(?:состав|перечень|определ[её]н|сформулирован|отраж[её]н)/iu)[0].trim();
+    if (phrase && !/^(?:направлениям|техническому\s+заданию|приложению)\b/iu.test(phrase)) {
+      // An explicit “по” supplies the printed dative phrase. Add only the
+      // service/document prefixes; never inflect, rewrite or truncate it.
+      const dative = /\sпо$/iu.test(match![1]);
+      const title = `${dative ? "КП по" : "КП:"} ${phrase}`;
+      const line = dative ? `Услуги по ${phrase}` : phrase;
+      if (phrase.length <= 190 && title.length <= LIMITS.name && line.length <= LIMITS.name) return { title, line };
+    }
   }
   const exact = subjects.map((fact) => fact.quote.replace(/^\s*\d+(?:\.\d+)*[.)]\s*/u, "").trim()).find((text) => text.length >= 10 && text.length <= 190 && !/\t/u.test(text));
-  return exact;
+  return exact ? { title: exact, line: exact.replace(/^КП:\s*/u, "") } : undefined;
 }
 function quotes(facts: readonly ContractProposalFact[]) { return unique(facts).map((fact) => fact.quote).join("\n\n"); }
 function allEvidence(facts: readonly ContractProposalFact[]): SourcePreparationProvenance[] {
@@ -36,12 +44,12 @@ function canonicalFields(document: ContractProposalDocument, inventory: Contract
   const deliverables = unique(facts.filter((fact) => fact.role === "deliverable"));
   const payment = unique(facts.filter((fact) => fact.role === "payment"));
   const delivery = unique(facts.filter((fact) => ["schedule", "dependency", "exclusion"].includes(fact.role)));
-  const title = titleFrom(facts), fields: CanonicalField[] = [];
-  if (title) fields.push({ field: "title", value: title, evidence: allEvidence(subject) });
+  const titles = titleFrom(facts), fields: CanonicalField[] = [];
+  if (titles) fields.push({ field: "title", value: titles.title, evidence: allEvidence(subject) });
   if (subject.length) fields.push({ field: "introduction", value: quotes(subject), evidence: allEvidence(subject) });
   const description = [scope.length ? `Состав работ по исходному документу:\n${quotes(scope)}` : "", deliverables.length ? `Результаты по исходному документу:\n${quotes(deliverables)}` : ""].filter(Boolean).join("\n\n");
-  if (title && description) {
-    fields.push({ field: "lines", value: [title.replace(/^КП:\s*/u, "")], evidence: allEvidence(subject) });
+  if (titles && description) {
+    fields.push({ field: "lines", value: [titles.line], evidence: allEvidence(subject) });
     fields.push({ field: "lineDescriptions", value: [description], evidence: allEvidence([...scope, ...deliverables]) });
   }
   if (payment.length) fields.push({ field: "paymentTerms", value: quotes(payment), evidence: allEvidence(payment) });

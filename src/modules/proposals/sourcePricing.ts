@@ -81,13 +81,29 @@ export function proposalSourceCandidateIssue(candidate: ProposalSourceFinancialC
   catch (reason) { return reason instanceof Error ? reason.message : "Исходная цена требует проверки."; }
 }
 
+function canonicalJson(value: unknown): string {
+  // Storage may round-trip JSON through an object-key-sorting serializer.
+  // Object insertion order is not business data; array order and every scalar
+  // remain exact, including decimal strings, source quotes and identifiers.
+  return JSON.stringify(value, (_property, entry: unknown) => entry && typeof entry === "object" && !Array.isArray(entry)
+    ? Object.fromEntries(Object.entries(entry).sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)) : entry);
+}
+
 function fingerprint(data: ProposalData): string {
   // Exact private binding, not a hash/authentication mechanism. Editing price,
   // scope, parties or family invalidates the previous applicability decision.
-  return JSON.stringify([data.familyId, data.title, [data.issuer.name, data.issuer.inn, data.issuer.kpp], [data.recipient.name, data.recipient.inn, data.recipient.kpp],
+  return canonicalJson([data.familyId, data.title, [data.issuer.name, data.issuer.inn, data.issuer.kpp], [data.recipient.name, data.recipient.inn, data.recipient.kpp],
     data.introduction, data.deliveryTerms, data.paymentTerms, data.conclusion,
     data.lines.map(({ id, title, description, unit, quantity, unitPrice, priceBasis, discountPercent, tax }) => ({ id, title, description, unit, quantity, unitPrice, priceBasis, discountPercent, tax })),
     data.sourceFinancials?.candidates]);
+}
+
+function sameFingerprint(stored: string, data: ProposalData): boolean {
+  if (typeof stored !== "string") return false;
+  const current = fingerprint(data);
+  // Also accept a genuine earlier insertion-ordered binding after comparing
+  // its complete parsed values. No DB migration or new approval is created.
+  return stored === current || canonicalJson(JSON.parse(stored)) === current;
 }
 
 export function applyProposalSourcePrice(data: ProposalData, candidateId: string, confirmation: {
@@ -137,7 +153,7 @@ export function proposalSourcePricingIssues(data: ProposalData): string[] {
     if (state.version !== 1) throw new Error();
     createProposalSourceFinancials(state.candidates);
     if (!state.candidates.length) return [];
-    if (!state.decision || !["applied", "not-used"].includes(state.decision.kind) || state.decision.fingerprint !== fingerprint(data)
+    if (!state.decision || !["applied", "not-used"].includes(state.decision.kind) || !sameFingerprint(state.decision.fingerprint, data)
       || state.decision.kind === "applied" && !state.candidates.some((candidate) => candidate.id === state.decision!.candidateId)) return ["Решите, использовать ли исходную цену в этом КП. После изменения проекта, сторон, состава или цен проверьте решение заново."];
     return [];
   } catch { return ["Исходные финансовые сведения повреждены. Повторите анализ или введите собственную цену после проверки."]; }

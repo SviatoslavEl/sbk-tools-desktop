@@ -11,6 +11,24 @@ function validDate(value: string): boolean {
 }
 export interface ProposalValidationOptions { today?: string; duplicateNumber?: boolean }
 const textLength = (value: string): number => Array.from(value).length;
+const publicScopeHeading = 'Состав работ и результаты';
+const publicScopeReference = 'Подробный состав работ и результаты приведены в разделе «Состав работ и результаты».';
+
+/** Presentation-only projection of an explicitly accepted package price. A
+ * long service scope belongs in full-width prose, not the narrow price cell.
+ * The stored proposal, evidence and reviewer decision remain untouched. */
+function aggregateScopeConclusion(data: ProposalData): string | undefined {
+  const decision = data.sourceFinancials?.decision;
+  const candidate = data.sourceFinancials?.candidates.find((entry) => entry.id === decision?.candidateId && entry.scope === 'aggregate');
+  if (data.lines.length !== 1 || decision?.kind !== 'applied'
+    || !candidate || !/(?:стоимост[ьи]|цен[аыуе])[^.;\n]{0,100}(?:услуг|работ)(?=$|[^\p{L}])/iu.test(candidate.quote)
+    || data.lines[0].unit !== 'комплекс' || data.lines[0].quantity !== '1'
+    || textLength(data.lines[0].description) <= 2000 || proposalSourcePricingIssues(data).length) return;
+  return `${data.conclusion ? `${data.conclusion}\n\n` : ''}${publicScopeHeading}\n\n${data.lines[0].description}`;
+}
+export function proposalHasFullWidthScope(data: ProposalData): boolean {
+  return aggregateScopeConclusion(data) !== undefined;
+}
 export function validateProposal(data: ProposalData, options: ProposalValidationOptions = {}): ProposalIssue[] {
   const issues: ProposalIssue[] = [];
   const issue = (field: string, step: ProposalIssue['step'], message: string, severity: ProposalIssue['severity'] = 'error', lineId?: string) => issues.push({ field, step, message, severity, ...(lineId ? { lineId } : {}) });
@@ -51,6 +69,8 @@ export function validateProposal(data: ProposalData, options: ProposalValidation
   if (data.template.logo && (!['image/png', 'image/jpeg'].includes(data.template.logo.mimeType) || data.template.logo.sizeBytes > 5 * 1024 * 1024)) issue('template.logo', 4, 'Логотип: PNG или JPEG размером до 5 МБ');
   if (data.attachments.length > 100) issue('attachments', 3, 'Не более 100 приложений');
   for (const message of proposalSourcePricingIssues(data)) issue('sourceFinancials', 2, message);
+  const publicConclusion = aggregateScopeConclusion(data);
+  if (publicConclusion !== undefined && textLength(publicConclusion) > 20000) issue('conclusion', 3, 'Полный состав работ вместе с заключением превышает 20 000 символов клиентского раздела. Сократите или разделите текст вручную без потери условий; экспорт не усекает его.');
   for (const question of data.sourceQuestions || []) issue('sourceQuestions', 3, question.message, 'warning');
   return issues;
 }
@@ -63,14 +83,15 @@ export function buildProposalPublic(data: ProposalData, options: { allowZero?: b
   const errors = validateProposal(data).filter((entry) => entry.severity === 'error');
   if (errors.length) throw new Error(errors[0].message);
   const priced = priceProposal(data.lines);
+  const publicConclusion = aggregateScopeConclusion(data);
   if (priced.totals.grossMinor === '0' && !options.allowZero) throw new Error('Подтвердите экспорт КП с нулевой стоимостью');
   return {
     schemaVersion: 1, number: data.number.trim(), revision: data.revision, documentDate: data.documentDate,
     title: data.title.trim(), validUntil: data.validUntil, currency: 'RUB', issuer: publicParty(data.issuer), recipient: publicParty(data.recipient),
     addressee: publicContact(data.addressee), contact: publicContact(data.contact),
     ...(data.signer ? { signer: { ...publicContact(data.signer), basis: data.signer.basis.trim(), issuedAt: data.signer.issuedAt, expiresAt: data.signer.expiresAt } } : {}),
-    lines: priced.lines, totals: priced.totals,
-    terms: { delivery: data.deliveryTerms.trim(), payment: data.paymentTerms.trim(), introduction: data.introduction.trim(), conclusion: data.conclusion.trim() },
+    lines: publicConclusion === undefined ? priced.lines : priced.lines.map((line) => ({ ...line, description: publicScopeReference })), totals: priced.totals,
+    terms: { delivery: data.deliveryTerms.trim(), payment: data.paymentTerms.trim(), introduction: data.introduction.trim(), conclusion: publicConclusion ?? data.conclusion.trim() },
     layout: { style: data.template.style, accentColor: data.template.accentColor, show: { address: data.template.show.address, requisites: data.template.show.requisites, contact: data.template.show.contact, signer: data.template.show.signer }, footer: data.template.footer.trim(), ...(data.template.logo ? { logo: publicAsset(data.template.logo) } : {}) },
     attachments: data.attachments.map(publicAsset),
   };

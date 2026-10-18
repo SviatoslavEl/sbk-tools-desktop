@@ -11,6 +11,8 @@ function proposal(patch: Partial<ProposalSourceFinancialCandidate> = {}) {
   data.sourceFinancials = createProposalSourceFinancials([candidate(patch)]); return data;
 }
 const confirmed = { sameProject: true, aggregateAsSingleLine: true };
+const sortedObjectRoundTrip = <T,>(value: T): T => JSON.parse(JSON.stringify(value, (_property, entry: unknown) => entry && typeof entry === "object" && !Array.isArray(entry)
+  ? Object.fromEntries(Object.entries(entry).sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)) : entry)) as T;
 
 describe("explicit private source price application", () => {
   it("uses one aggregate without inventing five prices, preserving every scope block and original data", () => {
@@ -44,6 +46,41 @@ describe("explicit private source price application", () => {
     }
     expect(cloneProposal(next).sourceFinancials?.decision).toBeUndefined(); expect(proposalSourcePricingIssues(cloneProposal(next))).not.toEqual([]);
     const reapplied = applyProposalSourcePrice(next, "price-a", { ...confirmed, replaceExistingPrices: true }); expect(reapplied.lines[0].description).toBe(next.lines[0].description);
+  });
+  it("preserves applied and rejected decisions across recursively key-sorted storage save/reopen", () => {
+    for (const reviewed of [applyProposalSourcePrice(proposal(), "price-a", confirmed), dismissProposalSourcePricing(proposal())]) {
+      const persisted = sortedObjectRoundTrip(reviewed);
+      expect(Object.keys(persisted.sourceFinancials!.candidates[0])).not.toEqual(Object.keys(reviewed.sourceFinancials!.candidates[0]));
+      expect(proposalSourcePricingIssues(persisted)).toEqual([]);
+      expect(persisted.sourceFinancials!.decision!.fingerprint).toBe(reviewed.sourceFinancials!.decision!.fingerprint);
+    }
+  });
+  it("accepts exact legacy insertion-ordered decisions after sorted storage without migrating or weakening the binding", () => {
+    const reviewed = applyProposalSourcePrice(proposal(), "price-a", confirmed);
+    const legacyProjection = [reviewed.familyId, reviewed.title, [reviewed.issuer.name, reviewed.issuer.inn, reviewed.issuer.kpp], [reviewed.recipient.name, reviewed.recipient.inn, reviewed.recipient.kpp],
+      reviewed.introduction, reviewed.deliveryTerms, reviewed.paymentTerms, reviewed.conclusion,
+      reviewed.lines.map(({ id, title, description, unit, quantity, unitPrice, priceBasis, discountPercent, tax }) => ({ id, title, description, unit, quantity, unitPrice, priceBasis, discountPercent, tax })), reviewed.sourceFinancials!.candidates];
+    reviewed.sourceFinancials!.decision!.fingerprint = JSON.stringify(legacyProjection);
+    const persisted = sortedObjectRoundTrip(reviewed), before = structuredClone(persisted);
+    expect(proposalSourcePricingIssues(persisted)).toEqual([]); expect(persisted).toEqual(before);
+    persisted.sourceFinancials!.candidates[0].quote += " Изменённое условие";
+    expect(proposalSourcePricingIssues(persisted)).not.toEqual([]);
+  });
+  it("keeps all scalar changes and ordering of lines, candidates and issue arrays bound after key-sorted storage", () => {
+    const data = proposal({ scope: "position", positionName: "Анализ", quantity: "2", unit: "час", unitPrice: "610", priceBasis: "gross" });
+    data.sourceFinancials!.candidates.push(candidate({ id: "price-b", issues: ["Первый вопрос", "Второй вопрос"] }));
+    const persisted = sortedObjectRoundTrip(applyProposalSourcePrice(data, "price-a", { sameProject: true }));
+    expect(proposalSourcePricingIssues(persisted)).toEqual([]);
+    for (const change of [
+      (copy: typeof persisted) => { copy.lines.reverse(); },
+      (copy: typeof persisted) => { copy.sourceFinancials!.candidates.reverse(); },
+      (copy: typeof persisted) => { copy.sourceFinancials!.candidates[1].issues.reverse(); },
+      (copy: typeof persisted) => { copy.lines[0].tax = { kind: "vat", rate: 20 }; },
+      (copy: typeof persisted) => { copy.lines[0].quantity = "2.0"; },
+      (copy: typeof persisted) => { copy.sourceFinancials!.candidates[0].net = "999"; },
+      (copy: typeof persisted) => { copy.sourceFinancials!.candidates[0].sourceId = "different-source"; },
+    ]) { const edited = structuredClone(persisted); change(edited); expect(proposalSourcePricingIssues(edited)).not.toEqual([]); }
+    persisted.sourceFinancials!.decision!.fingerprint = "not json"; expect(proposalSourcePricingIssues(persisted)).not.toEqual([]);
   });
   it("lets a reviewer reject source pricing, keeps legacy proposals unaffected, and excludes private source evidence from public output", () => {
     const data = proposal(), rejected = dismissProposalSourcePricing(data); expect(proposalSourcePricingIssues(rejected)).toEqual([]); expect(rejected.lines[0].unitPrice).toBe("");

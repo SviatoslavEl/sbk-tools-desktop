@@ -23,8 +23,8 @@ describe("whole contract to source-derived proposal preparation", () => {
     const input = source(), item = card({ title: "Коммерческое предложение" }), before = structuredClone({ input, item }); freeze(input); freeze(item);
     const result = completeContractProposalFields([item], [input], ["proposals"]), prepared = result.items[0];
     expect(result.limited).toBe(false); expect(result.changes.length).toBeGreaterThan(5);
-    expect(prepared.fields.title).toBe("КП: проверке учебной системы");
-    expect(prepared.fields.lines).toEqual(["проверке учебной системы"]);
+    expect(prepared.fields.title).toBe("КП по проверке учебной системы");
+    expect(prepared.fields.lines).toEqual(["Услуги по проверке учебной системы"]);
     expect((prepared.fields.lineDescriptions as string[])[0]).toContain("2.1. Анализ документации");
     expect((prepared.fields.lineDescriptions as string[])[0]).toContain("2.2. Проверка компонентов; SBOM при наличии.");
     expect((prepared.fields.lineDescriptions as string[])[0]).toContain("3.2. Материалы в DOCX и PDF; встреча");
@@ -56,7 +56,7 @@ describe("whole contract to source-derived proposal preparation", () => {
     const reply = runResponsePreparation(request);
     expect(reply.failed).toBeUndefined(); expect(reply.prepared?.items).toHaveLength(1);
     const prepared = reply.prepared!.items[0];
-    expect(prepared.sourceIds).toEqual([input.id]); expect(prepared.fields.lines).toEqual(["проверке учебной системы"]);
+    expect(prepared.sourceIds).toEqual([input.id]); expect(prepared.fields.lines).toEqual(["Услуги по проверке учебной системы"]);
     expect(prepared.fields.paymentTerms).toContain("или истечения срока отказа");
     expect((prepared.fields.lineDescriptions as string[])[0]).toContain("SBOM при наличии");
     expect(prepared.proposalSourceParties).toHaveLength(2);
@@ -100,6 +100,70 @@ describe("whole contract to source-derived proposal preparation", () => {
     expect(createContractProposalProver([input]).prove(missingClaim, [missingClaim])!.fields.has("lineDescriptions")).toBe(false);
     input.fragments![7].text = "Изменившийся состав другого источника";
     expect(createContractProposalProver([input]).prove(prepared, [prepared])!.fields.has("lineDescriptions")).toBe(false);
+  });
+
+  it("adds only distinct document and service prefixes to the same literal printed phrase", () => {
+    const input = source(), phrase = "сопровождению API-сервиса «Тест» и проверке модуля QA";
+    input.fragments![4].text = `1.1. Исполнитель оказывает комплекс услуг по ${phrase}, состав которых определён в приложении.`;
+    const prepared = completeContractProposalFields([card()], [input], ["proposals"]).items[0];
+    expect(prepared.title).toBe(`КП по ${phrase}`);
+    expect(prepared.fields.title).toBe(`КП по ${phrase}`);
+    expect(prepared.fields.lines).toEqual([`Услуги по ${phrase}`]);
+    expect(prepared.fields.introduction).toContain(input.fragments![4].text);
+    expect((prepared.fields.lineDescriptions as string[])[0]).toContain("SBOM при наличии");
+    const proof = createContractProposalProver([input]).prove(prepared, [prepared])!;
+    expect(proof.fields.has("title")).toBe(true); expect(proof.fields.has("lines")).toBe(true);
+    expect(proof.fields.get("title")!.evidence.some((entry) => entry.quote === input.fragments![4].text)).toBe(true);
+    expect(proof.fields.get("lines")!.evidence.some((entry) => entry.quote === input.fragments![4].text)).toBe(true);
+  });
+
+  it("keeps the old short literal fallback when no printed dative phrase is available", () => {
+    const input = source(), exact = "Исполнитель оказывает согласованные услуги аудита учебной системы.";
+    input.fragments![4].text = `1.1. ${exact}`;
+    const prepared = completeContractProposalFields([card()], [input], ["proposals"]).items[0];
+    expect(prepared.fields.title).toBe(exact); expect(prepared.fields.lines).toEqual([exact]);
+    const proof = createContractProposalProver([input]).prove(prepared, [prepared])!;
+    expect(proof.fields.has("title")).toBe(true); expect(proof.fields.has("lines")).toBe(true);
+  });
+
+  it("does not assume that a labelled subject is dative or change its existing short-title form", () => {
+    const input = source(); input.fragments![4].text = "1.1. Предмет: Аудит учебной системы.";
+    const prepared = completeContractProposalFields([card()], [input], ["proposals"]).items[0];
+    expect(prepared.fields.title).toBe("КП: Аудит учебной системы");
+    expect(prepared.fields.lines).toEqual(["Аудит учебной системы"]);
+    expect(createContractProposalProver([input]).prove(prepared, [prepared])!.fields.has("lines")).toBe(true);
+  });
+
+  it("fits both prefixes within the 200-character names without shortening an over-limit source phrase", () => {
+    const input = source(), phrase = "проверке " + "а".repeat(190 - "проверке ".length);
+    input.fragments![4].text = `1.1. Исполнитель оказывает комплекс услуг по ${phrase}.`;
+    const prepared = completeContractProposalFields([card()], [input], ["proposals"]).items[0];
+    expect(prepared.fields.title).toBe(`КП по ${phrase}`);
+    expect(prepared.fields.lines).toEqual([`Услуги по ${phrase}`]);
+    expect((prepared.fields.title as string).length).toBeLessThanOrEqual(200);
+    expect((prepared.fields.lines as string[])[0]).toHaveLength(200);
+    expect(createContractProposalProver([input]).prove(prepared, [prepared])!.fields.has("lines")).toBe(true);
+
+    input.fragments![4].text = `1.1. Исполнитель оказывает комплекс услуг по ${phrase}б.`;
+    const over = completeContractProposalFields([card()], [input], ["proposals"]).items[0];
+    expect(over.fields).not.toHaveProperty("title"); expect(over.fields).not.toHaveProperty("lines");
+    expect(over.fields.introduction).toContain(`${phrase}б`);
+    expect(createContractProposalProver([input]).prove(prepared, [prepared])!.fields.has("title")).toBe(false);
+    expect(createContractProposalProver([input]).prove(prepared, [prepared])!.fields.has("lines")).toBe(false);
+  });
+
+  it.each(["old-document-prefix", "copied-document-line", "changed-phrase", "missing-title-evidence", "missing-line-evidence"])("does not weaken the closed title/line proof for %s", (variant) => {
+    const input = source(), prepared = completeContractProposalFields([card()], [input], ["proposals"]).items[0];
+    const changed = structuredClone(prepared);
+    if (variant === "old-document-prefix") changed.fields.title = "КП: проверке учебной системы";
+    if (variant === "copied-document-line") changed.fields.lines = [prepared.fields.title as string];
+    if (variant === "changed-phrase") { changed.fields.title = "КП по разработке учебной системы"; changed.fields.lines = ["Услуги по разработке учебной системы"]; }
+    if (variant === "missing-title-evidence") changed.evidence = changed.evidence!.filter((entry) => entry.field !== "title");
+    if (variant === "missing-line-evidence") changed.evidence = changed.evidence!.filter((entry) => entry.field !== "lines");
+    const proof = createContractProposalProver([input]).prove(changed, [changed])!;
+    if (["old-document-prefix", "changed-phrase", "missing-title-evidence"].includes(variant)) expect(proof.fields.has("title")).toBe(false);
+    if (["copied-document-line", "changed-phrase", "missing-line-evidence"].includes(variant)) expect(proof.fields.has("lines")).toBe(false);
+    expect(proof.fields.has("lineDescriptions")).toBe(true);
   });
 
   it("preserves existing positions and their relationships, placing full source scope in a separate conclusion", () => {
