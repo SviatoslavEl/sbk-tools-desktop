@@ -47,7 +47,7 @@ export interface IntelligenceDateFacts {
 }
 
 type Role = "supplier" | "customer" | "internal" | "unknown";
-type SourceUnit = EvidenceExcerpt & { text: string; normalizedText: string; normalizedSourceName: string; numbers: string[]; source: IntelligenceSource; sourceFragmentIndex: number; sheetState?: IntelligenceFragment["sheetState"]; index: number; fragmentKey: number; context: string; precedingContext: string; role: Role; nmcAmounts: string[]; nmcHeaders: EvidenceExcerpt[] };
+type SourceUnit = EvidenceExcerpt & { text: string; normalizedText: string; normalizedSourceName: string; numbers: string[]; source: IntelligenceSource; sourceFragmentIndex: number; sheetState?: IntelligenceFragment["sheetState"]; index: number; fragmentKey: number; context: string; precedingContext: string; precedingRole: Role; role: Role; nmcAmounts: string[]; nmcHeaders: EvidenceExcerpt[] };
 type PersonBinding = { name: string; unit: SourceUnit };
 type StaffProfileBinding = { names: string[]; unit: SourceUnit; sharedContacts?: true };
 type StaffEducationBinding = { cells: string[]; header?: SourceUnit };
@@ -372,12 +372,13 @@ function createUnits(sources: readonly IntelligenceSource[]): { units: SourceUni
       for (let index = 0; index < rows.length; index++) {
         if (units.length >= maxUnits || characters + rows[index].length > maxAuditCharacters) { limited = true; break; }
         const text = rows[index].slice(0, maxUnitCharacters); if (text.length !== rows[index].length) limited = true;
+        const precedingRole = role;
         for (const clause of roleClauses(text)) { const explicit = lineRole(clause); if (explicit !== "unknown") role = explicit; }
         const context = rows.slice(Math.max(0, index - 1), Math.min(rows.length, index + 2)).map((line) => line.slice(0, maxUnitCharacters)).join("\n");
         const precedingContext = rows.slice(Math.max(0, index - 2), index).map((line) => line.slice(0, maxUnitCharacters)).join("\n");
         characters += text.length;
         const nmcAmounts = [...new Set([...(index === 0 ? nmc.amounts : []), ...splitRubleAmounts(text, nmcLabel)])];
-        units.push({ sourceId: source.id, sourceName: source.name, fragmentId: fragment.id, locator: fragment.locator, quote: text, text, normalizedText: normalize(text), normalizedSourceName, numbers: numberTokens(text), source, sourceFragmentIndex, sheetState: fragment.sheetState, index: units.length, fragmentKey, context, precedingContext, role, nmcAmounts, nmcHeaders: index === 0 ? nmc.headers : [] });
+        units.push({ sourceId: source.id, sourceName: source.name, fragmentId: fragment.id, locator: fragment.locator, quote: text, text, normalizedText: normalize(text), normalizedSourceName, numbers: numberTokens(text), source, sourceFragmentIndex, sheetState: fragment.sheetState, index: units.length, fragmentKey, context, precedingContext, precedingRole, role, nmcAmounts, nmcHeaders: index === 0 ? nmc.headers : [] });
         if (limited) break;
       }
       if (limited) break;
@@ -479,13 +480,23 @@ function expectedRole(destination: IntelligenceDestination, field: string): Role
 }
 function inlineValueRole(unit: SourceUnit, value: string): Role | undefined {
   const clauses = roleClauses(unit.text);
-  if (clauses.length < 2 || new Set(clauses.map(lineRole).filter((role) => role !== "unknown")).size < 2) return undefined;
-  let carried: Role = "unknown"; const matching: Role[] = [];
+  if (clauses.length < 2) return undefined;
+  // A DOCX row can end the issuer's multiline cell with its email, then TAB
+  // into the buyer heading. Join each value only to the role already in force
+  // at its own clause, not to the last label anywhere later in the row.
+  const normalizedValue = normalize(value), emails = emailTokens(normalizedValue), residue = emails.reduce((remaining, email) => remaining.split(email).join(""), normalizedValue).replace(/[\s,;<>()[\]]/gu, "");
+  const pureEmails = emails.length > 0 && !residue;
+  const matching = new Map((pureEmails ? emails : [value]).map((entry) => [entry, [] as Role[]]));
+  let carried: Role = unit.precedingRole;
   for (const clause of clauses) {
     const explicit = lineRole(clause); if (explicit !== "unknown") carried = explicit;
-    if (includesPhrase(clause, value)) matching.push(carried);
+    // Pure lists are token-joined in one pass, not every email against every
+    // clause. Longer domains and arbitrary text still cannot prove an email.
+    if (pureEmails) for (const email of emailTokens(normalize(clause))) matching.get(email)?.push(carried);
+    else if (includesPhrase(clause, value)) matching.get(value)!.push(carried);
   }
-  return matching.length && matching.every((role) => role === matching[0]) ? matching[0] : "unknown";
+  const groups = [...matching.values()], roles = groups.flat();
+  return groups.every((parts) => parts.length) && roles.every((role) => role === roles[0]) ? roles[0] : "unknown";
 }
 function entityRole(unit: SourceUnit, value?: string): Role {
   const inline = value === undefined ? undefined : inlineValueRole(unit, value);
@@ -1238,6 +1249,7 @@ function fieldStatus(item: IntelligenceItem, field: string, value: IntelligenceF
     return { itemId: item.id, field, status: correct.length ? "confirmed" : sameDates.length ? "conflict" : "unverified", message: correct.length ? correct.every((entry) => entry.lowerBound) ? "Указана нижняя допустимая граница поставки / работ (не ранее), а не обещание фактического начала в этот день." : "Дата найдена рядом с обозначением соответствующего события." : sameDates.length ? "Такая дата есть в источнике, но относится к другому событию или событие не подтверждено. Не подменяйте подачу поставкой, публикацию редакцией или работы подведением итогов." : "В выбранных источниках нет явной даты этого события. Относительная длительность не является календарной датой.", evidence: (correct.length ? correct : sameDates).slice(0, 3).map((entry) => excerpt(entry.unit, entry.quote)) };
   }
   if (selectedRole !== "unknown") {
+    if (item.destination === "proposals" && /^(?:contactName|addresseeName)$/u.test(field) && values.some((entry) => emailTokens(normalize(entry)).length)) return { itemId: item.id, field, status: "unverified", message: "Корпоративная или личная почта не подтверждает ФИО контактного лица. Оставьте адрес в поле почты; имя требует отдельного явного подтверждения.", evidence: matches.slice(0, 3).map((unit) => excerpt(unit)) };
     const role = (unit: SourceUnit) => entityRole(unit, values.find((entry) => matchesUnit(unit, entry)));
     const correct = matches.filter((unit) => role(unit) === selectedRole);
     const opposite = matches.filter((unit) => role(unit) !== "unknown" && role(unit) !== selectedRole);
