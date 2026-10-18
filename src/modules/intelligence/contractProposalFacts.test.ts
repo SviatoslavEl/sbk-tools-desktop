@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { collectContractProposalFacts, CONTRACT_PROPOSAL_LIMITS } from "./contractProposalFacts";
 import type { IntelligenceFragment, IntelligenceSource } from "./workbenchTypes";
+import { taskSourceSnapshotKey } from "./taskSourceIdentity";
+import { commercialFingerprint, validateCommercialQuoteHashes, type CommercialBlock } from "../proposals/commercialDocument";
+import { prepareCommercialDocument, validateCommercialSourceProjection } from "../proposals/commercialPreparation";
+import { projectReadiness } from "../proposals/commercialDecisions";
+import { projectCommercialBodyPublic } from "../proposals/commercialPublic";
 
 export const paragraph = (row: number, text: string): IntelligenceFragment => ({ id: `paragraph-${row}`, locator: `Абзац ${row}`, text });
 export const tableRow = (row: number, text: string): IntelligenceFragment => ({ id: `table-1-row-${row}`, locator: `Таблица 1, строка ${row}`, text });
@@ -39,6 +44,73 @@ export const contract = (): IntelligenceSource => ({ id: "source-contract", name
 ] });
 
 describe("contract/TЗ source inventory for useful proposals", () => {
+  it.each([
+    "10.2. Стоимость услуг по настоящему Договору определена только для исполнения настоящего Договора и не может служить прецедентом при заключении аналогичных договоров в будущем.",
+    "Цена услуг действует исключительно для данного проекта.",
+    "Согласованная цена работ не является прецедентом для будущих аналогичных договоров.",
+  ])("retains the whole explicit source price restriction under a legal heading: %s", (quote) => {
+    const input = contract(), before = collectContractProposalFacts([input]);
+    input.fragments!.push(paragraph(90, "10. Прочие условия"), paragraph(91, quote));
+    const original = structuredClone(input), after = collectContractProposalFacts([input]);
+    expect(after.facts.filter((fact) => fact.quote === quote)).toEqual([expect.objectContaining({ role: "exclusion", quote, sourceId: input.id, fragmentId: "paragraph-91" })]);
+    expect(after.facts.filter((fact) => fact.role === "aggregate-price")).toEqual(before.facts.filter((fact) => fact.role === "aggregate-price"));
+    expect(after.facts.filter((fact) => fact.quote !== quote)).toEqual(before.facts);
+    expect(input).toEqual(original);
+  });
+
+  it.each([
+    "Судебное решение не может служить прецедентом при заключении аналогичных договоров.",
+    "Стоимость судебных издержек определена только для исполнения настоящего Договора.",
+    "Согласование цены услуг не является прецедентом для будущих договоров.",
+    "Цена услуг определена для сравнения предложений.",
+    "Цена услуг применяется не только для данного проекта.",
+    "Цена услуг указана в приложении. Судебное решение не может служить прецедентом.",
+    "Цена услуг указана в договоре, а судебное решение не может служить прецедентом.",
+  ])("does not infer a price restriction from unrelated legal wording: %s", (quote) => {
+    const input = contract(); input.fragments!.push(paragraph(90, "10. Прочие условия"), paragraph(91, quote));
+    expect(collectContractProposalFacts([input]).facts.some((fact) => fact.quote === quote)).toBe(false);
+  });
+
+  it("does not join a price word to a restriction in another paragraph, source or hidden selection", () => {
+    const input = contract(); input.fragments!.push(paragraph(90, "10. Прочие условия"), paragraph(91, "Стоимость услуг указана отдельно."), paragraph(92, "Не может служить прецедентом для будущих договоров."));
+    input.fragments!.push({ ...paragraph(93, "Цена услуг действует только для данного проекта."), sheetState: "hidden" });
+    const other = { id: "foreign-legal", name: "Договор.txt", text: "Цена услуг действует только для данного проекта." };
+    expect(collectContractProposalFacts([input, other]).facts.filter((fact) => ["paragraph-91", "paragraph-92", "paragraph-93"].includes(fact.fragmentId || ""))).toEqual([]);
+    expect(collectContractProposalFacts([input, other]).facts.some((fact) => fact.sourceId === other.id)).toBe(false);
+  });
+
+  it("projects the complete original restriction with an open governing-document question, unchanged quote hashes and no price approval", async () => {
+    const input = contract(), quote = "10.2. Стоимость услуг по настоящему Договору определена только для исполнения настоящего Договора и не может служить прецедентом при заключении аналогичных договоров в будущем.", boilerplate = "10.1. Споры по настоящему Договору разрешаются в суде по месту нахождения ответчика.";
+    input.fragments!.push(paragraph(90, "10. Прочие условия"), paragraph(91, boilerplate), paragraph(92, quote));
+    const original = structuredClone(input), result = await prepareCommercialDocument({ sources: [input], sourceSnapshotKey: await taskSourceSnapshotKey([input]) });
+    expect(result.document).toBeDefined(); const document = result.document!, appendix = document.privateAppendix;
+    const clause = appendix.clauses.find((entry) => entry.quote === quote)!, coverage = appendix.coverage.find((entry) => entry.sourceClauseId === clause.id)!;
+    expect(clause).toMatchObject({ classification: "commercial", roles: ["exclusions"], quote, quoteHash: await commercialFingerprint(quote) });
+    expect(coverage.kind).toBe("projected");
+    const text = (block: CommercialBlock) => block.kind === "paragraph" ? block.content.map((part) => part.kind === "text" ? part.text : "[local reference]").join("") : block.kind === "list" ? block.items.flat().map((part) => part.kind === "text" ? part.text : "[local reference]").join("\n") : block.rows.flat(2).map((part) => part.kind === "text" ? part.text : "[local reference]").join("\n");
+    const section = document.body.sections.find((entry) => entry.kind === "exclusions")!;
+    // The existing presentation removes only the old numeric label, never a
+    // word of the source condition. The private quote stays byte-for-byte.
+    expect(section.blocks.map(text)).toContain(quote.replace(/^10\.2\.\s/u, ""));
+    const publicBody = projectCommercialBodyPublic(document.body);
+    expect(JSON.stringify(publicBody.sections)).toContain(quote.replace(/^10\.2\.\s/u, ""));
+    expect(JSON.stringify(publicBody.sections)).not.toContain(clause.id);
+    const question = document.questions.find((entry) => entry.kind === "source-reference" && entry.sourceClauseIds.includes(clause.id))!;
+    expect(question).toBeDefined(); expect(question.material).toBe(true); expect(question.sourceReferenceIds.length).toBeGreaterThan(0);
+    const price = appendix.clauses.find((entry) => /^4\.1\. Стоимость/u.test(entry.quote))!;
+    expect(appendix.coverage.find((entry) => entry.sourceClauseId === price.id)).toEqual({ sourceClauseId: price.id, kind: "external-field", field: "pricing" });
+    expect(JSON.stringify(document.body)).not.toContain("100 000,00"); expect(JSON.stringify(document.body)).not.toContain(boilerplate);
+    const privateClause = appendix.clauses.find((entry) => entry.quote === boilerplate)!;
+    expect(privateClause.classification).toBe("legal-context"); expect(appendix.coverage.find((entry) => entry.sourceClauseId === privateClause.id)?.kind).toBe("private-context");
+    expect(await validateCommercialQuoteHashes(document)).toEqual([]); expect(validateCommercialSourceProjection(document)).toEqual([]);
+    const hidden = structuredClone(document);
+    hidden.privateAppendix.coverage[hidden.privateAppendix.coverage.findIndex((entry) => entry.sourceClauseId === clause.id)] = { sourceClauseId: clause.id, kind: "private-context", reason: "Правовой заголовок не означает разрешение исключить условие." };
+    expect(validateCommercialSourceProjection(hidden).some((issue) => issue.code === "commercial-source-projection" && issue.path.endsWith(clause.id))).toBe(true);
+    const readiness = await projectReadiness(document);
+    expect(readiness.canFinalize).toBe(false); expect(readiness.activeDecisionIds).toEqual([]); expect(document.decisions).toEqual([]);
+    expect(readiness.questions.find((state) => state.question.id === question.id)?.activeDecision).toBeUndefined(); expect(input).toEqual(original);
+  });
+
   it("collects all service blocks, deliverables and whole conditional clauses without hardcoded counts", () => {
     const input = contract(), before = structuredClone(input), inventory = collectContractProposalFacts([input]);
     expect(inventory.limited).toBe(false); expect(inventory.documents).toHaveLength(1);
