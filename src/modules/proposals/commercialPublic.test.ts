@@ -84,7 +84,8 @@ function contextClause(id: string, quote: string, containerId = 'PRIVATE-contrac
 function contextAppendix(clauses: CommercialSourceClause[]): CommercialPrivateAppendix {
   const appendix: CommercialPrivateAppendix = { version: 1, sourceSnapshotKey: fingerprint, documentId: 'PRIVATE-document', extraction: { complete: true, requiresOcr: false, visualAssessment: 'unassessed' },
     containers: [{ id: 'PRIVATE-contract', sourceId: 'PRIVATE-source', kind: 'contract', heading: 'PRIVATE-heading /tmp/source' }, { id: 'PRIVATE-task', sourceId: 'PRIVATE-source', parentId: 'PRIVATE-contract', kind: 'technical-task', heading: 'PRIVATE-heading sha256:secret' }],
-    clauses: [contextClause('clause-PRIVATE-contract-heading', 'Договор'), ...clauses], references: [], coverage: [] };
+    clauses: [contextClause('clause-PRIVATE-contract-heading', 'Договор'), contextClause('clause-PRIVATE-subject-heading', '1. Предмет договора'), contextClause('clause-PRIVATE-subject', '1.1. Исполнитель оказывает комплекс услуг по проверке учебной системы.'),
+      ...clauses.filter(clause => clause.containerId === 'PRIVATE-contract'), contextClause('clause-PRIVATE-appendix', 'Приложение № 1'), contextClause('clause-PRIVATE-parent', 'к Договору'), contextClause('clause-PRIVATE-task-heading', 'Техническое задание № 1', 'PRIVATE-task'), ...clauses.filter(clause => clause.containerId === 'PRIVATE-task')], references: [], coverage: [] };
   appendix.references = collectCommercialReferences(appendix.clauses, appendix.containers);
   return appendix;
 }
@@ -149,13 +150,12 @@ describe('actionable public review cautions without private question diagnostics
     const { appendix, q, price, owner } = priceContext();
     if (variant === 'non-pricing') appendix.coverage = [{ sourceClauseId: price.id, kind: 'external-field', field: 'parties' }];
     else if (variant === 'forged-financial-tag') price.quote = '3.1. Состав услуг включает анализ документации.';
-    else if (variant === 'ambiguous') appendix.clauses.push({ ...price, id: 'clause-PRIVATE-duplicate-price' });
+    else if (variant === 'ambiguous') appendix.clauses.splice(appendix.clauses.indexOf(price) + 1, 0, { ...price, id: 'clause-PRIVATE-duplicate-price' });
     else { price.containerId = owner.containerId = variant === 'technical-task' ? 'PRIVATE-task' : 'PRIVATE-contract'; if (variant === 'unknown') appendix.containers[0].kind = 'unknown'; owner.quote = owner.quote.replace('Договора', variant === 'technical-task' ? 'ТЗ' : ''); }
     appendix.references = collectCommercialReferences(appendix.clauses, appendix.containers); q.sourceReferenceIds = appendix.references.filter(reference => reference.sourceClauseId === owner.id && reference.kind === 'clause').map(reference => reference.id);
     const output = projectCommercialReviewPublic(readiness([q]), projectCommercialBodyPublic(fixture()), 'review-draft', appendix);
-    expect(output.unresolved).toHaveLength(1); expect(output.unresolved[0].message).toContain('Исходная ссылка на пункт 3.1');
+    expect(output.unresolved).toHaveLength(1); expect(output.unresolved[0].message).toContain(variant === 'technical-task' || variant === 'unknown' ? 'Контекст исходного документа не уточнён.' : 'Исходная ссылка на пункт 3.1');
     expect(output.unresolved[0].message).not.toContain('связан с исходной ценой');
-    if (variant === 'unknown') expect(output.unresolved[0].message).toContain('вид не уточнён');
     expect(JSON.stringify(output)).not.toMatch(/PRIVATE|sha256|1000/);
   });
 

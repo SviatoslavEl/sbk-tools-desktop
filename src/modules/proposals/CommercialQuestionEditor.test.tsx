@@ -1,6 +1,6 @@
 import { isValidElement, type ReactNode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { CommercialQuestionEditor, type CommercialQuestionEditorProps } from "./CommercialQuestionEditor";
+import { CommercialQuestionEditor, commercialQuestionLabel, commercialReadableMessage, type CommercialQuestionEditorProps } from "./CommercialQuestionEditor";
 import { commercialFingerprint, commercialQuestionSourceFingerprint, type CommercialTermQuestion, type CommercialTermQuestionKind, type ProposalCommercialDocumentV1 } from "./commercialDocument";
 import { applyTermDecision, validateTermAnswer } from "./commercialDecisions";
 
@@ -64,6 +64,18 @@ async function setup(kind: CommercialTermQuestionKind = "advance-days", seed?: A
 }
 
 describe("concrete commercial question forms", () => {
+  it("consumes owner reference captions and next actions in the question and dependency labels without changing its answer lifecycle", async () => {
+    const seed = await fixture("source-reference"), related = { ...seed.question, id: "related-question" }; seed.doc.questions.push(related);
+    const ui = await setup("source-reference", seed), before = structuredClone(seed.doc);
+    const present: NonNullable<CommercialQuestionEditorProps["referencePresenter"]> = question => ({ status: "checked-reference-locations", caption: question.id === "related-question" ? "ТЗ, на которое ссылается договор" : "Договор, на который опирается ТЗ", nextAction: "Укажите применяемый договор для условий ТЗ.", context: "", referenceCount: 1, locatedReferenceCount: 0, topics: [], affectedPublicAnchors: [], action: "identify-contract-from-task" });
+    ui.props = { ...ui.props, referencePresenter: present, currentState: { question: seed.question, sourceCurrent: true, status: "blocked", dependencyFingerprint: seed.question.dependencyFingerprint, issues: [{ code: "commercial-upstream-unresolved", path: `questions.${seed.question.id}`, message: "Сначала рассмотрите связанные вопросы: related-question.", severity: "review" }] } };
+    expect(ui.text()).toContain("Договор, на который опирается ТЗ"); expect(ui.text()).toContain("ТЗ, на которое ссылается договор"); expect(ui.text()).toContain("Следующее действие: Укажите применяемый договор для условий ТЗ.");
+    expect(commercialQuestionLabel(seed.doc, seed.question)).toContain("Смысл исходных ссылок");
+    expect(commercialReadableMessage(seed.doc, "Сначала related-question.", present)).toContain("ТЗ, на которое ссылается договор");
+    expect(ui.field("Как разрешить исходные ссылки").value).toBe(""); expect(ui.onApply).not.toHaveBeenCalled(); expect(ui.props.doc).toEqual(before); expect(ui.dirty).toHaveBeenLastCalledWith(false);
+    ui.props = { ...ui.props, referencePresenter: question => ({ ...present(question), status: "unknown", caption: "PRIVATE-ignored" }) };
+    expect(ui.text()).toContain("Смысл исходных ссылок"); expect(ui.text()).not.toMatch(/PRIVATE-ignored|Следующее действие:/);
+  });
   it("shows one compact passive dependency block, retaining both distinct reasons and every code/path in details", async () => {
     const seed = await fixture("source-reference"), base = { ...seed.question, id: "question-advance-base-related", kind: "advance-base" as const }, days = { ...seed.question, id: "question-advance-days-related", kind: "advance-days" as const };
     seed.doc.questions.push(base, days);

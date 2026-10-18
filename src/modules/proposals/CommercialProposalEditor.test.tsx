@@ -10,6 +10,7 @@ import type { CommercialAnswerValidation, CommercialApplyResult, CommercialReadi
 const runtime = vi.hoisted(() => ({ index: 0, changed: false, slots: [] as Array<{ value?: unknown; deps?: readonly unknown[]; cleanup?: () => void }>, effects: [] as Array<() => void>, readiness: vi.fn(), validate: vi.fn(), apply: vi.fn() }));
 vi.mock('./commercialDecisions', () => ({ projectReadiness: runtime.readiness, validateTermAnswer: runtime.validate, applyTermDecision: runtime.apply }));
 vi.mock('react', async (original) => ({ ...await original<typeof import('react')>(),
+  useMemo: (factory: () => unknown, deps: readonly unknown[]) => { const index = runtime.index++, old = runtime.slots[index]; if (old?.deps?.length === deps.length && old.deps.every((value, i) => Object.is(value, deps[i]))) return old.value; const value = factory(); runtime.slots[index] = { value, deps }; return value; },
   useState: (initial: unknown) => { const index = runtime.index++; if (!runtime.slots[index]) runtime.slots[index] = { value: typeof initial === 'function' ? initial() : initial }; return [runtime.slots[index].value, (next: unknown) => { const value = typeof next === 'function' ? next(runtime.slots[index].value) : next; if (!Object.is(value, runtime.slots[index].value)) { runtime.slots[index].value = value; runtime.changed = true; } }]; },
   useRef: (initial: unknown) => { const index = runtime.index++; if (!runtime.slots[index]) runtime.slots[index] = { value: { current: initial } }; return runtime.slots[index].value; },
   useEffect: (effect: () => void | (() => void), deps: readonly unknown[]) => { const index = runtime.index++, old = runtime.slots[index]; if (old?.deps?.length === deps.length && old.deps.every((value, i) => Object.is(value, deps[i]))) return; runtime.slots[index] = { ...old, deps }; runtime.effects.push(() => { old?.cleanup?.(); const cleanup = effect(); runtime.slots[index].cleanup = typeof cleanup === 'function' ? cleanup : undefined; }); },
@@ -46,6 +47,14 @@ beforeEach(async () => {
 const answer = { kind: 'advance-days' as const, dayKind: 'calendar' as const };
 
 describe('commercial document sole-owner controller', () => {
+  it('reuses one source presenter across callback and local metadata renders, but replaces it for a new document snapshot', async () => {
+    const original = question().referencePresenter; expect(original).toBeTypeOf('function');
+    for (let index = 0; index < 20; index++) render({ value: { ...props.value, internalNote: `Заметка ${index}` }, onChange: vi.fn(() => true) });
+    expect(question().referencePresenter).toBe(original);
+    const doc = structuredClone(props.value.commercialDocument!); doc.revision++;
+    render({ value: { ...props.value, commercialDocument: doc } }); await flush();
+    expect(question().referencePresenter).not.toBe(original); expect(runtime.apply).not.toHaveBeenCalled();
+  });
   it('groups exact readiness messages but retains all distinct question links and reports zero applied decisions truthfully', async () => {
     const value = fixture(), doc = value.commercialDocument!;
     doc.questions = Array.from({ length: 12 }, (_, index) => ({ ...doc.questions[0], id: `question-source-reference-${index}`, kind: 'source-reference', message: 'Нужно проверить исходную ссылку.' }));

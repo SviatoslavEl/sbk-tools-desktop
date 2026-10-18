@@ -1,7 +1,6 @@
-import { COMMERCIAL_DOCUMENT_LIMITS, commercialCanonicalJson, validateCommercialBody, type CommercialBody, type CommercialInline, type CommercialIssue, type CommercialPrivateAppendix, type CommercialSourceContainer, type CommercialTermQuestion, type CommercialTermQuestionKind } from "./commercialDocument";
+import { COMMERCIAL_DOCUMENT_LIMITS, validateCommercialBody, type CommercialBody, type CommercialInline, type CommercialIssue, type CommercialPrivateAppendix, type CommercialTermQuestionKind, type ProposalCommercialDocumentV1 } from "./commercialDocument";
 import type { CommercialReadiness } from "./commercialDecisions";
-import { collectCommercialReferences } from "./commercialPreparation";
-import { collectContractProposalFacts } from "../intelligence/contractProposalFacts";
+import { createCommercialReferencePresenter } from "./commercialReferencePresentation";
 import type { ProposalPublicDocument } from "./types";
 
 /** Document-local ordinal anchors only. No private provenance identifiers are
@@ -62,70 +61,6 @@ export function publicCommercialIssueMessage(issue: Pick<CommercialIssue, 'code'
   return known[issue.code] || (questionKind ? publicCommercialQuestionMessage(questionKind) : 'Некоторые исходные условия требуют дополнительной проверки. Этот проект не готов к отправке.');
 }
 
-/** Private source material is used only to verify closed context labels. Never
- * copy a question message, quote, filename, locator or private ID into a DTO.
- * Recompute references once; persisted printed/scope labels are not evidence. */
-function sourceReferenceContext(appendix: Readonly<CommercialPrivateAppendix> | undefined): (question: Readonly<CommercialTermQuestion>) => string {
-  if (!appendix) return () => '';
-  const unique = (items: readonly { id: string }[]) => new Set(items.map(item => item.id)).size === items.length;
-  const unambiguous = unique(appendix.containers) && unique(appendix.clauses) && unique(appendix.references);
-  const containers = new Map(appendix.containers.map(container => [container.id, container]));
-  const clauses = new Map(appendix.clauses.map(clause => [clause.id, clause]));
-  const references = new Map(appendix.references.map(reference => [reference.id, reference]));
-  const coverageByClause = new Map<string, CommercialPrivateAppendix['coverage']>();
-  for (const entry of appendix.coverage) { const entries = coverageByClause.get(entry.sourceClauseId) || []; entries.push(entry); coverageByClause.set(entry.sourceClauseId, entries); }
-  const fresh = new Map(collectCommercialReferences(appendix.clauses, appendix.containers).map(reference => [reference.id, reference]));
-  // A persisted financial tag is not enough to call a referenced clause a
-  // source price. Reuse the existing independent source inventory, never a
-  // copied amount or a current-price/advance calculation.
-  const sources = [...new Set(appendix.clauses.map(clause => clause.sourceId))].map(id => {
-    const owned = appendix.clauses.filter(clause => clause.sourceId === id);
-    return { id, name: '', text: '', fragments: owned.map(clause => ({ id: clause.id, locator: clause.locator, text: clause.quote })) };
-  });
-  const inventory = collectContractProposalFacts(sources);
-  const sourcePrices = new Set(inventory.limited ? [] : inventory.facts.filter(fact => fact.role === 'aggregate-price').map(fact => fact.fragmentId));
-  const sourceKind = (kind: CommercialSourceContainer['kind'] | undefined) => kind === 'contract' ? 'исходный договор' : kind === 'technical-task' ? 'исходное ТЗ' : 'исходный документ (вид не уточнён)';
-  const targetKind = (kind: CommercialSourceContainer['kind'] | undefined) => kind === 'contract' ? 'исходного договора' : kind === 'technical-task' ? 'исходного ТЗ' : 'исходного документа (вид не уточнён)';
-  const numeric = /^\d{1,3}(?:\.\d{1,3}){0,7}(?:\s*[–—-]\s*\d{1,3}(?:\.\d{1,3}){0,7})?$/u;
-  return question => {
-    if (question.kind !== 'source-reference') return '';
-    const ids = [...new Set(question.sourceReferenceIds)], count = ` Ссылок в вопросе: ${ids.length}.`;
-    const unknown = `${count} Контекст исходного документа не уточнён.`;
-    if (!unambiguous || !ids.length) return unknown;
-    const groups = new Map<string, { description: string; count: number }>();
-    for (const id of ids) {
-      const reference = references.get(id), actual = fresh.get(id);
-      if (!reference || !actual || !question.sourceClauseIds.includes(reference.sourceClauseId)) return unknown;
-      const { localTargetIds: _privateTargets, ...sourceReference } = reference;
-      if (commercialCanonicalJson(sourceReference) !== commercialCanonicalJson(actual)) return unknown;
-      const owner = clauses.get(reference.sourceClauseId), container = owner && containers.get(owner.containerId);
-      if (!owner || !container || container.sourceId !== owner.sourceId) return unknown;
-      const destination = reference.scopeHint === 'contract' ? 'contract' : reference.scopeHint === 'technical-task' ? 'technical-task' : container.kind;
-      let description: string;
-      if (reference.kind === 'document' || reference.kind === 'event') {
-        description = `Источник: ${sourceKind(container.kind)}; ссылка на документ или связанное событие ${targetKind(destination)}. Применяемый документ и события ещё нужно согласовать.`;
-      } else {
-        if (!numeric.test(reference.printed)) return unknown;
-        const label = reference.printed.replace(/\s*[–—-]\s*/u, '–');
-        const candidate = reference.candidateClauseIds.length === 1 ? clauses.get(reference.candidateClauseIds[0]) : undefined;
-        const candidateContainer = candidate && containers.get(candidate.containerId);
-        const printedLabel = candidate && /^\s*(\d+(?:\.\d+)*)(?:[.)]|\s)/u.exec(candidate.quote)?.[1];
-        const coverage = candidate && coverageByClause.get(candidate.id);
-        const sourcePrice = reference.kind === 'clause' && !reference.localTargetIds?.length && reference.labels?.length === 1
-          && candidate?.printedLabel === label && printedLabel === label && candidate.sourceId === owner.sourceId
-          && candidateContainer?.sourceId === owner.sourceId && candidateContainer.kind === 'contract' && destination === 'contract'
-          && sourcePrices.has(candidate.id) && candidate.classification === 'financial' && coverage?.length === 1 && coverage[0].kind === 'external-field' && coverage[0].field === 'pricing';
-        description = sourcePrice
-          ? `Пункт ${label} исходного договора, не пункт этого КП; связан с исходной ценой, применимость нужно согласовать. Источник: ${sourceKind(container.kind)}.`
-          : `Исходная ссылка на ${reference.kind === 'section' ? 'раздел' : 'пункт'} ${label} ${targetKind(destination)}, не на пункт этого КП. Источник: ${sourceKind(container.kind)}.`;
-      }
-      const group = groups.get(description);
-      if (group) group.count++; else groups.set(description, { description, count: 1 });
-    }
-    return `${count} ${[...groups.values()].map(group => `${group.description}${groups.size > 1 ? ` Ссылок с этим контекстом: ${group.count}.` : ''}`).join(' ')}`;
-  };
-}
-
 /** A public draft has one actionable caution per question, with its current
  * document-local targets. Private IDs/messages are only join keys, never text.
  * Multiple diagnostics of that question become distinct safe details instead
@@ -136,11 +71,12 @@ export function projectCommercialReviewPublic(
   projection: CommercialPublicBodyProjection,
   mode: 'review-draft' | 'final',
   privateAppendix?: Readonly<CommercialPrivateAppendix>,
+  sourceDocument?: Readonly<ProposalCommercialDocumentV1>,
 ): Pick<ProposalPublicDocumentV2['commercial'], 'sections' | 'unresolved'> {
   if (mode !== 'review-draft' && mode !== 'final') throw new Error('Неизвестный режим публичного документа.');
   if (mode === 'final' && (!readiness.canFinalize || readiness.issues.length)) throw new Error('Остались нерешённые вопросы. Можно выгрузить только проект для проверки.');
   const sections = structuredClone(projection.sections), unresolved: ProposalPublicDocumentV2['commercial']['unresolved'] = [];
-  let referenceContext: ReturnType<typeof sourceReferenceContext> | undefined;
+  let referencePresenter: ReturnType<typeof createCommercialReferencePresenter> | undefined;
   const sectionAnchors = new Set(sections.map(section => section.anchor));
   const questionIssues = new Map(readiness.questions.map(state => [state.question.id, [] as CommercialIssue[]]));
   const issueOwners = new Map<string, Set<string>>();
@@ -178,14 +114,15 @@ export function projectCommercialReviewPublic(
       return `${match[1]}.${match[2]}`;
     });
     const context = targets.length ? ` ${targets.length === 1 ? 'Пункт' : 'Пункты'} ${targets.join(', ')}.` : '';
-    const base = publicCommercialQuestionMessage(state.question.kind), details = new Set<string>();
+    const genericBase = publicCommercialQuestionMessage(state.question.kind), details = new Set<string>();
     for (const issue of issues) {
       if (issue.code === 'commercial-material-question') continue;
       const message = publicCommercialIssueMessage(issue, state.question.kind);
-      details.add(message === base ? 'Есть дополнительные неуточнённые ограничения этого вопроса; их необходимо проверить перед выпуском.' : message);
+      details.add(message === genericBase ? 'Есть дополнительные неуточнённые ограничения этого вопроса; их необходимо проверить перед выпуском.' : message);
     }
-    const sourceContext = state.question.kind === 'source-reference' ? (referenceContext ||= sourceReferenceContext(privateAppendix))(state.question) : '';
-    add(section, `Вопрос ${index + 1}. ${base}${context}${sourceContext}${details.size ? ` ${[...details].join(' ')}` : ''}`);
+    const reference = state.question.kind === 'source-reference' ? (referencePresenter ||= createCommercialReferencePresenter({ appendix: privateAppendix, document: sourceDocument, anchors: projection.anchors }))(state.question) : undefined;
+    const base = reference?.status === 'checked-reference-locations' ? `${reference.caption}. ${reference.nextAction}` : genericBase;
+    add(section, `Вопрос ${index + 1}. ${base}${context}${reference?.context || ''}${details.size ? ` ${[...details].join(' ')}` : ''}`);
   }
   let genericAnchor: string | undefined;
   for (const issue of generic) {

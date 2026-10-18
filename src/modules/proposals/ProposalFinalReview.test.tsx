@@ -4,10 +4,12 @@ import { ProposalFinalReview } from "./ProposalFinalReview";
 import { createProposal } from "./defaults";
 import type { CommercialReadiness } from "./commercialDecisions";
 import type { ProposalData } from "./types";
+import { collectCommercialReferences } from "./commercialPreparation";
 
 const runtime = vi.hoisted(() => ({ index: 0, changed: false, slots: [] as Array<{ value?: unknown; deps?: readonly unknown[]; cleanup?: () => void }>, effects: [] as Array<() => void>, readiness: vi.fn() }));
 vi.mock("./commercialDecisions", () => ({ projectReadiness: runtime.readiness }));
 vi.mock("react", async (original) => ({ ...await original<typeof import("react")>(),
+  useMemo: (factory: () => unknown, deps: readonly unknown[]) => { const index = runtime.index++, old = runtime.slots[index]; if (old?.deps?.length === deps.length && old.deps.every((value, i) => Object.is(value, deps[i]))) return old.value; const value = factory(); runtime.slots[index] = { value, deps }; return value; },
   useState: (initial: unknown) => { const index = runtime.index++; if (!runtime.slots[index]) runtime.slots[index] = { value: typeof initial === "function" ? initial() : initial }; return [runtime.slots[index].value, (next: unknown) => { const value = typeof next === "function" ? next(runtime.slots[index].value) : next; if (!Object.is(value, runtime.slots[index].value)) { runtime.slots[index].value = value; runtime.changed = true; } }]; },
   useEffect: (effect: () => void | (() => void), deps: readonly unknown[]) => { const index = runtime.index++, old = runtime.slots[index]; if (old?.deps?.length === deps.length && old.deps.every((value, i) => Object.is(value, deps[i]))) return; runtime.slots[index] = { ...old, deps }; runtime.effects.push(() => { old?.cleanup?.(); const cleanup = effect(); runtime.slots[index].cleanup = typeof cleanup === "function" ? cleanup : undefined; }); },
 }));
@@ -37,6 +39,22 @@ beforeEach(() => {
 });
 
 describe("final proposal question overview", () => {
+  it("shows a specific safe reference caption and next action while keeping the exact question navigation", async () => {
+    const value = fixture(1), doc = value.commercialDocument!, quote = "Оплата осуществляется согласно ТЗ.";
+    doc.body.sections[0].blocks = [{ id: "payment-block", kind: "paragraph", style: "body", content: [{ kind: "text", text: quote }] }];
+    doc.privateAppendix.containers = [{ id: "source-contract", sourceId: "PRIVATE-source", kind: "contract", heading: "PRIVATE-heading" }];
+    doc.privateAppendix.clauses = [{ id: "clause-heading", containerId: "source-contract", sourceId: "PRIVATE-source", sourceName: "PRIVATE-name", locator: "PRIVATE-heading", quote: "Договор", quoteHash: fingerprint, roles: [], classification: "structural" },
+      { id: "clause-subject-heading", containerId: "source-contract", sourceId: "PRIVATE-source", sourceName: "PRIVATE-name", locator: "PRIVATE-subject-heading", quote: "1. Предмет договора", quoteHash: fingerprint, roles: [], classification: "structural" },
+      { id: "clause-subject", containerId: "source-contract", sourceId: "PRIVATE-source", sourceName: "PRIVATE-name", locator: "PRIVATE-subject", quote: "1.1. Исполнитель оказывает комплекс услуг по анализу учебной системы.", quoteHash: fingerprint, roles: [], classification: "commercial" },
+      { id: "clause-payment", containerId: "source-contract", sourceId: "PRIVATE-source", sourceName: "PRIVATE-name", locator: "PRIVATE-locator", quote, quoteHash: fingerprint, roles: ["payment"], classification: "commercial" }];
+    doc.privateAppendix.references = collectCommercialReferences(doc.privateAppendix.clauses, doc.privateAppendix.containers);
+    doc.privateAppendix.coverage = [{ sourceClauseId: "clause-heading", kind: "private-context", reason: "Заголовок" }, { sourceClauseId: "clause-subject-heading", kind: "private-context", reason: "Заголовок" }, { sourceClauseId: "clause-subject", kind: "private-context", reason: "Не участвует в проверке подписи" }, { sourceClauseId: "clause-payment", kind: "literal", targetBlockIds: ["payment-block"] }];
+    doc.questions[0].sourceClauseIds = ["clause-payment"]; doc.questions[0].sourceReferenceIds = doc.privateAppendix.references.filter(reference => reference.sourceClauseId === "clause-payment").map(reference => reference.id);
+    render({ value }); await flush();
+    expect(text(tree)).toContain("ТЗ, на которое ссылается договор"); expect(text(tree)).toContain("Следующее действие: Укажите применяемое ТЗ и его связь с этим предложением.");
+    expect(text(tree)).not.toContain("PRIVATE"); nodes(tree).find(node => node.type === "button")!.props.onClick!(); expect(props.onOpenQuestion).toHaveBeenCalledExactlyOnceWith("question-0");
+    expect(doc.decisions).toEqual([]);
+  });
   it("retains twelve same-caption question identities with individual destinations and separates warnings from zero decisions", async () => {
     const before = structuredClone(props.value); render(); await flush();
     const rows = nodes(tree).filter(node => node.props["data-commercial-review-question"]);

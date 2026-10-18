@@ -1,8 +1,9 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { CommercialDocumentView } from './CommercialDocumentView';
 import { CommercialQuestionEditor, commercialIssueGroups, commercialIssueMessage, commercialQuestionLabel } from './CommercialQuestionEditor';
 import { commercialCanonicalJson, type CommercialTermAnswer, type ProposalCommercialDocumentV1 } from './commercialDocument';
 import { applyTermDecision, projectReadiness, validateTermAnswer, type CommercialReadiness } from './commercialDecisions';
+import { createCommercialReferencePresenter } from './commercialReferencePresentation';
 import type { ProposalData } from './types';
 
 interface Evaluation { doc: ProposalCommercialDocumentV1; lines: ProposalData['lines']; currency: ProposalData['currency']; readiness?: CommercialReadiness; error?: string }
@@ -17,6 +18,7 @@ interface Props {
  * are made while typing, previewing a term, or recomputing local readiness. */
 export function CommercialProposalEditor(props: Props) {
   const { value, sessionKey, disabled = false } = props, doc = value.commercialDocument;
+  const referencePresenter = useMemo(() => doc ? createCommercialReferencePresenter({ appendix: doc.privateAppendix, document: doc }) : undefined, [doc]);
   const [evaluation, setEvaluation] = useState<Evaluation | null>(null);
   const latest = useRef(props), pending = useRef(new Map<string, boolean>()), callbackOwner = useRef(sessionKey), pendingCallbacks = useRef(new Map<string, (dirty: boolean) => void>());
   latest.current = props;
@@ -76,13 +78,13 @@ export function CommercialProposalEditor(props: Props) {
   return <>
     {!ready ? <p role="status">Проверяем связи и актуальность условий…</p> : ready.error ? <p className="notice error" role="alert">{ready.error} Сохранённый документ не изменён.</p> : ready.readiness && <details className="notice warning"><summary>{ready.readiness.canFinalize ? 'Связи исходных условий проверены' : 'Остаются вопросы для проверки'} · сохранить рабочий проект можно отдельно</summary><p>Это локальная проверка содержания, не разрешение раскрывать конфиденциальную информацию и не подтверждение сохранения или отправки.</p><p>Вопросов без действующего решения: {unresolvedQuestions} из {ready.readiness.questions.length}. Действующих применённых решений: {ready.readiness.activeDecisionIds.length}.</p><ul>{commercialIssueGroups(ready.readiness.issues).map(({ key, issue, entries }) => {
       const related = doc.questions.filter((question, index) => entries.some((entry) => entry.path === `questions.${question.id}` || entry.path === `questions[${index}]`));
-      return <li key={key} data-issue-paths={entries.map((entry) => entry.path).join(' ')}>{commercialIssueMessage(doc, issue)}{entries.length > 1 && <span> · замечаний: {entries.length}</span>}{related.length > 0 && <details><summary>Связанные вопросы: {related.length}</summary><ul>{related.map((question) => <li key={question.id} data-question-id={question.id}><a href={`#commercial-question-${question.id}`}>{commercialQuestionLabel(doc, question)}</a></li>)}</ul></details>}</li>;
+      return <li key={key} data-issue-paths={entries.map((entry) => entry.path).join(' ')}>{commercialIssueMessage(doc, issue, referencePresenter)}{entries.length > 1 && <span> · замечаний: {entries.length}</span>}{related.length > 0 && <details><summary>Связанные вопросы: {related.length}</summary><ul>{related.map((question) => <li key={question.id} data-question-id={question.id}><a href={`#commercial-question-${question.id}`}>{commercialQuestionLabel(doc, question, referencePresenter)}</a></li>)}</ul></details>}</li>;
     })}</ul></details>}
     <CommercialDocumentView value={doc} readOnly={disabled} onPendingEditChange={pendingCallback('body')} onChange={(next) => {
       const current = latest.current;
       if (current.disabled || current.sessionKey !== sessionKey || current.value.commercialDocument !== doc) return false;
       return current.onChange({ ...current.value, commercialDocument: next });
-    }} renderQuestion={(question) => <CommercialQuestionEditor key={question.id} doc={doc} question={question} disabled={disabled || !ready?.readiness} currentState={ready?.readiness?.questions.find((state) => state.question.id === question.id)} activeStages={activeStages} onDirtyChange={pendingCallback(`question:${question.id}`)} onPreview={async (answer) => {
+    }} renderQuestion={(question) => <CommercialQuestionEditor key={question.id} doc={doc} question={question} referencePresenter={referencePresenter} disabled={disabled || !ready?.readiness} currentState={ready?.readiness?.questions.find((state) => state.question.id === question.id)} activeStages={activeStages} onDirtyChange={pendingCallback(`question:${question.id}`)} onPreview={async (answer) => {
       const result = await withAnswer(question.id, answer, false);
       if (typeof result === 'boolean') throw new Error('Проверка вернула неверный формат.');
       return result;

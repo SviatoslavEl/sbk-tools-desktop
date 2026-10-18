@@ -1,7 +1,8 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { commercialIssueGroups, commercialIssueMessage, commercialQuestionLabel, commercialReadableMessage } from "./CommercialQuestionEditor";
 import { projectReadiness, type CommercialReadiness } from "./commercialDecisions";
 import type { CommercialIssue, ProposalCommercialDocumentV1 } from "./commercialDocument";
+import { createCommercialReferencePresenter } from "./commercialReferencePresentation";
 import type { ProposalData, ProposalIssue } from "./types";
 
 interface Evaluation {
@@ -20,6 +21,7 @@ interface Props {
  * start more work. Old source/document/session results are never displayed. */
 export function ProposalFinalReview({ sessionKey, value, proposalIssueCount, onOpenQuestion, onOpenSection, onOpenIssue }: Props) {
   const doc = value.commercialDocument, [evaluation, setEvaluation] = useState<Evaluation | null>(null);
+  const referencePresenter = useMemo(() => doc ? createCommercialReferencePresenter({ appendix: doc.privateAppendix, document: doc }) : undefined, [doc]);
   useEffect(() => {
     let alive = true;
     if (!doc) { setEvaluation(null); return () => { alive = false; }; }
@@ -50,7 +52,7 @@ export function ProposalFinalReview({ sessionKey, value, proposalIssueCount, onO
   const openIssue = (issue: CommercialIssue) => {
     const coverage = doc.privateAppendix.coverage.find(entry => issue.path === `privateAppendix.coverage.${entry.sourceClauseId}`);
     if (coverage?.kind === "external-field") {
-      onOpenIssue({ field: coverage.field === "pricing" ? "sourceFinancials" : "issuer.name", step: coverage.field === "pricing" ? 2 : 1, severity: "warning", message: commercialIssueMessage(doc, issue) });
+      onOpenIssue({ field: coverage.field === "pricing" ? "sourceFinancials" : "issuer.name", step: coverage.field === "pricing" ? 2 : 1, severity: "warning", message: commercialIssueMessage(doc, issue, referencePresenter) });
     } else onOpenSection(doc.body.sections.some(section => section.id === issue.sectionId) ? issue.sectionId : undefined);
   };
   return <section aria-label="Общая проверка коммерческого документа">
@@ -58,12 +60,13 @@ export function ProposalFinalReview({ sessionKey, value, proposalIssueCount, onO
     <p>Замечаний к реквизитам и расчётам: {proposalIssueCount}. Открытых коммерческих вопросов: {questions.length} из {doc.questions.length}. Действующих применённых решений: {readiness.activeDecisionIds.length}.</p>
     <p className="help-text">Замечания не являются решениями. Сохранение рабочего проекта не означает готовность к отправке; право на окончательный выпуск проверяется заново при создании файла.</p>
     {questions.length > 0 ? <ul className="proposal-issues">{questions.map(({ question, state, issues }) => <li key={question.id} className="warning" data-commercial-review-question={question.id}>
-      <button type="button" onClick={() => onOpenQuestion(question.id)}>Открыть {commercialQuestionLabel(doc, question)}</button>
-      <p>{commercialReadableMessage(doc, question.message)}</p>
+      <button type="button" onClick={() => onOpenQuestion(question.id)}>Открыть {commercialQuestionLabel(doc, question, referencePresenter)}</button>
+      <p>{commercialReadableMessage(doc, question.message, referencePresenter)}</p>
+      {question.kind === "source-reference" && referencePresenter?.(question).status === "checked-reference-locations" && <p className="help-text">Следующее действие: {referencePresenter(question).nextAction}</p>}
       {state?.activeDecision && <small>Решение применено, но связанные замечания ещё требуют проверки.</small>}
       {!state && <small>Проверка этого вопроса не завершена; он не считается решённым.</small>}
-      {issues.length > 0 && <details><summary>Связанные замечания</summary><ul>{commercialIssueGroups(issues).map(({ key, issue }) => <li key={key}>{commercialIssueMessage(doc, issue)}</li>)}</ul></details>}
+      {issues.length > 0 && <details><summary>Связанные замечания</summary><ul>{commercialIssueGroups(issues).map(({ key, issue }) => <li key={key}>{commercialIssueMessage(doc, issue, referencePresenter)}</li>)}</ul></details>}
     </li>)}</ul> : <p>Открытых коммерческих вопросов нет. Это не заменяет остальные проверки перед выпуском.</p>}
-    {generic.length > 0 && <details><summary>Другие проверки документа: {generic.length}</summary><ul className="proposal-issues">{generic.map(({ key, issue, entries }) => <li key={key} className="warning"><button type="button" onClick={() => openIssue(issue)}>Открыть проверку: {commercialIssueMessage(doc, issue)}</button>{entries.length > 1 && <small> · замечаний: {entries.length}</small>}</li>)}</ul></details>}
+    {generic.length > 0 && <details><summary>Другие проверки документа: {generic.length}</summary><ul className="proposal-issues">{generic.map(({ key, issue, entries }) => <li key={key} className="warning"><button type="button" onClick={() => openIssue(issue)}>Открыть проверку: {commercialIssueMessage(doc, issue, referencePresenter)}</button>{entries.length > 1 && <small> · замечаний: {entries.length}</small>}</li>)}</ul></details>}
   </section>;
 }
