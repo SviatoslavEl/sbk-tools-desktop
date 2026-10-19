@@ -18,6 +18,7 @@ from lxml import etree
 
 from scandocument.tempfiles import SecureWorkspace
 from scandocument.pdf_table_layout import extract_pdf_table_rows
+from scandocument.document_structure import DocxStructure
 from scandocument.validation import MAX_FILE_BYTES, MAX_PAGES, validate_docx_archive
 
 
@@ -249,6 +250,8 @@ def _docx(path: Path) -> tuple[str, list[dict], list[str], dict]:
         body = _xml(archive, "word/document.xml").find(f"{{{NS_WORD}}}body")
         if body is None:
             raise ValueError("DOCX повреждён или имеет неподдерживаемую структуру.")
+        structure = DocxStructure(body, _xml(archive, "word/styles.xml") if "word/styles.xml" in names else None,
+                                  max_fragments=MAX_FRAGMENTS, max_characters=MAX_EXTRACTED_CHARS)
         paragraph_index = 0
         row_index = 0
         for element in body.iter():
@@ -259,7 +262,8 @@ def _docx(path: Path) -> tuple[str, list[dict], list[str], dict]:
                 text = _word_text(element, references).strip()
                 if text:
                     fragments.append({"id": f"paragraph-{paragraph_index}", "locator": f"Абзац {paragraph_index}",
-                                      "section": f"Абзац {paragraph_index}", "text": text})
+                                      "section": f"Абзац {paragraph_index}", "text": text,
+                                      "structure": structure.describe(element, kind="paragraph", order=len(fragments), text=text)})
             elif element.tag == f"{{{NS_WORD}}}tr":
                 if any(ancestor.tag == f"{{{NS_WORD}}}tr" for ancestor in element.iterancestors()):
                     continue
@@ -267,21 +271,28 @@ def _docx(path: Path) -> tuple[str, list[dict], list[str], dict]:
                 text = _word_text(element, references).strip("\n")
                 if text.strip():
                     fragments.append({"id": f"table-row-{row_index}", "locator": f"Таблица, строка {row_index}",
-                                      "section": "Таблица", "text": text})
+                                      "section": "Таблица", "text": text,
+                                      "structure": structure.describe(element, kind="table-row", order=len(fragments), text=text,
+                                                                      cell_text=lambda cell: _word_text(cell, references).strip("\n"))})
         header_footer_names = sorted(name for name in names if (name.startswith("word/header") or name.startswith("word/footer")) and name.endswith(".xml"))
         for index, name in enumerate(header_footer_names, 1):
             kind = "Верхний колонтитул" if "/header" in name else "Нижний колонтитул"
-            text = _word_text(_xml(archive, name), references).strip()
+            root = _xml(archive, name)
+            structure.add_part(name, root)
+            text = _word_text(root, references).strip()
             if text:
                 fragments.append({"id": f"section-{index}", "locator": f"Раздел {index}: {kind}",
-                                  "section": f"Раздел {index}", "text": text})
+                                  "section": f"Раздел {index}", "text": text,
+                                  "structure": structure.describe(root, kind="header-footer", order=len(fragments), text=text)})
         for kind, note_ids in references.items():
             if not note_ids:
                 continue
             part = f"word/{'footnotes' if kind == 'footnote' else 'endnotes'}.xml"
             if part not in names:
                 raise ValueError("DOCX содержит ссылку на отсутствующую часть со сносками.")
-            notes = {note.attrib.get(f"{{{NS_WORD}}}id"): note for note in _xml(archive, part)
+            root = _xml(archive, part)
+            structure.add_part(part, root)
+            notes = {note.attrib.get(f"{{{NS_WORD}}}id"): note for note in root
                      if note.tag == f"{{{NS_WORD}}}{kind}"}
             for note_id in list(note_ids):
                 note = notes.get(note_id)
@@ -290,7 +301,8 @@ def _docx(path: Path) -> tuple[str, list[dict], list[str], dict]:
                 label = f"{('Сноска' if kind == 'footnote' else 'Концевая сноска')} {note_id}"
                 text = _word_text(note, references).strip()
                 fragments.append({"id": f"{kind}-{note_id}", "locator": label, "section": "Сноски",
-                                  "noteId": note_id, "noteType": kind, "text": f"[{label}] {text}"})
+                                  "noteId": note_id, "noteType": kind, "text": f"[{label}] {text}",
+                                  "structure": structure.describe(note, kind="note", order=len(fragments), text=text)})
     return "application/vnd.openxmlformats-officedocument.wordprocessingml.document", fragments, [], _coverage()
 
 

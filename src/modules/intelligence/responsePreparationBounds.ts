@@ -1,5 +1,6 @@
 import type { IntelligenceSource } from "./workbenchTypes";
 import { validPdfGridFragment } from "./pdfGrid";
+import { validDocxFragmentStructure } from "./documentStructure";
 
 /** Shared send/parse boundary, not an import limit or promise of extraction
  * completeness. One source may use the whole fragment budget, never exceed it. */
@@ -63,9 +64,10 @@ export function assertResponsePreparationSources(value: unknown): asserts value 
     if (source.fragments !== undefined) {
       if (Array.isArray(source.fragments) && source.fragments.length > limits.fragmentsPerSource) throw new Error(`${name}: ${source.fragments.length} фрагментов, предел — ${limits.fragmentsPerSource}. Выберите меньше листов или разделите документ. Ничего не усечено.`);
       if (!array(source.fragments, limits.fragmentsPerSource, (fragment) => object(fragment)
-        && keys(fragment, ["id", "locator", "text", "sheetId", "sheetState", "includedByUser", "pdfGrid", ...fragmentMetadata])
+        && keys(fragment, ["id", "locator", "text", "sheetId", "sheetState", "includedByUser", "pdfGrid", "structure", ...fragmentMetadata])
         && boundedText(fragment.locator, 20_000) && boundedText(fragment.text, limits.snapshotBytes)
         && optional(fragment, "pdfGrid", () => validPdfGridFragment(fragment) && metadata(fragment.pdfGrid))
+        && optional(fragment, "structure", () => validDocxFragmentStructure(fragment.structure, fragment.text as string) && metadata(fragment.structure))
         && fragmentMetadata.every((key) => optional(fragment, key, (entry) => metadata(entry)))
         && optional(fragment, "id", id) && optional(fragment, "sheetId", id)
         && optional(fragment, "sheetState", (entry) => ["visible", "hidden", "veryHidden"].includes(String(entry)))

@@ -6,6 +6,7 @@ import type { ProposalSourceFinancialCandidate } from "../proposals/sourcePricin
 import type { ProposalSourcePartyCandidate } from "./proposalSourceParties";
 import type { StaffData } from "../staff/types";
 import type { TaskDocumentOrigin } from "./taskDocumentSession";
+import type { DocxFragmentStructure } from "./documentStructure";
 
 export type IntelligenceDestination = "procurement" | "contracts" | "staff" | "counterparties" | "proposals";
 export type IntelligenceFieldValue = string | number | boolean | string[];
@@ -24,6 +25,8 @@ export interface IntelligenceFragment {
   text: string;
   /** Closed vector-grid cells from the same immutable PDF extraction snapshot. */
   pdfGrid?: PdfGridRow;
+  /** Additive native structure. No inferred header/section semantics. */
+  structure?: DocxFragmentStructure;
   sheetId?: string;
   sheetState?: "visible" | "hidden" | "veryHidden";
   /** Explicit opt-in for hidden sheets; false on visible sheets means default inclusion. */
