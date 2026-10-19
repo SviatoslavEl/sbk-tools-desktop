@@ -10,6 +10,8 @@ import { repairDateFromSource } from "./sourceRepairs";
 import { AutomaticConditionsSummary } from "./AutomaticConditionsSummary";
 import { runProposalQuotePreparation, runResponsePreparation, type ResponsePreparationRequest } from "./responsePreparationWorker";
 import { ProposalAnalysisProvenance } from "./ProposalAnalysisProvenance";
+import { ProposalWholeDraftWorkspace, type ProposalWholeDraftWorkspaceProps } from "./ProposalWholeDraftWorkspace";
+import { PROPOSAL_AREAS } from "./proposalAreaPlan";
 import { buildProposalQuotePlan, isProposalQuoteSelectionCandidate } from "./proposalQuotePlan";
 import type { ProposalQuotePreparationWireRequest, ProposalQuoteProvenance } from "./proposalQuotePreparation";
 import { runEvidenceAudit, type EvidenceAuditRequest, type EvidenceAuditReply } from "./evidenceAuditWorker";
@@ -60,7 +62,7 @@ function control(id: string) { const found = nodes().find((node) => node.props.i
 function labeled(label: string) { const found = nodes().find((node) => node.props["aria-label"] === label); if (!found) throw new Error(`Элемент не найден: ${label}`); return found; }
 function sourceId(name: string) { const found = nodes().find((node) => node.type === "li" && text(node.props.children).includes(name)); if (!found?.key) throw new Error(`Источник не найден: ${name}`); return String(found.key); }
 function field(key: string) { const found = nodes().find((node) => typeof node.props.id === "string" && /^iw-[0-9a-f]{8}-/.test(node.props.id) && node.props.id.endsWith(`-${key}`)); if (!found) throw new Error(`Поле карточки не найдено: ${key}`); return found; }
-async function selectPreparationMethod(method: "model" | "source-contract") { labeled(method === "model" ? "Подготовка с ИИ" : "Локальная подготовка по полному договору").props.onChange!({ target: { value: method, checked: true } }); await flush(); }
+async function selectPreparationMethod(method: "model" | "source-contract" | "whole-proposal") { labeled(method === "model" ? "Подготовка с ИИ" : method === "whole-proposal" ? "Полный черновик КП по семи областям" : "Локальная подготовка по полному договору").props.onChange!({ target: { value: method, checked: true } }); await flush(); }
 async function click(label: string) { if (label === "Подготовить по договору без модели") await selectPreparationMethod("source-contract"); button(label).props.onClick!(); await flush(); }
 function goalPicker(): TaskGoalPickerProps { return nodes().find((node) => node.type === TaskGoalPicker)!.props as unknown as TaskGoalPickerProps; }
 async function selectGoals(...selected: IntelligenceDestination[]) { goalPicker().onChange(selected); await flush(); }
@@ -367,6 +369,123 @@ describe("explicit local proposal preparation from a complete contract", () => {
     await selectGoals("proposals"); await selectPreparationMethod("source-contract"); expect(button(localAction).props.disabled).toBe(true);
     await addContract(); expect(button(localAction).props.disabled).toBe(false);
     await selectGoals("proposals", "staff"); expect(nodes().some((node) => node.type === "button" && text(node) === localAction)).toBe(false);
+  });
+});
+
+describe("seven-area whole proposal route — synthetic callback integration, not GUI or model acceptance", () => {
+  const sourceName = "Синтетический структурированный договор.docx", previousRaw = "KEEP-MANUAL-RAW-EXACT";
+  const cards = () => nodes().filter(node => node.props.className === "iw-card");
+  const editor = () => nodes().find(node => node.type === ProposalWholeDraftWorkspace)?.props as unknown as ProposalWholeDraftWorkspaceProps | undefined;
+  async function until(done: () => boolean) {
+    for (let turn = 0; turn < 250 && !done(); turn++) { await new Promise<void>(resolve => setTimeout(resolve, 0)); await flush(); }
+    expect(done()).toBe(true);
+  }
+  async function setup(options: { native?: boolean; complete?: boolean; excluded?: boolean; hidden?: boolean } = {}) {
+    await configureModel(); await selectGoals("proposals");
+    runtime.chooseOpen.mockResolvedValueOnce("/qa/seven-area.docx");
+    runtime.invoke.mockResolvedValueOnce({ fileName: sourceName, extractedText: "SOURCE_ONLY_NEVER_APPEND", sha256: "b".repeat(64),
+      coverage: { complete: options.complete !== false, requiresOcr: false }, warnings: [],
+      fragments: [{ id: "whole-owner", locator: "Учебный абзац", text: "SOURCE_ONLY_NEVER_APPEND", ...(options.excluded ? { includedByUser: false } : {}), ...(options.hidden ? { sheetState: "hidden" } : {}), ...(options.native === false ? {} : { structure: {
+        version: 1, format: "docx", method: "ooxml", part: "word/document.xml", kind: "paragraph", containerId: "body", order: 0, physicalSection: 0,
+      } }) }] });
+    await click("Добавить PDF, DOCX или XLSX"); await edit("iw-response", previousRaw);
+  }
+  function reply(schema: Record<string, unknown>, badReview = false) {
+    const properties = schema.properties as Record<string, { enum?: string[] }>, review = "reviewPlanKey" in properties;
+    return { model: "synthetic-callback-only", text: JSON.stringify({
+      ...Object.fromEntries(Object.entries(properties).filter(([key]) => key !== "areas").map(([key, value]) => [key, value.enum![0]])),
+      areas: Object.fromEntries(PROPOSAL_AREAS.map(area => [area, review ? { verdict: badReview && area === "payment" ? "unsupported" : "supported", reason: "Synthetic reviewer, not accuracy evidence." }
+        : { status: "answered", answer: `  SYNTHETIC_WHOLE_${area}\r\nNo source completion.  `, evidenceRefs: [{ ownerId: "whole-owner", cellIndex: null }] }])),
+    }) };
+  }
+  async function begin() { await selectPreparationMethod("whole-proposal"); preparationButton().props.onClick!(); await flush(); }
+  function mockReplies() { runtime.analyze.mockImplementation((_profile: unknown, _prompt: string, _key: unknown, _request: string, schema: Record<string, unknown>) => Promise.resolve(reply(schema))); }
+
+  it("requires an explicit complete-native source and confirmation, never falls back for an ineligible source", async () => {
+    await setup({ native: false }); expect(labeled("Полный черновик КП по семи областям").props.disabled).toBe(true);
+    await selectPreparationMethod("whole-proposal"); expect(preparationButton().props.disabled).toBe(true); expect(runtime.analyze).not.toHaveBeenCalled();
+    expect(text()).toContain("исходной структурой"); expect(editor()).toBeUndefined();
+  });
+
+  it("discloses request/time/payload cost before any call and leaves the method opt-in", async () => {
+    await setup(); expect(preparationButton().props.disabled).toBe(true); await begin();
+    const confirmation = nodes().find(node => node.type === ConfirmDialog)!;
+    expect(confirmation.props.title).toBe("Подготовить черновик по семи областям?");
+    const message = (confirmation.props as unknown as { message: string }).message;
+    for (const cap of ["128", "20 минут", "4 МиБ", "2 МиБ", "без сохранения"]) expect(message).toContain(cap);
+    expect(runtime.analyze).not.toHaveBeenCalled(); confirmation.props.onClose!(); await flush(); expect(runtime.analyze).not.toHaveBeenCalled(); expect(control("iw-response").props.value).toBe(previousRaw);
+  });
+
+  it("runs all seven areas and separate review, atomically opens a private draft and preserves old cards/manual response without a worker/source tail", async () => {
+    await setup(); await edit("iw-new-destination", "staff"); await click("Добавить карточку вручную"); const before = cards().map(card => card.key);
+    const workers = holdPreparations(); mockReplies(); await begin(); await confirm(); await until(() => Boolean(editor()));
+    expect(runtime.analyze).toHaveBeenCalledTimes(2); const calls = runtime.analyze.mock.calls;
+    expect(Object.keys(calls[0][4].properties.areas.properties)).toEqual(PROPOSAL_AREAS);
+    expect(calls[1][4].properties).toHaveProperty("reviewPlanKey"); expect(calls.every(call => !call[4].properties.items && !call[4].properties.units)).toBe(true);
+    const value = editor()!; expect(value.stale).toBe(false); expect(value.handoff.sections.map(section => section.area)).toEqual(PROPOSAL_AREAS);
+    expect(value.handoff.sections.flatMap(section => section.blocks.map(block => block.text))).toEqual(PROPOSAL_AREAS.map(area => `  SYNTHETIC_WHOLE_${area}\r\nNo source completion.  `));
+    expect(JSON.stringify(value.handoff.sections)).not.toContain("SOURCE_ONLY_NEVER_APPEND"); expect(value.handoff.readyForClient).toBe(false);
+    expect(cards().map(card => card.key)).toEqual(before); expect(control("iw-response").props.value).toBe(previousRaw); expect(workers).toHaveLength(0); expect(transfer).not.toHaveBeenCalled();
+    expect(runtime.invoke.mock.calls.map(([command]) => command)).toEqual(["scanner_run"]); expect(text()).toContain("Ответы полного черновика"); expect(text()).not.toContain("Исходные ответы выбора цитат");
+  });
+
+  it("stops locally on cancel even if the native provider promise remains in flight, and never installs its late reply", async () => {
+    await setup(); const waiting = deferred<{ text: string; model: string }>(); runtime.analyze.mockReturnValueOnce(waiting.promise);
+    await begin(); await confirm(); await until(() => runtime.analyze.mock.calls.length === 1); const call = runtime.analyze.mock.calls[0];
+    await click("Остановить запрос"); await until(() => Boolean(nodes().find(node => node.props["aria-label"] === "Незавершённый полный черновик")));
+    expect(runtime.cancel).toHaveBeenCalledWith(call[3]); expect(editor()).toBeUndefined(); expect(text(preparationButton())).toBe("Подготовить полный черновик КП");
+    waiting.resolve(reply(call[4])); await flush(); await flush(); expect(runtime.analyze).toHaveBeenCalledTimes(1); expect(editor()).toBeUndefined(); expect(control("iw-response").props.value).toBe(previousRaw);
+  });
+
+  it("retains already received raw when a source change cancels the following review, without installing a partial or stale draft", async () => {
+    await setup(); const waiting = deferred<{ text: string; model: string }>(); let raw = "";
+    runtime.analyze.mockImplementationOnce((_profile: unknown, _prompt: string, _key: unknown, _id: string, schema: Record<string, unknown>) => { const result = reply(schema); raw = result.text; return Promise.resolve(result); }).mockReturnValueOnce(waiting.promise);
+    await begin(); await confirm(); await until(() => runtime.analyze.mock.calls.length === 2);
+    await editLabeled(`Текст источника ${sourceName}`, "Changed native source removes its source proof.");
+    await until(() => text().includes("полученные ответы (1)"));
+    const failure = labeled("Незавершённый полный черновик"); expect(text(failure)).toContain(raw); expect(editor()).toBeUndefined();
+    waiting.resolve(reply(runtime.analyze.mock.calls[1][4])); await flush(); expect(runtime.analyze).toHaveBeenCalledTimes(2); expect(editor()).toBeUndefined(); expect(control("iw-response").props.value).toBe(previousRaw);
+  });
+
+  it.each(["access", "pause", "workspace", "profile"] as const)("cancels pending work promptly on %s snapshot change without waiting for provider completion", async change => {
+    await setup(); const waiting = deferred<{ text: string; model: string }>(); runtime.analyze.mockReturnValueOnce(waiting.promise);
+    await begin(); await confirm(); await until(() => runtime.analyze.mock.calls.length === 1); const call = runtime.analyze.mock.calls[0];
+    if (change === "access") { runtime.editor = false; render(); }
+    else if (change === "pause") { runtime.phase = "paused"; render(); }
+    else if (change === "profile") await edit("iw-model", "different-synthetic-model");
+    else render({ ...props, workspaceRoot: "/different-whole-workspace" });
+    await flush(); expect(runtime.cancel).toHaveBeenCalledWith(call[3]); expect(text(preparationButton())).toBe("Подготовить полный черновик КП"); expect(editor()).toBeUndefined();
+    waiting.resolve(reply(call[4])); await flush(); await flush(); expect(runtime.analyze).toHaveBeenCalledTimes(1); expect(editor()).toBeUndefined(); expect(transfer).not.toHaveBeenCalled();
+  });
+
+  it("keeps a previous whole draft readable but stale after editing its source, without merging source text into it", async () => {
+    await setup(); mockReplies(); await begin(); await confirm(); await until(() => Boolean(editor())); const original = editor()!.handoff;
+    await editLabeled(`Текст источника ${sourceName}`, "Replacement source text.");
+    expect(editor()!.handoff).toBe(original); expect(editor()!.stale).toBe(true); expect(original.sections[0].blocks[0].text).not.toContain("Replacement");
+  });
+
+  it.each(["excluded", "hidden"] as const)("fails complete native preflight for a %s owner without a legacy request or source-tail fallback", async variant => {
+    await setup({ [variant]: true }); await begin(); await confirm(); await until(() => text().includes("Подготовка полного черновика остановлена"));
+    expect(runtime.analyze).not.toHaveBeenCalled(); expect(editor()).toBeUndefined(); expect(control("iw-response").props.value).toBe(previousRaw);
+  });
+
+  it("warns that successful re-preparation replaces manual whole-draft edits and preserves them on confirmation cancellation", async () => {
+    await setup(); mockReplies(); await begin(); await confirm(); await until(() => Boolean(editor())); const original = editor()!.handoff;
+    original.sections[0].userText = "My unsaved session-only addition.";
+    await begin(); const confirmation = nodes().find(node => node.type === ConfirmDialog)!;
+    const message = (confirmation.props as unknown as { message: string }).message;
+    expect(message).toContain("предыдущий полный черновик КП будет заменён"); expect(message).toContain("ручные правки блоков"); expect(message).toContain("будут потеряны");
+    confirmation.props.onClose!(); await flush(); expect(editor()!.handoff).toBe(original); expect(original.sections[0].userText).toBe("My unsaved session-only addition."); expect(runtime.analyze).toHaveBeenCalledTimes(2);
+  });
+
+  it("rejects a malformed reviewer reply, preserves the previous whole draft, and displays each failed raw only once under its run identity", async () => {
+    await setup(); mockReplies(); await begin(); await confirm(); await until(() => Boolean(editor())); const original = editor()!.handoff;
+    runtime.analyze.mockImplementation((_profile: unknown, _prompt: string, _key: unknown, _id: string, schema: Record<string, unknown>) => Promise.resolve("reviewPlanKey" in (schema.properties as object) ? { text: "MALFORMED_REVIEW_NO_FALLBACK", model: "synthetic" } : reply(schema)));
+    await begin(); await confirm(); await until(() => Boolean(nodes().find(node => node.props["aria-label"] === "Незавершённый полный черновик")));
+    expect(runtime.analyze).toHaveBeenCalledTimes(4); expect(editor()!.handoff).toBe(original); expect(control("iw-response").props.value).toBe(previousRaw);
+    expect(text(labeled("Незавершённый полный черновик"))).toContain("проход №2");
+    expect(text().split("MALFORMED_REVIEW_NO_FALLBACK")).toHaveLength(2); expect(nodes().filter(node => node.props.className === "iw-analysis-parts")).toEqual([]);
+    expect(button("Разобрать ответ").props.disabled).toBe(true); expect(button("Скопировать запрос для другой модели").props.disabled).toBe(true); expect(text()).toContain("Ручной JSON items — отдельный прежний формат");
   });
 });
 
