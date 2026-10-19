@@ -146,6 +146,7 @@ export function createWorkingStorageServices(io: WorkingStorageIO, options: {
     async save({ binding, document, expectedStorageToken }, signal) {
       nullableToken(expectedStorageToken); const submitted = await body(binding, document, signal), recovery = recoveries.get(document.id);
       const consumeAutosave = recovery ? { ownerId: recovery.ownerId, storageToken: recovery.token, bodySha256: recovery.bodySha } : null;
+      gate(binding, signal, true); // Recheck AFTER the outer await, immediately before sending the write.
       const raw = await io.invoke('proposal_working_save', { request: { scope: mutationScope(binding), id: document.id, expectedStorageToken,
         submittedBodySha256: submitted.bodySha, documentJson: submitted.documentJson, historyJson: submitted.historyJson, consumeAutosave } }); gate(binding, signal, true);
       const saved = receipt(raw, binding, 'saved', expectedStorageToken, submitted.bodySha, document);
@@ -163,6 +164,7 @@ export function createWorkingStorageServices(io: WorkingStorageIO, options: {
     async autosave({ binding, document, autosaveOwnerId, expectedAutosaveToken, baseRecordStorageToken }, signal) {
       token(autosaveOwnerId); nullableToken(expectedAutosaveToken); nullableToken(baseRecordStorageToken);
       const submitted = await body(binding, document, signal);
+      gate(binding, signal, true); // The last inner body() check does not cover this continuation.
       const raw = await io.invoke('proposal_working_autosave', { request: { scope: mutationScope(binding), id: document.id, ownerId: autosaveOwnerId,
         expectedStorageToken: expectedAutosaveToken, baseRecordStorageToken, submittedBodySha256: submitted.bodySha, documentJson: submitted.documentJson, historyJson: submitted.historyJson } }); gate(binding, signal, true);
       const saved = receipt(raw, binding, 'autosaved', expectedAutosaveToken, submitted.bodySha, document); if (saved.consumedAutosave !== null) error();

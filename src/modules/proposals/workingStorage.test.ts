@@ -168,6 +168,41 @@ describe('working native bridge — synthetic I/O contract, not native/GUI/quali
     const services = createWorkingStorageServices(lateIO, { current: () => fresh }), result = services.save({ binding: bound, document, expectedStorageToken: null }, signal());
     await started.promise; fresh = false; pending.resolve(null); await expect(result).rejects.toThrow(/устарела/); expect(lateIO.invoke).toHaveBeenCalledTimes(1);
   });
+  it.each([
+    { method: 'save', invalidate: 'abort' }, { method: 'save', invalidate: 'current' },
+    { method: 'autosave', invalidate: 'abort' }, { method: 'autosave', invalidate: 'current' },
+  ] as const)('rechecks $method before native write when $invalidate changes in the outer await continuation gap', async ({ method, invalidate }) => {
+    const document = ordinary(), bound = await binding(document), controller = new AbortController();
+    const events: string[] = []; let fresh = true, checks = 0, lastInnerAccepted = false, invalidationRan = false, writes = 0;
+    const io = mockIO((command, args) => {
+      writes++; events.push('native-write');
+      expect(command).toBe(method === 'save' ? 'proposal_working_save' : 'proposal_working_autosave');
+      return writeReceipt(request(args), method === 'save' ? 'saved' : 'autosaved');
+    });
+    const services = createWorkingStorageServices(io, { current: () => {
+      const accepted = fresh; checks++; events.push(`current:${checks}:${accepted}`);
+      // No initialHistory: check #2 is body's LAST post-digest gate. It
+      // accepts TRUE; only its queued microtask invalidates the outer caller.
+      // An old implementation would WRITE once and fail only after that I/O.
+      if (checks === 2) {
+        lastInnerAccepted = accepted;
+        queueMicrotask(() => {
+          invalidationRan = true; events.push(`invalidate:${invalidate}`);
+          if (invalidate === 'abort') controller.abort(); else fresh = false;
+        });
+      }
+      return accepted;
+    } });
+    const pending = method === 'save'
+      ? services.save({ binding: bound, document, expectedStorageToken: null }, controller.signal)
+      : services.autosave!({ binding: bound, document, autosaveOwnerId: OWNER, expectedAutosaveToken: null, baseRecordStorageToken: null }, controller.signal);
+    await expect(pending).rejects.toThrow(/устарела/); events.push('rejected');
+    expect(lastInnerAccepted).toBe(true); expect(invalidationRan).toBe(true);
+    expect(writes).toBe(0); expect(io.invoke).not.toHaveBeenCalled(); expect(io.chooseSavePath).not.toHaveBeenCalled();
+    expect(events).toEqual(invalidate === 'abort'
+      ? ['current:1:true', 'current:2:true', 'invalidate:abort', 'rejected']
+      : ['current:1:true', 'current:2:true', 'invalidate:current', 'current:3:false', 'rejected']);
+  });
   it('autosave→Save consumes once, second Save omits consume, and next autosave uses the rotated tombstone/base record CAS', async () => {
     const document = ordinary(); let autosaves = 0, saves = 0;
     const io = mockIO((command, args) => { const r = request(args);

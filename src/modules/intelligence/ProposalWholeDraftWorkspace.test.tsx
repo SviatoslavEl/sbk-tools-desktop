@@ -53,7 +53,8 @@ describe('private whole-draft workspace — synthetic callback and SSR coverage 
     const html = renderToStaticMarkup(<>{tree}</>);
     for (const section of f.handoff.sections) expect(html).toContain(section.title);
     expect(html).toContain('Личный черновик текущего сеанса — не готовое КП');
-    expect(html).toContain('Сохранение и экспорт из этого редактора ещё не подключены');
+    expect(html).toContain('Этот предварительный просмотр хранится в памяти сеанса');
+    expect(html).toContain('Для сохранения и подготовки файла перейдите в рабочий редактор');
     expect(html).toContain('Это не доказательство их отсутствия');
     expect(nodes().filter(node => node.props['data-question-id']).map(node => node.props['data-question-id'])).toEqual(f.handoff.questions.map(question => question.id));
     expect(nodes().filter(node => node.type === 'textarea').every(node => node.props.style?.width === '100%' && node.props.style?.minWidth === 0)).toBe(true);

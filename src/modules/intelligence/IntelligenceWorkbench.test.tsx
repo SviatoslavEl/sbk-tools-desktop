@@ -414,6 +414,9 @@ describe("seven-area whole proposal route — synthetic callback integration, no
     expect(confirmation.props.title).toBe("Подготовить черновик по семи областям?");
     const message = (confirmation.props as unknown as { message: string }).message;
     for (const cap of ["128", "20 минут", "4 МиБ", "2 МиБ", "без сохранения"]) expect(message).toContain(cap);
+    expect(message).toContain("Сам проход завершается без сохранения в общую базу");
+    expect(message).toContain("явно перейти в рабочий редактор"); expect(message).toContain("подготовить DOCX/PDF после проверки пользователем");
+    expect(message).toContain("восстановительную копию"); expect(message).not.toContain("без сохранения и клиентского экспорта");
     expect(runtime.analyze).not.toHaveBeenCalled(); confirmation.props.onClose!(); await flush(); expect(runtime.analyze).not.toHaveBeenCalled(); expect(control("iw-response").props.value).toBe(previousRaw);
   });
 
