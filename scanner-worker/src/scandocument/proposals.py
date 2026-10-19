@@ -32,6 +32,10 @@ from scandocument.errors import CancelledError
 
 MAX_MINOR = 9007199254740991
 MAX_PUBLIC_BYTES = 8 * 1024 * 1024
+WORKING_PROPOSAL_AREAS = ("work-scope", "deliverables", "checked-facets", "price-vat", "payment", "parties-roles", "schedule")
+# JavaScript String.trim whitespace, including BOM. Python str.strip differs
+# for BOM/NEL; acceptance must match the new frontend's final-content guard.
+_WORKING_WHITESPACE = "\u0009\u000a\u000b\u000c\u000d\u0020\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff"
 RATES = (0, 5, 7, 10, 11, 20, 22)
 PROPOSAL_FONT = "SBK Proposal Sans"
 # Separate from the older scanner/OCR fonts. The pinned OFL derivatives change
@@ -90,6 +94,8 @@ def _embed_proposal_fonts(doc, document):
     fonts = _proposal_fonts(resource_path("proposals", "fonts").resolve())
     required = {ord(char) for text in _document_strings(document) for char in text if char not in "\n\r\t"}
     required.update(map(ord, "Коммерческое предложение Страница № ₽ · • ЧЕРНОВИК ДЛЯ ПРОВЕРКИ Нужно проверить раздел пункт"))
+    if document.get("schemaVersion") == 3:
+        required.update(map(ord, "Проект для проверки Номер Дата Действительно до Валюта Отправитель Получатель"))
     missing = sorted(set.union(*(required - coverage for _, _, _, coverage in fonts)))
     if missing:
         codes = ", ".join(f"U+{code:04X}" for code in missing[:12])
@@ -346,9 +352,65 @@ def _commercial(value):
     _commercial_narrative_budget(value)
 
 
+def _working_text(value, maximum=20000):
+    _text(value, maximum)
+    if any(127 <= ord(char) <= 159 or 0xD800 <= ord(char) <= 0xDFFF for char in value):
+        raise ValueError("Текст рабочего КП содержит недопустимый Unicode или управляющие символы")
+
+
+def _working_public(document):
+    """Separate V3 allowlist. Nullable facts stay null; no legacy pricing,
+    parties, dates or defaults are constructed, normalized or appended."""
+    _object(document, "kind schemaVersion mode title metadata layout sections")
+    if document["kind"] != "proposal-working-public-document" or document["mode"] not in ("review-draft", "final"):
+        raise ValueError("Неподдерживаемый вид или режим рабочего КП")
+    _working_text(document["title"], 500)
+    metadata = _object(document["metadata"], "number documentDate validUntil currency issuerName recipientName")
+    for key, maximum in (("number", 200), ("currency", 80), ("issuerName", 2000), ("recipientName", 2000)):
+        if metadata[key] is not None:
+            _working_text(metadata[key], maximum)
+    for key in ("documentDate", "validUntil"):
+        if metadata[key] is not None:
+            _date(metadata[key])  # datetime.date rejects year0000 and impossible dates.
+    layout = _object(document["layout"], "style accentColor")
+    if layout["style"] not in ("standard", "compact") or not isinstance(layout["accentColor"], str) or not re.fullmatch("#[0-9a-fA-F]{6}", layout["accentColor"]):
+        raise ValueError("Некорректное оформление рабочего КП")
+    sections = document["sections"]
+    if not isinstance(sections, list) or len(sections) != len(WORKING_PROPOSAL_AREAS):
+        raise ValueError("Нужны все семь разделов рабочего КП")
+    total_blocks, has_content = 0, False
+    for index, section in enumerate(sections):
+        _object(section, "area title blocks")
+        if section["area"] != WORKING_PROPOSAL_AREAS[index]:
+            raise ValueError("Нарушен порядок семи разделов рабочего КП")
+        _working_text(section["title"], 500)
+        blocks = section["blocks"]
+        if not isinstance(blocks, list) or len(blocks) > 65:
+            raise ValueError("Не более 65 целых блоков в разделе рабочего КП")
+        total_blocks += len(blocks)
+        if total_blocks > 455:
+            raise ValueError("Не более 455 целых блоков рабочего КП")
+        for block in blocks:
+            _working_text(block)
+            has_content = has_content or bool(block.strip(_WORKING_WHITESPACE))
+    if document["mode"] == "final" and not has_content:
+        raise ValueError("Для итогового рабочего КП нужен выбранный текст; пустой черновик можно сохранить")
+    return document
+
+
+def _working_render_options(output_format, entries):
+    """Pure V3 request validation, before filesystem/Document/Office work."""
+    if output_format not in ("docx", "pdf", "preview"):
+        raise ValueError("Рабочее КП поддерживает DOCX/PDF/предпросмотр; ZIP не поддерживается")
+    if not isinstance(entries, list) or entries:
+        raise ValueError("Вложения для рабочего КП V3 не поддерживаются")
+
+
 def validate_document(document: dict) -> dict:
     _public_size_budget(document)
     version = document.get("schemaVersion") if isinstance(document, dict) else None
+    if type(version) is int and version == 3:
+        return _working_public(document)
     if type(version) is not int or version not in (1, 2):
         raise ValueError("Неподдерживаемая версия КП")
     body_field = "terms" if version == 1 else "commercial"
@@ -767,8 +829,65 @@ def _render_commercial(doc, commercial, accent):
                     _commercial_table(doc, block, labels, accent)
 
 
+def _render_working_docx(document: dict, output: Path) -> None:
+    """Render validated V3 whole selected prose, never a V1/V2 dummy price
+    table. No source-only material or private question is available here."""
+    doc = Document()
+    compact = document["layout"]["style"] == "compact"
+    section = doc.sections[0]
+    section.page_width, section.page_height = Mm(210), Mm(297)
+    section.top_margin = section.bottom_margin = Mm(18 if compact else 20)
+    section.left_margin = section.right_margin = Mm(18)
+    section.header_distance = section.footer_distance = Mm(9)
+    normal = doc.styles["Normal"]
+    normal.font.name, normal.font.size = PROPOSAL_FONT, Pt(11)
+    normal.paragraph_format.space_after = Pt(5 if compact else 7)
+    normal.paragraph_format.line_spacing = 1.08
+    normal.paragraph_format.widow_control = True
+    for name, size in (("Title", 20), ("Heading 1", 13)):
+        style = doc.styles[name]
+        style.font.name, style.font.size = PROPOSAL_FONT, Pt(size)
+        style.font.color.rgb = RGBColor(0, 0, 0) if name == "Title" else RGBColor.from_string(document["layout"]["accentColor"][1:])
+        style.paragraph_format.keep_with_next = True
+    props = doc.core_properties
+    props.author = props.last_modified_by = ""
+    props.title, props.subject = document["title"], "Коммерческое предложение"
+    props.comments = props.keywords = props.category = props.identifier = props.language = ""
+    footer = section.footer.paragraphs[0]
+    footer.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    footer.paragraph_format.space_after = Pt(0)
+    if document["mode"] == "review-draft":
+        footer.add_run("Проект для проверки\n").bold = True
+        _paragraph(doc, "Проект для проверки", bold=True, keep=True)
+    footer.add_run("Страница ")
+    footer._p.append(_xml("w:fldSimple", **{"w:instr": "PAGE"}))
+    for run in footer.runs:
+        run.font.size = Pt(9)
+    _paragraph(doc, document["title"], style="Title")
+    # Issuer/recipient metadata is not evidence of contractor/customer roles.
+    for key, label in (("number", "Номер"), ("documentDate", "Дата"), ("validUntil", "Действительно до"), ("currency", "Валюта"), ("issuerName", "Отправитель"), ("recipientName", "Получатель")):
+        value = document["metadata"][key]
+        if value is not None:
+            _paragraph(doc, label + ": " + value)
+    for item in document["sections"]:
+        if not item["blocks"]:
+            continue
+        _paragraph(doc, item["title"], style="Heading 1")
+        for text in item["blocks"]:
+            paragraph = _paragraph(doc, text)
+            paragraph.paragraph_format.keep_together = False
+            paragraph.paragraph_format.keep_with_next = False
+    _embed_proposal_fonts(doc, document)
+    doc.save(output)
+
+
 def render_docx(document: dict, output: Path, assets: dict[str, Path]) -> None:
     validate_document(document)
+    if document["schemaVersion"] == 3:
+        if not isinstance(assets, dict) or assets:
+            raise ValueError("Вложения для рабочего КП V3 не поддерживаются")
+        _render_working_docx(document, output)
+        return
     doc = Document()
     compact = document["layout"]["style"] == "compact"
     section = doc.sections[0]
@@ -931,6 +1050,9 @@ def render_docx(document: dict, output: Path, assets: dict[str, Path]) -> None:
 
 
 def _verified_assets(document, entries, workdir: Path) -> dict[str, Path]:
+    if document.get("schemaVersion") == 3:
+        _working_render_options("docx", entries)
+        return {}
     references = document["attachments"] + ([document["layout"]["logo"]] if document["layout"].get("logo") else [])
     expected = {asset["sha256"]: asset for asset in references}
     if not isinstance(entries, list):
@@ -960,6 +1082,8 @@ def _digest(path: Path) -> str:
 
 def _render(config: dict, stopped: threading.Event) -> dict:
     document = validate_document(config["document"])
+    if document["schemaVersion"] == 3:
+        _working_render_options(config["format"], config.get("assets", []))
     workdir = Path(config["workdir"]).resolve(strict=True)
 
     def cancelled():

@@ -10,7 +10,8 @@ import { repairDateFromSource } from "./sourceRepairs";
 import { AutomaticConditionsSummary } from "./AutomaticConditionsSummary";
 import { runProposalQuotePreparation, runResponsePreparation, type ResponsePreparationRequest } from "./responsePreparationWorker";
 import { ProposalAnalysisProvenance } from "./ProposalAnalysisProvenance";
-import { ProposalWholeDraftWorkspace, type ProposalWholeDraftWorkspaceProps } from "./ProposalWholeDraftWorkspace";
+import type { ProposalWholeDraftWorkspaceProps } from "./ProposalWholeDraftWorkspace";
+import { ProposalWholeWorkingRoute } from "../proposals/ProposalWorkingRoute";
 import { PROPOSAL_AREAS } from "./proposalAreaPlan";
 import { buildProposalQuotePlan, isProposalQuoteSelectionCandidate } from "./proposalQuotePlan";
 import type { ProposalQuotePreparationWireRequest, ProposalQuoteProvenance } from "./proposalQuotePreparation";
@@ -375,7 +376,7 @@ describe("explicit local proposal preparation from a complete contract", () => {
 describe("seven-area whole proposal route — synthetic callback integration, not GUI or model acceptance", () => {
   const sourceName = "Синтетический структурированный договор.docx", previousRaw = "KEEP-MANUAL-RAW-EXACT";
   const cards = () => nodes().filter(node => node.props.className === "iw-card");
-  const editor = () => nodes().find(node => node.type === ProposalWholeDraftWorkspace)?.props as unknown as ProposalWholeDraftWorkspaceProps | undefined;
+  const editor = () => nodes().find(node => node.type === ProposalWholeWorkingRoute)?.props as unknown as ProposalWholeDraftWorkspaceProps & { open: boolean } | undefined;
   async function until(done: () => boolean) {
     for (let turn = 0; turn < 250 && !done(); turn++) { await new Promise<void>(resolve => setTimeout(resolve, 0)); await flush(); }
     expect(done()).toBe(true);
@@ -427,6 +428,16 @@ describe("seven-area whole proposal route — synthetic callback integration, no
     expect(JSON.stringify(value.handoff.sections)).not.toContain("SOURCE_ONLY_NEVER_APPEND"); expect(value.handoff.readyForClient).toBe(false);
     expect(cards().map(card => card.key)).toEqual(before); expect(control("iw-response").props.value).toBe(previousRaw); expect(workers).toHaveLength(0); expect(transfer).not.toHaveBeenCalled();
     expect(runtime.invoke.mock.calls.map(([command]) => command)).toEqual(["scanner_run"]); expect(text()).toContain("Ответы полного черновика"); expect(text()).not.toContain("Исходные ответы выбора цитат");
+  });
+
+  it("hides rather than unmounting the ordinary-editor route when folded, preserving the same handoff/session owner", async () => {
+    await setup(); mockReplies(); await begin(); await confirm(); await until(() => Boolean(editor()));
+    const before = editor()!, original = before.handoff;
+    expect(before.open).toBe(true); before.onClose!(); await flush();
+    expect(editor()!.handoff).toBe(original); expect(editor()!.open).toBe(false);
+    await click("Открыть редактор черновика");
+    expect(editor()!.handoff).toBe(original); expect(editor()!.open).toBe(true);
+    expect(runtime.analyze).toHaveBeenCalledTimes(2); expect(runtime.invoke.mock.calls.map(([command]) => command)).toEqual(["scanner_run"]);
   });
 
   it("stops locally on cancel even if the native provider promise remains in flight, and never installs its late reply", async () => {

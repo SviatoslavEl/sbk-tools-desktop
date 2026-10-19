@@ -21,6 +21,7 @@ import { hasPendingProposalDraftPersistence, queueProposalDraftMutation, settleP
 import { createTaskDocumentOrigin, projectTaskDocumentSession, sameTaskDocumentOrigin, taskDocumentDraftKey, type TaskDocumentOrigin } from "../intelligence/taskDocumentSession";
 import { ProposalTaskBridge, proposalTaskFingerprint, type ProposalTaskAttempt, type ProposalTaskEditorBinding, type ProposalTaskEntry, type ProposalTaskSessionChange } from "./proposalTaskBridge";
 import { ProposalAnalysisProvenance } from "../intelligence/ProposalAnalysisProvenance";
+import { ProposalWorkingLibrary } from "./ProposalWorkingRoute";
 import type { ProposalData, ProposalIssue, ProposalRenderFormat, ProposalRenderResult, ProposalStatus, ProposalTemplateData } from "./types";
 import "./proposals.css";
 type ProposalRecord = ProposalData | ProposalTemplateData;
@@ -866,6 +867,7 @@ export function Proposals({ active = true, openRecordId, onRecordOpened, handoff
     const validSignerAttachment = signerAttachment?.relativePath && signerAttachment.fileName && signerAttachment.sha256 && signerAttachment.mimeType && signerAttachment.sizeBytes != null ? signerAttachment as AttachmentInfo : null;
     return <section className={`proposals-tool${presentation === "ai-task" ? " is-task-document" : ""}`} aria-label="Подготовка коммерческих предложений" data-workspace-viewer-allowed data-workspace-managed-disabled="true" hidden={!active}>
     {presentation === "registry" && <div className="proposal-toolbar"><small>Предложений: {proposals.length} · шаблонов: {templates.length}</small><button className="primary" type="button" disabled={Boolean(busy)} onClick={() => requestTarget({ kind: "new" })}>{access.editor ? "Новое КП" : "Новое локальное КП"}</button></div>}
+    {presentation === "registry" && <ProposalWorkingLibrary active={active} />}
     {store.error && <div className="notice error" role="alert">Не удалось прочитать КП: {store.error}<button type="button" onClick={() => void store.reload()}>Повторить</button></div>}
     {error && <div className="notice error" role="alert">{error}</div>}{notice && <div className="notice" role="status">{notice}</div>}
     {handoff && failedHandoff === handoff.id && <div className="notice warning" role="status">Получение КП не завершено. Данные источника сохранены; после восстановления доступа повторите действие.<button type="button" className="secondary" disabled={Boolean(busy) || !active} onClick={() => void receiveHandoff(handoff)}>Повторить получение КП</button></div>}

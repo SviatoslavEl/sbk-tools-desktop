@@ -45,6 +45,7 @@ mod network_diagnostics;
 #[cfg(test)]
 mod network_transition_regression_tests;
 mod proposals;
+mod proposal_working;
 mod publication;
 mod scanner_outputs;
 mod scanner_previews;
@@ -5519,6 +5520,14 @@ pub fn run() {
                 };
                 let handler: fn(tauri::ipc::Invoke) -> bool = tauri::generate_handler![
                     proposals::proposal_render,
+                    proposals::proposal_working_render,
+                    proposal_working::proposal_working_context,
+                    proposal_working::proposal_working_list,
+                    proposal_working::proposal_working_read,
+                    proposal_working::proposal_working_read_history,
+                    proposal_working::proposal_working_save,
+                    proposal_working::proposal_working_autosave,
+                    proposal_working::proposal_working_cleanup,
                     proposals::proposal_cleanup_preview,
                     proposals::proposal_open_output,
                     report_startup_ui_visible,
