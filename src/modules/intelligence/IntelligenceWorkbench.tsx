@@ -502,7 +502,7 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
     setRunning(true); setError(""); setNotice(""); setEmptyWarning(""); setResponseDetails(null); setAnalysisParts([]); setAnalysisPartsOpen(false);
     try {
       if (useQuotes) {
-        const options = { instruction: instructionSnapshot };
+        const options = { maxUnitsPerBatch: 6, instruction: instructionSnapshot };
         const quotePlan = await buildProposalQuotePlan(snapshot, options);
         if (!current()) return;
         const quoteParts: ProposalQuoteResponsePart[] = [];
@@ -831,7 +831,7 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
           <label className="iw-full">Ключ доступа, если нужен<input id="iw-api-key" type="password" autoComplete="off" value={apiKey} placeholder="Хранится только до закрытия программы" onChange={(event) => { invalidateTask(); connectionEpoch.current++; connectionPending.current = null; setConnectionBusy(false); setApiKey(event.target.value); }} /></label>
         </div>
         <p className="help-text">Для сервиса на этом компьютере разрешён HTTP с адресом localhost. Для сети и внешнего сервиса нужен HTTPS. Сохраняются только адрес, модель и параметры подключения на этом компьютере; ключ и документы не сохраняются.</p>
-        <p className="help-text">«По схеме карточек» задаёт сервису структуру карточек и допустимые ссылки на выбранные документы. В режиме «Обычный JSON» схема остаётся инструкцией в тексте запроса, без принудительного ограничения ответа схемой на стороне сервиса. Формат не переключается автоматически. После выбора подключения подготовьте результат основной кнопкой задания; результат в любом режиме проверяется заново.</p>
+        <p className="help-text">«По схеме карточек» задаёт сервису структуру результата и допустимые ссылки на выбранные документы. Для отбора цитат договора используется отдельная схема фрагментов, а не карточек. В режиме «Обычный JSON» схема остаётся инструкцией в тексте запроса, без принудительного ограничения ответа схемой на стороне сервиса. Формат не переключается автоматически. После выбора подключения подготовьте результат основной кнопкой задания; результат в любом режиме проверяется заново.</p>
         <div className="iw-actions"><button type="button" className="secondary" disabled={connectionBusy} onClick={() => void testConnection()}>{connectionBusy ? "Проверяем…" : "Проверить подключение"}</button><button type="button" className="secondary" onClick={saveProfile}>Сохранить подключение</button>{profiles.some((entry) => entry.id === profile.id) && <button type="button" className="text-danger" onClick={focusBeforeConfirmation(() => setConfirm({ title: "Удалить подключение?", message: `Параметры «${profile.name}» будут удалены только с этого компьютера.`, run: () => { const next = profiles.filter((entry) => entry.id !== profile.id); try { window.localStorage.setItem(profilesKey, JSON.stringify(next)); setProfiles(next); editProfile(next[0] || defaultProfile()); setApiKey(""); setConfirm(null); } catch { setConnectionMessage("Не удалось удалить подключение."); setConfirm(null); } } }))}>Удалить подключение</button>}</div>
         {connectionMessage && <p className="iw-connection-message" role="status">{connectionMessage}</p>}
       </div>}

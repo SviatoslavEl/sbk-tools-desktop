@@ -14,7 +14,7 @@ const bytes = (value: string) => new TextEncoder().encode(value).byteLength;
 const payload = (prompt: string) => JSON.parse(prompt.split('sourceUnits (данные): ')[1]);
 function wire(plan: ProposalQuotePlan, batchIndex = 0, disposition: 'commercial' | 'context' | 'unclear' = 'context', roles: string[] = ['context']) {
   return { sourceSnapshotKey: plan.sourceSnapshotKey, batchId: plan.batches[batchIndex].id,
-    units: plan.batches[batchIndex].units.map(unit => ({ unitId: unit.unitId, disposition, roles: [...roles], quote: disposition === 'commercial' ? unit.text : null as string | null })) };
+    units: Object.fromEntries(plan.batches[batchIndex].units.map(unit => [unit.unitId, { disposition, roles: [...roles], quote: disposition === 'commercial' ? unit.text : null as string | null }])) };
 }
 const reorderKeys = (value: unknown): unknown => Array.isArray(value) ? value.map(reorderKeys) : value && typeof value === 'object'
   ? Object.fromEntries(Object.entries(value).reverse().map(([key, part]) => [key, reorderKeys(part)])) : value;
@@ -83,11 +83,14 @@ describe('bounded evidence-first whole-fragment plan', () => {
       expect(batch.promptBytes).toBe(bytes(batch.prompt)); expect(batch.promptBytes).toBeGreaterThan(batch.sourcePayloadBytes);
       expect(batch.prompt).not.toContain(input[0].text); expect(batch.prompt).toContain(JSON.stringify(options.instruction));
       expect(body.units).toEqual(batch.units); expect(body.relatedContextUnits).toEqual(batch.relatedContextUnits);
-      expect(schema.additionalProperties).toBe(false); expect(schema.properties.units.minItems).toBe(batch.units.length);
-      expect(schema.properties.units.maxItems).toBe(batch.units.length);
-      expect(schema.properties.units.items.required).toEqual(['unitId', 'disposition', 'roles', 'quote']);
-      expect(schema.properties.units.items.properties.unitId.enum).toEqual(batch.units.map(unit => unit.unitId));
-      expect(schema.properties.units.items.properties.quote.type).toEqual(['string', 'null']);
+      expect(schema.additionalProperties).toBe(false); expect(schema.properties.units.type).toBe('object');
+      expect(schema.properties.units.additionalProperties).toBe(false);
+      expect(schema.properties.units.required).toEqual(batch.units.map(unit => unit.unitId));
+      expect(Object.keys(schema.properties.units.properties)).toEqual(batch.units.map(unit => unit.unitId));
+      for (const entry of Object.values(schema.properties.units.properties) as any[]) {
+        expect(entry.additionalProperties).toBe(false); expect(entry.required).toEqual(['disposition', 'roles', 'quote']);
+        expect(entry.properties).not.toHaveProperty('unitId'); expect(entry.properties.quote.type).toEqual(['string', 'null']);
+      }
     }
     expect(input).toEqual(before); expect(Object.isFrozen(plan)).toBe(true); expect(Object.isFrozen(plan.batches[0].responseSchema)).toBe(true);
     expect(Object.isFrozen(plan.batches[0].relatedContextUnits)).toBe(true); expect(Object.isFrozen(PROPOSAL_QUOTE_ROLES)).toBe(true);
@@ -102,9 +105,10 @@ describe('bounded evidence-first whole-fragment plan', () => {
     const raw = JSON.stringify(wire(plan, 1, 'commercial', ['scope'])), result = await parseProposalQuoteResponse(raw, plan, plan.batches[1].id, input);
     expect(result.units).toHaveLength(2); expect(result.selections).toHaveLength(2);
     expect(result.selections.map(unit => unit.fragmentIndex)).toEqual([2, 3]);
-    const foreignContext = wire(plan, 1, 'commercial', ['scope']); foreignContext.units[0].unitId = plan.batches[1].relatedContextUnits[0].unitId;
+    const foreignContext = wire(plan, 1, 'commercial', ['scope']), firstId = plan.batches[1].units[0].unitId;
+    foreignContext.units[plan.batches[1].relatedContextUnits[0].unitId] = foreignContext.units[firstId]; delete foreignContext.units[firstId];
     await expect(parseProposalQuoteResponse(JSON.stringify(foreignContext), plan, plan.batches[1].id, input)).rejects.toThrow();
-    const expanded = wire(plan, 1); expanded.units.push({ unitId: plan.batches[1].relatedContextUnits[0].unitId, disposition: 'context', roles: ['context'], quote: null });
+    const expanded = wire(plan, 1); expanded.units[plan.batches[1].relatedContextUnits[0].unitId] = { disposition: 'context', roles: ['context'], quote: null };
     await expect(parseProposalQuoteResponse(JSON.stringify(expanded), plan, plan.batches[1].id, input)).rejects.toThrow();
   });
 
@@ -247,15 +251,52 @@ describe('atomic exact-quote response protocol, never model semantic acceptance'
   it('retains only actual model-selected whole quotes, identities and roles, without local enrichment or business approvals', async () => {
     const input = [source()], before = structuredClone(input), plan = await buildProposalQuotePlan(input), data = wire(plan, 0, 'commercial', ['scope', 'dependency']);
     const raw = JSON.stringify(data), result = await parseProposalQuoteResponse(raw, plan, plan.batches[0].id, input);
-    expect(result.units).toEqual(data.units); expect(result.selections).toEqual(plan.batches[0].units.map(unit => ({
+    expect(result.units).toEqual(plan.batches[0].units.map(unit => ({ unitId: unit.unitId, ...data.units[unit.unitId] }))); expect(result.selections).toEqual(plan.batches[0].units.map(unit => ({
       unitId: unit.unitId, sourceId: unit.sourceId, fragmentId: unit.fragmentId, fragmentIndex: unit.fragmentIndex,
       locator: unit.locator, roles: ['scope', 'dependency'], quote: unit.text,
     })));
-    expect(result.counts).toEqual({ commercial: data.units.length, context: 0, unclear: 0 }); expect(result.zeroCommercial).toBe(false);
+    expect(result.counts).toEqual({ commercial: Object.keys(data.units).length, context: 0, unclear: 0 }); expect(result.zeroCommercial).toBe(false);
     expect(result.status).toBe('model-quote-selection-only'); expect(result).not.toHaveProperty('raw'); expect(result).not.toHaveProperty('confirmed');
     expect(result).not.toHaveProperty('canFinalize'); expect(result).not.toHaveProperty('item');
     expect(Object.isFrozen(result.units[0].roles)).toBe(true); expect(Object.isFrozen(result.selections[0])).toBe(true);
     expect(raw).toBe(JSON.stringify(data)); expect(input).toEqual(before);
+  });
+
+  it('accepts object-key reordering without changing owner order, repairing IDs or rewriting the original raw', async () => {
+    const input = [source()], plan = await buildProposalQuotePlan(input), ordered = wire(plan, 0, 'commercial', ['scope']);
+    const raw = JSON.stringify(reorderKeys(ordered)), before = raw;
+    expect(Object.keys(JSON.parse(raw).units)).toEqual(plan.batches[0].units.map(unit => unit.unitId).reverse());
+    const result = await parseProposalQuoteResponse(raw, plan, plan.batches[0].id, input);
+    expect(result.units).toEqual(plan.batches[0].units.map(unit => ({ unitId: unit.unitId, ...ordered.units[unit.unitId] })));
+    expect(result.selections.map(selection => selection.unitId)).toEqual(plan.batches[0].units.map(unit => unit.unitId)); expect(raw).toBe(before);
+  });
+
+  it('uses exact own keys even for integer-like/prototype-named source IDs, never inherited properties or insertion-order ownership', async () => {
+    const input = [source()]; ['8', '3', '__proto__', 'constructor', 'toString'].forEach((id, index) => { input[0].fragments![index].id = id; });
+    const plan = await buildProposalQuotePlan(input), data = wire(plan, 0, 'commercial', ['scope']), raw = JSON.stringify(data);
+    expect(Object.keys(data.units).slice(0, 2)).toEqual(['3', '8']);
+    const result = await parseProposalQuoteResponse(raw, plan, plan.batches[0].id, input);
+    expect(result.units.map(unit => unit.unitId)).toEqual(input[0].fragments!.map(fragment => fragment.id));
+    expect(result.selections[2].quote).toBe(input[0].fragments![2].text);
+    const missingOwn = wire(plan); Reflect.deleteProperty(missingOwn.units, 'constructor');
+    await expect(parseProposalQuoteResponse(JSON.stringify(missingOwn), plan, plan.batches[0].id, input)).rejects.toThrow(/полному списку/);
+    expect(({} as { approved?: boolean }).approved).toBeUndefined();
+  });
+
+  it('rejects a synthetic 20-row/11-unique p-27 padded legacy response, repeated object keys and a one-key replacement without local repair', async () => {
+    const input = [source(40)], plan = await buildProposalQuotePlan(input), batch = plan.batches[1], data = wire(plan, 1, 'commercial', ['scope']);
+    expect(batch.units).toHaveLength(20); expect(batch.units.some(unit => unit.unitId === 'p-27')).toBe(true);
+    const legacyRows = batch.units.slice(0, 11).map(unit => ({ unitId: unit.unitId, ...data.units[unit.unitId] }));
+    while (legacyRows.length < 20) legacyRows.push({ unitId: 'p-27', ...data.units['p-27'] });
+    expect(new Set(legacyRows.map(unit => unit.unitId)).size).toBe(11);
+    const legacyRaw = JSON.stringify({ ...data, units: legacyRows });
+    await expect(parseProposalQuoteResponse(legacyRaw, plan, batch.id, input)).rejects.toThrow(/полному списку/);
+    const repeated = Array.from({ length: 20 }, () => `"p-27":${JSON.stringify(data.units['p-27'])}`).join(',');
+    const repeatedRaw = `{"sourceSnapshotKey":${JSON.stringify(data.sourceSnapshotKey)},"batchId":${JSON.stringify(data.batchId)},"units":{${repeated}}}`;
+    await expect(parseProposalQuoteResponse(repeatedRaw, plan, batch.id, input)).rejects.toThrow(/повторённое поле/);
+    await expect(parseProposalQuoteResponse(JSON.stringify({ ...data, units: { 'p-27': data.units['p-27'] } }), plan, batch.id, input)).rejects.toThrow(/полному списку/);
+    const paddedValues = { ...data, units: Object.fromEntries(batch.units.map(unit => [unit.unitId, data.units['p-27']])) };
+    await expect(parseProposalQuoteResponse(JSON.stringify(paddedValues), plan, batch.id, input)).rejects.toThrow(/изменённую цитату/);
   });
 
   it('accepts all-context/all-unclear without inventing selected quotes or claiming useful commercial content', async () => {
@@ -272,8 +313,8 @@ describe('atomic exact-quote response protocol, never model semantic acceptance'
     const plan = await buildProposalQuotePlan(input), data = wire(plan, 0, 'commercial', ['dependency']);
     const result = await parseProposalQuoteResponse(JSON.stringify(data), plan, plan.batches[0].id, input);
     expect(result.selections[4].quote).toBe(input[0].fragments![4].text);
-    for (const changed of [data.units[4].quote!.trim(), data.units[4].quote!.replace('\r\n', '\n'), data.units[4].quote!.slice(1), '2.1. Сохранить результат']) {
-      const invalid = structuredClone(data); invalid.units[4].quote = changed;
+    for (const changed of [data.units['p-4'].quote!.trim(), data.units['p-4'].quote!.replace('\r\n', '\n'), data.units['p-4'].quote!.slice(1), '2.1. Сохранить результат']) {
+      const invalid = structuredClone(data); invalid.units['p-4'].quote = changed;
       await expect(parseProposalQuoteResponse(JSON.stringify(invalid), plan, plan.batches[0].id, input)).rejects.toThrow(/изменённую цитату/);
     }
   });
@@ -282,18 +323,20 @@ describe('atomic exact-quote response protocol, never model semantic acceptance'
     const input = [source()]; input[0].fragments![4].text = ' \t\n';
     const plan = await buildProposalQuotePlan(input);
     await expect(parseProposalQuoteResponse(JSON.stringify(wire(plan, 0, 'commercial', ['scope'])), plan, plan.batches[0].id, input)).rejects.toThrow();
-    const context = wire(plan); context.units[0].quote = plan.batches[0].units[0].text;
+    const firstId = plan.batches[0].units[0].unitId, context = wire(plan); context.units[firstId].quote = plan.batches[0].units[0].text;
     await expect(parseProposalQuoteResponse(JSON.stringify(context), plan, plan.batches[0].id, input)).rejects.toThrow();
-    const cross = wire(plan); cross.units[0] = { unitId: cross.units[0].unitId, disposition: 'commercial', roles: ['scope'], quote: plan.batches[0].units[1].text };
+    const cross = wire(plan); cross.units[firstId] = { disposition: 'commercial', roles: ['scope'], quote: plan.batches[0].units[1].text };
     await expect(parseProposalQuoteResponse(JSON.stringify(cross), plan, plan.batches[0].id, input)).rejects.toThrow();
   });
 
-  it('rejects partial, repeated, reordered, foreign and context-slot IDs before returning any selections', async () => {
+  it('rejects missing, foreign, padded and legacy-array slots before returning any selections', async () => {
     const input = [source()], plan = await buildProposalQuotePlan(input, { maxUnitsPerBatch: 3 });
-    const invalid = [wire(plan), wire(plan), wire(plan), wire(plan), wire(plan)];
-    invalid[0].units.pop(); invalid[1].units[1] = invalid[1].units[0];
-    [invalid[2].units[0], invalid[2].units[1]] = [invalid[2].units[1], invalid[2].units[0]];
-    invalid[3].units[0].unitId = plan.batches[1].units[0].unitId; invalid[4].units[0].unitId = 'hidden-or-foreign';
+    const [first, second] = plan.batches[0].units, invalid: unknown[] = [];
+    const missing = wire(plan); delete missing.units[first.unitId]; invalid.push(missing);
+    const padded = wire(plan, 0, 'commercial', ['scope']); padded.units[second.unitId] = padded.units[first.unitId]; invalid.push(padded);
+    const foreign = wire(plan); foreign.units[plan.batches[1].units[0].unitId] = foreign.units[first.unitId]; delete foreign.units[first.unitId]; invalid.push(foreign);
+    const hidden = wire(plan); hidden.units['hidden-or-foreign'] = hidden.units[first.unitId]; delete hidden.units[first.unitId]; invalid.push(hidden);
+    const oldArray = { ...wire(plan), units: plan.batches[0].units.map(unit => ({ unitId: unit.unitId, disposition: 'context', roles: ['context'], quote: null })) }; invalid.push(oldArray);
     for (const data of invalid) await expect(parseProposalQuoteResponse(JSON.stringify(data), plan, plan.batches[0].id, input)).rejects.toThrow();
   });
 
@@ -321,13 +364,13 @@ describe('atomic exact-quote response protocol, never model semantic acceptance'
     const input = [source()], plan = await buildProposalQuotePlan(input), raw = JSON.stringify(wire(plan));
     const invalid: unknown[] = [null, [], { ...wire(plan), confirmed: true }, { ...wire(plan), fields: {} }];
     for (const patch of [
-      { explanation: 'Не требуется пересказ' }, { price: '100' }, { sourceId: 'source-a' }, { quote: undefined },
+      { explanation: 'Не требуется пересказ' }, { price: '100' }, { sourceId: 'source-a' }, { unitId: 'p-0' }, { quote: undefined },
       { roles: ['unknown'] }, { roles: ['scope', 'scope'] }, { roles: ['__proto__'] }, { roles: 'scope' },
       { disposition: 'resolved' }, { disposition: ['commercial'] }, { disposition: { value: 'context' } },
       { disposition: 'commercial', roles: [] }, { disposition: 'commercial', roles: ['context'] },
-    ]) { const data = wire(plan); Object.assign(data.units[0], patch); invalid.push(data); }
+    ]) { const data = wire(plan); Object.assign(data.units[plan.batches[0].units[0].unitId], patch); invalid.push(data); }
     for (const data of invalid) await expect(parseProposalQuoteResponse(JSON.stringify(data), plan, plan.batches[0].id, input)).rejects.toThrow();
-    for (const poisoned of [raw.replace('"units":', '"batchId":"duplicate","units":'), raw.replace('"unitId":', '"unitId":"duplicate","unitId":'), raw.slice(0, -1) + ',"__proto__":{"approved":true}}', raw.slice(0, -1) + ',"constructor":{}}', 'not-json', '```json\n' + raw + '\n```']) {
+    for (const poisoned of [raw.replace('"units":', '"batchId":"duplicate","units":'), raw.replace('"p-0":', '"p-0":{"disposition":"context","roles":[],"quote":null},"p-0":'), raw.replace('"p-0":', '"\\u0070-0":{"disposition":"context","roles":[],"quote":null},"p-0":'), raw.replace('"disposition":', '"disposition":"context","disposition":'), raw.slice(0, -1) + ',"__proto__":{"approved":true}}', raw.slice(0, -1) + ',"constructor":{}}', 'not-json', '```json\n' + raw + '\n```']) {
       await expect(parseProposalQuoteResponse(poisoned, plan, plan.batches[0].id, input)).rejects.toThrow();
     }
     expect(({} as { approved?: boolean }).approved).toBeUndefined();

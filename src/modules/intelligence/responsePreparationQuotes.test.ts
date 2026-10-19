@@ -19,7 +19,7 @@ function source(): IntelligenceSource {
 async function request(core = true): Promise<ProposalQuotePreparationWireRequest> {
   const sources = [source()], options = { maxUnitsPerBatch: 2 }, plan = await buildProposalQuotePlan(sources, options);
   return { origin: 'model-selected-quotes', revision: 7, sources, options, parts: plan.batches.map(batch => ({ batchId: batch.id, model: 'synthetic-model', raw: JSON.stringify({ sourceSnapshotKey: plan.sourceSnapshotKey, batchId: batch.id,
-    units: batch.units.map(unit => ({ unitId: unit.unitId, disposition: core && unit.fragmentIndex === 6 ? 'commercial' : 'context', roles: core && unit.fragmentIndex === 6 ? ['scope'] : [], quote: core && unit.fragmentIndex === 6 ? unit.text : null })) }) })) };
+    units: Object.fromEntries(batch.units.map(unit => [unit.unitId, { disposition: core && unit.fragmentIndex === 6 ? 'commercial' : 'context', roles: core && unit.fragmentIndex === 6 ? ['scope'] : [], quote: core && unit.fragmentIndex === 6 ? unit.text : null }])) }) })) };
 }
 function bare(input: ProposalQuotePreparationWireRequest): ProposalQuotePreparationRequest { const { origin: _origin, ...rest } = input; return rest; }
 class LocalWorker {
@@ -100,7 +100,7 @@ describe('quote selection one-shot bridge', () => {
   it('rejects an actual source quotation added to selections when the original model raw classified it as context', async () => {
     vi.stubGlobal('Worker', LocalWorker); const task = startProposalQuotePreparation(bare(await request())), worker = LocalWorker.instances[0], reply = await runProposalQuotePreparation(worker.request);
     const captured = worker.request as ProposalQuotePreparationWireRequest, fragment = captured.sources[0].fragments![10];
-    const originalUnit = captured.parts.flatMap(part => JSON.parse(part.raw).units).find(unit => unit.unitId === fragment.id);
+    const originalUnit = captured.parts.map(part => JSON.parse(part.raw).units[fragment.id!]).find(Boolean);
     expect(originalUnit).toMatchObject({ disposition: 'context', quote: null });
     const ledger = reply.modelQuoteProvenance!;
     ledger.selections.push({ unitId: fragment.id!, sourceId: captured.sources[0].id, fragmentId: fragment.id!, locator: fragment.locator, quote: fragment.text, roles: ['payment'] });

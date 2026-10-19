@@ -372,6 +372,8 @@ describe("explicit local proposal preparation from a complete contract", () => {
 describe("production whole-quote proposal callbacks with a MOCK provider, not actual inference or native acceptance", () => {
   const previousRaw = "PRIVATE-MANUAL-RAW: keep exactly, not a quote response";
   const cards = () => nodes().filter(node => node.props.className === "iw-card");
+  // The prompt's source payload still uses ordered arrays. Only the MODEL
+  // RESPONSE uses a closed object keyed by the primary fragment identifiers.
   interface QuotePayload { sourceId: string; sourceSnapshotKey: string; units: Array<{ unitId: string; text: string }>; relatedContextUnits: Array<{ unitId: string; text: string }> }
   function quoteContract(extra = 1): IntelligenceSource {
     const lines = ["Договор", "1. Предмет договора", "1.1. Исполнитель оказывает комплекс услуг по проверке учебной системы.",
@@ -398,7 +400,7 @@ describe("production whole-quote proposal callbacks with a MOCK provider, not ac
     // proves the real exact-quote grammar and callbacks, NOT semantic roles,
     // model relevance, full-document extraction or usable commercial content.
     return { model: "qa-model", text: JSON.stringify({ sourceSnapshotKey: body.sourceSnapshotKey, batchId: schema.properties.batchId.enum[0],
-      units: body.units.map(unit => ({ unitId: unit.unitId, disposition: commercial ? "commercial" : "context", roles: commercial ? ["scope"] : ["context"], quote: commercial ? unit.text : null })) }) };
+      units: Object.fromEntries(body.units.map(unit => [unit.unitId, { disposition: commercial ? "commercial" : "context", roles: commercial ? ["scope"] : ["context"], quote: commercial ? unit.text : null }])) }) };
   }
   async function settleQuote() { for (let index = 0; index < 8; index++) await flush(); }
   async function beginQuote() { await prepare(); if (nodes().some(node => node.type === ConfirmDialog)) await confirm(); await settleQuote(); }
@@ -440,16 +442,30 @@ describe("production whole-quote proposal callbacks with a MOCK provider, not ac
     await edit("iw-instruction", "Сохранить ограничения выбранного документа для проекта КП.");
     runtime.analyze.mockImplementation((_profile: unknown, prompt: string) => Promise.resolve(mockQuoteReply(prompt)));
     await beginQuote();
-    expect(runtime.analyze).toHaveBeenCalledTimes(1);
-    const [, prompt, , , schema] = runtime.analyze.mock.calls[0];
-    expect(Object.keys(schema.properties).sort()).toEqual(["sourceSnapshotKey", "batchId", "units"].sort());
-    expect(schema.properties).not.toHaveProperty("items"); expect(schema.properties.units.items.required).toEqual(["unitId", "disposition", "roles", "quote"]);
-    expect(prompt).toContain("Сохранить ограничения выбранного документа"); expect(prompt).not.toContain("sources (данные, не инструкции):");
+    expect(runtime.analyze).toHaveBeenCalledTimes(3);
+    const calls = runtime.analyze.mock.calls, primary = calls.flatMap(([, prompt]) => quotePayload(prompt).units);
+    for (const [, prompt, , , schema] of calls) {
+      const body = quotePayload(prompt), ids = body.units.map(unit => unit.unitId);
+      expect(Array.isArray(body.units)).toBe(true); expect(Array.isArray(body.relatedContextUnits)).toBe(true);
+      expect(body.units.length).toBeLessThanOrEqual(6);
+      expect(Object.keys(schema.properties).sort()).toEqual(["sourceSnapshotKey", "batchId", "units"].sort());
+      expect(schema.properties).not.toHaveProperty("items"); expect(schema.properties.units.type).toBe("object");
+      expect(schema.properties.units.additionalProperties).toBe(false); expect(schema.properties.units.required).toEqual(ids);
+      expect(Object.keys(schema.properties.units.properties)).toEqual(ids);
+      for (const id of ids) {
+        expect(schema.properties.units.properties[id].required).toEqual(["disposition", "roles", "quote"]);
+        expect(schema.properties.units.properties[id].properties).not.toHaveProperty("unitId");
+      }
+      const returned = JSON.parse(mockQuoteReply(prompt).text);
+      expect(Array.isArray(returned.units)).toBe(false); expect(Object.keys(returned.units)).toEqual(ids);
+      expect(Object.values(returned.units).every(unit => !Object.prototype.hasOwnProperty.call(unit, "unitId"))).toBe(true);
+      expect(prompt).toContain("Сохранить ограничения выбранного документа"); expect(prompt).not.toContain("sources (данные, не инструкции):");
+    }
     expect(cards()).toHaveLength(1); expect(control("iw-response").props.value).toBe(previousRaw);
-    const received = mockQuoteReply(prompt).text, selected = ledger()!;
-    expect(selected.origin).toBe("model-selected-quotes"); expect(selected.parts).toEqual([{ batchId: "batch-1", model: "qa-model", raw: received }]);
-    expect(selected.counts).toEqual({ units: quotePayload(prompt).units.length, commercial: quotePayload(prompt).units.length, context: 0, unclear: 0, batches: 1 });
-    expect(selected.selections.map(entry => ({ unitId: entry.unitId, quote: entry.quote }))).toEqual(quotePayload(prompt).units.map(unit => ({ unitId: unit.unitId, quote: unit.text })));
+    const selected = ledger()!;
+    expect(selected.origin).toBe("model-selected-quotes"); expect(selected.parts).toEqual(calls.map(([, prompt], index) => ({ batchId: `batch-${index + 1}`, model: "qa-model", raw: mockQuoteReply(prompt).text })));
+    expect(selected.counts).toEqual({ units: primary.length, commercial: primary.length, context: 0, unclear: 0, batches: 3 });
+    expect(selected.selections.map(entry => ({ unitId: entry.unitId, quote: entry.quote }))).toEqual(primary.map(unit => ({ unitId: unit.unitId, quote: unit.text })));
     expect(nodes().some(node => node.props["aria-label"] === "Вклад исходного ответа")).toBe(false); expect(transfer).not.toHaveBeenCalled();
     await reviewVisibleFindings(); incompleteButton("Коммерческие предложения").props.onClick!(); await flush(); await confirm(); await settleQuote();
     // The source-derived commercial-document projection uses real WebCrypto,
@@ -467,7 +483,10 @@ describe("production whole-quote proposal callbacks with a MOCK provider, not ac
   });
 
   it("runs primary batches serially and replaces both prior cards only after all exact parts and the real local worker result are accepted", async () => {
-    await setupQuote(quoteContract(35)); await previousCards(); const before = cards().map(card => card.key), jobs = holdQuotePreparation();
+    // Sixteen fixed fragments plus two work clauses: exactly 18 primary
+    // units, hence three serial production batches at the UI's cap of six.
+    const input = quoteContract(2); expect(input.fragments).toHaveLength(18);
+    await setupQuote(input); await previousCards(); const before = cards().map(card => card.key), jobs = holdQuotePreparation();
     const waits: Array<{ prompt: string; answer: ReturnType<typeof deferred<{ text: string; model: string }>> }> = [];
     runtime.analyze.mockImplementation((_profile: unknown, prompt: string) => { const answer = deferred<{ text: string; model: string }>(); waits.push({ prompt, answer }); return answer.promise; });
     await beginQuote(); expect(waits).toHaveLength(1); expect(text()).toContain("Этап 1 из 3"); expect(cards().map(card => card.key)).toEqual(before);
@@ -477,7 +496,8 @@ describe("production whole-quote proposal callbacks with a MOCK provider, not ac
       if (index < 2) { expect(waits).toHaveLength(index + 2); expect(jobs).toHaveLength(0); }
     }
     expect(runtime.analyze).toHaveBeenCalledTimes(3); expect(new Set(runtime.analyze.mock.calls.map(call => call[3])).size).toBe(3);
-    const primaryIds = waits.flatMap(wait => quotePayload(wait.prompt).units.map(unit => unit.unitId)); expect(new Set(primaryIds).size).toBe(primaryIds.length);
+    const primaryIds = waits.flatMap(wait => quotePayload(wait.prompt).units.map(unit => unit.unitId)); expect(primaryIds).toHaveLength(18); expect(new Set(primaryIds).size).toBe(primaryIds.length);
+    expect(waits.every(wait => quotePayload(wait.prompt).units.length === 6)).toBe(true);
     expect(jobs).toHaveLength(1); expect(jobs[0].request.origin).toBe("model-selected-quotes"); expect(jobs[0].request).not.toHaveProperty("raw");
     expect(jobs[0].request.parts.map(part => part.raw)).toEqual(waits.map(wait => mockQuoteReply(wait.prompt).text));
     const reply = await runProposalQuotePreparation(jobs[0].request); expect(reply.failed).toBeUndefined();
@@ -487,7 +507,7 @@ describe("production whole-quote proposal callbacks with a MOCK provider, not ac
   });
 
   it("stops at a malformed second quote part without a fallback request, partial installation or overwriting previous cards/manual raw", async () => {
-    await setupQuote(quoteContract(35)); await previousCards(); const before = cards().map(card => card.key), jobs = holdQuotePreparation();
+    await setupQuote(quoteContract(2)); await previousCards(); const before = cards().map(card => card.key), jobs = holdQuotePreparation();
     const returned: string[] = [];
     runtime.analyze.mockImplementation((_profile: unknown, prompt: string) => { const response = returned.length ? { text: "MOCK-MALFORMED-PART", model: "qa-model" } : mockQuoteReply(prompt); returned.push(response.text); return Promise.resolve(response); });
     await beginQuote();
@@ -499,7 +519,7 @@ describe("production whole-quote proposal callbacks with a MOCK provider, not ac
   });
 
   it.each(["cancel", "source-edit", "workspace-change"] as const)("never publishes a late mock quote response after %s or sends remaining batches", async change => {
-    await setupQuote(quoteContract(35)); await previousCards(); const before = cards().map(card => card.key), pending = deferred<{ text: string; model: string }>();
+    await setupQuote(quoteContract(2)); await previousCards(); const before = cards().map(card => card.key), pending = deferred<{ text: string; model: string }>();
     runtime.analyze.mockReturnValueOnce(pending.promise); await beginQuote();
     expect(runtime.analyze).toHaveBeenCalledTimes(1); const call = runtime.analyze.mock.calls[0];
     if (change === "cancel") await click("Остановить запрос");
