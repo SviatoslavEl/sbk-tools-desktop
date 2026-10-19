@@ -8,7 +8,7 @@ import { createRequirementComparator } from "./requirementDeduplication";
 import { isOrganizerBeneficiarySupport } from "./sourceTextCompletion";
 import { createProposalPublicTermsProver } from "./proposalPublicTerms";
 import { createContractProposalProver } from "./contractProposalCompletion";
-import { proposalQuoteNeedsConditionReview } from "./proposalQuoteCompleteness";
+import { proposalQuoteNeedsWholeTextReview } from "./proposalQuoteCompleteness";
 import { extractPreparedTableFacts, isPrimaryContractAmountLabel, isPrimaryNmcLabel, unsupportedMonetaryUnit, type PreparedTableFacts, type SourcePreparationProvenance } from "./sourcePreparedFacts";
 
 export interface EvidenceExcerpt { sourceId: string; sourceName: string; fragmentId?: string; locator: string; quote: string; }
@@ -1434,8 +1434,8 @@ export function auditIntelligenceResult(items: readonly IntelligenceItem[], sour
       const wholeProposalText = contractProposalProof?.fields.has(field)
         || field === "deliveryTerms" && Boolean(publicTermsProof)
         || field === "paymentTerms" && Boolean(paymentProof);
-      const result: FieldEvidenceStatus = originalResult.status === "confirmed" && !wholeProposalText && proposalQuoteNeedsConditionReview(item, field)
-        ? { ...originalResult, status: "unverified", message: "В цитатах этого поля есть условия или ограничения, которые не перенесены дословно целиком. Совпадение короткой фразы не подтверждает сохранение смысла. Сверьте поле с полными цитатами или явно замените его цитатами; это не подтверждает их применимость к новому КП." }
+      const result: FieldEvidenceStatus = originalResult.status === "confirmed" && !wholeProposalText && proposalQuoteNeedsWholeTextReview(item, field)
+        ? { ...originalResult, status: "unverified", message: "Поле не сохраняет дословно все приведённые для него цитаты. В опущенном тексте могут быть события, отрицания или другие ограничения; совпадение короткой фразы не подтверждает сохранение смысла. Сверьте поле с полными цитатами или явно замените его цитатами. Это не подтверждает их применимость к новому КП." }
         : originalResult;
       report.fields.push(result);
       if (result.status !== "confirmed") report.findings.push(finding(item, ownerIssue ? result.status === "conflict" ? "staff-owner-conflict" : "staff-owner-unverified" : item.destination === "procurement" && field === "submissionDeadline" && ambiguousLotDeadline(value!, scope.dates, scope.index) ? "ambiguous-lot-deadline" : result.status === "placeholder" ? "placeholder-value" : result.status === "conflict" ? "semantic-conflict" : "unverified-value", ownerIssue || noteIssue || isCritical(item.destination, field) || result.status !== "unverified" ? "blocking" : "warning", result.message, result.evidence, field));
