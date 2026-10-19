@@ -755,7 +755,7 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
     } });
   };
   const requestReset = () => {
-    if (sources.length || sourceText || rawResponse || items.length || failedResponseRef.current || instruction.trim() && instruction !== generatedInstruction(taskDestinations)) setConfirm({ title: "Очистить окно ИИ?", message: "Источники, задание, выбор результатов, ответ, сохранённая копия неразобранного ответа и подготовленные здесь карточки будут удалены из этого окна. Уже сохранённые карточки в других инструментах останутся.", run: reset });
+    if (sources.length || sourceText || rawResponse || items.length || failedResponseRef.current || wholeProposal || wholeRunFailureRef.current || instruction.trim() && instruction !== generatedInstruction(taskDestinations)) setConfirm({ title: "Очистить окно ИИ?", message: "Из этого окна будут удалены источники, задание, выбор результатов, ответы и подготовленные здесь карточки. Полный черновик КП, включая несохранённые ручные правки блоков, ваши дополнения и ответы на уточнения, также будет удалён. Сохранённая диагностика незавершённого полного прохода и копия неразобранного ответа будут удалены. Уже сохранённые карточки в других инструментах останутся.", run: reset });
     else reset();
   };
   const copyPrompt = async () => {

@@ -478,6 +478,29 @@ describe("seven-area whole proposal route — synthetic callback integration, no
     confirmation.props.onClose!(); await flush(); expect(editor()!.handoff).toBe(original); expect(original.sections[0].userText).toBe("My unsaved session-only addition."); expect(runtime.analyze).toHaveBeenCalledTimes(2);
   });
 
+  it("confirms reset for an unsaved whole draft even after the last source and legacy raw are removed, preserving edits on cancellation", async () => {
+    await setup(); mockReplies(); await begin(); await confirm(); await until(() => Boolean(editor())); const original = editor()!.handoff;
+    original.sections[0].userText = "UNSAVED-WHOLE-DRAFT-ADDITION";
+    await edit("iw-response", ""); labeled(`Удалить источник ${sourceName}`).props.onClick!(); await flush(); await confirm();
+    expect(editor()!.handoff).toBe(original); expect(editor()!.stale).toBe(true); expect(cards()).toHaveLength(0); expect(control("iw-response").props.value).toBe("");
+    await click("Новая задача"); const confirmation = nodes().find(node => node.type === ConfirmDialog)!;
+    expect(confirmation.props.title).toBe("Очистить окно ИИ?"); const message = (confirmation.props as unknown as { message: string }).message;
+    for (const warning of ["Полный черновик КП", "ручные правки блоков", "дополнения", "ответы на уточнения", "будет удалён"]) expect(message).toContain(warning);
+    confirmation.props.onClose!(); await flush(); expect(editor()!.handoff).toBe(original); expect(original.sections[0].userText).toBe("UNSAVED-WHOLE-DRAFT-ADDITION");
+    await click("Новая задача"); await confirm(); expect(editor()).toBeUndefined(); expect(runtime.analyze).toHaveBeenCalledTimes(2); expect(transfer).not.toHaveBeenCalled();
+  });
+
+  it("confirms reset when only retained full-run failure diagnostics remain and keeps them on cancellation", async () => {
+    await setup(); runtime.analyze.mockResolvedValueOnce({ text: "PRESERVE-FAILED-RAW-ON-RESET", model: "synthetic" });
+    await begin(); await confirm(); await until(() => Boolean(nodes().find(node => node.props["aria-label"] === "Незавершённый полный черновик")));
+    await edit("iw-response", ""); labeled(`Удалить источник ${sourceName}`).props.onClick!(); await flush(); await confirm();
+    expect(editor()).toBeUndefined(); expect(cards()).toHaveLength(0); expect(control("iw-response").props.value).toBe("");
+    await click("Новая задача"); const confirmation = nodes().find(node => node.type === ConfirmDialog)!;
+    expect((confirmation.props as unknown as { message: string }).message).toContain("диагностика незавершённого полного прохода");
+    confirmation.props.onClose!(); await flush(); expect(text(labeled("Незавершённый полный черновик"))).toContain("PRESERVE-FAILED-RAW-ON-RESET");
+    await click("Новая задача"); await confirm(); expect(nodes().find(node => node.props["aria-label"] === "Незавершённый полный черновик")).toBeUndefined(); expect(runtime.analyze).toHaveBeenCalledTimes(1);
+  });
+
   it("rejects a malformed reviewer reply, preserves the previous whole draft, and displays each failed raw only once under its run identity", async () => {
     await setup(); mockReplies(); await begin(); await confirm(); await until(() => Boolean(editor())); const original = editor()!.handoff;
     runtime.analyze.mockImplementation((_profile: unknown, _prompt: string, _key: unknown, _id: string, schema: Record<string, unknown>) => Promise.resolve("reviewPlanKey" in (schema.properties as object) ? { text: "MALFORMED_REVIEW_NO_FALLBACK", model: "synthetic" } : reply(schema)));
