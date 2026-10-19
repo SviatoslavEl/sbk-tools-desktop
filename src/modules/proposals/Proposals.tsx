@@ -10,7 +10,7 @@ import { useWorkspaceAccess } from "../../lib/workspaceAccess";
 import { trackedOperation } from "../../lib/activity";
 import { normalizeCompanyDirectory, type CompanyCard, type CompanyDirectoryData } from "../contracts/companies";
 import { BUILTIN_TEMPLATES, cloneProposal, createProposal, emptyContact, nextProposalRevision } from "./defaults";
-import { buildProposalDocumentPublic, proposalExportAssets, proposalHasFullWidthScope, proposalHasStructuredScopePriceReference, proposalPrivateSourceQuestions, safeProposalFileName, validateProposal } from "./exportPublic";
+import { assertProposalAnalysisProvenance, buildProposalDocumentPublic, proposalExportAssets, proposalHasFullWidthScope, proposalHasStructuredScopePriceReference, proposalPrivateSourceQuestions, safeProposalFileName, validateProposal } from "./exportPublic";
 import { CommercialProposalEditor } from "./CommercialProposalEditor";
 import { ProposalFinalReview } from "./ProposalFinalReview";
 import { validateCommercialDocument } from "./commercialDocument";
@@ -20,6 +20,7 @@ import { ProposalSourcePricingReview } from "./ProposalSourcePricingReview";
 import { hasPendingProposalDraftPersistence, queueProposalDraftMutation, settleProposalDraftPersistence } from "./proposalDraftPersistence";
 import { createTaskDocumentOrigin, projectTaskDocumentSession, sameTaskDocumentOrigin, taskDocumentDraftKey, type TaskDocumentOrigin } from "../intelligence/taskDocumentSession";
 import { ProposalTaskBridge, proposalTaskFingerprint, type ProposalTaskAttempt, type ProposalTaskEditorBinding, type ProposalTaskEntry, type ProposalTaskSessionChange } from "./proposalTaskBridge";
+import { ProposalAnalysisProvenance } from "../intelligence/ProposalAnalysisProvenance";
 import type { ProposalData, ProposalIssue, ProposalRenderFormat, ProposalRenderResult, ProposalStatus, ProposalTemplateData } from "./types";
 import "./proposals.css";
 type ProposalRecord = ProposalData | ProposalTemplateData;
@@ -59,7 +60,7 @@ const checkedDraft = (stored: ProposalDraft | null, expectedOrigin?: TaskDocumen
     if (!value) return null;
     const draftOrigin = stored?.kind === "proposal-draft" ? stored.taskOrigin : undefined;
     if (expectedOrigin ? !sameTaskDocumentOrigin(draftOrigin, expectedOrigin) : draftOrigin !== undefined) throw new Error("Черновик относится к другому результату задачи. Запись поверх него остановлена.");
-    try { if (value.kind !== "proposal" || value.schemaVersion !== 1 || !value.familyId || !Array.isArray(value.attachments)) throw new Error(); validateProposal(value); if (value.commercialDocument !== undefined && validateCommercialDocument(value.commercialDocument).some((issue) => issue.severity === "error")) throw new Error(); }
+    try { if (value.kind !== "proposal" || value.schemaVersion !== 1 || !value.familyId || !Array.isArray(value.attachments)) throw new Error(); assertProposalAnalysisProvenance(value); validateProposal(value); if (value.commercialDocument !== undefined && validateCommercialDocument(value.commercialDocument).some((issue) => issue.severity === "error")) throw new Error(); }
     catch { throw new Error("Черновик повреждён или имеет неизвестный формат. Запись поверх него остановлена; сохранённые карточки не изменены."); }
     const legacyOwners = [...new Set([...value.attachments, ...(value.template.logo ? [value.template.logo] : [])].map((file) => file.relativePath.match(/^attachment-staging\/commercial-proposals\/([^/]+)\//u)?.[1]).filter((id): id is string => Boolean(id)))];
     if (legacyOwners.length > 1) throw new Error("Черновик содержит временные вложения нескольких карточек. Сохранение остановлено, чтобы не потерять файлы.");
@@ -296,6 +297,7 @@ export function Proposals({ active = true, openRecordId, onRecordOpened, handoff
         const task = queueProposalDraftMutation(root, current.draftKey, "write", () => {
             if (!mounted.current || !accessRef.current || current.local)
                 throw new Error("Режим редактора недоступен; данные остаются в форме.");
+            assertProposalAnalysisProvenance(current.data);
             return (async () => {
                 if (current.taskOrigin) await freshTaskWorkspace(current.taskOrigin, true);
                 return saveDraft("commercial-proposals", { kind: "proposal-draft", schemaVersion: 1, recordId: current.id || current.writeId, data: current.data,
@@ -378,6 +380,7 @@ export function Proposals({ active = true, openRecordId, onRecordOpened, handoff
         if (mounted.current && latest.current === current) taskCallbacks.current.onTaskLocalChange?.({ session: captured.session, data: structuredClone(captured.data), writeId: captured.writeId, ...(captured.recordId ? { recordId: captured.recordId } : {}) });
     }, [session]);
     const install = (next: Session | null) => {
+        if (next) assertProposalAnalysisProvenance(next.data);
         const previous = latest.current;
         if (previous?.taskOrigin && !sameTaskDocumentOrigin(previous.taskOrigin, next?.taskOrigin)) {
             // Observe the workspace at callback time. A delayed detach must not
@@ -607,6 +610,7 @@ export function Proposals({ active = true, openRecordId, onRecordOpened, handoff
         const current = latest.current;
         if (!current || current.local || !accessRef.current || current.persistedStatus !== "draft")
             throw new Error("Сохранение общей карточки сейчас недоступно.");
+        assertProposalAnalysisProvenance(current.data);
         if (commercialEditPending(current)) throw new Error("Есть неприменённые правки текста или условий. Примените либо отмените их в документе, затем сохраните карточку.");
         if (current.data.status !== "draft") {
             await buildProposalDocumentPublic(current.data, { allowZero, mode: "final" });
@@ -634,6 +638,7 @@ export function Proposals({ active = true, openRecordId, onRecordOpened, handoff
         // Saving promotes attachment-staging paths to permanent attachments.
         // Continue with the returned snapshot; the old form paths no longer exist.
         const savedData = saved.payload as ProposalData;
+        assertProposalAnalysisProvenance(savedData);
         const next = { ...current, id: saved.id, data: savedData, savedJson: snapshot(savedData), draftKey: current.taskOrigin ? current.draftKey : `proposal:${saved.id}`, persistedStatus: savedData.status };
         if (current.taskOrigin && taskAttempt) {
             const root = await freshTaskWorkspace(current.taskOrigin, true);
@@ -823,6 +828,7 @@ export function Proposals({ active = true, openRecordId, onRecordOpened, handoff
         const previous = value as ProposalData;
         if (previous.kind !== "proposal" || previous.familyId !== data.familyId)
             throw new Error("Снимок не относится к этому КП.");
+        assertProposalAnalysisProvenance(previous);
         const max = Math.max(...proposals.filter((entry) => entry.payload.familyId === data.familyId).map((entry) => entry.payload.revision), data.revision);
         const restored = nextProposalRevision(previous, max);
         const done = await run("Восстанавливаем редакцию…", async () => { await store.save(`${restored.number} · ${restored.title || "Черновик КП"}`, restored); setNotice("Состояние из истории сохранено как новая редакция. Текущая карточка осталась неизменной; новая редакция доступна в списке КП."); });
@@ -878,6 +884,7 @@ export function Proposals({ active = true, openRecordId, onRecordOpened, handoff
       {!access.editor && !session.local && <p className="notice">Просмотр и экспорт доступны. Для изменения без записи в общую папку создайте локальную копию.</p>}
       {!access.editor && session.local && <p className="help-text">Данные находятся только в памяти окна. Новые вложения и общие шаблоны недоступны; экспорт использует уже прикреплённые файлы.</p>}
       {data!.source && <p className="help-text">Источник: {data!.source.tool === "calculator" ? "калькулятор" : "закупка"} · {data!.source.priceOrigin}{data!.source.wasUnsaved ? " · несохранённый снимок" : ""}. Себестоимость и внутренние заметки не переносились.</p>}
+      <ProposalAnalysisProvenance value={data!.analysisProvenance}/>
       {presentation === "ai-task" && !data!.commercialDocument && Boolean(sourceQuestions.length) && <p className="notice warning">Нужно проверить условия исходного документа. Сохранение карточки и создание файла не означают, что вопросы согласованы или КП готово к отправке.</p>}
       <nav className="proposal-steps" aria-label="Шаги подготовки КП" tabIndex={presentation === "ai-task" ? 0 : undefined}>{steps.map((label, index) => <button key={label} type="button" aria-current={step === index ? "step" : undefined} className={step === index ? "active" : ""} onClick={() => setStep(index)}>{index + 1}. {data!.commercialDocument && index === 2 ? "Документ и условия" : label}</button>)}</nav>
       {hasPendingCommercialEdit && <p className="notice warning" role="status">Есть неприменённые правки текста или условий. Они остаются в полях, но пока не входят в сохранение и выгрузку. Примените или отмените их в документе.</p>}

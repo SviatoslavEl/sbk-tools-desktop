@@ -8,7 +8,9 @@ import { TaskGoalPicker, type TaskGoalPickerProps } from "./TaskGoalPicker";
 import { TASK_GOAL_OPTIONS } from "./taskGoalSelection";
 import { repairDateFromSource } from "./sourceRepairs";
 import { AutomaticConditionsSummary } from "./AutomaticConditionsSummary";
-import { runResponsePreparation, type ResponsePreparationRequest } from "./responsePreparationWorker";
+import { runProposalQuotePreparation, runResponsePreparation, type ResponsePreparationRequest } from "./responsePreparationWorker";
+import { ProposalAnalysisProvenance } from "./ProposalAnalysisProvenance";
+import type { ProposalQuotePreparationWireRequest, ProposalQuoteProvenance } from "./proposalQuotePreparation";
 import { runEvidenceAudit, type EvidenceAuditRequest, type EvidenceAuditReply } from "./evidenceAuditWorker";
 import type { IntelligenceDestination, IntelligenceHandoff, IntelligenceSource } from "./workbenchTypes";
 import { createTaskDocumentSession, reduceTaskDocumentSession, taskDocumentOriginKey, type TaskDocumentOrigin, type TaskDocumentSession } from "./taskDocumentSession";
@@ -274,23 +276,21 @@ describe("explicit local proposal preparation from a complete contract", () => {
     nodes().find((node) => node.type === ConfirmDialog)!.props.onClose!(); await flush();
     expect(transfer).not.toHaveBeenCalled(); expect(cards().map((card) => card.key)).toEqual(previous);
   });
-  it("labels a real all-null reply before local enrichment and does not credit its recovered fields to the model", async () => {
+  it("rejects an ordinary all-null items reply for the contract quote grammar, without silently substituting the local route", async () => {
     await configureModel(); await selectGoals("proposals"); await addContract();
     const raw = result([{ destination: "proposals", title: "Коммерческое предложение", sourceIds: [sourceId(contract().name)], evidence: [], positions: null,
       fields: Object.fromEntries(fieldDefinitions.proposals.filter(field => !["lines", "lineDescriptions"].includes(field.key)).map(field => [field.key, null])) }]);
     runtime.analyze.mockResolvedValueOnce({ text: raw, model: "qa-model" });
     await prepare();
-    expect(cards()).toHaveLength(1);
-    expect(field("title").props.value).not.toBe("");
-    expect(text(labeled("Пустой исходный ответ"))).toContain("Это не успешное извлечение моделью");
-    expect(text(labeled("Вклад исходного ответа"))).toContain("полей без общего заголовка — 0");
-    expect(control("iw-response").props.value).toBe(raw);
+    expect(cards()).toHaveLength(0); expect(text()).toContain("Выбор цитат остановлен");
+    expect(control("iw-response").props.value).toBe("");
+    expect(nodes().some(node => node.props["aria-label"] === "Пустой исходный ответ")).toBe(false);
     // Explicit source-only preparation is another route, not a successful
     // retry of the model. It owns a new result, with its own clear origin.
-    await click(localAction); await confirm();
+    await click(localAction);
     expect(nodes().some(node => node.props["aria-label"] === "Пустой исходный ответ")).toBe(false);
     expect(text()).toContain("Модель в его подготовке не использовалась");
-    expect(control("iw-response").props.value).toBe(raw);
+    expect(control("iw-response").props.value).toBe("");
     expect(runtime.analyze).toHaveBeenCalledTimes(1);
   });
   it("retains the previous contribution receipt if a replacement response cannot be parsed", async () => {
@@ -366,6 +366,180 @@ describe("explicit local proposal preparation from a complete contract", () => {
     await selectGoals("proposals"); await selectPreparationMethod("source-contract"); expect(button(localAction).props.disabled).toBe(true);
     await addContract(); expect(button(localAction).props.disabled).toBe(false);
     await selectGoals("proposals", "staff"); expect(nodes().some((node) => node.type === "button" && text(node) === localAction)).toBe(false);
+  });
+});
+
+describe("production whole-quote proposal callbacks with a MOCK provider, not actual inference or native acceptance", () => {
+  const previousRaw = "PRIVATE-MANUAL-RAW: keep exactly, not a quote response";
+  const cards = () => nodes().filter(node => node.props.className === "iw-card");
+  interface QuotePayload { sourceId: string; sourceSnapshotKey: string; units: Array<{ unitId: string; text: string }>; relatedContextUnits: Array<{ unitId: string; text: string }> }
+  function quoteContract(extra = 1): IntelligenceSource {
+    const lines = ["Договор", "1. Предмет договора", "1.1. Исполнитель оказывает комплекс услуг по проверке учебной системы.",
+      "2. Состав оказываемых услуг", ...Array.from({ length: extra }, (_, index) => `2.${index + 1}. Анализ учебного раздела ${index + 1}; при наличии доступа сохранить ограничения.`),
+      "3. Итоговые материалы и результат оказания услуг", "3.1. Отчёт с рисками и рекомендациями.",
+      "4. Стоимость услуг и порядок расчетов", "4.1. Стоимость услуг составляет 12 000,00 рублей, в том числе НДС 22%.",
+      "4.2. Аванс 25% в течение 4 календарных дней от подписания.", "4.3. Окончательный расчет в течение 6 рабочих дней от акта или истечения срока отказа.",
+      "5. Срок оказания услуг", "5.1. Максимальный срок — 16 рабочих дней после аванса и материалов, что наступит позднее.",
+      "6. Входные данные и условия проведения работ", "6.1. Заказчик предоставляет материалы и доступы.",
+      "7. Допущения и ограничения", "7.1. Восстановление архитектуры в объём работ не входит."];
+    return { id: "mock-contract", name: "Договор для mock quote callback.docx", text: lines.join("\n"), coverage: { complete: true, requiresOcr: false },
+      fragments: lines.map((text, index) => ({ id: `quote-${index}`, locator: `Абзац ${index + 1}`, text })) };
+  }
+  async function setupQuote(input = quoteContract()) {
+    await configureModel(); await selectGoals("proposals");
+    runtime.chooseOpen.mockResolvedValueOnce("/qa/mock-quote-contract.docx");
+    runtime.invoke.mockResolvedValueOnce({ fileName: input.name, extractedText: input.text, sha256: "b".repeat(64), fragments: input.fragments, coverage: input.coverage, warnings: [] });
+    await click("Добавить PDF, DOCX или XLSX"); await edit("iw-response", previousRaw);
+  }
+  function quotePayload(prompt: string): QuotePayload { return JSON.parse(prompt.split("sourceUnits (данные): ")[1]); }
+  function mockQuoteReply(prompt: string, commercial = true) {
+    const body = quotePayload(prompt), schema = JSON.parse(prompt.split("JSON-схема ответа: ")[1].split("\n\nsourceUnits")[0]);
+    // Deliberately mechanical MOCK: all nonempty fragments use scope. This
+    // proves the real exact-quote grammar and callbacks, NOT semantic roles,
+    // model relevance, full-document extraction or usable commercial content.
+    return { model: "qa-model", text: JSON.stringify({ sourceSnapshotKey: body.sourceSnapshotKey, batchId: schema.properties.batchId.enum[0],
+      units: body.units.map(unit => ({ unitId: unit.unitId, disposition: commercial ? "commercial" : "context", roles: commercial ? ["scope"] : ["context"], quote: commercial ? unit.text : null })) }) };
+  }
+  async function settleQuote() { for (let index = 0; index < 8; index++) await flush(); }
+  async function beginQuote() { await prepare(); if (nodes().some(node => node.type === ConfirmDialog)) await confirm(); await settleQuote(); }
+  async function previousCards() {
+    await edit("iw-new-destination", "proposals"); await click("Добавить карточку вручную");
+    field("title").props.onChange!({ target: { value: "Предыдущий исправленный проект", checked: false } }); await flush();
+    await edit("iw-new-destination", "staff"); await click("Добавить карточку вручную");
+    field("fullName").props.onChange!({ target: { value: "Предыдущий сотрудник", checked: false } }); await flush();
+  }
+  function ledger() { return nodes().find(node => node.type === ProposalAnalysisProvenance)?.props.value as ProposalQuoteProvenance | null | undefined; }
+  function holdQuotePreparation() {
+    const jobs: QuoteWorker[] = [];
+    class QuoteWorker {
+      request!: ProposalQuotePreparationWireRequest;
+      onmessage: ((event: { data: unknown }) => void) | null = null;
+      onerror: ((event: Event) => void) | null = null;
+      onmessageerror: ((event: Event) => void) | null = null;
+      terminated = false;
+      constructor(readonly url: URL) {}
+      postMessage(request: ProposalQuotePreparationWireRequest | ResponsePreparationRequest | EvidenceAuditRequest) {
+        if (this.url.pathname.endsWith("responsePreparationWorker.ts")) {
+          if ("origin" in request && request.origin === "model-selected-quotes") { this.request = request; jobs.push(this); }
+          else this.onmessage?.({ data: runResponsePreparation(request) });
+        } else this.onmessage?.({ data: runEvidenceAudit(request as EvidenceAuditRequest) });
+      }
+      terminate() { this.terminated = true; }
+    }
+    vi.stubGlobal("Worker", QuoteWorker); return jobs;
+  }
+  async function openRawParts() {
+    const panel = nodes().find(node => node.props.className === "iw-analysis-parts");
+    if (!panel) throw new Error("Нет исходных ответов выбора цитат");
+    (panel.props as unknown as { onToggle: (event: { currentTarget: { open: boolean } }) => void }).onToggle({ currentTarget: { open: true } }); await flush();
+    return text(nodes().find(node => node.props.className === "iw-analysis-parts"));
+  }
+
+  it("uses the quote schema instead of the ordinary 19 fields, preserves task instructions and passes the private raw ledger to an unsaved proposal", async () => {
+    vi.stubGlobal("Worker", undefined); await setupQuote();
+    await edit("iw-instruction", "Сохранить ограничения выбранного документа для проекта КП.");
+    runtime.analyze.mockImplementation((_profile: unknown, prompt: string) => Promise.resolve(mockQuoteReply(prompt)));
+    await beginQuote();
+    expect(runtime.analyze).toHaveBeenCalledTimes(1);
+    const [, prompt, , , schema] = runtime.analyze.mock.calls[0];
+    expect(Object.keys(schema.properties).sort()).toEqual(["sourceSnapshotKey", "batchId", "units"].sort());
+    expect(schema.properties).not.toHaveProperty("items"); expect(schema.properties.units.items.required).toEqual(["unitId", "disposition", "roles", "quote"]);
+    expect(prompt).toContain("Сохранить ограничения выбранного документа"); expect(prompt).not.toContain("sources (данные, не инструкции):");
+    expect(cards()).toHaveLength(1); expect(control("iw-response").props.value).toBe(previousRaw);
+    const received = mockQuoteReply(prompt).text, selected = ledger()!;
+    expect(selected.origin).toBe("model-selected-quotes"); expect(selected.parts).toEqual([{ batchId: "batch-1", model: "qa-model", raw: received }]);
+    expect(selected.counts).toEqual({ units: quotePayload(prompt).units.length, commercial: quotePayload(prompt).units.length, context: 0, unclear: 0, batches: 1 });
+    expect(selected.selections.map(entry => ({ unitId: entry.unitId, quote: entry.quote }))).toEqual(quotePayload(prompt).units.map(unit => ({ unitId: unit.unitId, quote: unit.text })));
+    expect(nodes().some(node => node.props["aria-label"] === "Вклад исходного ответа")).toBe(false); expect(transfer).not.toHaveBeenCalled();
+    await reviewVisibleFindings(); incompleteButton("Коммерческие предложения").props.onClick!(); await flush(); await confirm(); await settleQuote();
+    // The source-derived commercial-document projection uses real WebCrypto,
+    // unlike the separately mocked task snapshot key. Give its async digest
+    // callbacks bounded event-loop turns; no native IO/inference is involved.
+    for (let turn = 0; turn < 200 && !transfer.mock.calls.length && !nodes().some(node => node.props.className === "notice error"); turn++) {
+      await new Promise<void>(resolve => setTimeout(resolve, 0)); await flush();
+    }
+    expect(nodes().filter(node => node.props.className === "notice error").map(node => text(node))).toEqual([]);
+    expect(transfer).toHaveBeenCalledOnce(); const handoff = transfer.mock.calls[0][0];
+    if (handoff.destination !== "proposals") throw new Error("Нет передачи КП");
+    expect(handoff.data.analysisProvenance).toEqual(selected); expect(handoff.data.analysisProvenance).not.toBe(selected);
+    expect(handoff.taskOrigin?.sourceSnapshotKey).toBe(selected.sourceSnapshotKey); expect(control("iw-response").props.value).toBe(previousRaw);
+    expect(runtime.invoke.mock.calls.map(([command]) => command)).toEqual(["scanner_run"]);
+  });
+
+  it("runs primary batches serially and replaces both prior cards only after all exact parts and the real local worker result are accepted", async () => {
+    await setupQuote(quoteContract(35)); await previousCards(); const before = cards().map(card => card.key), jobs = holdQuotePreparation();
+    const waits: Array<{ prompt: string; answer: ReturnType<typeof deferred<{ text: string; model: string }>> }> = [];
+    runtime.analyze.mockImplementation((_profile: unknown, prompt: string) => { const answer = deferred<{ text: string; model: string }>(); waits.push({ prompt, answer }); return answer.promise; });
+    await beginQuote(); expect(waits).toHaveLength(1); expect(text()).toContain("Этап 1 из 3"); expect(cards().map(card => card.key)).toEqual(before);
+    for (let index = 0; index < 3; index++) {
+      expect(waits).toHaveLength(index + 1); waits[index].answer.resolve(mockQuoteReply(waits[index].prompt)); await settleQuote();
+      expect(cards().map(card => card.key)).toEqual(before); expect(control("iw-response").props.value).toBe(previousRaw);
+      if (index < 2) { expect(waits).toHaveLength(index + 2); expect(jobs).toHaveLength(0); }
+    }
+    expect(runtime.analyze).toHaveBeenCalledTimes(3); expect(new Set(runtime.analyze.mock.calls.map(call => call[3])).size).toBe(3);
+    const primaryIds = waits.flatMap(wait => quotePayload(wait.prompt).units.map(unit => unit.unitId)); expect(new Set(primaryIds).size).toBe(primaryIds.length);
+    expect(jobs).toHaveLength(1); expect(jobs[0].request.origin).toBe("model-selected-quotes"); expect(jobs[0].request).not.toHaveProperty("raw");
+    expect(jobs[0].request.parts.map(part => part.raw)).toEqual(waits.map(wait => mockQuoteReply(wait.prompt).text));
+    const reply = await runProposalQuotePreparation(jobs[0].request); expect(reply.failed).toBeUndefined();
+    jobs[0].onmessage!({ data: reply }); await settleQuote();
+    expect(cards()).toHaveLength(1); expect(nodes().some(node => typeof node.props.id === "string" && node.props.id.endsWith("-fullName"))).toBe(false);
+    expect(ledger()?.counts.batches).toBe(3); expect(jobs[0].terminated).toBe(true); expect(control("iw-response").props.value).toBe(previousRaw); expect(transfer).not.toHaveBeenCalled();
+  });
+
+  it("stops at a malformed second quote part without a fallback request, partial installation or overwriting previous cards/manual raw", async () => {
+    await setupQuote(quoteContract(35)); await previousCards(); const before = cards().map(card => card.key), jobs = holdQuotePreparation();
+    const returned: string[] = [];
+    runtime.analyze.mockImplementation((_profile: unknown, prompt: string) => { const response = returned.length ? { text: "MOCK-MALFORMED-PART", model: "qa-model" } : mockQuoteReply(prompt); returned.push(response.text); return Promise.resolve(response); });
+    await beginQuote();
+    expect(runtime.analyze).toHaveBeenCalledTimes(2); expect(jobs).toHaveLength(0); expect(cards().map(card => card.key)).toEqual(before);
+    expect(field("title").props.value).toBe("Предыдущий исправленный проект"); expect(field("fullName").props.value).toBe("Предыдущий сотрудник");
+    expect(text()).toContain("Выбор цитат остановлен"); expect(control("iw-response").props.value).toBe(previousRaw); expect(ledger()).toBeNull();
+    const parts = await openRawParts(); expect(parts).toContain(returned[0]); expect(parts).toContain(returned[1]);
+    expect(runtime.analyze.mock.calls.every(call => call[4].properties.units && !call[4].properties.items)).toBe(true); expect(transfer).not.toHaveBeenCalled();
+  });
+
+  it.each(["cancel", "source-edit", "workspace-change"] as const)("never publishes a late mock quote response after %s or sends remaining batches", async change => {
+    await setupQuote(quoteContract(35)); await previousCards(); const before = cards().map(card => card.key), pending = deferred<{ text: string; model: string }>();
+    runtime.analyze.mockReturnValueOnce(pending.promise); await beginQuote();
+    expect(runtime.analyze).toHaveBeenCalledTimes(1); const call = runtime.analyze.mock.calls[0];
+    if (change === "cancel") await click("Остановить запрос");
+    if (change === "source-edit") await editLabeled(`Текст источника ${quoteContract().name}`, "Исправленный источник во время запроса.");
+    if (change === "workspace-change") { render({ ...props, workspaceRoot: "/different-quote-workspace" }); await flush(); }
+    const retained = cards().map(card => card.key), raw = control("iw-response").props.value;
+    pending.resolve(mockQuoteReply(call[1])); await settleQuote();
+    expect(runtime.analyze).toHaveBeenCalledTimes(1); if (change !== "workspace-change") expect(runtime.cancel).toHaveBeenCalledWith(call[3]); expect(cards().map(card => card.key)).toEqual(retained);
+    if (change !== "workspace-change") { expect(retained).toEqual(before); expect(raw).toBe(previousRaw); }
+    expect(control("iw-response").props.value).toBe(raw); expect(ledger()).toBeNull(); expect(transfer).not.toHaveBeenCalled();
+  });
+
+  it.each(["cancel", "source-edit"] as const)("rejects a retained quote-preparation worker callback after %s, not only a late provider response", async change => {
+    await setupQuote(); await previousCards(); const before = cards().map(card => card.key), jobs = holdQuotePreparation();
+    runtime.analyze.mockImplementation((_profile: unknown, prompt: string) => Promise.resolve(mockQuoteReply(prompt)));
+    await beginQuote(); expect(jobs).toHaveLength(1);
+    const job = jobs[0], stale = job.onmessage!, reply = await runProposalQuotePreparation(job.request); expect(reply.failed).toBeUndefined();
+    if (change === "cancel") await click("Остановить разбор");
+    else await editLabeled(`Текст источника ${quoteContract().name}`, "Изменённый источник после выбора цитат, до подготовки.");
+    expect(job.terminated).toBe(true); stale({ data: reply }); await settleQuote();
+    expect(cards().map(card => card.key)).toEqual(before); expect(control("iw-response").props.value).toBe(previousRaw);
+    expect(ledger()).toBeNull(); expect(transfer).not.toHaveBeenCalled();
+  });
+
+  it("fails an eligible contract's quote preflight visibly without making an ordinary fallback request", async () => {
+    const input = quoteContract(); input.fragments![4].text += "x".repeat(13 * 1024); input.text = input.fragments!.map(fragment => fragment.text).join("\n");
+    await setupQuote(input); await previousCards(); const before = cards().map(card => card.key);
+    await beginQuote();
+    expect(runtime.analyze).not.toHaveBeenCalled(); expect(cards().map(card => card.key)).toEqual(before);
+    expect(text()).toContain("Выбор цитат остановлен"); expect(text()).toContain("Целый фрагмент");
+    expect(control("iw-response").props.value).toBe(previousRaw); expect(ledger()).toBeNull(); expect(transfer).not.toHaveBeenCalled();
+  });
+
+  it("treats all-context mock responses as empty model selection, never substituting a local full-contract success", async () => {
+    vi.stubGlobal("Worker", undefined); await setupQuote(); await previousCards(); const before = cards().map(card => card.key);
+    runtime.analyze.mockImplementation((_profile: unknown, prompt: string) => Promise.resolve(mockQuoteReply(prompt, false)));
+    await beginQuote();
+    expect(cards().map(card => card.key)).toEqual(before); expect(text()).toContain("Модель не выбрала содержательный предмет");
+    expect(text()).not.toContain("Локальный проект по тексту договора"); expect(control("iw-response").props.value).toBe(previousRaw);
+    expect(ledger()).toBeNull(); expect(transfer).not.toHaveBeenCalled();
   });
 });
 

@@ -18,6 +18,9 @@ import { getItemTaskCompletion, type TaskCompletionReport } from "./taskCompleti
 import { ItemTaskCompletionSummary, TaskCompletionSummary } from "./TaskCompletionSummary";
 import { ProposalContentPreview } from "./ProposalContentPreview";
 import { ProposalQuotedTextRepair } from "./ProposalQuotedTextRepair";
+import { ProposalAnalysisProvenance } from "./ProposalAnalysisProvenance";
+import { buildProposalQuotePlan, isProposalQuoteSelectionCandidate, parseProposalQuoteResponse } from "./proposalQuotePlan";
+import { validProposalQuoteProvenance, type ProposalQuoteProvenance, type ProposalQuoteResponsePart } from "./proposalQuotePreparation";
 import { SourceFactsDesk } from "./SourceFactsDesk";
 import { TaskGoalPicker } from "./TaskGoalPicker";
 import { normalizeTaskGoalSelection } from "./taskGoalSelection";
@@ -25,7 +28,7 @@ import { createTaskDocumentOrigin, projectTaskDocumentSession, sameTaskDocumentO
 import { taskSourceSnapshotKey } from "./taskSourceIdentity";
 import { prepareCommercialTaskProposal } from "../proposals/commercialTaskPreparation";
 import { useSourceFactsInventory } from "./useSourceFactsInventory";
-import { ResponsePreparationCancelled, startResponsePreparation, startSourceContractPreparation } from "./responsePreparation";
+import { ResponsePreparationCancelled, startProposalQuotePreparation, startResponsePreparation, startSourceContractPreparation } from "./responsePreparation";
 import { assertResponsePreparationSources } from "./responsePreparationBounds";
 import type { AutoConditionResult } from "./automaticConditions";
 import { AutomaticConditionsSummary } from "./AutomaticConditionsSummary";
@@ -147,7 +150,8 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
   const [preparedResultFocus, setPreparedResultFocus] = useState(0);
   const [analysisMode, setAnalysisMode] = useState<AnalysisMode>("combined");
   const [analysisProgress, setAnalysisProgress] = useState<{ index: number; total: number; label: string } | null>(null);
-  const [analysisParts, setAnalysisParts] = useState<Array<AnalysisResponsePart & { model: string }>>([]);
+  const [analysisParts, setAnalysisParts] = useState<Array<AnalysisResponsePart & { model: string; batchId?: string }>>([]);
+  const [analysisPartsOpen, setAnalysisPartsOpen] = useState(false);
   const [rawResponse, setRawResponse] = useState("");
   const [rawResponseOpen, setRawResponseOpen] = useState(false);
   const [failedResponse, setFailedResponse] = useState<FailedIntelligenceResponse | null>(null);
@@ -156,6 +160,8 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
   const [emptyWarning, setEmptyWarning] = useState("");
   const [responseDetails, setResponseDetails] = useState<Omit<IntelligenceAnalysisResult, "text"> | null>(null);
   const [modelContribution, setModelContribution] = useState<ModelResponseContribution | null>(null);
+  const [modelQuoteProvenance, setModelQuoteProvenance] = useState<ProposalQuoteProvenance | null>(null);
+  const quoteProvenanceRef = useRef(modelQuoteProvenance); quoteProvenanceRef.current = modelQuoteProvenance;
   const [manualDestination, setManualDestination] = useState<IntelligenceDestination>("procurement");
   const [items, setItems] = useState<IntelligenceItem[]>([]);
   const itemsRef = useRef<IntelligenceItem[]>([]); itemsRef.current = items;
@@ -211,6 +217,7 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
   const accessRef = useRef({ access, phase: network.phase, workspaceRoot });
   accessRef.current = { access, phase: network.phase, workspaceRoot };
   const selectedSources = useMemo(() => sources.filter((source) => source.selected && source.text.trim()).map(({ selected: _selected, filePath: _filePath, sheets: _sheets, ...source }) => source), [sources]);
+  const quoteRouteAvailable = useMemo(() => taskDestinations.length === 1 && taskDestinations[0] === "proposals" && isProposalQuoteSelectionCandidate(selectedSources), [selectedSources, taskDestinations]);
   const sourceCharacters = selectedSources.reduce((count, source) => count + source.text.length, 0);
   const canTransfer = access.editor && network.phase === "connected";
   const updateSources = (update: (previous: WorkbenchSource[]) => WorkbenchSource[]) => { const next = update(sourcesRef.current); sourcesRef.current = next; setSources(next); };
@@ -405,11 +412,12 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
     } catch (reason) { if (mounted.current && token === extractionEpoch.current) setError(errorMessage(reason)); }
     finally { if (extractionPending.current === token) extractionPending.current = null; if (mounted.current && token === extractionEpoch.current) setExtracting(false); }
   };
-  const installPreparedResult = (prepared: NonNullable<ResponsePreparationReply["prepared"]>, snapshot: IntelligenceSource[], requestedDestinations: IntelligenceDestination[], contribution?: ModelResponseContribution) => {
+  const installPreparedResult = (prepared: NonNullable<ResponsePreparationReply["prepared"]>, snapshot: IntelligenceSource[], requestedDestinations: IntelligenceDestination[], contribution?: ModelResponseContribution, quoteProvenance?: ProposalQuoteProvenance) => {
     const revision = ++baseResultRevision.current;
     itemResultRevisions.current = new Map(prepared.items.map((item) => [item.id, revision]));
     proposalTransferOrigins.current.clear();
     setModelContribution(contribution || null);
+    quoteProvenanceRef.current = quoteProvenance || null; setModelQuoteProvenance(quoteProvenance || null);
     itemsRef.current = prepared.items;
     setItems(prepared.items); setResultSources(snapshot); setResultDestinations([...requestedDestinations]); setAutomaticConditions({ changes: prepared.changes, skipped: prepared.skipped, limited: prepared.limited }); setSourcePreparation(prepared.sourcePreparation || null); setManualItemIds([]); setReviewedFindings({}); setOpenedItems([]); setResultStale(false); setError("");
     setEmptyWarning("");
@@ -417,6 +425,7 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
     const added = prepared.changes.filter((change) => change.kind === "added").length;
     setNotice(prepared.sourcePreparation?.origin === "source-contract"
       ? "Проект КП подготовлен локально по полному тексту договора, без модели. Прежний ответ модели не использован и не изменён. Проверьте цену, спорные условия и полноту документа перед выпуском."
+      : quoteProvenance ? "Модель выбрала цитаты договора; программа отдельно подготовила черновик и дополнения из источника. Исходные ответы и выбор модели сохранены в журнале участия ИИ. Проверьте состав, цену и условия: выбор цитат не означает готовность КП."
       : `Получено черновиков: ${prepared.items.length}.${added ? ` Из источников автоматически добавлено пунктов: ${added}.` : ""} Идёт отдельная проверка содержания и достоверности. Заполненные поля ещё не означают, что задача выполнена.`);
   };
   const acceptResponse = async (raw: string, snapshot: IntelligenceSource[], requestedDestinations: IntelligenceDestination[], format: FailedIntelligenceResponse["format"] = "manual") => {
@@ -482,13 +491,57 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
     if (!profile.model.trim()) { setError("Для подготовки с ИИ сначала настройте и выберите модель. Локальный способ выбирается отдельно и не запускается автоматически."); return; }
     const instructionSnapshot = instruction.trim() ? instruction : generatedInstruction(taskDestinations);
     const destinationSnapshot = [...taskDestinations], snapshot = structuredClone(selectedSources), profileSnapshot = { ...profile }, keySnapshot = apiKey || undefined, modeSnapshot = analysisMode, rootSnapshot = workspaceRoot;
-    let plan: ReturnType<typeof buildAnalysisPlan>;
-    try { plan = buildAnalysisPlan(instructionSnapshot, snapshot, destinationSnapshot, modeSnapshot); } catch (reason) { setError(errorMessage(reason)); return; }
+    // Choose the quote grammar before preflight. A budget/ID/protocol failure
+    // of an eligible contract must not silently send the old full-document job.
+    const useQuotes = quoteRouteAvailable;
+    let plan: ReturnType<typeof buildAnalysisPlan> = [];
+    if (!useQuotes) try { plan = buildAnalysisPlan(instructionSnapshot, snapshot, destinationSnapshot, modeSnapshot); } catch (reason) { setError(errorMessage(reason)); return; }
     const request = { id: crypto.randomUUID(), epoch: epoch.current }; pending.current = request;
     const current = () => mounted.current && pending.current === request && epoch.current === request.epoch && accessRef.current.workspaceRoot === rootSnapshot;
     const parts: Array<AnalysisResponsePart & { model: string }> = [];
-    setRunning(true); setError(""); setNotice(""); setEmptyWarning(""); setResponseDetails(null); setAnalysisParts([]);
+    setRunning(true); setError(""); setNotice(""); setEmptyWarning(""); setResponseDetails(null); setAnalysisParts([]); setAnalysisPartsOpen(false);
     try {
+      if (useQuotes) {
+        const options = { instruction: instructionSnapshot };
+        const quotePlan = await buildProposalQuotePlan(snapshot, options);
+        if (!current()) return;
+        const quoteParts: ProposalQuoteResponsePart[] = [];
+        let rawBytes = 0;
+        for (const [index, batch] of quotePlan.batches.entries()) {
+          if (!current()) return;
+          if (index > 0) request.id = crypto.randomUUID();
+          setAnalysisProgress({ index: index + 1, total: quotePlan.batches.length, label: "Выбор целых цитат договора" });
+          const result = await runIntelligenceAnalysis(profileSnapshot, batch.prompt, keySnapshot, request.id, batch.responseSchema as Record<string, unknown>);
+          if (!current()) return;
+          setResponseDetails({ model: result.model, metrics: result.metrics, diagnostics: result.diagnostics });
+          quoteParts.push({ batchId: batch.id, model: result.model, raw: result.text });
+          setAnalysisParts(quoteParts.map(part => ({ batchId: part.batchId, model: part.model, text: part.raw, destinations: ["proposals"] })));
+          rawBytes += bytes(result.text);
+          if (rawBytes > maxTextBytes) throw new Error("Общий объём ответов выбора цитат превышает 2 МБ. Ничего не усечено; частичный результат не принят.");
+          // Stop before sending another batch if any exact slot/quote is bad.
+          // The legacy items parser is deliberately not a recovery path here.
+          await parseProposalQuoteResponse(result.text, quotePlan, batch.id, snapshot);
+          if (!current()) return;
+        }
+        const preparation = startProposalQuotePreparation({ revision: ++preparationRevision.current, sources: snapshot, options, parts: quoteParts });
+        preparationPending.current = preparation; setPreparingResponse(true);
+        try {
+          const reply = await preparation.promise;
+          if (!current() || preparationPending.current !== preparation) return;
+          if (reply.failed) throw new Error(reply.failed);
+          if (reply.empty) {
+            setResultStale(itemsRef.current.length > 0);
+            setEmptyWarning("Модель не выбрала содержательный предмет, состав работ или результат. Локальный проект не подставлен вместо её ответа. Исходные ответы доступны по пакетам; прежние карточки, если были, сохранены.");
+            return;
+          }
+          if (reply.origin !== "model-selected-quotes" || !reply.prepared || !validProposalQuoteProvenance(reply.modelQuoteProvenance)
+            || reply.modelQuoteProvenance.sourceSnapshotKey !== quotePlan.sourceSnapshotKey) throw new Error("Результат выбора цитат не соответствует текущему договору. Прежние карточки сохранены.");
+          installPreparedResult(reply.prepared, snapshot, destinationSnapshot, undefined, reply.modelQuoteProvenance);
+        } finally {
+          if (preparationPending.current === preparation) { preparationPending.current = null; if (mounted.current) setPreparingResponse(false); }
+        }
+        return;
+      }
       for (const [index, step] of plan.entries()) {
         if (!current()) return;
         if (index > 0) request.id = crypto.randomUUID();
@@ -514,7 +567,7 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
       const raw = modeSnapshot === "combined" ? parts[0].text : mergeAnalysisResponses(parts, snapshot.map((source) => source.id)).text;
       setRawResponse(raw);
       try { await acceptResponse(raw, snapshot, destinationSnapshot, profileSnapshot.outputMode === "schema" ? "schema" : "json"); } catch (reason) { if (current() && !(reason instanceof ResponsePreparationCancelled)) { setResultStale(itemsRef.current.length > 0); setError(`Ответ получен, но карточки не разобраны: ${errorMessage(reason)}. Текст ответа доступен ниже. Ранее подготовленные карточки относятся к предыдущему ответу.`); } }
-    } catch (reason) { if (current()) setError(`${modeSnapshot === "by-destination" ? "Разбор по направлениям остановлен. Предыдущие карточки и решения сохранены. " : ""}${errorMessage(reason)}`); }
+    } catch (reason) { if (current()) { if (useQuotes) setResultStale(itemsRef.current.length > 0); setError(`${useQuotes ? "Выбор цитат остановлен. Предыдущие карточки и решения сохранены; полученные ответы доступны по пакетам. " : modeSnapshot === "by-destination" ? "Разбор по направлениям остановлен. Предыдущие карточки и решения сохранены. " : ""}${errorMessage(reason)}`); } }
     finally { if (mounted.current && pending.current === request) { pending.current = null; setRunning(false); setAnalysisProgress(null); } }
   };
   const parseManualResponse = async () => {
@@ -527,7 +580,7 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
   const requestAnalysis = () => {
     if (!taskDestinations.length) { setError("Выберите хотя бы один результат для подготовки."); return; }
     const confirmationEpoch = epoch.current;
-    if (items.length) setConfirm({ title: "Подготовить новый результат?", message: `${analysisMode === "by-destination" ? `Будет ${taskDestinations.length} последовательных запросов; выбранные материалы отправятся модели ${taskDestinations.length} раз. ` : ""}После успешного разбора ответа он заменит подготовленные здесь карточки, включая внесённые вручную исправления. Уже открытые карточки в других инструментах не изменятся.`, label: analysisMode === "by-destination" ? `Отправить запросы (${taskDestinations.length})` : "Отправить запрос", run: () => { setConfirm(null); if (epoch.current !== confirmationEpoch) { setError("Задача изменилась после открытия подтверждения. Проверьте материалы и отправьте запрос заново."); return; } void analyze(); } });
+    if (items.length) setConfirm({ title: "Подготовить новый результат?", message: `${quoteRouteAvailable ? "Договор будет обработан последовательными пакетами целых фрагментов с ближайшим контекстом. Число пакетов появится после проверки объёма. " : analysisMode === "by-destination" ? `Будет ${taskDestinations.length} последовательных запросов; выбранные материалы отправятся модели ${taskDestinations.length} раз. ` : ""}После успешного разбора ответа он заменит подготовленные здесь карточки, включая внесённые вручную исправления. Уже открытые карточки в других инструментах не изменятся.`, label: quoteRouteAvailable ? "Выбрать цитаты и подготовить КП" : analysisMode === "by-destination" ? `Отправить запросы (${taskDestinations.length})` : "Отправить запрос", run: () => { setConfirm(null); if (epoch.current !== confirmationEpoch) { setError("Задача изменилась после открытия подтверждения. Проверьте материалы и отправьте запрос заново."); return; } void analyze(); } });
     else void analyze();
   };
   const requestParse = () => {
@@ -561,7 +614,7 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
     const errors = validateIntelligenceItem(item);
     if (errors.length) { setError(errors.join(" ")); return; }
     transferPending.current = true; const taskEpoch = epoch.current; setTransferring(item.id); setError("");
-    const resultSnapshot = current.resultSources, ownerTaskId = taskId.current, ownerRevision = itemResultRevisions.current.get(item.id);
+    const resultSnapshot = current.resultSources, provenanceSnapshot = quoteProvenanceRef.current, ownerTaskId = taskId.current, ownerRevision = itemResultRevisions.current.get(item.id);
     const checkLiveResult = () => {
       if (preparationPending.current) throw new Error("Подготавливается новый результат. Дождитесь завершения и проверьте текущую карточку.");
       if (itemsRef.current.find((entry) => entry.id === item.id) !== item || evidenceCurrent.current.resultSources !== resultSnapshot) throw new Error("Результат заменён. Проверьте новую карточку и повторите передачу.");
@@ -589,6 +642,14 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
         checkLiveResult();
         handoff = { ...handoff, data: structured.data };
       }
+      if (handoff.destination === "proposals" && provenanceSnapshot?.projectedItemId === item.id) {
+        if (!validProposalQuoteProvenance(provenanceSnapshot) || provenanceSnapshot.sourceSnapshotKey !== proposalSourceKey
+          || provenanceSnapshot.selections.some(selection => !item.sourceIds.includes(selection.sourceId))) throw new Error("Журнал участия ИИ не соответствует источникам текущего результата. Повторно подготовьте КП.");
+        // This is the original run's PRIVATE history, not an endorsement of
+        // manual edits or current fields. Untrusted model/manual JSON cannot
+        // create it through the public handoff schema.
+        handoff = { ...handoff, data: { ...handoff.data, analysisProvenance: structuredClone(provenanceSnapshot) } };
+      }
       const fresh = await getWorkspaceInfo();
       if (!mounted.current) return;
       if (taskEpoch !== epoch.current) return;
@@ -608,6 +669,7 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
   };
   const reset = () => {
     setModelContribution(null);
+    quoteProvenanceRef.current = null; setModelQuoteProvenance(null); setAnalysisPartsOpen(false);
     taskId.current = crypto.randomUUID(); itemResultRevisions.current.clear(); proposalTransferOrigins.current.clear();
     pendingOcr.current = null; setScanWithoutText(null);
     failedResponseRef.current = null; setFailedResponse(null); setFailedCopyMessage(""); setRawResponseOpen(false);
@@ -807,8 +869,8 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
         <label>Что нужно сделать<textarea id="iw-instruction" rows={3} maxLength={20000} value={instruction} onChange={(event) => { if (event.target.value.length > 20000) { setError("Задание не должно превышать 20 000 символов."); return; } invalidateTask(); setInstruction(event.target.value); }} /></label>
         </details>
         <details className="iw-request-options iw-analysis-options"><summary>Технические параметры разбора</summary>
-        <label className="iw-analysis-mode">Разбор<select id="iw-analysis-mode" value={analysisMode} onChange={(event) => { invalidateTask(); setAnalysisMode(event.target.value as AnalysisMode); }}><option value="combined">Одним запросом</option><option value="by-destination">Отдельно по направлениям</option></select></label>
-        {analysisMode === "by-destination" && <p className="help-text iw-batch-disclosure" role="note">Будет {taskDestinations.length} последовательных запросов. Одни и те же выбранные материалы отправятся модели {taskDestinations.length} раз. Это дольше и может увеличить стоимость; точность и полнота не гарантируются. Карточки появятся только после завершения всех этапов.</p>}
+        {quoteRouteAvailable ? <p className="help-text iw-batch-disclosure" role="note">Для КП по полному договору модель выбирает целые цитаты последовательными пакетами, с ближайшим контекстом. Документ не отправляется целиком одним большим запросом. Число пакетов появится после проверки объёма; результат устанавливается только после всех пакетов. Такой отбор не гарантирует полноту и может занять время.</p> : <><label className="iw-analysis-mode">Разбор<select id="iw-analysis-mode" value={analysisMode} onChange={(event) => { invalidateTask(); setAnalysisMode(event.target.value as AnalysisMode); }}><option value="combined">Одним запросом</option><option value="by-destination">Отдельно по направлениям</option></select></label>
+        {analysisMode === "by-destination" && <p className="help-text iw-batch-disclosure" role="note">Будет {taskDestinations.length} последовательных запросов. Одни и те же выбранные материалы отправятся модели {taskDestinations.length} раз. Это дольше и может увеличить стоимость; точность и полнота не гарантируются. Карточки появятся только после завершения всех этапов.</p>}</>}
         </details>
         <div className="iw-send-summary"><span>{method === "source-contract" ? "Для локальной подготовки" : "К отправке"}: {formatRussianCount(selectedSources.length, ["источник", "источника", "источников"])} · {formatRussianCount(sourceCharacters, ["символ", "символа", "символов"])}</span>{method !== "source-contract" && (profile.scope !== "local" ? <div className="iw-disclosure" role="note"><strong>При подготовке с ИИ тексты будут переданы {profile.scope === "external" ? "внешнему сервису" : "сервису в локальной сети"}:</strong><code>{profile.endpoint || "Адрес не указан"}</code></div> : <details><summary>Параметры запроса ИИ</summary><code>{profile.endpoint || "Адрес не указан"}</code><span>Формат: {profile.outputMode === "schema" ? "по схеме карточек" : "обычный JSON"}</span></details>)}</div>
         {taskDestinations.includes("procurement") && <p className="help-text">В карточках закупок сертификаты и документы заявки автоматически дополнят результат из выбранных источников с сохранением чисел и оговорок. Неоднозначная принадлежность к карточке или лоту останется на проверке.</p>}
@@ -821,7 +883,7 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
         <div className="iw-actions"><button type="button" className="primary" disabled={running || preparingResponse || extracting || !selectedSources.length || !taskDestinations.length || !method || method === "model" && !profile.model.trim()} onClick={focusBeforeConfirmation(requestPreparation)}>{preparingResponse ? "Дополняем результат из источников…" : running ? "Модель готовит ответ…" : !taskDestinations.length ? "Выберите результат" : !method ? "Выберите способ подготовки" : method === "source-contract" ? "Подготовить по договору без модели" : taskDestinations.length === 1 ? preparationLabels[taskDestinations[0]] : "Подготовить результаты"}</button>{running && !preparingResponse && <button type="button" className="secondary" onClick={() => { cancelPending(); setNotice("Запрос отменён. Поздний ответ не будет добавлен."); }}>Остановить запрос</button>}</div>
         {items.some((item) => item.destination === "proposals") && <section ref={preparedResultRef} tabIndex={-1} className="notice iw-prepared-proposals" aria-label="Подготовленные КП — следующий шаг"><h4>Проект подготовлен — проверьте и откройте</h4><p>{sourcePreparation?.origin === "source-contract" ? "Локальный проект по договору, без модели." : "Это подготовленный черновик, не подтверждение успешного извлечения ИИ или готовности к отправке."}{resultStale ? " Показан предыдущий результат; материалы или задание изменены." : ""} Цена, полнота и спорные условия требуют проверки в редакторе.</p>{items.filter((item) => item.destination === "proposals").map((item) => <div key={item.id} data-prepared-item-id={item.id}><strong>{proposalDisplayTitle(item)}</strong><div className="iw-actions">{openActions(item)}<a href={`#iw-result-${item.id}`}>Посмотреть замечания и состав</a></div></div>)}</section>}
         {running && !preparingResponse && analysisProgress && <p className="help-text" role="status">Этап {analysisProgress.index} из {analysisProgress.total}: {analysisProgress.label}</p>}
-        {analysisMode === "by-destination" && analysisParts.length > 0 && <details className="iw-analysis-parts"><summary>Ответы по этапам ({analysisParts.length})</summary><p className="help-text">Диагностика отдельных запросов. Частичный результат не заменяет карточки. Поле готового ответа ниже содержит только полностью завершённый результат.</p>{analysisParts.map((part, index) => <details key={index}><summary>{index + 1}. {part.destinations.map((destination) => destinationLabels[destination]).join(" · ")} · {part.model}</summary><pre>{part.text}</pre></details>)}</details>}
+        {(analysisMode === "by-destination" || analysisParts.some(part => part.batchId)) && analysisParts.length > 0 && <details className="iw-analysis-parts" open={analysisPartsOpen} onToggle={event => setAnalysisPartsOpen(event.currentTarget.open)}><summary>{analysisParts.some(part => part.batchId) ? "Исходные ответы выбора цитат" : "Ответы по этапам"} ({analysisParts.length})</summary>{analysisPartsOpen && <><p className="help-text">Диагностика отдельных запросов. Частичный результат не заменяет карточки. {analysisParts.some(part => part.batchId) ? "Это отдельная схема выбора цитат: ответы не преобразуются в выдуманный ответ items и не переписывают поле ручной вставки ниже." : "Поле готового ответа ниже содержит только полностью завершённый результат."}</p>{analysisParts.map((part, index) => <details key={part.batchId || index}><summary>{index + 1}. {part.destinations.map((destination) => destinationLabels[destination]).join(" · ")} · {part.model}</summary><pre>{part.text}</pre></details>)}</>}</details>}
         {responseDetails && <details className="iw-response-technical">
           <summary>Последний ответ · технические подробности</summary>
           <div className="iw-response-metrics"><strong>Последний ответ: {responseDetails.model}</strong>
@@ -847,6 +909,7 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
       {preparingResponse && <div className="iw-audit-progress" role="status"><span className="iw-spinner" aria-hidden="true" />Подготавливаем результат и проверяем исходные материалы…<button type="button" className="secondary" onClick={() => { cancelPending(); setNotice("Локальный разбор отменён. Предыдущие карточки сохранены; поздний результат не будет добавлен."); }}>Остановить разбор</button></div>}
       {sourcePreparation?.origin === "source-contract" && <p className="notice" role="status">Локальный проект по тексту договора. Модель в его подготовке не использовалась; её прежний ответ, если был, оставлен в технических подробностях. Это не подтверждение готовности документа к отправке.</p>}
       {modelContribution?.fields === 0 && <p className="notice warning" role="status" aria-label="Пустой исходный ответ">Исходный ответ не содержал заполненных полей, кроме возможного общего заголовка. Это не успешное извлечение моделью. Последующее локальное дополнение, ручные правки и покрытие текста ниже не меняют этот результат.</p>}
+      <ProposalAnalysisProvenance value={modelQuoteProvenance} />
       {evidenceReady && !evidenceState?.failed && <TaskCompletionSummary report={evidenceState?.completion} previous={resultStale || Boolean(emptyWarning)} />}
       {(sourcePreparation?.limited || automaticConditions?.limited) && <p className="notice warning" role="status">Разбор источников выполнен не полностью. Проверьте журнал подготовки; такой результат не считается завершённым.</p>}
       {(automaticConditions || sourcePreparation || modelContribution) && <details><summary>Как подготовлен результат · технические подробности</summary>{modelContribution && <div aria-label="Вклад исходного ответа"><p className="help-text">До локального дополнения: карточек в ответе — {modelContribution.items}, заполненных полей без общего заголовка — {modelContribution.fields}, записей evidence — {modelContribution.evidence}. Это счётчики ответа, а не проверка достоверности или полноты.</p>{modelContribution.destinations.length > 1 && modelContribution.destinations.map(entry => <p className="help-text" key={entry.destination}>{destinationLabels[entry.destination]}: карточек — {entry.items}, полей — {entry.fields}.</p>)}</div>}<AutomaticConditionsSummary receipt={automaticConditions} items={items} /><SourcePreparationSummary receipt={sourcePreparation} items={items} /></details>}

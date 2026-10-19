@@ -6,6 +6,7 @@ import { validateCommercialDocument, validateCommercialQuoteHashes } from './com
 import { projectReadiness } from './commercialDecisions';
 import { assertPublicDocumentBudget, projectCommercialBodyPublic, projectCommercialReviewPublic, type AnyProposalPublicDocument, type ProposalPublicDocumentV2 } from './commercialPublic';
 import { hasFreshCommercialScopeSnapshot } from './commercialScopeSnapshot';
+import { validProposalQuoteProvenance } from '../intelligence/proposalQuotePreparation';
 import type { PartySnapshot, ProposalContact, ProposalData, ProposalIssue, ProposalPublicDocument, PublicAsset } from './types';
 
 function validDate(value: string): boolean {
@@ -45,9 +46,15 @@ export function proposalHasStructuredScopePriceReference(data: ProposalData): bo
 export function proposalPrivateSourceQuestions(data: ProposalData) {
   return (data.sourceQuestions || []).filter((question) => !data.commercialDocument?.questions.some((entry) => entry.message === question.message));
 }
+/** Additive private payload admission only. This checks storage structure and
+ * limits; it does not authenticate historical provider output or approve it. */
+export function assertProposalAnalysisProvenance(data: Pick<ProposalData, 'analysisProvenance'>): void {
+  if (data.analysisProvenance !== undefined && !validProposalQuoteProvenance(data.analysisProvenance)) throw new Error('Журнал отбора цитат ИИ повреждён или превышает допустимый объём. Исходные данные не удалены; сохранение и выгрузка остановлены.');
+}
 export function validateProposal(data: ProposalData, options: ProposalValidationOptions = {}): ProposalIssue[] {
   const issues: ProposalIssue[] = [];
   const issue = (field: string, step: ProposalIssue['step'], message: string, severity: ProposalIssue['severity'] = 'error', lineId?: string) => issues.push({ field, step, message, severity, ...(lineId ? { lineId } : {}) });
+  try { assertProposalAnalysisProvenance(data); } catch (reason) { issue('analysisProvenance', 3, reason instanceof Error ? reason.message : 'Журнал отбора цитат ИИ повреждён.'); }
   for (const [field, value, label] of [['number', data.number, 'Номер'], ['title', data.title, 'Предмет'], ['issuer.name', data.issuer.name, 'Исполнитель'], ['recipient.name', data.recipient.name, 'Заказчик']] as const) {
     if (!value.trim()) issue(field, 1, `${label}: заполните обязательное поле`);
     if (textLength(value) > 500) issue(field, 1, `${label}: не более 500 символов`);
@@ -127,6 +134,7 @@ export async function buildProposalDocumentPublic(data: ProposalData, options: {
   // Snapshot before the first await: a mutable UI caller cannot swap source,
   // price or decisions between readiness and projection.
   const captured = structuredClone(data);
+  assertProposalAnalysisProvenance(captured);
   if (captured.commercialDocument === undefined) return buildProposalPublic(captured, options);
   const sourceErrors = await validateCommercialQuoteHashes(captured.commercialDocument);
   if (sourceErrors.some((entry) => entry.severity === 'error')) throw new Error(sourceErrors[0].message);

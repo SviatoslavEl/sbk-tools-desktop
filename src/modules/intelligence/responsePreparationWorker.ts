@@ -14,6 +14,7 @@ import { buildIntelligenceResponseSchema, destinationLabels, fieldDefinitions, p
 import { summarizeParsedModelContribution, validModelResponseContribution, type ModelResponseContribution } from "./modelContribution";
 import { assertResponsePreparationRaw, assertResponsePreparationSources, RESPONSE_PREPARATION_LIMITS } from "./responsePreparationBounds";
 import { assertPreparedSourceContract, assertSourceContractSources } from "./sourceContractPreparation";
+import { assertProposalQuotePreparationRequest, prepareProposalQuoteSelection, validProposalQuoteProvenance, type ProposalQuoteProvenance } from "./proposalQuotePreparation";
 export { RESPONSE_PREPARATION_LIMITS } from "./responsePreparationBounds";
 import type { IntelligenceDestination, IntelligenceItem, IntelligenceSource } from "./workbenchTypes";
 
@@ -27,11 +28,14 @@ export interface ResponsePreparationRequest {
   revision: number; raw: string; sources: IntelligenceSource[]; destinations: IntelligenceDestination[];
 }
 export interface ResponsePreparationReply {
-  origin?: "source-contract";
+  origin?: "source-contract" | "model-selected-quotes";
   revision: number; prepared?: ResponsePreparationResult; empty?: true; failed?: string;
   /** Original parsed response before local supplementation; never a fact gate.
    * Kept outside prepared cards and absent for source-only/empty/failed replies. */
   modelContribution?: ModelResponseContribution;
+  /** Actual raw quote-selection parts before the local source completion tail.
+   * Never equivalent to an ordinary 19-field model response or approval. */
+  modelQuoteProvenance?: ProposalQuoteProvenance;
 }
 const object = (value: unknown): value is Record<string, unknown> => Boolean(value && typeof value === "object" && !Array.isArray(value));
 const bytes = (value: string) => new TextEncoder().encode(value).byteLength;
@@ -137,17 +141,20 @@ function validPrepared(value: unknown): value is ResponsePreparationResult {
 
 /** Structural protocol guard, not a substitute for the existing evidence audit.
  * Passing the expected revision also rejects a well-formed stale response. */
-export function validResponsePreparationReply(value: unknown, expectedRevision?: number, expectedOrigin?: "source-contract"): value is ResponsePreparationReply {
+export function validResponsePreparationReply(value: unknown, expectedRevision?: number, expectedOrigin?: "source-contract" | "model-selected-quotes"): value is ResponsePreparationReply {
   try {
-    if (!object(value) || !keys(value, ["revision", "prepared", "empty", "failed", "origin", "modelContribution"]) || value.origin !== expectedOrigin || !Number.isSafeInteger(value.revision)
+    if (!object(value) || !keys(value, ["revision", "prepared", "empty", "failed", "origin", "modelContribution", "modelQuoteProvenance"]) || value.origin !== expectedOrigin || !Number.isSafeInteger(value.revision)
       || Number(value.revision) < -1 || expectedRevision !== undefined && value.revision !== expectedRevision) return false;
     const alternatives = [own(value, "prepared"), own(value, "empty"), own(value, "failed")];
     if (alternatives.filter(Boolean).length !== 1) return false;
     if (own(value, "modelContribution") && (expectedOrigin !== undefined || !own(value, "prepared") || !validModelResponseContribution(value.modelContribution))) return false;
+    if (own(value, "modelQuoteProvenance") && (expectedOrigin !== "model-selected-quotes" || !own(value, "prepared") || !validProposalQuoteProvenance(value.modelQuoteProvenance))) return false;
     if (own(value, "failed")) return text(value.failed, errorLimit, true);
     if (Number(value.revision) < 0) return false;
-    if (own(value, "empty")) return expectedOrigin === undefined && value.empty === true;
-    return validPrepared(value.prepared) && value.prepared.sourcePreparation?.origin === expectedOrigin;
+    if (own(value, "empty")) return expectedOrigin !== "source-contract" && value.empty === true;
+    if (!validPrepared(value.prepared) || value.prepared.sourcePreparation?.origin !== (expectedOrigin === "source-contract" ? "source-contract" : undefined)) return false;
+    return expectedOrigin !== "model-selected-quotes" || validProposalQuoteProvenance(value.modelQuoteProvenance)
+      && value.prepared.items.length === 1 && value.prepared.items[0].destination === "proposals" && value.modelQuoteProvenance.projectedItemId === value.prepared.items[0].id;
   } catch { return false; }
 }
 
@@ -224,8 +231,33 @@ export function runResponsePreparation(request: unknown): ResponsePreparationRep
   }
 }
 
+/** Separate asynchronous quote route: raw parts are parsed as their real
+ * schema, never wrapped in an invented ordinary model response. */
+export async function runProposalQuotePreparation(request: unknown): Promise<ResponsePreparationReply> {
+  const revision = object(request) && Number.isSafeInteger(request.revision) && Number(request.revision) >= 0 ? Number(request.revision) : -1;
+  const origin = "model-selected-quotes" as const;
+  try {
+    assertProposalQuotePreparationRequest(request, true);
+    const captured = structuredClone(request);
+    const selected = await prepareProposalQuoteSelection({ revision: captured.revision, sources: captured.sources, parts: captured.parts, ...(captured.options === undefined ? {} : { options: captured.options }) });
+    if (!selected.item) return { revision, origin, empty: true };
+    // This existing tail is deliberately source-derived; its additions remain
+    // in sourcePreparation and cannot increase the model selection receipt.
+    const prepared = prepareItems([selected.item], captured.sources, ["proposals"]);
+    if (!prepared || prepared.limited || prepared.sourcePreparation?.limited) throw new Error("Полный проект по выбранным цитатам не подготовлен в пределах допустимого объёма. Частичный результат не принят.");
+    const reply: ResponsePreparationReply = { revision, origin, prepared, modelQuoteProvenance: selected.provenance };
+    if (!validResponsePreparationReply(reply, revision, origin)) throw new Error("Проект или журнал выбранных цитат некорректен. Прежние результаты не заменены.");
+    return reply;
+  } catch (reason) {
+    return { revision, origin, failed: (reason instanceof Error ? reason.message : "Не удалось подготовить проект по выбранным цитатам.").slice(0, errorLimit) || "Не удалось подготовить проект по выбранным цитатам." };
+  }
+}
+
 // Importing the pure fallback in a Window must never replace window.onmessage.
 if (typeof self !== "undefined" && typeof document === "undefined" && typeof self.postMessage === "function") {
   const worker = self as unknown as { onmessage: ((event: MessageEvent<unknown>) => void) | null; postMessage: (reply: ResponsePreparationReply) => void };
-  worker.onmessage = (event) => worker.postMessage(runResponsePreparation(event.data));
+  worker.onmessage = (event) => {
+    if (object(event.data) && event.data.origin === "model-selected-quotes") void runProposalQuotePreparation(event.data).then(reply => worker.postMessage(reply));
+    else worker.postMessage(runResponsePreparation(event.data));
+  };
 }

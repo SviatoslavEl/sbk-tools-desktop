@@ -1,0 +1,8 @@
+.proposal-analysis-provenance { min-width: 0; margin-block: .75rem; }
+.proposal-analysis-provenance summary { overflow-wrap: anywhere; cursor: pointer; }
+.proposal-analysis-provenance > div { padding: .5rem; }
+.proposal-analysis-provenance details { margin-block: .5rem; }
+.proposal-analysis-scroll { max-height: 28rem; overflow: auto; overscroll-behavior: contain; }
+.proposal-analysis-provenance pre, .proposal-analysis-provenance blockquote { white-space: pre-wrap; overflow-wrap: anywhere; margin: .5rem; }
+.proposal-analysis-provenance figure, .proposal-analysis-provenance section { margin: .5rem 0; min-width: 0; }
+.proposal-analysis-provenance figcaption { overflow-wrap: anywhere; font-weight: 600; }

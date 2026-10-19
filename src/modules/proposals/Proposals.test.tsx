@@ -14,6 +14,7 @@ import type { ProposalTaskSessionChange } from './proposalTaskBridge';
 import { CommercialProposalEditor } from './CommercialProposalEditor';
 import { ProposalFinalReview } from './ProposalFinalReview';
 import { commercialFingerprint } from './commercialDocument';
+import { ProposalAnalysisProvenance } from '../intelligence/ProposalAnalysisProvenance';
 
 // Real component callbacks/effects with persistent hook slots. DOM layout and
 // child components are covered separately; storage and native rendering are boundaries.
@@ -60,6 +61,13 @@ function proposal(title = 'Тестовое предложение'): ProposalDa
   const data = createProposal(); data.title = title; data.issuer.name = 'Исполнитель'; data.recipient.name = 'Заказчик'; data.lines[0].title = 'Услуга'; data.lines[0].unitPrice = '1000';
   data.internalNote = 'СЕКРЕТ: внутренняя себестоимость'; data.source = { tool: 'calculator', recordId: 'private-source', capturedAt: '2026-09-18', wasUnsaved: false, priceOrigin: 'цена' };
   return data;
+}
+function analysisReceipt(): NonNullable<ProposalData['analysisProvenance']> {
+  const sourceSnapshotKey = `sha256:${'a'.repeat(64)}` as const, quote = 'PRIVATE-LEDGER-QUOTE';
+  return { version: 1, origin: 'model-selected-quotes', sourceSnapshotKey,
+    parts: [{ batchId: 'batch-1', model: 'PRIVATE-LEDGER-MODEL', raw: JSON.stringify({ sourceSnapshotKey, batchId: 'batch-1', units: [{ unitId: 'private-unit', disposition: 'commercial', roles: ['scope'], quote }] }) }],
+    selections: [{ unitId: 'private-unit', sourceId: 'private-source', fragmentId: 'private-unit', locator: 'PRIVATE-LEDGER-LOCATOR', quote, roles: ['scope'] }],
+    counts: { units: 1, commercial: 1, context: 0, unclear: 0, batches: 1 }, projectedItemId: 'private-result' };
 }
 const record = (id: string, data: ProposalData): StoredRecord<ProposalData> => ({ id, title: data.title, payload: structuredClone(data), archived: false, createdAt: '2026-09-18', updatedAt: '2026-09-18' });
 const result: ProposalRenderResult = { outputPath: '/tmp/proposal.pdf', outputBytes: 1234, sha256: 'a'.repeat(64), pageCount: 1, previewPages: ['/tmp/proposal-page-1.png'] };
@@ -946,6 +954,63 @@ describe('proposal attachment ownership and durable draft identity', () => {
     expect(template.logo?.relativePath).toBe(`attachment-staging/commercial-proposals/${template.id}/logo.png`);
     expect(runtime.store.save.mock.calls[0][2]).toBe(template.id);
     await click('Сохранить КП'); expect(runtime.store.save.mock.calls[1][2]).toBe(proposalWriteId); expect(runtime.store.save.mock.calls[1][1].template.logo.relativePath).toBe(proposalLogoPath);
+  });
+});
+
+describe('private model-selection provenance persistence boundaries', () => {
+  it('preserves actual raw parts through draft, explicit save and reopening the same stored proposal', async () => {
+    const data = proposal(); data.analysisProvenance = analysisReceipt();
+    runtime.store.save.mockImplementation(async (_title: string, value: ProposalData, id: string) => {
+      const saved = record(id, JSON.parse(JSON.stringify(value)) as ProposalData); runtime.store.records = [saved]; return saved;
+    });
+    await seed(data); await edit('proposal-title', 'Ручная редакторская правка'); await vi.advanceTimersByTimeAsync(600); await flush();
+    expect(nodes().find(node => node.type === ProposalAnalysisProvenance)?.props.value).toEqual(data.analysisProvenance);
+    expect(runtime.saveDraft.mock.lastCall![1].data.analysisProvenance).toEqual(data.analysisProvenance);
+    await click('Сохранить КП'); const saved = runtime.store.records[0] as StoredRecord<ProposalData>;
+    expect(saved.payload.analysisProvenance).toEqual(data.analysisProvenance); expect(saved.payload.status).toBe('draft');
+    await click('К списку'); render({ openRecordId: saved.id }); await flush(); expect(input('proposal-title').props.value).toBe('Ручная редакторская правка');
+    await edit('proposal-title', 'Вторая ручная правка'); await click('Сохранить КП');
+    expect(runtime.store.save.mock.calls[1][1].analysisProvenance).toEqual(data.analysisProvenance); expect(runtime.store.save.mock.calls[1][1].sourceFinancials?.decision).toBeUndefined();
+  });
+  it('does not copy private raw/model selections into a reusable template', async () => {
+    const data = proposal(); data.analysisProvenance = analysisReceipt(); await seed(data);
+    await click('4. Оформление'); await click('Сохранить как шаблон'); await click('Сохранить шаблон');
+    const template = runtime.store.save.mock.calls[0][1] as ProposalTemplateData;
+    expect(template.kind).toBe('template'); expect(JSON.stringify(template)).not.toMatch(/analysisProvenance|PRIVATE-LEDGER|private-unit|private-source|model-selected-quotes/);
+    await click('Сохранить КП'); expect(runtime.store.save.mock.calls[1][1].analysisProvenance).toEqual(data.analysisProvenance);
+  });
+  it('rejects a corrupt temporary draft without replacing it or clearing its recovery data', async () => {
+    const data = proposal(); Object.assign(data, { analysisProvenance: null }); const stored = { kind: 'proposal-draft', schemaVersion: 1, recordId: 'recoverable', data }, before = structuredClone(stored);
+    runtime.readDraft.mockResolvedValue(stored); render(); await flush(); expect(text()).toContain('Черновик повреждён');
+    await vi.advanceTimersByTimeAsync(1000); await flush(); expect(runtime.saveDraft).not.toHaveBeenCalled(); expect(runtime.clearDraft).not.toHaveBeenCalled(); expect(runtime.store.save).not.toHaveBeenCalled(); expect(stored).toEqual(before);
+  });
+  it('stops draft and explicit storage writes if private provenance becomes corrupt in the current form', async () => {
+    const data = proposal(); data.analysisProvenance = analysisReceipt(); await seed(data);
+    const inForm = nodes().find(node => node.type === ProposalAnalysisProvenance)!.props.value as NonNullable<ProposalData['analysisProvenance']>;
+    inForm.counts.commercial = 999; await edit('proposal-title', 'Несохранённая правка'); await vi.advanceTimersByTimeAsync(600); await flush();
+    expect(text()).toContain('Журнал отбора цитат ИИ повреждён'); expect(runtime.saveDraft).not.toHaveBeenCalled();
+    await click('Сохранить КП'); expect(runtime.store.save).not.toHaveBeenCalled(); expect(runtime.clearDraft).not.toHaveBeenCalled(); expect(input('proposal-title').props.value).toBe('Несохранённая правка');
+    expect(data.analysisProvenance.counts.commercial).toBe(1);
+  });
+  it('rejects a corrupt stored proposal before installing an editable session', async () => {
+    const data = proposal(); Object.assign(data, { analysisProvenance: { approved: true } }); const stored = record('corrupt', data), before = structuredClone(stored);
+    runtime.store.records = [stored]; render({ openRecordId: stored.id }); await flush(); expect(text()).toContain('Журнал отбора цитат ИИ повреждён');
+    await vi.advanceTimersByTimeAsync(1000); await flush(); expect(nodes().some(node => node.type === 'input' && node.props.id === 'proposal-title')).toBe(false);
+    expect(runtime.saveDraft).not.toHaveBeenCalled(); expect(runtime.clearDraft).not.toHaveBeenCalled(); expect(runtime.store.save).not.toHaveBeenCalled(); expect(stored).toEqual(before);
+  });
+  it('restores valid historical provenance as a new revision but rejects a corrupt history entry', async () => {
+    const data = proposal(); data.analysisProvenance = analysisReceipt(); runtime.store.records = [record('saved', data)]; render({ openRecordId: 'saved' }); await flush();
+    const historical = structuredClone(data); historical.title = 'Исторический предмет';
+    await nodes().find(node => node.type === VersionHistory)!.props.onRestore!(historical); await flush();
+    expect(runtime.store.save.mock.lastCall![1]).toMatchObject({ revision: 2, status: 'draft', analysisProvenance: historical.analysisProvenance }); expect(runtime.store.records[0].payload).toEqual(data);
+    const corrupt = structuredClone(historical); Object.assign(corrupt, { analysisProvenance: {} });
+    await expect(nodes().find(node => node.type === VersionHistory)!.props.onRestore!(corrupt)).rejects.toThrow(/Журнал/); expect(runtime.store.save).toHaveBeenCalledOnce();
+  });
+  it('does not acknowledge a malformed storage return as a valid saved editor snapshot', async () => {
+    const data = proposal(); data.analysisProvenance = analysisReceipt(); await seed(data);
+    runtime.store.save.mockImplementationOnce(async (_title: string, value: ProposalData, id: string) => { const corrupt = structuredClone(value); Object.assign(corrupt, { analysisProvenance: null }); return record(id, corrupt); });
+    await click('Сохранить КП'); expect(text()).toContain('Журнал отбора цитат ИИ повреждён'); expect(input('proposal-title').props.value).toBe(data.title);
+    expect(runtime.clearDraft).not.toHaveBeenCalled(); expect(runtime.store.save.mock.calls[0][1].analysisProvenance).toEqual(data.analysisProvenance);
   });
 });
 
