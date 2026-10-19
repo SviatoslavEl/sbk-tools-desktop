@@ -10,6 +10,7 @@ import { repairDateFromSource } from "./sourceRepairs";
 import { AutomaticConditionsSummary } from "./AutomaticConditionsSummary";
 import { runProposalQuotePreparation, runResponsePreparation, type ResponsePreparationRequest } from "./responsePreparationWorker";
 import { ProposalAnalysisProvenance } from "./ProposalAnalysisProvenance";
+import { buildProposalQuotePlan, isProposalQuoteSelectionCandidate } from "./proposalQuotePlan";
 import type { ProposalQuotePreparationWireRequest, ProposalQuoteProvenance } from "./proposalQuotePreparation";
 import { runEvidenceAudit, type EvidenceAuditRequest, type EvidenceAuditReply } from "./evidenceAuditWorker";
 import type { IntelligenceDestination, IntelligenceHandoff, IntelligenceSource } from "./workbenchTypes";
@@ -551,6 +552,33 @@ describe("production whole-quote proposal callbacks with a MOCK provider, not ac
     expect(runtime.analyze).not.toHaveBeenCalled(); expect(cards().map(card => card.key)).toEqual(before);
     expect(text()).toContain("Выбор цитат остановлен"); expect(text()).toContain("Целый фрагмент");
     expect(control("iw-response").props.value).toBe(previousRaw); expect(ledger()).toBeNull(); expect(transfer).not.toHaveBeenCalled();
+  });
+
+  it.each(["visible-default-false", "hidden"] as const)("refuses the new quote-to-source-tail route before any provider call for an eligible contract with a %s fragment", async variant => {
+    const input = quoteContract(), fragment = input.fragments![10], original = structuredClone(input);
+    // A non-subject payment condition leaves the contract eligible. The old
+    // source-tail contract treats visible includedByUser:false as DEFAULT
+    // inclusion; this test does not redefine that global/legacy behaviour.
+    // The NEW quote route must instead refuse this selection mismatch before
+    // sending anything, rather than quietly filtering/reintroducing a clause.
+    fragment.sheetState = variant === "hidden" ? "hidden" : "visible";
+    fragment.includedByUser = variant === "hidden";
+    const before = structuredClone(input);
+    expect(isProposalQuoteSelectionCandidate([input])).toBe(true);
+    const plan = await buildProposalQuotePlan([input], { maxUnitsPerBatch: 6 });
+    const exclusion = [{ fragmentIndex: 10, fragmentId: fragment.id }];
+    expect(plan.excludedUnselectedFragments).toEqual(variant === "visible-default-false" ? exclusion : []);
+    expect(plan.excludedHiddenFragments).toEqual(variant === "hidden" ? exclusion : []);
+    expect(input.text).toBe(original.text); expect(input).toEqual(before);
+    await setupQuote(input); await previousCards(); const priorCards = cards().map(card => card.key), jobs = holdQuotePreparation();
+    expect(text()).toContain("Для КП по полному договору модель выбирает целые цитаты");
+    await beginQuote();
+    expect(runtime.analyze).not.toHaveBeenCalled(); expect(jobs).toHaveLength(0);
+    expect(text()).toContain("Выбор цитат остановлен"); expect(text()).toContain("Источник содержит скрытые или отдельно помеченные фрагменты");
+    expect(cards().map(card => card.key)).toEqual(priorCards); expect(field("title").props.value).toBe("Предыдущий исправленный проект");
+    expect(field("fullName").props.value).toBe("Предыдущий сотрудник"); expect(control("iw-response").props.value).toBe(previousRaw);
+    expect(labeled(`Текст источника ${input.name}`).props.value).toBe(input.text); expect(input).toEqual(before);
+    expect(ledger()).toBeNull(); expect(runtime.workspace).not.toHaveBeenCalled(); expect(transfer).not.toHaveBeenCalled();
   });
 
   it("treats all-context mock responses as empty model selection, never substituting a local full-contract success", async () => {

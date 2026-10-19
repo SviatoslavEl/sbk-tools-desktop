@@ -2,7 +2,7 @@ import { runProposalQuotePreparation, runResponsePreparation, validResponsePrepa
 import { assertResponsePreparationRaw, assertResponsePreparationSources } from "./responsePreparationBounds";
 import type { SourceContractPreparationRequest, SourceContractPreparationWireRequest } from "./sourceContractPreparation";
 import { assertPreparedSourceContract } from "./sourceContractPreparation";
-import { assertProposalQuotePreparationRequest, type ProposalQuotePreparationRequest, type ProposalQuotePreparationWireRequest, type ProposalQuoteProvenance } from "./proposalQuotePreparation";
+import { assertFullProposalQuotePlan, assertProposalQuotePreparationRequest, type ProposalQuotePreparationRequest, type ProposalQuotePreparationWireRequest, type ProposalQuoteProvenance } from "./proposalQuotePreparation";
 import { buildProposalQuotePlan, parseProposalQuoteResponse } from "./proposalQuotePlan";
 import { taskSourceSnapshotKey } from "./taskSourceIdentity";
 export type { SourceContractPreparationRequest } from "./sourceContractPreparation";
@@ -83,6 +83,7 @@ function startPreparation(request: ResponsePreparationRequest | SourceContractPr
           if (key !== ledger.sourceSnapshotKey) throw new Error("Ключ выбранных цитат не соответствует снимку материалов. Прежние карточки сохранены.");
           const plan = await buildProposalQuotePlan(captured.sources, captured.options);
           if (settled) return;
+          assertFullProposalQuotePlan(plan);
           if (captured.parts.length !== plan.batches.length || captured.parts.some((part, index) => part.batchId !== plan.batches[index].id)) throw new Error("Журнал выбранных цитат не соответствует полному плану исходных ответов. Прежние карточки сохранены.");
           const selections: ProposalQuoteProvenance["selections"] = [];
           const counts = { units: 0, commercial: 0, context: 0, unclear: 0, batches: plan.batches.length };

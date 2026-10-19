@@ -1,4 +1,4 @@
-import { buildProposalQuotePlan, parseProposalQuoteResponse, PROPOSAL_QUOTE_ROLES, PROPOSAL_QUOTE_LIMITS, type ProposalQuotePlanOptions, type ProposalQuoteRole } from './proposalQuotePlan';
+import { buildProposalQuotePlan, parseProposalQuoteResponse, PROPOSAL_QUOTE_ROLES, PROPOSAL_QUOTE_LIMITS, type ProposalQuotePlan, type ProposalQuotePlanOptions, type ProposalQuoteRole } from './proposalQuotePlan';
 import { assertResponsePreparationRaw, assertResponsePreparationSources, RESPONSE_PREPARATION_LIMITS } from './responsePreparationBounds';
 import type { IntelligenceEvidence, IntelligenceItem, IntelligenceSource } from './workbenchTypes';
 
@@ -53,6 +53,14 @@ export function assertProposalQuotePreparationRequest(value: unknown, wire = fal
   }
 }
 
+/** Admission for the production quote-to-proposal route only. The standalone
+ * selector may inspect a partial plan, but the legacy source-completion tail
+ * has a different selection contract. Never repair/filter the original source
+ * snapshot to make those contracts appear equivalent. */
+export function assertFullProposalQuotePlan(plan: ProposalQuotePlan): void {
+  if (plan.excludedUnselectedFragments.length || plan.excludedHiddenFragments.length) throw new Error('Источник содержит скрытые или отдельно помеченные фрагменты. Автоматическая подготовка КП по такому снимку недоступна; исходные материалы и прежние результаты не изменены.');
+}
+
 /** Closed structural storage/worker guard only. Fresh source/raw ownership is
  * checked by the asynchronous plan parser before constructing this receipt. */
 export function validProposalQuoteProvenance(value: unknown): value is ProposalQuoteProvenance {
@@ -84,6 +92,7 @@ export function validProposalQuoteProvenance(value: unknown): value is ProposalQ
 export async function prepareProposalQuoteSelection(request: ProposalQuotePreparationRequest): Promise<{ item?: IntelligenceItem; provenance: ProposalQuoteProvenance }> {
   assertProposalQuotePreparationRequest(request);
   const captured = structuredClone(request), plan = await buildProposalQuotePlan(captured.sources, captured.options);
+  assertFullProposalQuotePlan(plan);
   if (captured.parts.length !== plan.batches.length || captured.parts.some((part, index) => part.batchId !== plan.batches[index].id)) throw new Error('Нужны все пакеты текущего плана ровно один раз и в исходном порядке. Частичный проект не создан.');
   const provenance: ProposalQuoteProvenance = { version: 1, origin: 'model-selected-quotes', sourceSnapshotKey: plan.sourceSnapshotKey,
     parts: captured.parts, selections: [], counts: { units: 0, commercial: 0, context: 0, unclear: 0, batches: plan.batches.length } };

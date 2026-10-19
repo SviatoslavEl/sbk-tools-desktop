@@ -1,6 +1,11 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { buildProposalQuotePlan, type ProposalQuoteRole } from './proposalQuotePlan';
-import { assertProposalQuotePreparationRequest, prepareProposalQuoteSelection, validProposalQuoteProvenance, type ProposalQuotePreparationRequest } from './proposalQuotePreparation';
+import * as quotePlan from './proposalQuotePlan';
+import * as contractCompletion from './contractProposalCompletion';
+import { collectContractProposalFacts } from './contractProposalFacts';
+import { runProposalQuotePreparation } from './responsePreparationWorker';
+import { taskSourceSnapshotKey } from './taskSourceIdentity';
+import { assertFullProposalQuotePlan, assertProposalQuotePreparationRequest, prepareProposalQuoteSelection, validProposalQuoteProvenance, type ProposalQuotePreparationRequest } from './proposalQuotePreparation';
 import type { IntelligenceSource } from './workbenchTypes';
 
 function source(): IntelligenceSource {
@@ -23,9 +28,37 @@ async function request(roles = rolesFor): Promise<ProposalQuotePreparationReques
     units: Object.fromEntries(batch.units.map(unit => { const selected = roles(unit.text); return [unit.unitId, { disposition: selected.length ? 'commercial' : 'context', roles: selected, quote: selected.length ? unit.text : null }]; })) }) })) };
 }
 const freeze = <T,>(value: T): T => { if (value && typeof value === 'object') { Object.values(value).forEach(freeze); Object.freeze(value); } return value; };
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
 describe('actual quote-selection projection before local source completion', () => {
+  it('admits the full plan without changing its snapshot or the legacy visible-false meaning', async () => {
+    const sources = [source()], before = structuredClone(sources), plan = await buildProposalQuotePlan(sources);
+    expect(() => assertFullProposalQuotePlan(plan)).not.toThrow(); expect(sources).toEqual(before);
+    sources[0].fragments![10].includedByUser = false;
+    const legacy = collectContractProposalFacts(sources);
+    expect(legacy.documents[0].complete).toBe(true); expect(legacy.facts.some(fact => fact.fragmentId === 'p-10' && fact.role === 'payment')).toBe(true);
+  });
+  it.each(['visible-false', 'hidden', 'veryHidden', 'hidden-opted-in'] as const)('rejects authored partial %s quote-to-proposal input before parsing or local completion, without snapshot/raw repair', async variant => {
+    const sources = [source()], fragment = sources[0].fragments![10];
+    if (variant === 'visible-false') fragment.includedByUser = false;
+    else fragment.sheetState = variant === 'veryHidden' ? 'veryHidden' : 'hidden';
+    if (variant === 'hidden-opted-in') fragment.includedByUser = true;
+    const options = { maxUnitsPerBatch: 2 }, before = structuredClone(sources), sourceKey = await taskSourceSnapshotKey(sources), plan = await buildProposalQuotePlan(sources, options);
+    // This is authored synthetic protocol input, not an actual model result.
+    // The standalone selector retains its deliberate partial-plan capability.
+    const input: ProposalQuotePreparationRequest = { revision: 1, sources, options, parts: plan.batches.map(batch => ({ batchId: batch.id, model: 'authored-synthetic-not-inference', raw: JSON.stringify({ sourceSnapshotKey: plan.sourceSnapshotKey, batchId: batch.id,
+      units: Object.fromEntries(batch.units.map(unit => [unit.unitId, { disposition: unit.fragmentId === 'p-4' ? 'commercial' : 'context', roles: unit.fragmentId === 'p-4' ? ['subject'] : [], quote: unit.fragmentId === 'p-4' ? unit.text : null }])) }) })) };
+    const first = await quotePlan.parseProposalQuoteResponse(input.parts[0].raw, plan, plan.batches[0].id, sources);
+    expect(first.units).toHaveLength(plan.batches[0].units.length); expect(plan.sourceSnapshotKey).toBe(sourceKey);
+    expect(plan.batches.flatMap(batch => [...batch.units, ...batch.relatedContextUnits]).some(unit => unit.fragmentId === fragment.id)).toBe(false);
+    expect(() => assertFullProposalQuotePlan(plan)).toThrow(/скрытые или отдельно помеченные фрагменты/);
+    const inputBefore = structuredClone(input), parse = vi.spyOn(quotePlan, 'parseProposalQuoteResponse'), complete = vi.spyOn(contractCompletion, 'completeContractProposalFields');
+    await expect(prepareProposalQuoteSelection(input)).rejects.toThrow(/Автоматическая подготовка КП/);
+    const reply = await runProposalQuotePreparation({ ...input, origin: 'model-selected-quotes' });
+    expect(reply).toEqual({ revision: 1, origin: 'model-selected-quotes', failed: expect.stringMatching(/Автоматическая подготовка КП/) });
+    expect(reply.prepared).toBeUndefined(); expect(reply.modelQuoteProvenance).toBeUndefined(); expect(parse).not.toHaveBeenCalled(); expect(complete).not.toHaveBeenCalled();
+    expect(sources).toEqual(before); expect(input).toEqual(inputBefore); expect(await taskSourceSnapshotKey(sources)).toBe(sourceKey);
+  });
   it('retains raw parts and exact selected quotes without fabricating ordinary model fields or doing IO', async () => {
     const fetch = vi.fn(), storage = { getItem: vi.fn(), setItem: vi.fn() }; vi.stubGlobal('fetch', fetch); vi.stubGlobal('window', { localStorage: storage });
     const input = freeze(await request()), before = structuredClone(input), result = await prepareProposalQuoteSelection(input);

@@ -20,7 +20,7 @@ import { ProposalContentPreview } from "./ProposalContentPreview";
 import { ProposalQuotedTextRepair } from "./ProposalQuotedTextRepair";
 import { ProposalAnalysisProvenance } from "./ProposalAnalysisProvenance";
 import { buildProposalQuotePlan, isProposalQuoteSelectionCandidate, parseProposalQuoteResponse } from "./proposalQuotePlan";
-import { validProposalQuoteProvenance, type ProposalQuoteProvenance, type ProposalQuoteResponsePart } from "./proposalQuotePreparation";
+import { assertFullProposalQuotePlan, validProposalQuoteProvenance, type ProposalQuoteProvenance, type ProposalQuoteResponsePart } from "./proposalQuotePreparation";
 import { SourceFactsDesk } from "./SourceFactsDesk";
 import { TaskGoalPicker } from "./TaskGoalPicker";
 import { normalizeTaskGoalSelection } from "./taskGoalSelection";
@@ -505,6 +505,9 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
         const options = { maxUnitsPerBatch: 6, instruction: instructionSnapshot };
         const quotePlan = await buildProposalQuotePlan(snapshot, options);
         if (!current()) return;
+        // The legacy source tail interprets visible false as default inclusion.
+        // Do not pass a partial quote selection to that different contract.
+        assertFullProposalQuotePlan(quotePlan);
         const quoteParts: ProposalQuoteResponsePart[] = [];
         let rawBytes = 0;
         for (const [index, batch] of quotePlan.batches.entries()) {

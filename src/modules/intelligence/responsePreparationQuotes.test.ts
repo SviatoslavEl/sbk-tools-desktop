@@ -85,6 +85,30 @@ describe('quote selection one-shot bridge', () => {
     vi.stubGlobal('Worker', LocalWorker); const task = startProposalQuotePreparation(bare(await request())), worker = LocalWorker.instances[0], reply = await runProposalQuotePreparation(worker.request);
     reply.modelQuoteProvenance!.sourceSnapshotKey = `sha256:${'a'.repeat(64)}`; worker.reply(reply); await expect(task.promise).rejects.toThrow(/Ключ/); expect(worker.terminated).toBe(1);
   });
+  it('rejects a forged prepared worker result for a partial quote plan, even with exact raw selections and source hash', async () => {
+    const full = await request(), reply = await runProposalQuotePreparation(full);
+    const sources = structuredClone(full.sources); sources[0].fragments![10].includedByUser = false;
+    const plan = await buildProposalQuotePlan(sources, full.options);
+    expect(plan.excludedUnselectedFragments).toHaveLength(1);
+    const parts = plan.batches.map(batch => ({ batchId: batch.id, model: 'synthetic-model', raw: JSON.stringify({ sourceSnapshotKey: plan.sourceSnapshotKey, batchId: batch.id,
+      units: Object.fromEntries(batch.units.map(unit => [unit.unitId, { disposition: unit.fragmentIndex === 6 ? 'commercial' : 'context', roles: unit.fragmentIndex === 6 ? ['scope'] : [], quote: unit.fragmentIndex === 6 ? unit.text : null }])) }) }));
+    const ledger = reply.modelQuoteProvenance!;
+    ledger.sourceSnapshotKey = plan.sourceSnapshotKey; ledger.parts = parts; ledger.selections = [];
+    ledger.counts = { units: 0, commercial: 0, context: 0, unclear: 0, batches: parts.length };
+    // The standalone parser can inspect a partial selection. That does not
+    // authorize the differently selected legacy source-completion result.
+    for (const part of parts) {
+      const parsed = await quotePlan.parseProposalQuoteResponse(part.raw, plan, part.batchId, sources);
+      ledger.counts.units += parsed.units.length;
+      for (const kind of ['commercial', 'context', 'unclear'] as const) ledger.counts[kind] += parsed.counts[kind];
+      ledger.selections.push(...parsed.selections.map(({ unitId, sourceId, fragmentId, locator, quote, roles }) => ({ unitId, sourceId, fragmentId, locator, quote, roles: [...roles] })));
+    }
+    expect(validResponsePreparationReply(reply, 7, 'model-selected-quotes')).toBe(true);
+    vi.stubGlobal('Worker', LocalWorker);
+    const task = startProposalQuotePreparation({ revision: 7, sources, options: full.options, parts }), worker = LocalWorker.instances[0];
+    worker.reply(reply); await expect(task.promise).rejects.toThrow(/скрытые или отдельно помеченные/);
+    expect(worker.terminated).toBe(1);
+  });
   it.each(['raw', 'quote'] as const)('rejects a changed receipt %s against the immutable input', async variant => {
     vi.stubGlobal('Worker', LocalWorker); const task = startProposalQuotePreparation(bare(await request())), worker = LocalWorker.instances[0], reply = await runProposalQuotePreparation(worker.request);
     if (variant === 'raw') reply.modelQuoteProvenance!.parts[0].raw += ' '; else reply.modelQuoteProvenance!.selections[0].quote += ' changed';
