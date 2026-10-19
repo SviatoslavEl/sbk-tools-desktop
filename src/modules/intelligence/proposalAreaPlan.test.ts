@@ -181,6 +181,59 @@ describe('whole physical frame seven-area protocol, not a semantic quality claim
 });
 
 describe('per-frame seven-area fallible semantic review of original issued whole bundles', () => {
+  it('states separate review rules for answered, locally not-stated and unclear without changing the seven-area wire or full payload', async () => {
+    const input = source([paragraph(0, 'Учебная формулировка для проверки протокола.')]), before = structuredClone(input), plan = await buildProposalAreaPlan(input), wire = extraction(plan);
+    wire.areas.payment = noAnswer(); wire.areas.schedule = noAnswer('unclear');
+    const candidate = await parse(wire, plan, input), reviewPlan = await buildProposalAreaReviewPlan(candidate, plan, input);
+    expect(reviewPlan.prompt).toContain('Сначала прочитай status каждой области');
+    expect(reviewPlan.prompt).toContain('ВСЕ утверждения и существенные уточнения');
+    expect(reviewPlan.prompt).toContain('её собственными explicit evidenceRefs из PRIMARY и прямо отвечают вопросу области');
+    expect(reviewPlan.prompt).toContain('Верни supported, если в PRIMARY нет прямого ответа');
+    expect(reviewPlan.prompt).toContain('отсутствие сведений подтверждает локальное not-stated, а не опровергает его');
+    expect(reviewPlan.prompt).toContain('Для not-stated верни unsupported ТОЛЬКО если сам PRIMARY прямо содержит сведения');
+    expect(reviewPlan.prompt).toContain('конкретный контрпример и его PRIMARY locator');
+    expect(reviewPlan.prompt).toContain('Факт только из CONTEXT не опровергает локальное not-stated');
+    expect(reviewPlan.prompt).toContain('При действительной неоднозначности');
+    expect(reviewPlan.prompt).toContain('Для unclear исходная область остаётся нерешённой при любом вердикте');
+    expect(payload(reviewPlan.prompt)).toBe(payload(plan.blocks[0].prompt));
+    expect(reviewPlan.extractionResponse).toBe(candidate); expect(candidate.areas).toEqual(wire.areas); expect(input).toEqual(before);
+    expect(reviewPlan.responseSchema).toHaveProperty('properties.areas.required', [...PROPOSAL_AREAS]);
+    for (const area of PROPOSAL_AREAS) expect(reviewPlan.responseSchema).toHaveProperty(`properties.areas.properties.${area}.required`, ['verdict', 'reason']);
+  });
+
+  it('permits source-stated nominal work/service wording without modal verbs, but leaves semantic relevance to fallible review', async () => {
+    const nominal = 'Учебная услуга по инвентаризации макетов.', input = source([paragraph(0, nominal)]), plan = await buildProposalAreaPlan(input), wire = extraction(plan);
+    expect(plan.blocks[0].prompt).toContain('Какие конкретные работы, услуги или действия составляют предмет задания');
+    expect(plan.blocks[0].prompt).toContain('Именная формулировка работы или услуги допустима');
+    expect(plan.blocks[0].prompt).toContain('не требуй буквальных слов «обязан» или «должен»');
+    expect(plan.blocks[0].prompt).toContain('название документа без такого содержания не задаёт состав работ');
+    wire.areas['work-scope'].answer = `  ${nominal}\n  `;
+    const response = await parse(wire, plan, input), reviewPlan = await buildProposalAreaReviewPlan(response, plan, input);
+    expect(response.areas['work-scope']).toEqual(wire.areas['work-scope']);
+    expect(reviewPlan.prompt).toContain('допустима именная формулировка работы или услуги');
+    expect(reviewPlan.prompt).toContain('наличие слов «обязан» или «должен» не обязательно');
+    expect(response.semanticReviewRequired).toBe(true); expect(response.completeness).toBe('not-assessed');
+    // This is a grammar/prompt regression, not a gold classification or proof
+    // that any actual model will select or correctly assess nominal wording.
+  });
+
+  it('preserves even semantically inconsistent reviewer reasons verbatim rather than repairing not-stated or promoting unclear', async () => {
+    const input = source([paragraph(0)]), plan = await buildProposalAreaPlan(input), wire = extraction(plan);
+    wire.areas['work-scope'] = noAnswer(); wire.areas.schedule = noAnswer('unclear');
+    const candidate = await parse(wire, plan, input), reviewPlan = await buildProposalAreaReviewPlan(candidate, plan, input), verdicts = review(reviewPlan);
+    verdicts.areas.payment = { verdict: 'unsupported', reason: '  СИНТЕТИЧЕСКАЯ ошибочная оценка: сведения отсутствуют.\r\n  ' };
+    verdicts.areas.schedule = { verdict: 'supported', reason: 'СИНТЕТИЧЕСКАЯ оценка неопределённости; это не подтверждение фактов.' };
+    const raw = JSON.stringify(verdicts, null, 2), response = await parseProposalAreaReviewResponse(raw, reviewPlan, plan, input);
+    // No string-meaning filter, invented counterexample, status flip or repair:
+    // a structurally valid model verdict still requires independent domain QA.
+    expect(response.areas).toEqual(verdicts.areas); expect(response.rawBytes).toBe(new TextEncoder().encode(raw).byteLength);
+    const resolved = await resolveProposalAreaReviewResponse(response, reviewPlan, plan, input);
+    expect(resolved.extractionResponse).toBe(candidate); expect(resolved.extractionResponse.areas.payment).toEqual(noAnswer());
+    expect(resolved.extractionResponse.areas.schedule).toEqual(noAnswer('unclear')); expect(candidate.areas).toEqual(wire.areas);
+    expect(response.semanticTruth).toBe('not-proven'); expect(response.humanApproval).toBe(false); expect(response.completeness).toBe('not-assessed');
+    expect(response).not.toHaveProperty('answer'); expect(response).not.toHaveProperty('ready');
+  });
+
   it('consumes only original extraction objects, keeps all seven bundles/ref lists and whole source unchanged', async () => {
     const input = source([paragraph(0), paragraph(1)]), plan = await buildProposalAreaPlan(input), wire = extraction(plan); wire.areas.schedule = noAnswer('unclear');
     const response = await parse(wire, plan, input), before = structuredClone(response), reviewPlan = await buildProposalAreaReviewPlan(response, plan, input);
