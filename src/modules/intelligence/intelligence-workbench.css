@@ -171,3 +171,5 @@
 .iw-task-issue.missing { border-left-color: #b44747; }
 .iw-task-issue.question { border-left-color: #b18335; }
 .iw-task-issue blockquote { white-space: pre-wrap; }
+.iw-quoted-text-repair blockquote { white-space: pre-wrap; overflow-wrap: anywhere; margin-inline: 0; }
+.iw-quoted-text-repair figure { min-width: 0; margin-inline: 0; }

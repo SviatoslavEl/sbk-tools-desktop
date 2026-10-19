@@ -17,6 +17,7 @@ import { runEvidenceAudit, type EvidenceAuditReply } from "./evidenceAuditWorker
 import { getItemTaskCompletion, type TaskCompletionReport } from "./taskCompletion";
 import { ItemTaskCompletionSummary, TaskCompletionSummary } from "./TaskCompletionSummary";
 import { ProposalContentPreview } from "./ProposalContentPreview";
+import { ProposalQuotedTextRepair } from "./ProposalQuotedTextRepair";
 import { SourceFactsDesk } from "./SourceFactsDesk";
 import { TaskGoalPicker } from "./TaskGoalPicker";
 import { normalizeTaskGoalSelection } from "./taskGoalSelection";
@@ -899,6 +900,11 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
               {item.destination === "proposals" && field.key === "deliveryTerms" && <p className="help-text">Публичные условия: попадут в выгружаемое КП.</p>}
               {item.destination === "proposals" && field.key === "internalNote" && <p className="help-text">Внутренняя заметка: не выгружается в КП.</p>}
               {evidence && <div className={`iw-field-evidence ${evidence.status}`}><strong>{evidence.status === "confirmed" ? "Найдено в источнике" : evidence.status === "conflict" ? "Противоречие контексту" : evidence.status === "placeholder" ? "Заглушка, не факт" : "Не подтверждено"}</strong><p>{evidence.message}</p>{evidenceQuotes(evidence.evidence)}</div>}
+              <ProposalQuotedTextRepair item={item} field={field.key} label={field.label} sources={resultSources} disabled={preparingResponse || Boolean(transferring)} onApply={(patch) => {
+                if (!mounted.current || itemsRef.current.find(entry => entry.id === item.id) !== item || evidenceCurrent.current.resultSources !== resultSources) throw new Error("Карточка или источники изменились. Повторите сверку для текущего результата.");
+                editItem(item.id, patch);
+                setNotice("Поле заменено дословными цитатами только в черновике. Исходный ответ ИИ не изменён; смысл и применимость условий требуют повторной проверки.");
+              }} />
               {problem && field.kind === "date" && typeof value === "string" && /\d{1,2}:\d{2}/.test(value) && <><p className="help-text">В ответе есть дата со временем. Укажите дату отдельно; время и часовой пояс можно сохранить в примечаниях.</p><button type="button" className="secondary iw-copy-date" onClick={() => {
                 const noteKey = item.destination === "proposals" ? "internalNote" : "notes";
                 const oldNote = typeof item.fields[noteKey] === "string" ? item.fields[noteKey] as string : "";

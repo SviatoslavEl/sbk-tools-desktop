@@ -8,6 +8,7 @@ import { createRequirementComparator } from "./requirementDeduplication";
 import { isOrganizerBeneficiarySupport } from "./sourceTextCompletion";
 import { createProposalPublicTermsProver } from "./proposalPublicTerms";
 import { createContractProposalProver } from "./contractProposalCompletion";
+import { proposalQuoteNeedsConditionReview } from "./proposalQuoteCompleteness";
 import { extractPreparedTableFacts, isPrimaryContractAmountLabel, isPrimaryNmcLabel, unsupportedMonetaryUnit, type PreparedTableFacts, type SourcePreparationProvenance } from "./sourcePreparedFacts";
 
 export interface EvidenceExcerpt { sourceId: string; sourceName: string; fragmentId?: string; locator: string; quote: string; }
@@ -1425,7 +1426,17 @@ export function auditIntelligenceResult(items: readonly IntelligenceItem[], sour
         : noteIssue ? { itemId: item.id, field, ...noteIssue } : tableProof?.fields.get(field) || (field === "paymentTerms" && paymentProof
         ? { itemId: item.id, field, status: "confirmed", message: "Полные условия оплаты дословно подтверждены отдельными цитатами в порядке одной явно обозначенной секции. Это проверка наличия текста, не заключение о применимости, полноте документа или юридической достоверности.", evidence: paymentProof.evidence }
         : fieldStatus(item, field, value!, scope.units, scope.dates, scope.index)));
-      const ownerResult = staffOwnershipGate(item, valueResult, value!, scope.units, scope.dates, scope.index), ownerIssue = ownerResult && ownerResult.status !== "confirmed", result = ownerResult || valueResult;
+      const ownerResult = staffOwnershipGate(item, valueResult, value!, scope.units, scope.dates, scope.index), ownerIssue = ownerResult && ownerResult.status !== "confirmed";
+      const originalResult = ownerResult || valueResult;
+      // Exact membership of a short consequence is not proof that its longer
+      // cited conditional quote was retained. Only fresh whole-field
+      // provers above may exempt their own bounded source/context claims.
+      const wholeProposalText = contractProposalProof?.fields.has(field)
+        || field === "deliveryTerms" && Boolean(publicTermsProof)
+        || field === "paymentTerms" && Boolean(paymentProof);
+      const result: FieldEvidenceStatus = originalResult.status === "confirmed" && !wholeProposalText && proposalQuoteNeedsConditionReview(item, field)
+        ? { ...originalResult, status: "unverified", message: "В цитатах этого поля есть условия или ограничения, которые не перенесены дословно целиком. Совпадение короткой фразы не подтверждает сохранение смысла. Сверьте поле с полными цитатами или явно замените его цитатами; это не подтверждает их применимость к новому КП." }
+        : originalResult;
       report.fields.push(result);
       if (result.status !== "confirmed") report.findings.push(finding(item, ownerIssue ? result.status === "conflict" ? "staff-owner-conflict" : "staff-owner-unverified" : item.destination === "procurement" && field === "submissionDeadline" && ambiguousLotDeadline(value!, scope.dates, scope.index) ? "ambiguous-lot-deadline" : result.status === "placeholder" ? "placeholder-value" : result.status === "conflict" ? "semantic-conflict" : "unverified-value", ownerIssue || noteIssue || isCritical(item.destination, field) || result.status !== "unverified" ? "blocking" : "warning", result.message, result.evidence, field));
     }
