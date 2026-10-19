@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { completeContractProposalFields, createContractProposalProver } from "./contractProposalCompletion";
+import { completeContractProposalFields, createContractProposalProver, deriveContractProposalCaption } from "./contractProposalCompletion";
 import { runResponsePreparation } from "./responsePreparationWorker";
 import { buildIntelligenceResponseSchema } from "./workbenchModel";
 import type { IntelligenceItem, IntelligenceSource } from "./workbenchTypes";
@@ -19,6 +19,19 @@ const card = (fields: IntelligenceItem["fields"] = {}): IntelligenceItem => ({ i
 const freeze = <T,>(value: T): T => { if (value && typeof value === "object") { Object.values(value).forEach(freeze); Object.freeze(value); } return value; };
 
 describe("whole contract to source-derived proposal preparation", () => {
+  it('exposes only a separately source-derived caption without completing scope, conditions or model values', () => {
+    const input = source(); input.coverage = { complete: true, requiresOcr: false }; const before = structuredClone(input), caption = deriveContractProposalCaption([input]);
+    expect(caption).toMatchObject({ origin: 'source-derived-caption', title: 'КП по проверке учебной системы', lineTitle: 'Услуги по проверке учебной системы', sourceIds: [input.id] });
+    expect(caption!.evidence.some(proof => proof.quote === input.fragments![4].text)).toBe(true);
+    expect(caption).not.toHaveProperty('lineDescriptions'); expect(caption).not.toHaveProperty('paymentTerms'); expect(caption).not.toHaveProperty('price'); expect(input).toEqual(before);
+  });
+  it('does not invent a caption when source identity, completeness or a bounded printed title is unavailable', () => {
+    const input = source(); expect(deriveContractProposalCaption([input])).toBeUndefined();
+    input.coverage = { complete: true, requiresOcr: false };
+    expect(deriveContractProposalCaption([input, { ...input, id: 'another' }])).toBeUndefined();
+    input.fragments![4].text = `1.1. Исполнитель оказывает комплекс услуг по ${'а'.repeat(220)}.`;
+    expect(deriveContractProposalCaption([input])).toBeUndefined();
+  });
   it("turns an almost-empty response into a substantive editable aggregate, without invented price, dates or contacts", () => {
     const input = source(), item = card({ title: "Коммерческое предложение" }), before = structuredClone({ input, item }); freeze(input); freeze(item);
     const result = completeContractProposalFields([item], [input], ["proposals"]), prepared = result.items[0];

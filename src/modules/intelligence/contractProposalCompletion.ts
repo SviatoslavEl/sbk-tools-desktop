@@ -37,6 +37,20 @@ function allEvidence(facts: readonly ContractProposalFact[]): SourcePreparationP
   const entries = facts.flatMap((fact) => [...fact.supportingEvidence, proof(fact)]);
   return entries.filter((entry, index) => entries.findIndex((other) => other.sourceId === entry.sourceId && other.fragmentId === entry.fragmentId && other.locator === entry.locator && other.quote === entry.quote) === index);
 }
+export interface ContractProposalCaption {
+  origin: 'source-derived-caption'; documentId: string; sourceIds: string[];
+  title: string; lineTitle: string; evidence: SourcePreparationProvenance[];
+}
+/** A printed source-derived caption only, never a model-generated position or
+ * permission to supplement its scope. Uses the unchanged canonical title rule. */
+export function deriveContractProposalCaption(sources: readonly IntelligenceSource[]): ContractProposalCaption | undefined {
+  if (sources.length !== 1 || sources[0].coverage?.complete !== true || sources[0].coverage.requiresOcr || sources[0].coverage.pagesWithoutText?.length) return;
+  const inventory = collectContractProposalFacts(sources), document = inventory.documents[0];
+  if (inventory.limited || inventory.documents.length !== 1 || !document?.eligible || !document.complete) return;
+  const subjects = inventory.facts.filter(fact => fact.documentId === document.documentId && fact.role === 'subject'), caption = titleFrom(subjects);
+  if (!caption) return;
+  return { origin: 'source-derived-caption', documentId: document.documentId, sourceIds: [...document.sourceIds], title: caption.title, lineTitle: caption.line, evidence: allEvidence(subjects) };
+}
 function canonicalFields(document: ContractProposalDocument, inventory: ContractProposalInventory): CanonicalField[] {
   const facts = inventory.facts.filter((fact) => fact.documentId === document.documentId);
   const subject = unique(facts.filter((fact) => fact.role === "subject"));
