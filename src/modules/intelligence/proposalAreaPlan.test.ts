@@ -103,6 +103,58 @@ describe('whole physical frame seven-area protocol, not a semantic quality claim
     const para = source([paragraph(0)]), paraPlan = await buildProposalAreaPlan(para), paraWire = extraction(paraPlan); paraWire.areas['work-scope'].evidenceRefs = [{ ownerId: 'owner-0', cellIndex: 0 }]; await expect(parse(paraWire, paraPlan, para)).rejects.toThrow(/cellIndex:null/);
   });
 
+  it('constrains every area schema to null for whole non-table owners instead of offering a synthetic cell zero', async () => {
+    for (const fragments of [[paragraph(0), paragraph(1)], [auxiliary(0)], [paragraph(0, 'Учебная сноска.', { kind: 'note', part: 'word/footnotes.xml', containerId: 'note-1' })]]) {
+      const input = source(fragments), before = structuredClone(input), plan = await buildProposalAreaPlan(input);
+      for (const block of plan.blocks) for (const area of PROPOSAL_AREAS) {
+        expect(block.responseSchema).toHaveProperty(`properties.areas.properties.${area}.properties.evidenceRefs.items.properties.cellIndex`, { type: 'null' });
+        expect(block.responseSchema).toHaveProperty(`properties.areas.properties.${area}.properties.evidenceRefs.items.properties.ownerId.enum`, block.primary.map(owner => owner.ownerId));
+      }
+      const wire = extraction(plan), beforeWire = structuredClone(wire);
+      wire.areas['work-scope'].evidenceRefs[0].cellIndex = 0;
+      const rejectedWire = structuredClone(wire);
+      await expect(parse(wire, plan, input)).rejects.toThrow(/cellIndex:null/);
+      expect(wire).toEqual(rejectedWire); // No0→null repair of a returned answer.
+      expect((await parse(beforeWire, plan, input)).areas).toEqual(beforeWire.areas);
+      expect(input).toEqual(before);
+    }
+  });
+
+  it('offers only nonempty own native table cell indices in every area, not null, context, empty cells or visual merged columns', async () => {
+    const header = row(0, 0, 2, ['Учебное условие заголовка'], true), body = row(1, 1, 2, ['Первая целая ячейка', '', 'Третья целая ячейка']);
+    body.structure!.cells![0].gridSpan = 4;
+    const input = source([header, body]), plan = await buildProposalAreaPlan(input);
+    for (const [index, expected] of [[0, [0]], [1, [0, 2]]] as const) for (const area of PROPOSAL_AREAS) {
+      expect(plan.blocks[index].responseSchema).toHaveProperty(`properties.areas.properties.${area}.properties.evidenceRefs.items.properties.cellIndex`, { type: 'integer', enum: expected });
+      expect(plan.blocks[index].responseSchema).toHaveProperty(`properties.areas.properties.${area}.properties.evidenceRefs.items.properties.ownerId.enum`, [`owner-${index}`]);
+    }
+    const wire = extraction(plan, 1); wire.areas['work-scope'].evidenceRefs = [{ ownerId: 'owner-1', cellIndex: 2 }];
+    expect((await parse(wire, plan, input, 1)).areas['work-scope'].evidenceRefs).toEqual(wire.areas['work-scope'].evidenceRefs);
+    const blankInput = source([row(0, 0, 1, ['', ' '])]), blankPlan = await buildProposalAreaPlan(blankInput);
+    for (const area of PROPOSAL_AREAS) expect(blankPlan.blocks[0].responseSchema).toHaveProperty(`properties.areas.properties.${area}.properties.evidenceRefs.maxItems`, 0);
+    const blankWire = extraction(blankPlan); blankWire.areas['work-scope'] = noAnswer();
+    expect((await parse(blankWire, blankPlan, blankInput)).areas['work-scope']).toEqual(noAnswer());
+  });
+
+  it('keeps headings with business actions as PRIMARY and requests semantic area relevance without claiming the parser proves it', async () => {
+    const input = source([paragraph(0, 'Учебный идентификатор ALPHA-001.'), auxiliary(1)]);
+    input[0].fragments![1].text = 'Исполнитель должен выполнить учебную проверку.';
+    const before = structuredClone(input), plan = await buildProposalAreaPlan(input);
+    expect(plan.blocks.flatMap(block => block.primary.map(owner => owner.ownerId))).toEqual(['owner-0', 'owner-1']);
+    expect(plan.blocks[0].prompt).toContain('answered должен прямо отвечать на вопрос именно этой области');
+    expect(plan.blocks[0].prompt).toContain('Это не правило пропуска заголовков');
+    const candidateWire = extraction(plan); candidateWire.areas['work-scope'].answer = input[0].fragments![0].text;
+    const candidate = await parse(candidateWire, plan, input), reviewPlan = await buildProposalAreaReviewPlan(candidate, plan, input);
+    expect(candidate.areas['work-scope'].answer).toBe(candidateWire.areas['work-scope'].answer);
+    expect(candidate.semanticReviewRequired).toBe(true); // Formatting is not a semantic relevance oracle.
+    expect(reviewPlan.prompt).toContain('точная цитата или верный реквизит не являются supported-ответом на другой вопрос');
+    const verdictWire = review(reviewPlan); verdictWire.areas['work-scope'] = { verdict: 'unsupported', reason: 'СИНТЕТИЧЕСКАЯ оценка нерелевантного ответа, не результат реальной модели.' };
+    expect((await parseReview(verdictWire, reviewPlan, plan, input)).areas['work-scope'].verdict).toBe('unsupported');
+    const business = extraction(plan, 1); business.areas['work-scope'].answer = input[0].fragments![1].text;
+    expect((await parse(business, plan, input, 1)).areas['work-scope'].answer).toBe(business.areas['work-scope'].answer);
+    expect(input).toEqual(before);
+  });
+
   it('enforces answer/ref/raw bounds and duplicate-key rejection, without rewriting an answer to pass', async () => {
     const input = source([paragraph(0)]), plan = await buildProposalAreaPlan(input), wire = extraction(plan);
     wire.areas['work-scope'].answer = '🧪'.repeat(8000); expect((await parse(wire, plan, input)).areas['work-scope'].answer).toBe(wire.areas['work-scope'].answer);
