@@ -402,6 +402,26 @@ describe("seven-area whole proposal route — synthetic callback integration, no
   async function begin() { await selectPreparationMethod("whole-proposal"); preparationButton().props.onClick!(); await flush(); }
   function mockReplies() { runtime.analyze.mockImplementation((_profile: unknown, _prompt: string, _key: unknown, _request: string, schema: Record<string, unknown>) => Promise.resolve(reply(schema))); }
 
+  it.each(['json', 'schema'] as const)('keeps the user %s profile and supplies a truthful schema carrier before both whole-route requests', async outputMode => {
+    await setup(); await edit('iw-output-mode', outputMode); mockReplies();
+    await begin(); await confirm(); await until(() => Boolean(editor()));
+    expect(runtime.analyze).toHaveBeenCalledTimes(2);
+    for (const call of runtime.analyze.mock.calls) {
+      expect(call[0].outputMode).toBe(outputMode);
+      const prompt = call[1] as string, schema = call[4] as Record<string, unknown>;
+      expect(schema).toHaveProperty('properties.schemaCarrier.enum', [outputMode === 'schema' ? 'native' : 'prompt']);
+      if (outputMode === 'json') {
+        expect(prompt).toContain(`Схема: ${JSON.stringify(schema)}`);
+        expect(prompt).not.toContain('Полная закрытая JSON-схема передана провайдеру отдельно');
+      } else {
+        expect(prompt).not.toContain(`Схема: ${JSON.stringify(schema)}`);
+        expect(prompt).toContain('Полная закрытая JSON-схема передана провайдеру отдельно');
+      }
+    }
+    expect(control('iw-output-mode').props.value).toBe(outputMode);
+    expect(control('iw-response').props.value).toBe(previousRaw);
+  });
+
   it("requires an explicit complete-native source and confirmation, never falls back for an ineligible source", async () => {
     await setup({ native: false }); expect(labeled("Полный черновик КП по семи областям").props.disabled).toBe(true);
     await selectPreparationMethod("whole-proposal"); expect(preparationButton().props.disabled).toBe(true); expect(runtime.analyze).not.toHaveBeenCalled();

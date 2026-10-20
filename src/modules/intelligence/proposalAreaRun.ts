@@ -1,4 +1,4 @@
-import { buildProposalAreaPlan, parseProposalAreaBlockResponse, buildProposalAreaReviewPlan, parseProposalAreaReviewResponse, type ProposalAreaPlan, type ProposalAreaPlanOptions } from './proposalAreaPlan';
+import { buildProposalAreaPlan, parseProposalAreaBlockResponse, buildProposalAreaReviewPlan, parseProposalAreaReviewResponse, type ProposalAreaPlan, type ProposalAreaPlanOptions, type ProposalAreaSchemaCarrier } from './proposalAreaPlan';
 import { buildProposalWholeDraft, revalidateProposalWholeDraft, type ProposalWholeDraft, type ProposalWholeDraftRecord } from './proposalWholeDraft';
 import { assertResponsePreparationSources } from './responsePreparationBounds';
 import type { IntelligenceSource } from './workbenchTypes';
@@ -14,6 +14,7 @@ export interface ProposalAreaRunCoverage {
 export interface ProposalAreaTransportJob {
   readonly kind: 'extraction' | 'review'; readonly requestId: ReturnType<typeof crypto.randomUUID>; readonly blockId: string;
   readonly prompt: string; readonly responseSchema: Readonly<Record<string, unknown>>; readonly signal: AbortSignal;
+  readonly schemaCarrier: ProposalAreaSchemaCarrier;
 }
 export interface ProposalAreaRunPart {
   readonly kind: ProposalAreaTransportJob['kind']; readonly blockId: string; readonly requestId: string;
@@ -107,12 +108,12 @@ export function startProposalAreaRun(input: ProposalAreaRunInput): { readonly pr
     try { const value = await Promise.race([work, cancelled]); retainBeforePublication?.(value); check(); return value; }
     finally { controller.signal.removeEventListener('abort', listener); }
   };
-  const call = async (kind: ProposalAreaTransportJob['kind'], blockId: string, prompt: string, responseSchema: Readonly<Record<string, unknown>>) => {
+  const call = async (kind: ProposalAreaTransportJob['kind'], blockId: string, prompt: string, responseSchema: Readonly<Record<string, unknown>>, schemaCarrier: ProposalAreaSchemaCarrier) => {
     check(); if (requests >= requestedLimit) fail('LIMITS', 'Исчерпан общий бюджет запросов. Повтор или частичный результат не подставлены.');
     const requestBytes = bytes(prompt) + bytes(JSON.stringify(responseSchema));
     if (payloadBytes + requestBytes > payloadLimit) fail('LIMITS', 'Исчерпан общий бюджет текста запросов и JSON-схем. Следующий блок не отправлен, частичный КП не установлен.');
     const requestId = crypto.randomUUID();
-    const job = Object.freeze({ kind, blockId, requestId, prompt, responseSchema, signal: controller.signal });
+    const job = Object.freeze({ kind, blockId, requestId, prompt, responseSchema, schemaCarrier, signal: controller.signal });
     let part: ProposalAreaRunPart | undefined;
     await awaitCurrent(() => { check(); requests++; payloadBytes += requestBytes; const frame = frames.find(frame => frame.blockId === blockId)!;
       if (kind === 'extraction') frame.extractionRequests++; else frame.reviewRequests++;
@@ -153,11 +154,11 @@ export function startProposalAreaRun(input: ProposalAreaRunInput): { readonly pr
       const records: ProposalWholeDraftRecord[] = [];
       for (const block of plan.blocks) {
         progress('extraction', block.id);
-        const extractionPart = await call('extraction', block.id, block.prompt, block.responseSchema); check();
+        const extractionPart = await call('extraction', block.id, block.prompt, block.responseSchema, plan.schemaCarrier); check();
         const response = await awaitCurrent(() => parseProposalAreaBlockResponse(extractionPart.raw, plan, block.id, originalSnapshot.captured)); check();
         const reviewPlan = await awaitCurrent(() => buildProposalAreaReviewPlan(response, plan, originalSnapshot.captured)); check();
         progress('review', block.id);
-        const reviewPart = await call('review', block.id, reviewPlan.prompt, reviewPlan.responseSchema); check();
+        const reviewPart = await call('review', block.id, reviewPlan.prompt, reviewPlan.responseSchema, plan.schemaCarrier); check();
         const reviewResponse = await awaitCurrent(() => parseProposalAreaReviewResponse(reviewPart.raw, reviewPlan, plan, originalSnapshot.captured)); check();
         records.push(Object.freeze({ response, reviewPlan, reviewResponse }));
         frames.find(frame => frame.blockId === block.id)!.state = 'REVIEWED';

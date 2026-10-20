@@ -30,7 +30,7 @@ async function fixture(options: { allAnswered?: boolean; blocked?: ProposalArea 
     for (const area of PROPOSAL_AREAS) areas[area] = options.allAnswered || area === 'work-scope' || area === options.blocked
       ? { status: 'answered', answer: `  SYNTHETIC_MODEL_${area}\r\nWhole unchanged answer.  `, evidenceRefs: [{ ownerId: 'owner', cellIndex: 0 }] }
       : { status: 'not-stated', answer: null, evidenceRefs: [] };
-    const response = await parseProposalAreaBlockResponse(JSON.stringify({ planKey: plan.planKey, sourceSnapshotKey: plan.sourceSnapshotKey, structureSnapshotKey: plan.structureSnapshotKey, blockId: block.id, areas }), plan, block.id, sources);
+    const response = await parseProposalAreaBlockResponse(JSON.stringify({ schemaCarrier: plan.schemaCarrier, planKey: plan.planKey, sourceSnapshotKey: plan.sourceSnapshotKey, structureSnapshotKey: plan.structureSnapshotKey, blockId: block.id, areas }), plan, block.id, sources);
     const reviewPlan = await buildProposalAreaReviewPlan(response, plan, sources);
     const reviewResponse = await parseProposalAreaReviewResponse(JSON.stringify({ ...syntheticReviewContract, reviewPlanKey: reviewPlan.reviewPlanKey, planKey: plan.planKey, sourceSnapshotKey: plan.sourceSnapshotKey, structureSnapshotKey: plan.structureSnapshotKey,
       blockId: block.id, areas: Object.fromEntries(PROPOSAL_AREAS.map(area => [area, syntheticReview(response.areas[area].status, area === options.blocked ? 'unsupported' : 'supported', `PRIVATE_REVIEW_${area}`)])) }), reviewPlan, plan, sources);

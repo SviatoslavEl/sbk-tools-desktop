@@ -9,18 +9,20 @@ import { createWorkingProposal, createWorkingProposalReviewIntent, editWorkingPr
 
 const ID = 'a1234567-1234-4234-8234-123456789abc';
 /** Synthetic, actually parser-issued capabilities. No model/provider is run. */
-async function issuedFixture() {
+async function issuedFixture(withWitness = false) {
   const sources: IntelligenceSource[] = [{ id: 'synthetic', name: 'PRIVATE_SOURCE_NAME', sha256: 'b'.repeat(64), text: 'PRIVATE_SOURCE_AGGREGATE', warnings: ['PRIVATE_SOURCE_WARNING'],
-    coverage: { complete: true, requiresOcr: false }, fragments: [{ id: 'owner-0', locator: 'PRIVATE_OWNER_LOCATOR', text: 'WHOLE_SYNTHETIC_SOURCE_TEXT', structure: {
+    coverage: { complete: true, requiresOcr: false }, fragments: [{ id: 'owner-0', locator: 'PRIVATE_OWNER_LOCATOR', text: withWitness ? 'PRIVATE_NON_NULL_WITNESS_ONLY' : 'WHOLE_SYNTHETIC_SOURCE_TEXT', structure: {
       version: 1, format: 'docx', method: 'ooxml', part: 'word/document.xml', kind: 'paragraph', containerId: 'body', order: 0, physicalSection: 0 } }] }];
   const plan = await buildProposalAreaPlan(sources), records: ProposalWholeDraftRecord[] = [];
   for (const block of plan.blocks) {
-    const response = await parseProposalAreaBlockResponse(JSON.stringify({ planKey: plan.planKey, sourceSnapshotKey: plan.sourceSnapshotKey, structureSnapshotKey: plan.structureSnapshotKey,
+    const response = await parseProposalAreaBlockResponse(JSON.stringify({ schemaCarrier: plan.schemaCarrier, planKey: plan.planKey, sourceSnapshotKey: plan.sourceSnapshotKey, structureSnapshotKey: plan.structureSnapshotKey,
       blockId: block.id, areas: Object.fromEntries(PROPOSAL_AREAS.map(area => [area, area === 'payment' ? { status: 'not-stated', answer: null, evidenceRefs: [] }
         : { status: 'answered', answer: `  Деловой текст ${area}\r\nПолный блок 🧪 e\u0301.  `, evidenceRefs: [{ ownerId: 'owner-0', cellIndex: null }] }])) }), plan, block.id, sources);
     const reviewPlan = await buildProposalAreaReviewPlan(response, plan, sources);
-    const reviewResponse = await parseProposalAreaReviewResponse(JSON.stringify({ reviewContract: 'state-aware-primary-v2', reviewPlanKey: reviewPlan.reviewPlanKey, planKey: plan.planKey, sourceSnapshotKey: plan.sourceSnapshotKey,
-      structureSnapshotKey: plan.structureSnapshotKey, blockId: block.id, areas: Object.fromEntries(PROPOSAL_AREAS.map(area => [area, { verdict: 'supported', reason: `PRIVATE_REVIEW_REASON_${area}`, basis: response.areas[area].status === 'answered' ? 'answer-supported' : 'primary-no-answer', counterexample: null }])) }), reviewPlan, plan, sources);
+    const reviewResponse = await parseProposalAreaReviewResponse(JSON.stringify({ schemaCarrier: plan.schemaCarrier, reviewContract: 'state-aware-primary-v2', reviewPlanKey: reviewPlan.reviewPlanKey, planKey: plan.planKey, sourceSnapshotKey: plan.sourceSnapshotKey,
+      structureSnapshotKey: plan.structureSnapshotKey, blockId: block.id, areas: Object.fromEntries(PROPOSAL_AREAS.map(area => [area, withWitness && area === 'payment'
+        ? { verdict: 'unsupported', reason: 'SYNTHETIC diagnostic only', basis: 'primary-answer-found', counterexample: { ownerId: 'owner-0', cellIndex: null, quote: 'PRIVATE_NON_NULL_WITNESS_ONLY' } }
+        : { verdict: 'supported', reason: `PRIVATE_REVIEW_REASON_${area}`, basis: response.areas[area].status === 'answered' ? 'answer-supported' : 'primary-no-answer', counterexample: null }])) }), reviewPlan, plan, sources);
     records.push({ response, reviewPlan, reviewResponse });
   }
   const draft = await buildProposalWholeDraft(plan, records, sources), handoff = await createProposalDraftEditorHandoff(draft, plan, records, sources);
@@ -33,6 +35,20 @@ const ordinary = () => parseWorkingProposalDocument(serializeWorkingProposalDocu
 const digest = async (text: string) => `sha256:${Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text))), byte => byte.toString(16).padStart(2, '0')).join('')}`;
 
 describe('ordinary working proposal, not proof restoration or an export operation', () => {
+  it('preserves a non-null reviewer witness only in private history through ordinary conversion and real publicV3 projection', async () => {
+    const { handoff } = await issuedFixture(true), { document, historyJson } = await createWorkingProposal(handoff);
+    expect(historyJson).toContain('PRIVATE_NON_NULL_WITNESS_ONLY');
+    const review = await projectWorkingProposalPublic(document, 'review-draft');
+    const intent = await createWorkingProposalReviewIntent(document), final = await projectWorkingProposalPublic(document, 'final', intent);
+    for (const publicValue of [review, final]) {
+      const serialized = JSON.stringify(publicValue);
+      expect(publicValue.schemaVersion).toBe(3); expect(serialized).not.toContain('PRIVATE_NON_NULL_WITNESS_ONLY');
+      expect(serialized).not.toContain('counterexample'); expect(serialized).not.toContain('primary-answer-found');
+    }
+    expect(document.sections.find(section => section.area === 'payment')?.blocks).toEqual([]);
+    expect(await inspectWorkingProposalHistory(document, historyJson)).toEqual({ state: 'available-unvalidated', warning: null });
+    // Pure projection only: no native command, filesystem output or rendering.
+  });
   it('does not accept duplicate historical JSON keys even with an exact matching hash', async () => {
     const doc = ordinary(), duplicated = originalHistory.replace('{', '{"version":1,');
     const altered = { ...doc, historicalSource: { ...doc.historicalSource, bytes: new TextEncoder().encode(duplicated).byteLength, sha256: (await digest(duplicated)).slice(7) } };

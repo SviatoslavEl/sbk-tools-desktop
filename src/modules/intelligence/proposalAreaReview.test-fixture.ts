@@ -1,7 +1,7 @@
 /** SYNTHETIC test fixtures only. Never a provider fallback or verdict repair. */
 import { PROPOSAL_AREA_REVIEW_CONTRACT, type ProposalAreaAnswer, type ProposalAreaReviewVerdict } from './proposalAreaPlan';
 
-export const syntheticReviewContract = { reviewContract: PROPOSAL_AREA_REVIEW_CONTRACT } as const;
+export const syntheticReviewContract = { reviewContract: PROPOSAL_AREA_REVIEW_CONTRACT, schemaCarrier: 'prompt' } as const;
 export function syntheticReview(status: ProposalAreaAnswer['status'], verdict: ProposalAreaReviewVerdict['verdict'] = 'supported',
   reason = 'SYNTHETIC fallible review; not semantic model accuracy.'): ProposalAreaReviewVerdict {
   const basis = status === 'unclear' ? 'uncertainty-assessment'

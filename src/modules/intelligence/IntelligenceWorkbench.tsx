@@ -526,9 +526,11 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
         const ownerTaskId = taskId.current, editorSnapshot = accessRef.current.access.editor, phaseSnapshot = accessRef.current.phase;
         const wholeCurrent = () => current() && taskId.current === ownerTaskId && accessRef.current.access.editor === editorSnapshot && accessRef.current.phase === phaseSnapshot;
         const wholeParts: typeof analysisParts = [];
-        const handle = startProposalAreaRun({ sources: snapshot, options: { instruction: instructionSnapshot }, isCurrent: wholeCurrent,
+        const wholeSchemaCarrier = profileSnapshot.outputMode === "schema" ? "native" : "prompt";
+        const handle = startProposalAreaRun({ sources: snapshot, options: { instruction: instructionSnapshot, schemaCarrier: wholeSchemaCarrier }, isCurrent: wholeCurrent,
           transport: async job => {
             if (!wholeCurrent() || job.signal.aborted) throw new Error("Задача изменилась перед отправкой. Запрос не отправлен.");
+            if (job.schemaCarrier !== wholeSchemaCarrier || job.schemaCarrier === "native" && profileSnapshot.outputMode !== "schema") throw new Error("Формат подключения не соответствует носителю схемы плана. Запрос не отправлен.");
             request.id = job.requestId;
             const abort = () => { void cancelIntelligenceRequest(job.requestId).catch(() => undefined); };
             job.signal.addEventListener("abort", abort, { once: true });

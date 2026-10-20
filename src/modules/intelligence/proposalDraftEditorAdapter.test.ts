@@ -20,7 +20,7 @@ async function fixture(options: { answers?: Partial<Record<ProposalArea, Proposa
   for (const block of plan.blocks) {
     const areas = Object.fromEntries(PROPOSAL_AREAS.map((area, index) => [area, options.answers?.[area] || { status: 'answered', answer: `  MODEL_${area}\r\nWhole unchanged bundle ${index}.  `,
       evidenceRefs: index % 2 ? [{ ownerId: 'owner-0', cellIndex: 0 }] : [{ ownerId: 'owner-0', cellIndex: 2 }, { ownerId: 'owner-0', cellIndex: 0 }] }]));
-    const response = await parseProposalAreaBlockResponse(JSON.stringify({ planKey: plan.planKey, sourceSnapshotKey: plan.sourceSnapshotKey, structureSnapshotKey: plan.structureSnapshotKey, blockId: block.id, areas }), plan, block.id, sources);
+    const response = await parseProposalAreaBlockResponse(JSON.stringify({ schemaCarrier: plan.schemaCarrier, planKey: plan.planKey, sourceSnapshotKey: plan.sourceSnapshotKey, structureSnapshotKey: plan.structureSnapshotKey, blockId: block.id, areas }), plan, block.id, sources);
     const reviewPlan = await buildProposalAreaReviewPlan(response, plan, sources);
     const reviewResponse = await parseProposalAreaReviewResponse(JSON.stringify({ ...syntheticReviewContract, reviewPlanKey: reviewPlan.reviewPlanKey, planKey: plan.planKey, sourceSnapshotKey: plan.sourceSnapshotKey, structureSnapshotKey: plan.structureSnapshotKey,
       blockId: block.id, areas: Object.fromEntries(PROPOSAL_AREAS.map(area => [area, syntheticReview(response.areas[area].status, options.verdicts?.[area], `PRIVATE_REVIEW_DIAGNOSTIC_${area}`)])) }), reviewPlan, plan, sources);

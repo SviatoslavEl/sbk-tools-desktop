@@ -19,10 +19,10 @@ const noAnswer = (status: 'not-stated' | 'unclear' = 'not-stated'): FixtureAnswe
 function extraction(plan: ProposalAreaPlan, index = 0) {
   const owner = plan.blocks[index].primary[0], areas = Object.fromEntries(PROPOSAL_AREAS.map(area => [area, noAnswer()])) as Record<ProposalArea, FixtureAnswer>;
   areas['work-scope'] = { status: 'answered', answer: '  Учебный неизменённый whole bundle.\r\nВторое утверждение.  ', evidenceRefs: [{ ownerId: owner.ownerId, cellIndex: owner.structure.kind === 'table-row' ? 0 : null }] };
-  return { planKey: plan.planKey, sourceSnapshotKey: plan.sourceSnapshotKey, structureSnapshotKey: plan.structureSnapshotKey, blockId: plan.blocks[index].id, areas };
+  return { schemaCarrier: plan.schemaCarrier, planKey: plan.planKey, sourceSnapshotKey: plan.sourceSnapshotKey, structureSnapshotKey: plan.structureSnapshotKey, blockId: plan.blocks[index].id, areas };
 }
 function review(plan: ProposalAreaReviewPlan) {
-  return { ...syntheticReviewContract, reviewPlanKey: plan.reviewPlanKey, planKey: plan.planKey, sourceSnapshotKey: plan.sourceSnapshotKey, structureSnapshotKey: plan.structureSnapshotKey, blockId: plan.blockId,
+  return { ...syntheticReviewContract, schemaCarrier: plan.schemaCarrier, reviewPlanKey: plan.reviewPlanKey, planKey: plan.planKey, sourceSnapshotKey: plan.sourceSnapshotKey, structureSnapshotKey: plan.structureSnapshotKey, blockId: plan.blockId,
     areas: Object.fromEntries(PROPOSAL_AREAS.map(area => [area, syntheticReview(plan.extractionResponse.areas[area].status)])) };
 }
 const parse = (wire: unknown, plan: ProposalAreaPlan, input: IntelligenceSource[], index = 0) => parseProposalAreaBlockResponse(JSON.stringify(wire), plan, plan.blocks[index].id, input);
@@ -31,8 +31,39 @@ const payload = (prompt: string) => prompt.split('Целый блок (данн�
 afterEach(() => vi.unstubAllGlobals());
 
 describe('whole physical frame seven-area protocol, not a semantic quality claim', () => {
+  it.each(['prompt', 'native', 'both'] as const)('binds %s schema carriage to plan, prompts, reply contracts and carrier-aware byte metrics', async schemaCarrier => {
+    const input = source([paragraph(0)]), plan = await buildProposalAreaPlan(input, { schemaCarrier }), block = plan.blocks[0];
+    const candidate = await parse(extraction(plan), plan, input), reviewPlan = await buildProposalAreaReviewPlan(candidate, plan, input);
+    for (const frame of [block, reviewPlan]) {
+      expect(frame.schemaCarrier).toBe(schemaCarrier);
+      expect(frame.nativeSchemaBytes).toBe(schemaCarrier === 'prompt' ? 0 : frame.schemaBytes);
+      expect(frame.responseSchema).toHaveProperty('properties.schemaCarrier.enum', [schemaCarrier]);
+      if (schemaCarrier === 'native') {
+        expect(frame.prompt).toContain('Полная закрытая JSON-схема передана провайдеру отдельно');
+        expect(frame.prompt).not.toContain(`Схема: ${JSON.stringify(frame.responseSchema)}`);
+      } else {
+        expect(frame.prompt).toContain(`Схема: ${JSON.stringify(frame.responseSchema)}`);
+        expect(frame.prompt).not.toContain('Полная закрытая JSON-схема передана провайдеру отдельно');
+      }
+    }
+    expect((await parseReview(review(reviewPlan), reviewPlan, plan, input)).schemaCarrier).toBe(schemaCarrier);
+    const wrong = schemaCarrier === 'native' ? 'prompt' : 'native';
+    await expect(parse({ ...extraction(plan), schemaCarrier: wrong }, plan, input)).rejects.toThrow();
+    await expect(parseReview({ ...review(reviewPlan), schemaCarrier: wrong }, reviewPlan, plan, input)).rejects.toThrow();
+    const alternative = await buildProposalAreaPlan(input, { schemaCarrier: wrong });
+    expect(alternative.planKey).not.toBe(plan.planKey); expect(payload(alternative.blocks[0].prompt)).toBe(payload(block.prompt));
+    expect(plan.schemaCarrier).toBe(schemaCarrier);
+  });
+
+  it('defaults safely to a full prompt schema and rejects unknown or mutated carrier options without a fallback', async () => {
+    const input = source([paragraph(0)]), plan = await buildProposalAreaPlan(input);
+    expect(plan.schemaCarrier).toBe('prompt'); expect(plan.blocks[0].prompt).toContain(`Схема: ${JSON.stringify(plan.blocks[0].responseSchema)}`);
+    expect(await buildProposalAreaPlan(input, { schemaCarrier: undefined })).toEqual(plan);
+    for (const schemaCarrier of ['automatic', null, ['native'], true]) await expect(buildProposalAreaPlan(input, { schemaCarrier } as never)).rejects.toThrow(/носитель/);
+  });
+
   it('keeps full native schemas and exact bindings without duplicating schemas in extraction/review user prompts', async () => {
-    const input = source([paragraph(0, 'SYNTHETIC_WHOLE_PAYLOAD_UNCHANGED')]), before = structuredClone(input), plan = await buildProposalAreaPlan(input);
+    const input = source([paragraph(0, 'SYNTHETIC_WHOLE_PAYLOAD_UNCHANGED')]), before = structuredClone(input), plan = await buildProposalAreaPlan(input, { schemaCarrier: 'native' });
     const candidate = await parse(extraction(plan), plan, input), reviewPlan = await buildProposalAreaReviewPlan(candidate, plan, input);
     for (const frame of [plan.blocks[0], reviewPlan]) {
       expect(frame.prompt).not.toContain(`Схема: ${JSON.stringify(frame.responseSchema)}`);
@@ -86,7 +117,7 @@ describe('whole physical frame seven-area protocol, not a semantic quality claim
   });
 
   it('checks schema/native envelope metrics independently and exposes no token or model-capacity promise', async () => {
-    const plan = await buildProposalAreaPlan(source([paragraph(0)])), block = plan.blocks[0];
+    const plan = await buildProposalAreaPlan(source([paragraph(0)]), { schemaCarrier: 'native' }), block = plan.blocks[0];
     expect(block.promptBytes).toBe(new TextEncoder().encode(block.prompt).byteLength); expect(block.schemaBytes).toBe(new TextEncoder().encode(JSON.stringify(block.responseSchema)).byteLength);
     expect(block.schemaBytes).toBeLessThanOrEqual(65_536); expect(block.nativeRequestBodyBytesUpperBound).toBeGreaterThan(block.promptBytes + block.schemaBytes); expect(block.nativeRequestBodyBytesUpperBound).toBeLessThanOrEqual(2_097_152);
     expect(PROPOSAL_AREA_LIMITS).toMatchObject({ payloadBytes: 12_288, frames: 64, planBytes: 4_194_304, schemaBytes: 65_536, schemaDepth: 32, schemaNodes: 10_000, rawBytes: 2_097_152 });
@@ -332,7 +363,7 @@ describe('per-frame seven-area fallible semantic review of original issued whole
   it('requires every review area with strict enums/reasons and exact bindings, rejecting answer/ref replacement and duplicate keys', async () => {
     const input = source([paragraph(0)]), plan = await buildProposalAreaPlan(input), response = await parse(extraction(plan), plan, input), reviewPlan = await buildProposalAreaReviewPlan(response, plan, input), wire = review(reviewPlan);
     const missing = structuredClone(wire); delete missing.areas.payment; await expect(parseReview(missing, reviewPlan, plan, input)).rejects.toThrow();
-    for (const patch of [{ verdict: ['supported'], reason: 'X' }, { verdict: 'SUPPORTED', reason: 'X' }, { verdict: 'supported', reason: '' }, { verdict: 'unclear', reason: '\ud800' }, { verdict: 'supported', reason: '🧪'.repeat(2001) }, { verdict: 'supported', reason: 'X', answer: 'Replacement' }, { verdict: 'supported', reason: 'X', evidenceRefs: [] }]) await expect(parseReview({ ...wire, areas: { ...wire.areas, payment: patch } }, reviewPlan, plan, input)).rejects.toThrow();
+    for (const patch of [{ verdict: ['supported'], reason: 'X' }, { verdict: 'SUPPORTED', reason: 'X' }, { verdict: 'supported', reason: '' }, { verdict: 'unclear', reason: '\ud800' }, { verdict: 'supported', reason: '🧪'.repeat(2001) }, { verdict: 'supported', reason: 'X', answer: 'Replacement' }, { verdict: 'supported', reason: 'X', evidenceRefs: [] }]) await expect(parseReview({ ...wire, areas: { ...wire.areas, payment: { ...wire.areas.payment, ...patch } } }, reviewPlan, plan, input)).rejects.toThrow();
     for (const patch of [{ reviewPlanKey: 'other' }, { planKey: 'other' }, { blockId: 'other' }, { rawBytes: 0 }]) await expect(parseReview({ ...wire, ...patch }, reviewPlan, plan, input)).rejects.toThrow();
     const raw = JSON.stringify(wire); await expect(parseProposalAreaReviewResponse(raw.replace('"verdict":', '"verdict":"unclear","verdict":'), reviewPlan, plan, input)).rejects.toThrow(/повторённое поле/);
     await expect(parseProposalAreaReviewResponse('я'.repeat(1_048_577), reviewPlan, plan, input)).rejects.toThrow(/2 МБ/);
