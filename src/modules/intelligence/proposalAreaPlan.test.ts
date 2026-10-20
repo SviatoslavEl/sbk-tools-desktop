@@ -28,6 +28,32 @@ function review(plan: ProposalAreaReviewPlan) {
 const parse = (wire: unknown, plan: ProposalAreaPlan, input: IntelligenceSource[], index = 0) => parseProposalAreaBlockResponse(JSON.stringify(wire), plan, plan.blocks[index].id, input);
 const parseReview = (wire: unknown, reviewPlan: ProposalAreaReviewPlan, plan: ProposalAreaPlan, input: IntelligenceSource[]) => parseProposalAreaReviewResponse(JSON.stringify(wire), reviewPlan, plan, input);
 const payload = (prompt: string) => prompt.split('Целый блок (данные): ')[1];
+type ReviewSchemaBranch = {
+  type: string; additionalProperties: boolean; required: string[];
+  properties: {
+    verdict: { type: string; enum: string[] }; basis: { type: string; enum: string[] };
+    reason: { type: string; minLength: number; maxLength: number };
+    counterexample: { type: 'null' } | { type: 'object'; additionalProperties: boolean; required: string[]; properties: {
+      ownerId: { type: string; enum: string[] }; cellIndex: { type: 'null' } | { type: 'integer'; enum: number[] }; quote: { type: string; minLength: number; maxLength: number };
+    } };
+  };
+};
+const reviewBranches = (plan: ProposalAreaReviewPlan, area: ProposalArea) => (plan.responseSchema as unknown as {
+  properties: { areas: { properties: Record<ProposalArea, { anyOf: ReviewSchemaBranch[] }> } };
+}).properties.areas.properties[area].anyOf;
+// Enumerates only the finite verdict/basis/proof tuple encoded by complete
+// anyOf branches. Not a general JSON-schema validator or model/meaning test.
+function schemaAllowsReviewTuple(branches: ReviewSchemaBranch[], verdict: string, basis: string, proof: { ownerId: string; cellIndex: number | null; quote: string } | null) {
+  return branches.some(branch => {
+    if (!branch.properties.verdict.enum.includes(verdict) || !branch.properties.basis.enum.includes(basis)) return false;
+    const node = branch.properties.counterexample;
+    if (node.type === 'null') return proof === null;
+    if (!proof || !node.properties.ownerId.enum.includes(proof.ownerId)) return false;
+    const cell = node.properties.cellIndex;
+    return (cell.type === 'null' ? proof.cellIndex === null : cell.enum.includes(proof.cellIndex as number))
+      && proof.quote.length >= node.properties.quote.minLength && proof.quote.length <= node.properties.quote.maxLength;
+  });
+}
 afterEach(() => vi.unstubAllGlobals());
 
 describe('whole physical frame seven-area protocol, not a semantic quality claim', () => {
@@ -259,7 +285,7 @@ describe('per-frame seven-area fallible semantic review of original issued whole
     wire.areas.payment = area;
     const accepted = await parseReview(wire, reviewPlan, plan, input);
     expect(accepted.areas.payment.counterexample).toEqual(good); expect(candidate.areas.payment).toEqual(noAnswer());
-    expect(reviewPlan.responseSchema).toHaveProperty('properties.areas.properties.payment.properties.counterexample.anyOf.1.properties.cellIndex.enum', [0, 2]);
+    expect(reviewPlan.responseSchema).toHaveProperty('properties.areas.properties.payment.anyOf.1.properties.counterexample.properties.cellIndex.enum', [0, 2]);
     for (const proof of [
       { ...good, ownerId: 'owner-0', quote: 'PRIVATE_CONTEXT_ONLY' }, { ...good, cellIndex: null },
       { ...good, cellIndex: 1 }, { ...good, cellIndex: 3 }, { ...good, cellIndex: 0.5 },
@@ -299,10 +325,60 @@ describe('per-frame seven-area fallible semantic review of original issued whole
     expect(payload(reviewPlan.prompt)).toBe(payload(plan.blocks[0].prompt));
     expect(reviewPlan.extractionResponse).toBe(candidate); expect(candidate.areas).toEqual(wire.areas); expect(input).toEqual(before);
     expect(reviewPlan.responseSchema).toHaveProperty('properties.areas.required', [...PROPOSAL_AREAS]);
-    for (const area of PROPOSAL_AREAS) expect(reviewPlan.responseSchema).toHaveProperty(`properties.areas.properties.${area}.required`, ['verdict', 'reason', 'basis', 'counterexample']);
+    for (const area of PROPOSAL_AREAS) for (const branch of reviewBranches(reviewPlan, area)) {
+      expect(branch.required).toEqual(['verdict', 'reason', 'basis', 'counterexample']);
+      expect(branch.type).toBe('object'); expect(branch.additionalProperties).toBe(false);
+      expect(Object.keys(branch.properties)).toEqual(['verdict', 'reason', 'basis', 'counterexample']);
+    }
     expect(reviewPlan.responseSchema).toHaveProperty('properties.reviewContract.enum', ['state-aware-primary-v2']);
-    expect(reviewPlan.responseSchema).toHaveProperty('properties.areas.properties.payment.properties.basis.enum', ['primary-no-answer', 'primary-answer-found', 'ambiguous-primary']);
-    expect(reviewPlan.responseSchema).toHaveProperty('properties.areas.properties.schedule.properties.basis.enum', ['uncertainty-assessment']);
+    expect(reviewBranches(reviewPlan, 'payment').flatMap(branch => branch.properties.basis.enum)).toEqual(['primary-no-answer', 'primary-answer-found', 'ambiguous-primary']);
+    expect(reviewBranches(reviewPlan, 'schedule').flatMap(branch => branch.properties.basis.enum)).toEqual(['uncertainty-assessment']);
+  });
+
+  it.each([
+    ['paragraph', 'answered'], ['paragraph', 'not-stated'], ['paragraph', 'unclear'],
+    ['native-row', 'answered'], ['native-row', 'not-stated'], ['native-row', 'unclear'],
+    ['blank-native-row', 'not-stated'], ['blank-native-row', 'unclear'],
+  ] as const)('matches provider branch tuples to unchanged runtime for %s / %s (48 combinations)', async (shape, status) => {
+    const term = 'SYNTHETIC_INDEPENDENT_CONDITION', blank = shape === 'blank-native-row';
+    const input = source([shape === 'paragraph' ? paragraph(0, term) : row(0, 0, 1, blank ? ['', ' '] : [term, '', 'SYNTHETIC_OTHER'])]);
+    const plan = await buildProposalAreaPlan(input), wire = extraction(plan);
+    wire.areas['work-scope'] = noAnswer();
+    wire.areas.payment = status === 'answered' ? { status, answer: term, evidenceRefs: [{ ownerId: 'owner-0', cellIndex: shape === 'paragraph' ? null : 0 }] } : noAnswer(status);
+    const candidate = await parse(wire, plan, input), reviewPlan = await buildProposalAreaReviewPlan(candidate, plan, input), before = structuredClone(candidate);
+    const branches = reviewBranches(reviewPlan, 'payment'), baseline = review(reviewPlan);
+    const allowed = new Set(status === 'answered' ? [
+      'supported/answer-supported/null', 'unsupported/answer-unsupported/null', 'unsupported/answer-wrong-area/null',
+      'unsupported/answer-incomplete/proof', 'unclear/ambiguous-primary/null',
+    ] : status === 'not-stated' ? ['supported/primary-no-answer/null', ...(!blank ? ['unsupported/primary-answer-found/proof'] : []), 'unclear/ambiguous-primary/null']
+      : ['supported/uncertainty-assessment/null', 'unsupported/uncertainty-assessment/null', 'unclear/uncertainty-assessment/null']);
+    const basisValues = ['answer-supported', 'answer-unsupported', 'answer-wrong-area', 'answer-incomplete', 'primary-no-answer', 'primary-answer-found', 'ambiguous-primary', 'uncertainty-assessment'];
+    let checked = 0, admitted = 0;
+    for (const verdict of ['supported', 'unsupported', 'unclear']) for (const basis of basisValues) for (const withProof of [false, true]) {
+      const counterexample = withProof ? { ownerId: 'owner-0', cellIndex: shape === 'paragraph' ? null : 0, quote: term } : null;
+      const expected = allowed.has(`${verdict}/${basis}/${withProof ? 'proof' : 'null'}`);
+      expect(schemaAllowsReviewTuple(branches, verdict, basis, counterexample)).toBe(expected);
+      const result = parseReview({ ...baseline, areas: { ...baseline.areas, payment: { verdict, basis, reason: 'SYNTHETIC_DIAGNOSTIC_ONLY', counterexample } } }, reviewPlan, plan, input);
+      if (expected) { expect((await result).areas.payment).toEqual({ verdict, basis, reason: 'SYNTHETIC_DIAGNOSTIC_ONLY', counterexample }); admitted++; }
+      else await expect(result).rejects.toThrow();
+      checked++;
+    }
+    expect(checked).toBe(48); expect(admitted).toBe(allowed.size); expect(candidate).toEqual(before); expect(input[0].fragments![0].text).toBe(shape === 'paragraph' ? term : (blank ? '\t ' : `${term}\t\tSYNTHETIC_OTHER`));
+    for (const branch of branches) {
+      expect(branch.required).toEqual(['verdict', 'reason', 'basis', 'counterexample']); expect(branch.additionalProperties).toBe(false);
+      expect(branch).not.toHaveProperty('allOf'); expect(branch).not.toHaveProperty('if');
+    }
+  });
+
+  it('asks whole-primary completeness and area-specific relevance without adding source facts to candidates or payload', async () => {
+    const input = source([paragraph(0, 'SYNTHETIC_UNCLASSIFIED_WHOLE_PRIMARY')]), before = structuredClone(input), plan = await buildProposalAreaPlan(input);
+    const candidate = await parse(extraction(plan), plan, input), candidateBefore = structuredClone(candidate), reviewPlan = await buildProposalAreaReviewPlan(candidate, plan, input);
+    for (const phrase of ['Для каждого из семи вопросов просмотри ВСЕ PRIMARY-владельцы заново', 'относительные сроки назначения или замены представителей', 'Отсутствие общей длительности проекта не означает отсутствия таких сроков', 'имена представителей и указанные полномочия', 'не превращай представителя автоматически в контактное лицо КП', 'необходимые доступы, информацию и материалы другой стороны']) expect(plan.blocks[0].prompt).toContain(phrase);
+    for (const phrase of ['Проверяй релевантность контрпримера отдельно для каждого вопроса', 'это primary-no-answer/supported, не primary-answer-found/unsupported', 'не добавляется в кандидата и не расширяет его evidenceRefs', 'Не объявляй полный ответ supported только потому']) expect(reviewPlan.prompt).toContain(phrase);
+    expect(payload(reviewPlan.prompt)).toBe(payload(plan.blocks[0].prompt)); expect(candidate).toEqual(candidateBefore); expect(input).toEqual(before);
+    expect(candidate.completeness).toBe('not-assessed'); expect(candidate.humanApproval).toBe(false);
+    // Prompt/schema coverage does not assert an actual model finds, understands
+    // or faithfully preserves the synthetic text, much less a real contract.
   });
 
   it('permits source-stated nominal work/service wording without modal verbs, but leaves semantic relevance to fallible review', async () => {
