@@ -6,6 +6,7 @@ import { buildProposalAreaPlan, buildProposalAreaReviewPlan, parseProposalAreaBl
 import { buildProposalWholeDraft } from './proposalWholeDraft';
 import { createProposalDraftEditorHandoff, projectProposalDraftEditorPreview, PROPOSAL_DRAFT_EDITOR_LIMITS } from './proposalDraftEditorAdapter';
 import type { IntelligenceSource } from './workbenchTypes';
+import { syntheticReview, syntheticReviewContract } from './proposalAreaReview.test-fixture';
 
 // Real source-only protocol/assembler/adapter fixtures; synthetic model answers
 // and verdicts only. This hook/SSR harness exercises callbacks, not a real DOM,
@@ -31,8 +32,8 @@ async function fixture(options: { allAnswered?: boolean; blocked?: ProposalArea 
       : { status: 'not-stated', answer: null, evidenceRefs: [] };
     const response = await parseProposalAreaBlockResponse(JSON.stringify({ planKey: plan.planKey, sourceSnapshotKey: plan.sourceSnapshotKey, structureSnapshotKey: plan.structureSnapshotKey, blockId: block.id, areas }), plan, block.id, sources);
     const reviewPlan = await buildProposalAreaReviewPlan(response, plan, sources);
-    const reviewResponse = await parseProposalAreaReviewResponse(JSON.stringify({ reviewPlanKey: reviewPlan.reviewPlanKey, planKey: plan.planKey, sourceSnapshotKey: plan.sourceSnapshotKey, structureSnapshotKey: plan.structureSnapshotKey,
-      blockId: block.id, areas: Object.fromEntries(PROPOSAL_AREAS.map(area => [area, { verdict: area === options.blocked ? 'unsupported' : 'supported', reason: `PRIVATE_REVIEW_${area}` }])) }), reviewPlan, plan, sources);
+    const reviewResponse = await parseProposalAreaReviewResponse(JSON.stringify({ ...syntheticReviewContract, reviewPlanKey: reviewPlan.reviewPlanKey, planKey: plan.planKey, sourceSnapshotKey: plan.sourceSnapshotKey, structureSnapshotKey: plan.structureSnapshotKey,
+      blockId: block.id, areas: Object.fromEntries(PROPOSAL_AREAS.map(area => [area, syntheticReview(response.areas[area].status, area === options.blocked ? 'unsupported' : 'supported', `PRIVATE_REVIEW_${area}`)])) }), reviewPlan, plan, sources);
     records.push({ response, reviewPlan, reviewResponse });
   }
   const draft = await buildProposalWholeDraft(plan, records, sources);

@@ -5,6 +5,7 @@ import {
 } from './proposalAreaPlan';
 import { buildProposalWholeDraft, revalidateProposalWholeDraft, PROPOSAL_WHOLE_DRAFT_LIMITS, type ProposalWholeDraftRecord } from './proposalWholeDraft';
 import type { IntelligenceFragment, IntelligenceSource } from './workbenchTypes';
+import { syntheticReview } from './proposalAreaReview.test-fixture';
 
 /** Every response/review below is a SYNTHETIC ordinary schema response issued
  * by the new pure parser. No provider, actual raw or semantic accuracy proof. */
@@ -33,7 +34,10 @@ async function recordFor(plan: ProposalAreaPlan, input: IntelligenceSource[], fr
   let extractionRaw = JSON.stringify(schemaWire(block.responseSchema, areas));
   if (extractionPadTo !== undefined) { if (extractionPadTo < length(extractionRaw)) throw new Error('Synthetic padding cannot truncate raw'); extractionRaw += ' '.repeat(extractionPadTo - length(extractionRaw)); }
   const response = await parseProposalAreaBlockResponse(extractionRaw, plan, block.id, input), reviewPlan = await buildProposalAreaReviewPlan(response, plan, input);
-  const reviewAreas = Object.fromEntries(PROPOSAL_AREAS.map(area => [area, { verdict: 'supported', reason: 'SYNTHETIC ошибающаяся модельная оценка; истинность тестом не доказана.', ...reviews?.(area, frameIndex) }]));
+  const reviewAreas = Object.fromEntries(PROPOSAL_AREAS.map(area => {
+    const override = reviews?.(area, frameIndex);
+    return [area, { ...syntheticReview(response.areas[area].status, override?.verdict, override?.reason), ...override }];
+  }));
   const reviewRaw = JSON.stringify(schemaWire(reviewPlan.responseSchema, reviewAreas)) + ' '.repeat(reviewPadding);
   const reviewResponse = await parseProposalAreaReviewResponse(reviewRaw, reviewPlan, plan, input);
   return { record: { response, reviewPlan, reviewResponse } satisfies ProposalWholeDraftRecord, extractionRaw, reviewRaw };
@@ -47,6 +51,19 @@ const notStated: ProposalAreaAnswer = { status: 'not-stated', answer: null, evid
 afterEach(() => vi.unstubAllGlobals());
 
 describe('atomic original-issued seven-area whole draft, never client-ready or semantic proof', () => {
+  it('keeps a new native omission quote private and never uses it to repair a blocked whole-answer bundle', async () => {
+    const marker = 'SYNTHETIC_PRIVATE_REVIEW_OMISSION_ONLY', input = source([paragraph(0, marker)]);
+    const { plan, records } = await complete(input, undefined, area => area === 'work-scope'
+      ? { verdict: 'unsupported', basis: 'answer-incomplete', reason: 'SYNTHETIC incomplete answer, not a model accuracy result.', counterexample: { ownerId: 'owner-0', cellIndex: null, quote: marker } } : {});
+    const draft = await buildProposalWholeDraft(plan, records, input);
+    expect(draft.audit.frames[0].modelReview.areas['work-scope'].counterexample?.quote).toBe(marker);
+    expect(draft.sections.find(section => section.area === 'work-scope')?.bundles).toEqual([]);
+    expect(JSON.stringify(draft.sections)).not.toContain(marker);
+    expect(draft.clarificationQuestions.filter(question => question.area === 'work-scope').length).toBeGreaterThan(0);
+    expect(records[0].response.areas['work-scope'].answer).not.toContain(marker);
+    expect(draft.readyForClient).toBe(false); expect(draft.semanticTruth).toBe('not-proven');
+  });
+
   it('retains all seven actual returned whole answers, ordered refs and source owners without canonical/source-only completion', async () => {
     const input = source([paragraph(0), paragraph(1), paragraph(2)]), before = structuredClone(input);
     const { plan, records } = await complete(input, area => ({ answer: `  SYNTHETIC ${area}: первая часть.\r\nВторая часть без разделения.  `,

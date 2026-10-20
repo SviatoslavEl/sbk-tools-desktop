@@ -19,8 +19,8 @@ async function issuedFixture() {
       blockId: block.id, areas: Object.fromEntries(PROPOSAL_AREAS.map(area => [area, area === 'payment' ? { status: 'not-stated', answer: null, evidenceRefs: [] }
         : { status: 'answered', answer: `  Деловой текст ${area}\r\nПолный блок 🧪 e\u0301.  `, evidenceRefs: [{ ownerId: 'owner-0', cellIndex: null }] }])) }), plan, block.id, sources);
     const reviewPlan = await buildProposalAreaReviewPlan(response, plan, sources);
-    const reviewResponse = await parseProposalAreaReviewResponse(JSON.stringify({ reviewPlanKey: reviewPlan.reviewPlanKey, planKey: plan.planKey, sourceSnapshotKey: plan.sourceSnapshotKey,
-      structureSnapshotKey: plan.structureSnapshotKey, blockId: block.id, areas: Object.fromEntries(PROPOSAL_AREAS.map(area => [area, { verdict: 'supported', reason: `PRIVATE_REVIEW_REASON_${area}` }])) }), reviewPlan, plan, sources);
+    const reviewResponse = await parseProposalAreaReviewResponse(JSON.stringify({ reviewContract: 'state-aware-primary-v2', reviewPlanKey: reviewPlan.reviewPlanKey, planKey: plan.planKey, sourceSnapshotKey: plan.sourceSnapshotKey,
+      structureSnapshotKey: plan.structureSnapshotKey, blockId: block.id, areas: Object.fromEntries(PROPOSAL_AREAS.map(area => [area, { verdict: 'supported', reason: `PRIVATE_REVIEW_REASON_${area}`, basis: response.areas[area].status === 'answered' ? 'answer-supported' : 'primary-no-answer', counterexample: null }])) }), reviewPlan, plan, sources);
     records.push({ response, reviewPlan, reviewResponse });
   }
   const draft = await buildProposalWholeDraft(plan, records, sources), handoff = await createProposalDraftEditorHandoff(draft, plan, records, sources);

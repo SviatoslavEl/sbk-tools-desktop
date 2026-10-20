@@ -3,6 +3,7 @@ import { buildProposalAreaPlan, buildProposalAreaReviewPlan, parseProposalAreaBl
 import { buildProposalWholeDraft, type ProposalWholeDraftRecord } from './proposalWholeDraft';
 import { createProposalDraftEditorHandoff, editProposalDraftEditorBlock, projectProposalDraftEditorPreview, PROPOSAL_DRAFT_EDITOR_LIMITS } from './proposalDraftEditorAdapter';
 import type { IntelligenceSource } from './workbenchTypes';
+import { syntheticReview, syntheticReviewContract } from './proposalAreaReview.test-fixture';
 
 function source(): IntelligenceSource[] {
   const cells = ['OWNED_A', 'SOURCE_ONLY_PRIVATE_CELL', 'OWNED_B'].map((text, index) => ({ index, text, gridSpan: 1, verticalMerge: 'none' as const, nestedTableCount: 0 }));
@@ -21,8 +22,8 @@ async function fixture(options: { answers?: Partial<Record<ProposalArea, Proposa
       evidenceRefs: index % 2 ? [{ ownerId: 'owner-0', cellIndex: 0 }] : [{ ownerId: 'owner-0', cellIndex: 2 }, { ownerId: 'owner-0', cellIndex: 0 }] }]));
     const response = await parseProposalAreaBlockResponse(JSON.stringify({ planKey: plan.planKey, sourceSnapshotKey: plan.sourceSnapshotKey, structureSnapshotKey: plan.structureSnapshotKey, blockId: block.id, areas }), plan, block.id, sources);
     const reviewPlan = await buildProposalAreaReviewPlan(response, plan, sources);
-    const reviewResponse = await parseProposalAreaReviewResponse(JSON.stringify({ reviewPlanKey: reviewPlan.reviewPlanKey, planKey: plan.planKey, sourceSnapshotKey: plan.sourceSnapshotKey, structureSnapshotKey: plan.structureSnapshotKey,
-      blockId: block.id, areas: Object.fromEntries(PROPOSAL_AREAS.map(area => [area, { verdict: options.verdicts?.[area] || 'supported', reason: `PRIVATE_REVIEW_DIAGNOSTIC_${area}` }])) }), reviewPlan, plan, sources);
+    const reviewResponse = await parseProposalAreaReviewResponse(JSON.stringify({ ...syntheticReviewContract, reviewPlanKey: reviewPlan.reviewPlanKey, planKey: plan.planKey, sourceSnapshotKey: plan.sourceSnapshotKey, structureSnapshotKey: plan.structureSnapshotKey,
+      blockId: block.id, areas: Object.fromEntries(PROPOSAL_AREAS.map(area => [area, syntheticReview(response.areas[area].status, options.verdicts?.[area], `PRIVATE_REVIEW_DIAGNOSTIC_${area}`)])) }), reviewPlan, plan, sources);
     records.push({ response, reviewPlan, reviewResponse });
   }
   const draft = await buildProposalWholeDraft(plan, records, sources);

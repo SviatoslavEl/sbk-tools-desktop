@@ -73,8 +73,8 @@ beforeAll(async () => {
   for (const block of plan.blocks) {
     const response = await parseProposalAreaBlockResponse(JSON.stringify({ planKey: plan.planKey, sourceSnapshotKey: plan.sourceSnapshotKey, structureSnapshotKey: plan.structureSnapshotKey, blockId: block.id,
       areas: Object.fromEntries(PROPOSAL_AREAS.map(area => [area, { status: 'answered', answer: `WHOLE_${area}`, evidenceRefs: [{ ownerId: 'owner', cellIndex: null }] }])) }), plan, block.id, sources);
-    const reviewPlan = await buildProposalAreaReviewPlan(response, plan, sources), reviewResponse = await parseProposalAreaReviewResponse(JSON.stringify({ reviewPlanKey: reviewPlan.reviewPlanKey, planKey: plan.planKey, sourceSnapshotKey: plan.sourceSnapshotKey,
-      structureSnapshotKey: plan.structureSnapshotKey, blockId: block.id, areas: Object.fromEntries(PROPOSAL_AREAS.map(area => [area, { verdict: 'supported', reason: 'SYNTHETIC only, not model accuracy' }])) }), reviewPlan, plan, sources);
+    const reviewPlan = await buildProposalAreaReviewPlan(response, plan, sources), reviewResponse = await parseProposalAreaReviewResponse(JSON.stringify({ reviewContract: 'state-aware-primary-v2', reviewPlanKey: reviewPlan.reviewPlanKey, planKey: plan.planKey, sourceSnapshotKey: plan.sourceSnapshotKey,
+      structureSnapshotKey: plan.structureSnapshotKey, blockId: block.id, areas: Object.fromEntries(PROPOSAL_AREAS.map(area => [area, { verdict: 'supported', reason: 'SYNTHETIC only, not model accuracy', basis: 'answer-supported', counterexample: null }])) }), reviewPlan, plan, sources);
     records.push({ response, reviewPlan, reviewResponse });
   }
   issued = await createProposalDraftEditorHandoff(await buildProposalWholeDraft(plan, records, sources), plan, records, sources);

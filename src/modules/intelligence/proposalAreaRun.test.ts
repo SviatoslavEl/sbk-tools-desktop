@@ -16,7 +16,7 @@ function wire(job: ProposalAreaTransportJob, reason = 'Учебный fallible v
   const ownerIndex = Number(job.blockId.match(/block-(\d+)$/u)![1]) - 1;
   const areas = Object.fromEntries(PROPOSAL_AREAS.map(area => [area, job.kind === 'extraction'
     ? { status: 'answered', answer: `Неизменённый учебный ответ ${area}.`, evidenceRefs: [{ ownerId: `owner-${ownerIndex}`, cellIndex: null }] }
-    : { verdict: 'supported', reason }]));
+    : { verdict: 'supported', reason, basis: 'answer-supported', counterexample: null }]));
   return JSON.stringify({ ...keys, areas });
 }
 afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); vi.useRealTimers(); });

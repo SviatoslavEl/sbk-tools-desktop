@@ -3,6 +3,7 @@ import { buildProposalStructuralBlockPlan } from './proposalStructuralBlockPlan'
 import { PROPOSAL_AREAS, PROPOSAL_AREA_LIMITS, buildProposalAreaPlan, resolveProposalAreaPlan, parseProposalAreaBlockResponse, resolveProposalAreaBlockResponse, buildProposalAreaReviewPlan, resolveProposalAreaReviewPlan, parseProposalAreaReviewResponse, resolveProposalAreaReviewResponse, type ProposalArea, type ProposalAreaAnswer, type ProposalAreaPlan, type ProposalAreaReviewPlan } from './proposalAreaPlan';
 import type { DocxFragmentStructure } from './documentStructure';
 import type { IntelligenceFragment, IntelligenceSource } from './workbenchTypes';
+import { syntheticReview, syntheticReviewContract } from './proposalAreaReview.test-fixture';
 
 function paragraph(index: number, content = `Учебное условие ${index}.`, native: Partial<DocxFragmentStructure> = {}): IntelligenceFragment {
   return { id: `owner-${index}`, locator: `Позиция ${index}`, text: content, structure: { version: 1, format: 'docx', method: 'ooxml', part: 'word/document.xml', kind: 'paragraph', containerId: 'body', order: index, physicalSection: 0, ...native } };
@@ -21,8 +22,8 @@ function extraction(plan: ProposalAreaPlan, index = 0) {
   return { planKey: plan.planKey, sourceSnapshotKey: plan.sourceSnapshotKey, structureSnapshotKey: plan.structureSnapshotKey, blockId: plan.blocks[index].id, areas };
 }
 function review(plan: ProposalAreaReviewPlan) {
-  return { reviewPlanKey: plan.reviewPlanKey, planKey: plan.planKey, sourceSnapshotKey: plan.sourceSnapshotKey, structureSnapshotKey: plan.structureSnapshotKey, blockId: plan.blockId,
-    areas: Object.fromEntries(PROPOSAL_AREAS.map(area => [area, { verdict: 'supported', reason: 'Синтетическая ошибающаяся модельная оценка, не предметная приёмка.' }])) };
+  return { ...syntheticReviewContract, reviewPlanKey: plan.reviewPlanKey, planKey: plan.planKey, sourceSnapshotKey: plan.sourceSnapshotKey, structureSnapshotKey: plan.structureSnapshotKey, blockId: plan.blockId,
+    areas: Object.fromEntries(PROPOSAL_AREAS.map(area => [area, syntheticReview(plan.extractionResponse.areas[area].status)])) };
 }
 const parse = (wire: unknown, plan: ProposalAreaPlan, input: IntelligenceSource[], index = 0) => parseProposalAreaBlockResponse(JSON.stringify(wire), plan, plan.blocks[index].id, input);
 const parseReview = (wire: unknown, reviewPlan: ProposalAreaReviewPlan, plan: ProposalAreaPlan, input: IntelligenceSource[]) => parseProposalAreaReviewResponse(JSON.stringify(wire), reviewPlan, plan, input);
@@ -148,7 +149,7 @@ describe('whole physical frame seven-area protocol, not a semantic quality claim
     expect(candidate.areas['work-scope'].answer).toBe(candidateWire.areas['work-scope'].answer);
     expect(candidate.semanticReviewRequired).toBe(true); // Formatting is not a semantic relevance oracle.
     expect(reviewPlan.prompt).toContain('точная цитата или верный реквизит не являются supported-ответом на другой вопрос');
-    const verdictWire = review(reviewPlan); verdictWire.areas['work-scope'] = { verdict: 'unsupported', reason: 'СИНТЕТИЧЕСКАЯ оценка нерелевантного ответа, не результат реальной модели.' };
+    const verdictWire = review(reviewPlan); verdictWire.areas['work-scope'] = { ...syntheticReview('answered', 'unsupported', 'СИНТЕТИЧЕСКАЯ оценка нерелевантного ответа, не результат реальной модели.'), basis: 'answer-wrong-area' };
     expect((await parseReview(verdictWire, reviewPlan, plan, input)).areas['work-scope'].verdict).toBe('unsupported');
     const business = extraction(plan, 1); business.areas['work-scope'].answer = input[0].fragments![1].text;
     expect((await parse(business, plan, input, 1)).areas['work-scope'].answer).toBe(business.areas['work-scope'].answer);
@@ -181,7 +182,57 @@ describe('whole physical frame seven-area protocol, not a semantic quality claim
 });
 
 describe('per-frame seven-area fallible semantic review of original issued whole bundles', () => {
-  it('states separate review rules for answered, locally not-stated and unclear without changing the seven-area wire or full payload', async () => {
+  it('rejects old review shapes and incompatible local-absence intent without changing the returned raw or verdict', async () => {
+    const input = source([paragraph(0)]), plan = await buildProposalAreaPlan(input), candidate = await parse(extraction(plan), plan, input), reviewPlan = await buildProposalAreaReviewPlan(candidate, plan, input);
+    const wire = review(reviewPlan), legacy = structuredClone(wire) as Record<string, unknown>;
+    delete legacy.reviewContract;
+    await expect(parseReview(legacy, reviewPlan, plan, input)).rejects.toThrow(/контракту v2/);
+    for (const patch of [
+      { verdict: 'unsupported', reason: 'СИНТЕТИЧЕСКАЯ оценка без найденных данных.', basis: 'primary-no-answer', counterexample: null },
+      { ...syntheticReview('not-stated', 'unsupported'), counterexample: null },
+      { ...syntheticReview('not-stated', 'supported'), counterexample: { ownerId: 'owner-0', cellIndex: null, quote: input[0].fragments![0].text } },
+      { ...syntheticReview('answered', 'supported') },
+      { verdict: 'unsupported', reason: 'Старая только текстовая причина.' },
+    ]) {
+      const raw = JSON.stringify({ ...wire, areas: { ...wire.areas, payment: patch } }), before = raw;
+      await expect(parseProposalAreaReviewResponse(raw, reviewPlan, plan, input)).rejects.toThrow();
+      expect(raw).toBe(before); expect(candidate.areas.payment).toEqual(noAnswer());
+    }
+  });
+
+  it('requires an exact own PRIMARY/native-cell counterexample, not a reason locator, context, invented quote or visual cell', async () => {
+    const input = source([row(0, 0, 2, ['PRIVATE_CONTEXT_ONLY'], true), row(1, 1, 2, ['SYNTHETIC_NATIVE\r\nQUOTE e\u0301', '', 'Другой текст'])]);
+    input[0].fragments![1].structure!.cells![0].gridSpan = 3;
+    const plan = await buildProposalAreaPlan(input), candidate = await parse(extraction(plan, 1), plan, input, 1), reviewPlan = await buildProposalAreaReviewPlan(candidate, plan, input), wire = review(reviewPlan);
+    const good = { ownerId: 'owner-1', cellIndex: 0, quote: 'SYNTHETIC_NATIVE\r\nQUOTE e\u0301' };
+    const area = { ...syntheticReview('not-stated', 'unsupported'), counterexample: good };
+    wire.areas.payment = area;
+    const accepted = await parseReview(wire, reviewPlan, plan, input);
+    expect(accepted.areas.payment.counterexample).toEqual(good); expect(candidate.areas.payment).toEqual(noAnswer());
+    expect(reviewPlan.responseSchema).toHaveProperty('properties.areas.properties.payment.properties.counterexample.anyOf.1.properties.cellIndex.enum', [0, 2]);
+    for (const proof of [
+      { ...good, ownerId: 'owner-0', quote: 'PRIVATE_CONTEXT_ONLY' }, { ...good, cellIndex: null },
+      { ...good, cellIndex: 1 }, { ...good, cellIndex: 3 }, { ...good, cellIndex: 0.5 },
+      { ...good, quote: 'SYNTHETIC_NATIVE\nQUOTE e\u0301' }, { ...good, quote: 'SYNTHETIC_NATIVE\r\nQUOTE é' },
+      { ...good, quote: 'Придуманное условие' }, { ...good, quote: ' ' }, { ...good, quote: '\ud800' },
+      { ...good, quote: 'x'.repeat(2001) }, { ...good, locator: 'Даже верный locator не разрешает лишние поля' },
+    ]) await expect(parseReview({ ...wire, areas: { ...wire.areas, payment: { ...area, counterexample: proof } } }, reviewPlan, plan, input)).rejects.toThrow();
+  });
+
+  it('keeps an incomplete-answer diagnostic separate from the unchanged whole answer and rejects unsupported omission without a quote', async () => {
+    const input = source([paragraph(0, 'SYNTHETIC_PRIVATE_MISSING_CONDITION')]), plan = await buildProposalAreaPlan(input), candidate = await parse(extraction(plan), plan, input), before = structuredClone(candidate);
+    const reviewPlan = await buildProposalAreaReviewPlan(candidate, plan, input), wire = review(reviewPlan);
+    const incomplete = { ...syntheticReview('answered', 'unsupported'), basis: 'answer-incomplete' as const, counterexample: { ownerId: 'owner-0', cellIndex: null, quote: 'SYNTHETIC_PRIVATE_MISSING_CONDITION' } };
+    wire.areas['work-scope'] = incomplete;
+    const parsed = await parseReview(wire, reviewPlan, plan, input);
+    expect(parsed.areas['work-scope']).toEqual(incomplete); expect(candidate).toEqual(before);
+    await expect(parseReview({ ...wire, areas: { ...wire.areas, 'work-scope': { ...incomplete, counterexample: null } } }, reviewPlan, plan, input)).rejects.toThrow(/цитата/);
+    await expect(parseReview({ ...wire, areas: { ...wire.areas, 'work-scope': { ...incomplete, verdict: 'supported' } } }, reviewPlan, plan, input)).rejects.toThrow(/несовместим/);
+    expect(reviewPlan.prompt).toContain('полноту ответа области по всему PRIMARY');
+    expect(reviewPlan.prompt).toContain('рабочие/календарные дни, И/ИЛИ, более позднее событие');
+  });
+
+  it('binds the new state-aware review contract while retaining seven areas and the whole physical payload', async () => {
     const input = source([paragraph(0, 'Учебная формулировка для проверки протокола.')]), before = structuredClone(input), plan = await buildProposalAreaPlan(input), wire = extraction(plan);
     wire.areas.payment = noAnswer(); wire.areas.schedule = noAnswer('unclear');
     const candidate = await parse(wire, plan, input), reviewPlan = await buildProposalAreaReviewPlan(candidate, plan, input);
@@ -198,7 +249,10 @@ describe('per-frame seven-area fallible semantic review of original issued whole
     expect(payload(reviewPlan.prompt)).toBe(payload(plan.blocks[0].prompt));
     expect(reviewPlan.extractionResponse).toBe(candidate); expect(candidate.areas).toEqual(wire.areas); expect(input).toEqual(before);
     expect(reviewPlan.responseSchema).toHaveProperty('properties.areas.required', [...PROPOSAL_AREAS]);
-    for (const area of PROPOSAL_AREAS) expect(reviewPlan.responseSchema).toHaveProperty(`properties.areas.properties.${area}.required`, ['verdict', 'reason']);
+    for (const area of PROPOSAL_AREAS) expect(reviewPlan.responseSchema).toHaveProperty(`properties.areas.properties.${area}.required`, ['verdict', 'reason', 'basis', 'counterexample']);
+    expect(reviewPlan.responseSchema).toHaveProperty('properties.reviewContract.enum', ['state-aware-primary-v2']);
+    expect(reviewPlan.responseSchema).toHaveProperty('properties.areas.properties.payment.properties.basis.enum', ['primary-no-answer', 'primary-answer-found', 'ambiguous-primary']);
+    expect(reviewPlan.responseSchema).toHaveProperty('properties.areas.properties.schedule.properties.basis.enum', ['uncertainty-assessment']);
   });
 
   it('permits source-stated nominal work/service wording without modal verbs, but leaves semantic relevance to fallible review', async () => {
@@ -221,11 +275,12 @@ describe('per-frame seven-area fallible semantic review of original issued whole
     const input = source([paragraph(0)]), plan = await buildProposalAreaPlan(input), wire = extraction(plan);
     wire.areas['work-scope'] = noAnswer(); wire.areas.schedule = noAnswer('unclear');
     const candidate = await parse(wire, plan, input), reviewPlan = await buildProposalAreaReviewPlan(candidate, plan, input), verdicts = review(reviewPlan);
-    verdicts.areas.payment = { verdict: 'unsupported', reason: '  СИНТЕТИЧЕСКАЯ ошибочная оценка: сведения отсутствуют.\r\n  ' };
-    verdicts.areas.schedule = { verdict: 'supported', reason: 'СИНТЕТИЧЕСКАЯ оценка неопределённости; это не подтверждение фактов.' };
+    verdicts.areas.payment = { ...syntheticReview('not-stated', 'unsupported', '  СИНТЕТИЧЕСКАЯ ошибочная оценка: сведения отсутствуют.\r\n  '), counterexample: { ownerId: 'owner-0', cellIndex: null, quote: input[0].fragments![0].text } };
+    verdicts.areas.schedule = syntheticReview('unclear', 'supported', 'СИНТЕТИЧЕСКАЯ оценка неопределённости; это не подтверждение фактов.');
     const raw = JSON.stringify(verdicts, null, 2), response = await parseProposalAreaReviewResponse(raw, reviewPlan, plan, input);
     // No string-meaning filter, invented counterexample, status flip or repair:
-    // a structurally valid model verdict still requires independent domain QA.
+    // Even an exact PRIMARY quote plus a compatible machine basis does not
+    // prove its relevance or the free-text reason. Domain QA remains required.
     expect(response.areas).toEqual(verdicts.areas); expect(response.rawBytes).toBe(new TextEncoder().encode(raw).byteLength);
     const resolved = await resolveProposalAreaReviewResponse(response, reviewPlan, plan, input);
     expect(resolved.extractionResponse).toBe(candidate); expect(resolved.extractionResponse.areas.payment).toEqual(noAnswer());
@@ -247,7 +302,7 @@ describe('per-frame seven-area fallible semantic review of original issued whole
   it('preserves all model verdicts/reasons as fallible diagnostics and never promotes a supported unclear area or repairs missing answers', async () => {
     const input = source([paragraph(0)]), plan = await buildProposalAreaPlan(input), wire = extraction(plan); wire.areas.payment = noAnswer('unclear');
     const response = await parse(wire, plan, input), reviewPlan = await buildProposalAreaReviewPlan(response, plan, input), verdicts = review(reviewPlan);
-    verdicts.areas.deliverables = { verdict: 'unsupported', reason: '  Непроверенное пояснение.\r\nНе новый source факт.  ' }; verdicts.areas.schedule = { verdict: 'unclear', reason: 'Нельзя установить.' };
+    verdicts.areas.deliverables = { ...syntheticReview('not-stated', 'unsupported', '  Непроверенное пояснение.\r\nНе новый source факт.  '), counterexample: { ownerId: 'owner-0', cellIndex: null, quote: input[0].fragments![0].text } }; verdicts.areas.schedule = syntheticReview('not-stated', 'unclear', 'Нельзя установить.');
     const raw = JSON.stringify(verdicts, null, 2), result = await parseProposalAreaReviewResponse(raw, reviewPlan, plan, input);
     expect(result.areas).toEqual(verdicts.areas); expect(result.extractionRawSHA256).toBe(response.rawSHA256); expect(result.rawBytes).toBe(new TextEncoder().encode(raw).byteLength);
     expect(result.semanticTruth).toBe('not-proven'); expect(result.humanApproval).toBe(false); expect(result.completeness).toBe('not-assessed'); expect(result.providerAuthenticity).toBe('not-attested');

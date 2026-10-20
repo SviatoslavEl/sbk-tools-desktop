@@ -43,9 +43,17 @@ export interface ProposalAreaReviewPlan {
   readonly sourcePayloadBytes: number; readonly prompt: string; readonly promptBytes: number; readonly responseSchema: Readonly<Record<string, unknown>>;
   readonly schemaBytes: number; readonly nativeRequestBodyBytesUpperBound: number;
 }
-export interface ProposalAreaReviewVerdict { readonly verdict: 'supported' | 'unsupported' | 'unclear'; readonly reason: string }
+export const PROPOSAL_AREA_REVIEW_CONTRACT = 'state-aware-primary-v2' as const;
+export type ProposalAreaReviewBasis = 'answer-supported' | 'answer-unsupported' | 'answer-wrong-area' | 'answer-incomplete'
+  | 'primary-no-answer' | 'primary-answer-found' | 'ambiguous-primary' | 'uncertainty-assessment';
+export interface ProposalAreaCounterexample extends ProposalAreaReference { readonly quote: string }
+export interface ProposalAreaReviewVerdict {
+  readonly verdict: 'supported' | 'unsupported' | 'unclear'; readonly reason: string;
+  readonly basis: ProposalAreaReviewBasis; readonly counterexample: ProposalAreaCounterexample | null;
+}
 export interface ProposalAreaReviewResponse {
   readonly version: 1; readonly purpose: 'fallible-model-seven-area-review-only';
+  readonly reviewContract: typeof PROPOSAL_AREA_REVIEW_CONTRACT;
   readonly reviewPlanKey: `sha256:${string}`; readonly planKey: `sha256:${string}`; readonly sourceSnapshotKey: `sha256:${string}`; readonly structureSnapshotKey: `sha256:${string}`; readonly blockId: string;
   readonly areas: Readonly<Record<ProposalArea, ProposalAreaReviewVerdict>>;
   readonly extractionRawSHA256: `sha256:${string}`; readonly rawSHA256: `sha256:${string}`; readonly rawBytes: number;
@@ -221,11 +229,23 @@ export async function resolveProposalAreaBlockResponse(response: ProposalAreaBlo
   const before = capture(sources); await freshPlan(plan, sources); current(sources, before, 'перед возвратом исходного ответа'); const block = plan.blocks.find(block => block.id === response.blockId); if (!block) fail('Чужой блок ответа.');
   return freeze({ response, plan, block });
 }
-function reviewSchema(reviewKey: string, plan: ProposalAreaPlan, blockId: string): Record<string, unknown> {
-  const verdict = { type: 'object', additionalProperties: false, required: ['verdict', 'reason'], properties: { verdict: { type: 'string', enum: ['supported', 'unsupported', 'unclear'] }, reason: { type: 'string', minLength: 1, maxLength: PROPOSAL_AREA_LIMITS.reasonCharacters } } };
-  return { type: 'object', additionalProperties: false, required: ['reviewPlanKey', 'planKey', 'sourceSnapshotKey', 'structureSnapshotKey', 'blockId', 'areas'], properties: {
-    reviewPlanKey: { type: 'string', enum: [reviewKey] }, planKey: { type: 'string', enum: [plan.planKey] }, sourceSnapshotKey: { type: 'string', enum: [plan.sourceSnapshotKey] }, structureSnapshotKey: { type: 'string', enum: [plan.structureSnapshotKey] }, blockId: { type: 'string', enum: [blockId] },
-    areas: { type: 'object', additionalProperties: false, required: [...PROPOSAL_AREAS], properties: Object.fromEntries(PROPOSAL_AREAS.map(area => [area, verdict])) },
+function reviewSchema(reviewKey: string, plan: ProposalAreaPlan, response: ProposalAreaBlockResponse, block: ProposalAreaFrame): Record<string, unknown> {
+  const table = block.primary[0]?.structure.kind === 'table-row' ? block.primary[0] : undefined;
+  const nativeCells = table?.structure.cells!.filter(cell => cell.text.trim()).map(cell => cell.index) ?? [];
+  const counterexample = table && !nativeCells.length ? { type: 'null' } : { anyOf: [{ type: 'null' }, { type: 'object', additionalProperties: false, required: ['ownerId', 'cellIndex', 'quote'], properties: {
+    ownerId: { type: 'string', enum: block.primary.map(owner => owner.ownerId) },
+    cellIndex: table ? { type: 'integer', enum: nativeCells } : { type: 'null' },
+    quote: { type: 'string', minLength: 1, maxLength: PROPOSAL_AREA_LIMITS.reasonCharacters },
+  } }] };
+  const verdict = (status: ProposalAreaAnswer['status']) => ({ type: 'object', additionalProperties: false, required: ['verdict', 'reason', 'basis', 'counterexample'], properties: {
+    verdict: { type: 'string', enum: ['supported', 'unsupported', 'unclear'] }, reason: { type: 'string', minLength: 1, maxLength: PROPOSAL_AREA_LIMITS.reasonCharacters },
+    basis: { type: 'string', enum: status === 'answered' ? ['answer-supported', 'answer-unsupported', 'answer-wrong-area', 'answer-incomplete', 'ambiguous-primary']
+      : status === 'not-stated' ? ['primary-no-answer', 'primary-answer-found', 'ambiguous-primary'] : ['uncertainty-assessment'] }, counterexample,
+  } });
+  return { type: 'object', additionalProperties: false, required: ['reviewContract', 'reviewPlanKey', 'planKey', 'sourceSnapshotKey', 'structureSnapshotKey', 'blockId', 'areas'], properties: {
+    reviewContract: { type: 'string', enum: [PROPOSAL_AREA_REVIEW_CONTRACT] },
+    reviewPlanKey: { type: 'string', enum: [reviewKey] }, planKey: { type: 'string', enum: [plan.planKey] }, sourceSnapshotKey: { type: 'string', enum: [plan.sourceSnapshotKey] }, structureSnapshotKey: { type: 'string', enum: [plan.structureSnapshotKey] }, blockId: { type: 'string', enum: [block.id] },
+    areas: { type: 'object', additionalProperties: false, required: [...PROPOSAL_AREAS], properties: Object.fromEntries(PROPOSAL_AREAS.map(area => [area, verdict(response.areas[area].status)])) },
   } };
 }
 function reviewPrompt(response: ProposalAreaBlockResponse, sourceText: string, schema: Record<string, unknown>) {
@@ -237,16 +257,19 @@ function reviewPrompt(response: ProposalAreaBlockResponse, sourceText: string, s
     'Для not-stated верни unsupported ТОЛЬКО если сам PRIMARY прямо содержит сведения, отвечающие вопросу области. В reason укажи конкретный контрпример и его PRIMARY locator; можно уточнить ownerId/cellIndex из данных. Это диагностическое указание, не новый ответ кандидата и не замена evidenceRefs. Факт только из CONTEXT не опровергает локальное not-stated в PRIMARY; CONTEXT может лишь пояснять смысл PRIMARY. При действительной неоднозначности, когда нельзя установить наличие или отсутствие прямого ответа, верни unclear. Не выводи полноту КП из локальной проверки.',
     'Для unclear исходная область остаётся нерешённой при любом вердикте; supported не создаёт из неё факт. Оцени обоснованность неопределённости, не заполняя answer и не выбирая новые ссылки. Не переноси правила проверки answered на not-stated или unclear.',
     'Заголовок или название колонки сами по себе не создают новое обязательство. Native headerMarker — только структура, НЕ доказательство отсутствия деловых фактов и НЕ правило пропуска владельца.',
-    'Верни JSON по схеме: каждой из семи областей только verdict и reason до2000 символов. reason — диагностическая модельная оценка; контрпример и locator в нём лишь объясняют оценку, не создавая новый ответ кандидата или публичное утверждение. Запрещены replacement answer, отдельные поля refs/evidenceRefs, дополнение ответов новыми фактами и лишние поля. Все вердикты ошибающиеся, не истина, не одобрение человека и не готовность КП.',
+    'Проверяй не только истинность включённых фраз, но и полноту ответа области по всему PRIMARY: не потеряны ли существенные условия, ограничения, альтернативы и зависимости. Для сроков сохраняются относительное событие, рабочие/календарные дни, И/ИЛИ, более позднее событие, полнота набора входных данных и способ уведомления; не вычисляй даты. Условия оплаты не становятся работами исполнителя. Все прямо названные стороны и представители оцениваются в parties-roles, не только один участник.',
+    'Верни JSON по контракту state-aware-primary-v2. В каждой области ровно verdict, reason, basis, counterexample. reason до2000 символов сохраняется как твоя диагностическая оценка, не новый ответ. Для answered: supported требует basis=answer-supported и полного ответа по собственным ссылкам; unsupported требует answer-unsupported, answer-wrong-area либо answer-incomplete; unclear требует ambiguous-primary. Для not-stated: supported требует primary-no-answer; unsupported требует primary-answer-found; unclear требует ambiguous-primary. Для исходного unclear basis=uncertainty-assessment при любом вердикте, область остаётся нерешённой.',
+    'При primary-answer-found или answer-incomplete counterexample ОБЯЗАТЕЛЕН: ровно ownerId, cellIndex, quote — точная непустая цитата из собственного PRIMARY-владельца или его собственной нативной ячейки, показывающая найденные или пропущенные сведения. Для всех остальных basis counterexample=null. Ссылка на CONTEXT, выдуманная цитата, отсутствие цитаты или несовместимые verdict/basis не принимаются; это ошибка ответа, а не повод автоматически менять вердикт. Цитата — частная диагностика, она никогда не дописывается в кандидат или публичное КП.',
+    'Запрещены replacement answer, отдельные поля refs/evidenceRefs, дополнение ответов новыми фактами и лишние поля. Все вердикты ошибающиеся, не истина, не одобрение человека и не готовность КП.',
     `Схема: ${JSON.stringify(schema)}`, `Неизменённые кандидатные области (данные): ${JSON.stringify(response.areas)}`, `Целый блок (данные): ${sourceText}`].join('\n\n');
 }
 export async function buildProposalAreaReviewPlan(response: ProposalAreaBlockResponse, plan: ProposalAreaPlan, sources: readonly IntelligenceSource[]): Promise<ProposalAreaReviewPlan> {
   const before = capture(sources), resolved = await resolveProposalAreaBlockResponse(response, plan, sources); current(sources, before, 'после разрешения кандидатного ответа');
-  const block = inventory(resolved.block), sourceText = payload(plan, block), templateSchema = reviewSchema('__AREA_REVIEW_KEY__', plan, block.id), templatePrompt = reviewPrompt(response, sourceText, templateSchema);
+  const block = inventory(resolved.block), sourceText = payload(plan, block), templateSchema = reviewSchema('__AREA_REVIEW_KEY__', plan, response, block), templatePrompt = reviewPrompt(response, sourceText, templateSchema);
   if (bytes(sourceText) !== block.sourcePayloadBytes || bytes(sourceText) > plan.limits.maxSourcePayloadBytes) limit('Whole source payload review изменился или превышает12КиБ.');
   const reviewPlanKey = await hash(bounded({ version: 1, purpose: 'model-whole-frame-seven-area-semantic-review', planKey: plan.planKey, sourceSnapshotKey: plan.sourceSnapshotKey, structureSnapshotKey: plan.structureSnapshotKey,
     extractionResponse: response, limits: PROPOSAL_AREA_LIMITS, block, prompt: templatePrompt, responseSchema: templateSchema }));
-  const responseSchema = reviewSchema(reviewPlanKey, plan, block.id), prompt = reviewPrompt(response, sourceText, responseSchema);
+  const responseSchema = reviewSchema(reviewPlanKey, plan, response, block), prompt = reviewPrompt(response, sourceText, responseSchema);
   const reviewPlan: ProposalAreaReviewPlan = { version: 1, purpose: 'model-whole-frame-seven-area-semantic-review', reviewPlanKey, planKey: plan.planKey, sourceSnapshotKey: plan.sourceSnapshotKey, structureSnapshotKey: plan.structureSnapshotKey,
     blockId: block.id, extractionResponse: response, block, sourcePayloadBytes: block.sourcePayloadBytes, prompt, responseSchema, ...metrics(prompt, responseSchema) };
   const serialized = bounded(reviewPlan); current(sources, before, 'перед выдачей review-плана'); freeze(reviewPlan); reviewPlans.set(reviewPlan, { plan, response, canonical: serialized }); return reviewPlan;
@@ -259,16 +282,39 @@ async function freshReviewPlan(reviewPlan: ProposalAreaReviewPlan, plan: Proposa
 export async function resolveProposalAreaReviewPlan(reviewPlan: ProposalAreaReviewPlan, plan: ProposalAreaPlan, sources: readonly IntelligenceSource[]): Promise<ProposalAreaReviewPlan> {
   const before = capture(sources); await freshReviewPlan(reviewPlan, plan, sources); current(sources, before, 'перед возвратом исходного review-плана'); return reviewPlan;
 }
+function reviewVerdict(value: unknown, status: ProposalAreaAnswer['status'], block: ProposalAreaFrame): ProposalAreaReviewVerdict {
+  if (!plain(value) || !keys(value, ['verdict', 'reason', 'basis', 'counterexample']) || typeof value.verdict !== 'string'
+    || !['supported', 'unsupported', 'unclear'].includes(value.verdict) || !text(value.reason, PROPOSAL_AREA_LIMITS.reasonCharacters) || !value.reason.trim()
+    || typeof value.basis !== 'string') fail('Некорректный закрытый state-aware вердикт области.');
+  const verdict = value.verdict as ProposalAreaReviewVerdict['verdict'];
+  const allowed = status === 'answered' ? { supported: ['answer-supported'], unsupported: ['answer-unsupported', 'answer-wrong-area', 'answer-incomplete'], unclear: ['ambiguous-primary'] }
+    : status === 'not-stated' ? { supported: ['primary-no-answer'], unsupported: ['primary-answer-found'], unclear: ['ambiguous-primary'] }
+      : { supported: ['uncertainty-assessment'], unsupported: ['uncertainty-assessment'], unclear: ['uncertainty-assessment'] };
+  if (!allowed[verdict].includes(value.basis)) fail('Вердикт несовместим с исходным status и явно указанным basis. Ответ не исправлен и не принят.');
+  const needsCounterexample = value.basis === 'primary-answer-found' || value.basis === 'answer-incomplete';
+  let counterexample: ProposalAreaCounterexample | null = null;
+  if (needsCounterexample) {
+    const proof = value.counterexample;
+    if (!plain(proof) || !keys(proof, ['ownerId', 'cellIndex', 'quote']) || !text(proof.quote, PROPOSAL_AREA_LIMITS.reasonCharacters) || !proof.quote.trim()) fail('Для найденных или пропущенных сведений нужна точная непустая PRIMARY-цитата с нативной ссылкой.');
+    // Reuse only native-reference validation, never infer a fact from a quote
+    // or promote it into the unchanged whole-answer candidate/public text.
+    const checked = answer({ status: 'answered', answer: proof.quote, evidenceRefs: [{ ownerId: proof.ownerId, cellIndex: proof.cellIndex }] }, block);
+    const ref = checked.evidenceRefs[0], owner = block.primary.find(owner => owner.ownerId === ref.ownerId)!;
+    const nativeText = owner.structure.kind === 'table-row' ? owner.structure.cells!.find(cell => cell.index === ref.cellIndex)!.text : owner.text;
+    if (!nativeText.includes(proof.quote)) fail('Контрпример не является точной цитатой собственного PRIMARY-владельца/ячейки. Ответ не исправлен.');
+    counterexample = { ownerId: ref.ownerId, cellIndex: ref.cellIndex, quote: proof.quote };
+  } else if (value.counterexample !== null) fail('Этот basis требует counterexample:null; лишние факты не принимаются.');
+  return { verdict, reason: value.reason, basis: value.basis as ProposalAreaReviewBasis, counterexample };
+}
 export async function parseProposalAreaReviewResponse(raw: string, reviewPlan: ProposalAreaReviewPlan, plan: ProposalAreaPlan, sources: readonly IntelligenceSource[]): Promise<ProposalAreaReviewResponse> {
   assertResponsePreparationRaw(raw); if (!wellFormed(raw)) fail('Некорректный Unicode reviewer raw.'); const before = capture(sources); await freshReviewPlan(reviewPlan, plan, sources); current(sources, before, 'после проверки reviewer-плана');
   const wire = parseUniqueJson(raw);
-  if (!plain(wire) || !keys(wire, ['reviewPlanKey', 'planKey', 'sourceSnapshotKey', 'structureSnapshotKey', 'blockId', 'areas']) || wire.reviewPlanKey !== reviewPlan.reviewPlanKey || wire.planKey !== plan.planKey || wire.sourceSnapshotKey !== plan.sourceSnapshotKey || wire.structureSnapshotKey !== plan.structureSnapshotKey || wire.blockId !== reviewPlan.blockId || !plain(wire.areas) || !keys(wire.areas, PROPOSAL_AREAS)) fail('Reviewer ответ не соответствует закрытым семи областям и точному candidate-плану.');
+  if (!plain(wire) || !keys(wire, ['reviewContract', 'reviewPlanKey', 'planKey', 'sourceSnapshotKey', 'structureSnapshotKey', 'blockId', 'areas']) || wire.reviewContract !== PROPOSAL_AREA_REVIEW_CONTRACT || wire.reviewPlanKey !== reviewPlan.reviewPlanKey || wire.planKey !== plan.planKey || wire.sourceSnapshotKey !== plan.sourceSnapshotKey || wire.structureSnapshotKey !== plan.structureSnapshotKey || wire.blockId !== reviewPlan.blockId || !plain(wire.areas) || !keys(wire.areas, PROPOSAL_AREAS)) fail('Reviewer ответ не соответствует закрытым семи областям, контракту v2 и точному candidate-плану.');
   const inputAreas = wire.areas, areas = Object.fromEntries(PROPOSAL_AREAS.map(area => {
-    const value = inputAreas[area]; if (!plain(value) || !keys(value, ['verdict', 'reason']) || typeof value.verdict !== 'string' || !['supported', 'unsupported', 'unclear'].includes(value.verdict) || !text(value.reason, PROPOSAL_AREA_LIMITS.reasonCharacters) || !value.reason.trim()) fail('Некорректный fallible вердикт области или replacement-поля.');
-    return [area, { verdict: value.verdict, reason: value.reason }];
+    return [area, reviewVerdict(inputAreas[area], reviewPlan.extractionResponse.areas[area].status, reviewPlan.block)];
   })) as unknown as Record<ProposalArea, ProposalAreaReviewVerdict>;
   const rawSHA256 = await hash(raw); current(sources, before, 'перед выдачей raw-привязанного review-ответа');
-  const response: ProposalAreaReviewResponse = { version: 1, purpose: 'fallible-model-seven-area-review-only', reviewPlanKey: reviewPlan.reviewPlanKey, planKey: plan.planKey, sourceSnapshotKey: plan.sourceSnapshotKey, structureSnapshotKey: plan.structureSnapshotKey, blockId: reviewPlan.blockId,
+  const response: ProposalAreaReviewResponse = { version: 1, purpose: 'fallible-model-seven-area-review-only', reviewContract: PROPOSAL_AREA_REVIEW_CONTRACT, reviewPlanKey: reviewPlan.reviewPlanKey, planKey: plan.planKey, sourceSnapshotKey: plan.sourceSnapshotKey, structureSnapshotKey: plan.structureSnapshotKey, blockId: reviewPlan.blockId,
     areas, extractionRawSHA256: reviewPlan.extractionResponse.rawSHA256, rawSHA256, rawBytes: bytes(raw), semanticTruth: 'not-proven', humanApproval: false, completeness: 'not-assessed', providerAuthenticity: 'not-attested' };
   const serialized = bounded(response); freeze(response); reviewResponses.set(response, { plan, reviewPlan, canonical: serialized }); return response;
 }
