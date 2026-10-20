@@ -31,6 +31,25 @@ const payload = (prompt: string) => prompt.split('Целый блок (данн�
 afterEach(() => vi.unstubAllGlobals());
 
 describe('whole physical frame seven-area protocol, not a semantic quality claim', () => {
+  it('keeps full native schemas and exact bindings without duplicating schemas in extraction/review user prompts', async () => {
+    const input = source([paragraph(0, 'SYNTHETIC_WHOLE_PAYLOAD_UNCHANGED')]), before = structuredClone(input), plan = await buildProposalAreaPlan(input);
+    const candidate = await parse(extraction(plan), plan, input), reviewPlan = await buildProposalAreaReviewPlan(candidate, plan, input);
+    for (const frame of [plan.blocks[0], reviewPlan]) {
+      expect(frame.prompt).not.toContain(`Схема: ${JSON.stringify(frame.responseSchema)}`);
+      expect(frame.prompt).toContain('Полная закрытая JSON-схема передана провайдеру отдельно');
+      const bindingText = frame.prompt.split('Точные привязки результата (верни без изменения): ')[1].split('\n\n')[0];
+      const properties = frame.responseSchema.properties as Record<string, { enum?: string[] }>;
+      expect(JSON.parse(bindingText)).toEqual(Object.fromEntries(Object.entries(properties).filter(([key]) => key !== 'areas').map(([key, spec]) => [key, spec.enum![0]])));
+      expect(frame.responseSchema).toHaveProperty('additionalProperties', false);
+      expect(frame.responseSchema).toHaveProperty('properties.areas.required', [...PROPOSAL_AREAS]);
+      expect(frame.schemaBytes).toBe(new TextEncoder().encode(JSON.stringify(frame.responseSchema)).byteLength);
+      expect(payload(frame.prompt)).toBe(payload(plan.blocks[0].prompt));
+    }
+    expect(reviewPlan.extractionResponse).toBe(candidate); expect(input).toEqual(before);
+    // Byte reduction and native schema retention are not a model speed,
+    // context-capacity, semantic equivalence or completeness proof.
+  });
+
   it('preserves complete original grouping, native headers/context and exact source payload while asking all seven questions once per frame', async () => {
     const fragments = [paragraph(0), paragraph(1), row(2, 0, 2, ['Валюта и условие согласования'], true), row(3, 1, 2, ['Действие', 'Результат']), auxiliary(4)], input = source(fragments), before = structuredClone(input);
     const base = await buildProposalStructuralBlockPlan(input, { focus: 'work-scope' }), plan = await buildProposalAreaPlan(input);
