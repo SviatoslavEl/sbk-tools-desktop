@@ -57,6 +57,34 @@ function schemaAllowsReviewTuple(branches: ReviewSchemaBranch[], verdict: string
 afterEach(() => vi.unstubAllGlobals());
 
 describe('whole physical frame seven-area protocol, not a semantic quality claim', () => {
+  it.each(['prompt', 'native', 'both'] as const)('binds the explicit finite response budget without changing whole source or provider defaults (%s)', async schemaCarrier => {
+    const input = source([paragraph(0, 'SYNTHETIC_UNIQUE_CONDITIONS')]), before = structuredClone(input);
+    const unknown = await buildProposalAreaPlan(input, { schemaCarrier }), plan = await buildProposalAreaPlan(input, { schemaCarrier, responseTokenBudget: 2048 });
+    expect(unknown.responseTokenBudget).toBeNull(); expect(unknown.blocks[0].responseTokenBudget).toBeNull();
+    expect(unknown.blocks[0].prompt).toContain('Лимит генерации провайдера неизвестен');
+    expect(plan.planKey).not.toBe(unknown.planKey); expect(plan.responseTokenBudget).toBe(2048);
+    expect(plan.blocks[0].responseTokenBudget).toBe(2048); expect(payload(plan.blocks[0].prompt)).toBe(payload(unknown.blocks[0].prompt));
+    expect(plan.blocks[0].prompt).toContain('2048 токенов на ВЕСЬ JSON');
+    expect(plan.blocks[0].prompt).toContain('Каждый существенный факт внутри одной области излагай один раз');
+    expect(plan.blocks[0].prompt).toContain('не сокращай молча условия');
+    const wire = extraction(plan), candidate = await parse(wire, plan, input), candidateBefore = structuredClone(candidate), reviewed = await buildProposalAreaReviewPlan(candidate, plan, input);
+    expect(reviewed.responseTokenBudget).toBe(2048); expect(reviewed.prompt).toContain('2048 токенов на ВЕСЬ JSON');
+    expect(reviewed.prompt).toContain('без повторного заполнения reason'); expect(candidate).toEqual(candidateBefore); expect(input).toEqual(before);
+    expect(candidate.areas).toEqual(wire.areas); expect(candidate.completeness).toBe('not-assessed');
+    expect(plan).not.toHaveProperty('runtimeOptions'); expect(plan).not.toHaveProperty('num_predict');
+    expect(await buildProposalAreaPlan(input, { schemaCarrier, responseTokenBudget: null })).toEqual(unknown);
+    expect((await buildProposalAreaPlan(input, { schemaCarrier, responseTokenBudget: 4096 })).planKey).not.toBe(plan.planKey);
+    await expect(parse(extraction(unknown), plan, input)).rejects.toThrow();
+    // Prompt budget binding is not tokenizer/provider enforcement or proof a
+    // real complete response fits. Caller wire binding requires separate QA.
+  });
+
+  it('rejects non-finite, fractional or out-of-range response budgets without silently clamping', async () => {
+    const input = source([paragraph(0)]);
+    for (const responseTokenBudget of [0, -1, 511, 8193, 2048.5, NaN, Infinity, '2048', true, {}]) await expect(buildProposalAreaPlan(input, { responseTokenBudget } as never)).rejects.toThrow(/Бюджет/);
+    for (const responseTokenBudget of [512, 8192]) expect((await buildProposalAreaPlan(input, { responseTokenBudget })).responseTokenBudget).toBe(responseTokenBudget);
+  });
+
   it.each(['prompt', 'native', 'both'] as const)('binds %s schema carriage to plan, prompts, reply contracts and carrier-aware byte metrics', async schemaCarrier => {
     const input = source([paragraph(0)]), plan = await buildProposalAreaPlan(input, { schemaCarrier }), block = plan.blocks[0];
     const candidate = await parse(extraction(plan), plan, input), reviewPlan = await buildProposalAreaReviewPlan(candidate, plan, input);
