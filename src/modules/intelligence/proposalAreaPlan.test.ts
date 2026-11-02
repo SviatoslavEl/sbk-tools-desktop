@@ -31,6 +31,7 @@ const payload = (prompt: string) => prompt.split('Целый блок (данн�
 type ReviewSchemaBranch = {
   type: string; additionalProperties: boolean; required: string[];
   properties: {
+    decision: { type: string; enum: string[] };
     verdict: { type: string; enum: string[] }; basis: { type: string; enum: string[] };
     reason: { type: string; minLength: number; maxLength: number };
     counterexample: { type: 'null' } | { type: 'object'; additionalProperties: boolean; required: string[]; properties: {
@@ -43,8 +44,13 @@ const reviewBranches = (plan: ProposalAreaReviewPlan, area: ProposalArea) => (pl
 }).properties.areas.properties[area].anyOf;
 // Enumerates only the finite verdict/basis/proof tuple encoded by complete
 // anyOf branches. Not a general JSON-schema validator or model/meaning test.
-function schemaAllowsReviewTuple(branches: ReviewSchemaBranch[], verdict: string, basis: string, proof: { ownerId: string; cellIndex: number | null; quote: string } | null) {
+function syntheticDecision(verdict: string, basis: string): string {
+  if (basis === 'uncertainty-assessment') return verdict === 'supported' ? 'uncertainty-justified' : verdict === 'unsupported' ? 'uncertainty-unjustified' : 'source-ambiguous';
+  return ({ 'answer-supported': 'answer-complete', 'answer-unsupported': 'answer-not-supported', 'answer-wrong-area': 'answer-off-topic', 'answer-incomplete': 'answer-missing-conditions', 'primary-no-answer': 'local-absence-confirmed', 'primary-answer-found': 'direct-area-fact-found', 'ambiguous-primary': 'source-ambiguous' } as Record<string, string>)[basis];
+}
+function schemaAllowsReviewTuple(branches: ReviewSchemaBranch[], verdict: string, basis: string, proof: { ownerId: string; cellIndex: number | null; quote: string } | null, decision: string) {
   return branches.some(branch => {
+    if (!branch.properties.decision.enum.includes(decision)) return false;
     if (!branch.properties.verdict.enum.includes(verdict) || !branch.properties.basis.enum.includes(basis)) return false;
     const node = branch.properties.counterexample;
     if (node.type === 'null') return proof === null;
@@ -275,7 +281,7 @@ describe('whole physical frame seven-area protocol, not a semantic quality claim
     expect(candidate.areas['work-scope'].answer).toBe(candidateWire.areas['work-scope'].answer);
     expect(candidate.semanticReviewRequired).toBe(true); // Formatting is not a semantic relevance oracle.
     expect(reviewPlan.prompt).toContain('точная цитата или верный реквизит не являются supported-ответом на другой вопрос');
-    const verdictWire = review(reviewPlan); verdictWire.areas['work-scope'] = { ...syntheticReview('answered', 'unsupported', 'СИНТЕТИЧЕСКАЯ оценка нерелевантного ответа, не результат реальной модели.'), basis: 'answer-wrong-area' };
+    const verdictWire = review(reviewPlan); verdictWire.areas['work-scope'] = { ...syntheticReview('answered', 'unsupported', 'СИНТЕТИЧЕСКАЯ оценка нерелевантного ответа, не результат реальной модели.'), decision: 'answer-off-topic', basis: 'answer-wrong-area' };
     expect((await parseReview(verdictWire, reviewPlan, plan, input)).areas['work-scope'].verdict).toBe('unsupported');
     const business = extraction(plan, 1); business.areas['work-scope'].answer = input[0].fragments![1].text;
     expect((await parse(business, plan, input, 1)).areas['work-scope'].answer).toBe(business.areas['work-scope'].answer);
@@ -308,11 +314,30 @@ describe('whole physical frame seven-area protocol, not a semantic quality claim
 });
 
 describe('per-frame seven-area fallible semantic review of original issued whole bundles', () => {
+  it('rejects v2 markers/missing or inconsistent decisions rather than upgrading old wire or repairing the verdict', async () => {
+    const input = source([paragraph(0, 'SYNTHETIC_SOURCE_CONDITION')]), plan = await buildProposalAreaPlan(input), candidate = await parse(extraction(plan), plan, input), original = structuredClone(candidate);
+    const reviewPlan = await buildProposalAreaReviewPlan(candidate, plan, input), wire = review(reviewPlan);
+    expect(plan.reviewContract).toBe('state-specific-primary-v3');
+    expect(wire.reviewContract).toBe('state-specific-primary-v3');
+    const old = structuredClone(wire) as unknown as Record<string, unknown>; old.reviewContract = 'state-aware-primary-v2';
+    await expect(parseReview(old, reviewPlan, plan, input)).rejects.toThrow(/контракту v3/);
+    for (const decision of [undefined, null, ['local-absence-confirmed'], 'direct-area-fact-found', 'answer-complete', 'invented']) {
+      const bad = { ...wire, areas: { ...wire.areas, payment: { ...wire.areas.payment, decision } } }, raw = JSON.stringify(bad);
+      await expect(parseProposalAreaReviewResponse(raw, reviewPlan, plan, input)).rejects.toThrow();
+      expect(JSON.stringify(bad)).toBe(raw);
+    }
+    const result = await parseReview(wire, reviewPlan, plan, input); expect(result.areas).toEqual(wire.areas); expect(candidate).toEqual(original);
+    expect(reviewPlan.prompt).toContain('Сначала выбери смысловое decision');
+    expect(reviewPlan.prompt).toContain('во всём PRIMARY НЕТ прямого факта именно этой области');
+    expect(reviewPlan.prompt).toContain('все существенные условия, события, зависимости, альтернативы и роли');
+    expect(result.semanticTruth).toBe('not-proven'); expect(result.completeness).toBe('not-assessed');
+  });
+
   it('rejects old review shapes and incompatible local-absence intent without changing the returned raw or verdict', async () => {
     const input = source([paragraph(0)]), plan = await buildProposalAreaPlan(input), candidate = await parse(extraction(plan), plan, input), reviewPlan = await buildProposalAreaReviewPlan(candidate, plan, input);
     const wire = review(reviewPlan), legacy = structuredClone(wire) as Record<string, unknown>;
     delete legacy.reviewContract;
-    await expect(parseReview(legacy, reviewPlan, plan, input)).rejects.toThrow(/контракту v2/);
+    await expect(parseReview(legacy, reviewPlan, plan, input)).rejects.toThrow(/контракту v3/);
     for (const patch of [
       { verdict: 'unsupported', reason: 'СИНТЕТИЧЕСКАЯ оценка без найденных данных.', basis: 'primary-no-answer', counterexample: null },
       { ...syntheticReview('not-stated', 'unsupported'), counterexample: null },
@@ -348,7 +373,7 @@ describe('per-frame seven-area fallible semantic review of original issued whole
   it('keeps an incomplete-answer diagnostic separate from the unchanged whole answer and rejects unsupported omission without a quote', async () => {
     const input = source([paragraph(0, 'SYNTHETIC_PRIVATE_MISSING_CONDITION')]), plan = await buildProposalAreaPlan(input), candidate = await parse(extraction(plan), plan, input), before = structuredClone(candidate);
     const reviewPlan = await buildProposalAreaReviewPlan(candidate, plan, input), wire = review(reviewPlan);
-    const incomplete = { ...syntheticReview('answered', 'unsupported'), basis: 'answer-incomplete' as const, counterexample: { ownerId: 'owner-0', cellIndex: null, quote: 'SYNTHETIC_PRIVATE_MISSING_CONDITION' } };
+    const incomplete = { ...syntheticReview('answered', 'unsupported'), decision: 'answer-missing-conditions' as const, basis: 'answer-incomplete' as const, counterexample: { ownerId: 'owner-0', cellIndex: null, quote: 'SYNTHETIC_PRIVATE_MISSING_CONDITION' } };
     wire.areas['work-scope'] = incomplete;
     const parsed = await parseReview(wire, reviewPlan, plan, input);
     expect(parsed.areas['work-scope']).toEqual(incomplete); expect(candidate).toEqual(before);
@@ -376,13 +401,13 @@ describe('per-frame seven-area fallible semantic review of original issued whole
     expect(reviewPlan.extractionResponse).toBe(candidate); expect(candidate.areas).toEqual(wire.areas); expect(input).toEqual(before);
     expect(reviewPlan.responseSchema).toHaveProperty('properties.areas.required', [...PROPOSAL_AREAS]);
     for (const area of PROPOSAL_AREAS) for (const branch of reviewBranches(reviewPlan, area)) {
-      expect(branch.required).toEqual(['verdict', 'reason', 'basis', 'counterexample']);
+      expect(branch.required).toEqual(['decision', 'verdict', 'reason', 'basis', 'counterexample']);
       expect(branch.type).toBe('object'); expect(branch.additionalProperties).toBe(false);
-      expect(Object.keys(branch.properties)).toEqual(['verdict', 'reason', 'basis', 'counterexample']);
+      expect(Object.keys(branch.properties)).toEqual(['decision', 'verdict', 'reason', 'basis', 'counterexample']);
     }
-    expect(reviewPlan.responseSchema).toHaveProperty('properties.reviewContract.enum', ['state-aware-primary-v2']);
+    expect(reviewPlan.responseSchema).toHaveProperty('properties.reviewContract.enum', ['state-specific-primary-v3']);
     expect(reviewBranches(reviewPlan, 'payment').flatMap(branch => branch.properties.basis.enum)).toEqual(['primary-no-answer', 'primary-answer-found', 'ambiguous-primary']);
-    expect(reviewBranches(reviewPlan, 'schedule').flatMap(branch => branch.properties.basis.enum)).toEqual(['uncertainty-assessment']);
+    expect([...new Set(reviewBranches(reviewPlan, 'schedule').flatMap(branch => branch.properties.basis.enum))]).toEqual(['uncertainty-assessment']);
   });
 
   it.each([
@@ -407,15 +432,23 @@ describe('per-frame seven-area fallible semantic review of original issued whole
     for (const verdict of ['supported', 'unsupported', 'unclear']) for (const basis of basisValues) for (const withProof of [false, true]) {
       const counterexample = withProof ? { ownerId: 'owner-0', cellIndex: shape === 'paragraph' ? null : 0, quote: term } : null;
       const expected = allowed.has(`${verdict}/${basis}/${withProof ? 'proof' : 'null'}`);
-      expect(schemaAllowsReviewTuple(branches, verdict, basis, counterexample)).toBe(expected);
-      const result = parseReview({ ...baseline, areas: { ...baseline.areas, payment: { verdict, basis, reason: 'SYNTHETIC_DIAGNOSTIC_ONLY', counterexample } } }, reviewPlan, plan, input);
-      if (expected) { expect((await result).areas.payment).toEqual({ verdict, basis, reason: 'SYNTHETIC_DIAGNOSTIC_ONLY', counterexample }); admitted++; }
+      const decision = syntheticDecision(verdict, basis);
+      expect(schemaAllowsReviewTuple(branches, verdict, basis, counterexample, decision)).toBe(expected);
+      const result = parseReview({ ...baseline, areas: { ...baseline.areas, payment: { decision, verdict, basis, reason: 'SYNTHETIC_DIAGNOSTIC_ONLY', counterexample } } }, reviewPlan, plan, input);
+      if (expected) {
+        expect((await result).areas.payment).toEqual({ decision, verdict, basis, reason: 'SYNTHETIC_DIAGNOSTIC_ONLY', counterexample }); admitted++;
+        for (const other of ['local-absence-confirmed', 'direct-area-fact-found', 'source-ambiguous', 'answer-complete', 'answer-not-supported', 'answer-off-topic', 'answer-missing-conditions', 'uncertainty-justified', 'uncertainty-unjustified', 'invented-decision']) {
+          if (other === decision) continue;
+          expect(schemaAllowsReviewTuple(branches, verdict, basis, counterexample, other)).toBe(false);
+          await expect(parseReview({ ...baseline, areas: { ...baseline.areas, payment: { decision: other, verdict, basis, reason: 'SYNTHETIC_DIAGNOSTIC_ONLY', counterexample } } }, reviewPlan, plan, input)).rejects.toThrow(/Decision несовместим/);
+        }
+      }
       else await expect(result).rejects.toThrow();
       checked++;
     }
     expect(checked).toBe(48); expect(admitted).toBe(allowed.size); expect(candidate).toEqual(before); expect(input[0].fragments![0].text).toBe(shape === 'paragraph' ? term : (blank ? '\t ' : `${term}\t\tSYNTHETIC_OTHER`));
     for (const branch of branches) {
-      expect(branch.required).toEqual(['verdict', 'reason', 'basis', 'counterexample']); expect(branch.additionalProperties).toBe(false);
+      expect(branch.required).toEqual(['decision', 'verdict', 'reason', 'basis', 'counterexample']); expect(branch.additionalProperties).toBe(false);
       expect(branch).not.toHaveProperty('allOf'); expect(branch).not.toHaveProperty('if');
     }
   });

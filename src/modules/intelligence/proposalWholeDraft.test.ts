@@ -54,7 +54,7 @@ describe('atomic original-issued seven-area whole draft, never client-ready or s
   it('keeps a new native omission quote private and never uses it to repair a blocked whole-answer bundle', async () => {
     const marker = 'SYNTHETIC_PRIVATE_REVIEW_OMISSION_ONLY', input = source([paragraph(0, marker)]);
     const { plan, records } = await complete(input, undefined, area => area === 'work-scope'
-      ? { verdict: 'unsupported', basis: 'answer-incomplete', reason: 'SYNTHETIC incomplete answer, not a model accuracy result.', counterexample: { ownerId: 'owner-0', cellIndex: null, quote: marker } } : {});
+      ? { decision: 'answer-missing-conditions', verdict: 'unsupported', basis: 'answer-incomplete', reason: 'SYNTHETIC incomplete answer, not a model accuracy result.', counterexample: { ownerId: 'owner-0', cellIndex: null, quote: marker } } : {});
     const draft = await buildProposalWholeDraft(plan, records, input);
     expect(draft.audit.frames[0].modelReview.areas['work-scope'].counterexample?.quote).toBe(marker);
     expect(draft.sections.find(section => section.area === 'work-scope')?.bundles).toEqual([]);

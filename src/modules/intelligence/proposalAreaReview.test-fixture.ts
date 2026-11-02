@@ -8,5 +8,8 @@ export function syntheticReview(status: ProposalAreaAnswer['status'], verdict: P
     : verdict === 'unclear' ? 'ambiguous-primary'
       : status === 'not-stated' ? verdict === 'supported' ? 'primary-no-answer' : 'primary-answer-found'
         : verdict === 'supported' ? 'answer-supported' : 'answer-unsupported';
-  return { verdict, reason, basis, counterexample: null };
+  const decision = status === 'unclear' ? verdict === 'supported' ? 'uncertainty-justified' : verdict === 'unsupported' ? 'uncertainty-unjustified' : 'source-ambiguous'
+    : verdict === 'unclear' ? 'source-ambiguous' : status === 'not-stated' ? verdict === 'supported' ? 'local-absence-confirmed' : 'direct-area-fact-found'
+      : verdict === 'supported' ? 'answer-complete' : 'answer-not-supported';
+  return { decision, verdict, reason, basis, counterexample: null };
 }

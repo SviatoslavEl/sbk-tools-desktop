@@ -19,10 +19,10 @@ async function issuedFixture(withWitness = false) {
       blockId: block.id, areas: Object.fromEntries(PROPOSAL_AREAS.map(area => [area, area === 'payment' ? { status: 'not-stated', answer: null, evidenceRefs: [] }
         : { status: 'answered', answer: `  Деловой текст ${area}\r\nПолный блок 🧪 e\u0301.  `, evidenceRefs: [{ ownerId: 'owner-0', cellIndex: null }] }])) }), plan, block.id, sources);
     const reviewPlan = await buildProposalAreaReviewPlan(response, plan, sources);
-    const reviewResponse = await parseProposalAreaReviewResponse(JSON.stringify({ schemaCarrier: plan.schemaCarrier, reviewContract: 'state-aware-primary-v2', reviewPlanKey: reviewPlan.reviewPlanKey, planKey: plan.planKey, sourceSnapshotKey: plan.sourceSnapshotKey,
+    const reviewResponse = await parseProposalAreaReviewResponse(JSON.stringify({ schemaCarrier: plan.schemaCarrier, reviewContract: 'state-specific-primary-v3', reviewPlanKey: reviewPlan.reviewPlanKey, planKey: plan.planKey, sourceSnapshotKey: plan.sourceSnapshotKey,
       structureSnapshotKey: plan.structureSnapshotKey, blockId: block.id, areas: Object.fromEntries(PROPOSAL_AREAS.map(area => [area, withWitness && area === 'payment'
-        ? { verdict: 'unsupported', reason: 'SYNTHETIC diagnostic only', basis: 'primary-answer-found', counterexample: { ownerId: 'owner-0', cellIndex: null, quote: 'PRIVATE_NON_NULL_WITNESS_ONLY' } }
-        : { verdict: 'supported', reason: `PRIVATE_REVIEW_REASON_${area}`, basis: response.areas[area].status === 'answered' ? 'answer-supported' : 'primary-no-answer', counterexample: null }])) }), reviewPlan, plan, sources);
+        ? { decision: 'direct-area-fact-found', verdict: 'unsupported', reason: 'SYNTHETIC diagnostic only', basis: 'primary-answer-found', counterexample: { ownerId: 'owner-0', cellIndex: null, quote: 'PRIVATE_NON_NULL_WITNESS_ONLY' } }
+        : { decision: response.areas[area].status === 'answered' ? 'answer-complete' : 'local-absence-confirmed', verdict: 'supported', reason: `PRIVATE_REVIEW_REASON_${area}`, basis: response.areas[area].status === 'answered' ? 'answer-supported' : 'primary-no-answer', counterexample: null }])) }), reviewPlan, plan, sources);
     records.push({ response, reviewPlan, reviewResponse });
   }
   const draft = await buildProposalWholeDraft(plan, records, sources), handoff = await createProposalDraftEditorHandoff(draft, plan, records, sources);

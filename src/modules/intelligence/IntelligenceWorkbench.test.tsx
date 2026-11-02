@@ -395,7 +395,7 @@ describe("seven-area whole proposal route — synthetic callback integration, no
     const properties = schema.properties as Record<string, { enum?: string[] }>, review = "reviewPlanKey" in properties;
     return { model: "synthetic-callback-only", text: JSON.stringify({
       ...Object.fromEntries(Object.entries(properties).filter(([key]) => key !== "areas").map(([key, value]) => [key, value.enum![0]])),
-      areas: Object.fromEntries(PROPOSAL_AREAS.map(area => [area, review ? { verdict: badReview && area === "payment" ? "unsupported" : "supported", reason: "Synthetic reviewer, not accuracy evidence.", basis: badReview && area === "payment" ? "answer-unsupported" : "answer-supported", counterexample: null }
+      areas: Object.fromEntries(PROPOSAL_AREAS.map(area => [area, review ? { decision: badReview && area === "payment" ? "answer-not-supported" : "answer-complete", verdict: badReview && area === "payment" ? "unsupported" : "supported", reason: "Synthetic reviewer, not accuracy evidence.", basis: badReview && area === "payment" ? "answer-unsupported" : "answer-supported", counterexample: null }
         : { status: "answered", answer: `  SYNTHETIC_WHOLE_${area}\r\nNo source completion.  `, evidenceRefs: [{ ownerId: "whole-owner", cellIndex: null }] }])),
     }) };
   }
