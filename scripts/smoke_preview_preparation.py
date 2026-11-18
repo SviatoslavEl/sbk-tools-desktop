@@ -1,4 +1,4 @@
-"""Exercise a real scanner executable using isolated PDF/DOCX fixtures.
+"""Exercise a real scanner executable using isolated PDF/DOCX and HEIC fixtures.
 
 The same script runs against the built sidecar, the final Mac bundle, and the
 installed Windows copy. It intentionally never imports the worker's source.
@@ -29,7 +29,8 @@ def sha256(path: Path) -> str:
 
 def run_smoke(worker: Path, runtime: Path, directory: Path) -> dict:
     fixtures = REPOSITORY / "scanner-worker/tests/fixtures"
-    originals = {path: sha256(path) for path in [fixtures / "simple.pdf", fixtures / "simple.docx"]}
+    heic = fixtures / "iphone-orientation.heic"
+    originals = {path: sha256(path) for path in [fixtures / "simple.pdf", fixtures / "simple.docx", heic]}
     pdf = directory / "three-pages.pdf"
     writer = PdfWriter()
     reader = PdfReader(fixtures / "simple.pdf")
@@ -161,6 +162,13 @@ def run_smoke(worker: Path, runtime: Path, directory: Path) -> dict:
         assert len(list(cache.glob("raster-*.png"))) <= 64
         assert sum(path.stat().st_size for path in cache.glob("raster-*.png")) <= 128 * 1024 * 1024
         assert not list(directory.glob(f"{kind}-*.png")), "Job-owned preview copies were not cleaned"
+
+    photo, _ = run("convert", {"protocolVersion": 2, "inputPath": str(heic), "outputFormat": "png",
+                               "outputDirectory": str(directory)}, "heic-to-png")
+    assert photo["type"] == "complete" and len(photo["outputPaths"]) == 1
+    with Image.open(photo["outputPaths"][0]) as image:
+        assert image.format == "PNG" and image.size == (96, 160)
+        assert image.getpixel((48, 40))[0] > 220 and image.getpixel((48, 120))[2] > 220
 
     assert all(sha256(path) == digest for path, digest in originals.items()), "Repository fixture changed"
     return {"status": "passed", "worker": str(worker.resolve()), "runtime": str(runtime.resolve()),

@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 import pypdfium2 as pdfium
 from PIL import Image
 from scandocument.errors import SaveError
+from scandocument.image_engine import RasterDocument
 
 if TYPE_CHECKING:
     from pypdf import PdfWriter
@@ -31,7 +32,9 @@ def open_render_document(source: Path | str) -> pdfium.PdfDocument:
         raise
 
 
-def render_page(document: pdfium.PdfDocument, index: int, dpi: int) -> tuple[Image.Image, tuple[float, float]]:
+def render_page(document: pdfium.PdfDocument | RasterDocument, index: int, dpi: int) -> tuple[Image.Image, tuple[float, float]]:
+    if isinstance(document, RasterDocument):
+        return document.render(index, dpi)
     # Idempotent fallback for callers that supply an already-open parser.
     document.init_forms()
     page = document[index]
@@ -184,10 +187,12 @@ class StreamingPdfWriter:
 
     def add_page(
         self,
-        jpeg: bytes,
+        image_data: bytes,
         page_size: tuple[float, float],
         image_size: tuple[int, int],
         words=None,
+        *,
+        lossless: bool = False,
     ) -> None:
         if words is not None:
             self._ocr_attempted = True
@@ -195,11 +200,12 @@ class StreamingPdfWriter:
         self._next_id += 3
         image_name = f"Im{len(self._page_ids) + 1}"
         width, height = image_size
+        image_filter = "FlateDecode" if lossless else "DCTDecode"
         image_dictionary = (
             f"<< /Type /XObject /Subtype /Image /Width {width} /Height {height} "
-            "/ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode >>"
+            f"/ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /{image_filter} >>"
         ).encode("ascii")
-        self._write_stream(image_id, image_dictionary, jpeg)
+        self._write_stream(image_id, image_dictionary, image_data)
         page_width, page_height = page_size
         ocr_content, used_banks = self._ocr_content(words, image_size, page_size)
         content = f"q {page_width:.4f} 0 0 {page_height:.4f} 0 0 cm /{image_name} Do Q\n".encode("ascii") + ocr_content

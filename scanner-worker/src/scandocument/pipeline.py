@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from scandocument.errors import CancelledError, SaveError, ScanDocumentError
+from scandocument.image_engine import IMAGE_KINDS, RasterDocument, open_raster_document
 from scandocument.models import Annotation, FacsimilePlacement, ProcessRequest, ProgressEvent, Redaction
 from scandocument.tempfiles import SecureWorkspace
 from scandocument.validation import detect_kind, inspect_document, validate_preview_limits, validate_render_budget
@@ -203,12 +204,11 @@ def process_document(
         pdf_source = source
         prepared_warnings: list[str] = []
         prepared_document: PreviewDocument | None = None
-        if kind == "docx":
+        if kind != "pdf":
             token.check()
-            _notify(callback, "Подготовка DOCX", 0, 1, 2)
-            # Preview and export must use the same conversion revision. The
-            # context retains both the parser and its temporary-file lifetime;
-            # an absent/unavailable cache still uses a private conversion.
+            _notify(callback, "Подготовка DOCX" if kind == "docx" else "Чтение изображения", 0, 1, 2)
+            # Use the same source revision and geometry as the preview.
+            # This context owns either the conversion or the decoded pixels.
             prepared_document = prepared_resources.enter_context(
                 open_preview_document(source, token, preview_cache_dir)
             )
@@ -221,6 +221,11 @@ def process_document(
             cancelled=lambda: token.cancelled,
             prepared_docx_pdf=pdf_source if kind == "docx" else None,
             prepared_docx_warnings=prepared_warnings,
+            prepared_image_size=(
+                prepared_document.document.size
+                if prepared_document is not None and isinstance(prepared_document.document, RasterDocument)
+                else None
+            ),
         )
         warnings.extend(info.warnings)
         validate_render_budget(info, request.settings.dpi)
@@ -427,7 +432,7 @@ def open_preview_document(
     cancellation: CancellationToken | None = None,
     preview_cache_dir: Path | None = None,
 ):
-    """Open/validate once per small batch, retaining only the PDF parser."""
+    """Open/validate once per small batch, retaining the parser or decoded image."""
     from scandocument.pdf_engine import open_render_document
     from scandocument.preview_cache import source_fingerprint
 
@@ -435,6 +440,13 @@ def open_preview_document(
     token.check()
     fingerprint = source_fingerprint(source)
     kind = detect_kind(source)
+    if kind in IMAGE_KINDS:
+        with open_raster_document(source, kind) as document:
+            token.check()
+            prepared = PreviewDocument(source, source, document, [], fingerprint)
+            prepared.check_source()
+            yield prepared
+        return
     with SecureWorkspace() as workspace:
         pdf_source = source
         cached_pdf = None

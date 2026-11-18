@@ -54,7 +54,8 @@ describe("private session draft", () => {
 });
 
 it("retains both same-stem inputs for backend planning and labels retry by operation", () => {
-  expect(plannedBatchNames(["C:\\one\\договор.pdf", "C:\\two\\договор.docx"])).toEqual(["договор — обработано.pdf", "договор — обработано.pdf"]);
+  expect(plannedBatchNames(["C:\\one\\договор.pdf", "C:\\two\\договор.docx", "/tmp/оборот.JPEG", "/tmp/печать.png"]))
+    .toEqual(["договор — обработано.pdf", "договор — обработано.pdf", "оборот — обработано.pdf", "печать — обработано.pdf"]);
   expect(scannerRetryLabel("save")).toContain("сохранение");
   expect(scannerRetryLabel("preview")).toContain("загрузку");
   expect(scannerRetryLabel("batch")).toContain("неготовые");

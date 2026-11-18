@@ -10,8 +10,7 @@ import { repairDateFromSource } from "./sourceRepairs";
 import { AutomaticConditionsSummary } from "./AutomaticConditionsSummary";
 import { runProposalQuotePreparation, runResponsePreparation, type ResponsePreparationRequest } from "./responsePreparationWorker";
 import { ProposalAnalysisProvenance } from "./ProposalAnalysisProvenance";
-import type { ProposalWholeDraftWorkspaceProps } from "./ProposalWholeDraftWorkspace";
-import { ProposalWholeWorkingRoute } from "../proposals/ProposalWorkingRoute";
+import { ProposalWorkingHost } from "../proposals/ProposalWorkingRoute";
 import { PROPOSAL_AREAS } from "./proposalAreaPlan";
 import { buildProposalQuotePlan, isProposalQuoteSelectionCandidate } from "./proposalQuotePlan";
 import type { ProposalQuotePreparationWireRequest, ProposalQuoteProvenance } from "./proposalQuotePreparation";
@@ -38,12 +37,12 @@ vi.mock("../../lib/workspaceAccess", () => ({ useWorkspaceAccess: () => ({ edito
 vi.mock("../../lib/networkDiagnostics", () => ({ useNetworkAccess: () => ({ phase: runtime.phase }), networkAccessIsPaused: () => runtime.phase !== "connected", invoke: runtime.invoke }));
 vi.mock("../../lib/files", () => ({ chooseOpenPath: runtime.chooseOpen }));
 vi.mock("../../lib/storage", () => ({ getWorkspaceInfo: runtime.workspace }));
-vi.mock("./connectionApi", async (original) => ({ ...await original<typeof import("./connectionApi")>(), testIntelligenceConnection: runtime.testConnection, runIntelligenceAnalysis: runtime.analyze, cancelIntelligenceRequest: runtime.cancel }));
+vi.mock("./connectionApi", async (original) => ({ ...await original<typeof import("./connectionApi")>(), testIntelligenceConnection: runtime.testConnection, runIntelligenceAnalysis: runtime.analyze, runContractFactAnalysis: runtime.analyze, cancelIntelligenceRequest: runtime.cancel }));
 // The real SHA-256 implementation has its own actual-WebCrypto tests. Keep this
 // async boundary controllable without running child components or native IO.
 vi.mock("./taskSourceIdentity", () => ({ taskSourceSnapshotKey: runtime.sourceKey }));
 
-interface NodeProps { children?: ReactNode; value?: unknown; checked?: boolean; id?: string; title?: string; type?: string; disabled?: boolean; className?: string; open?: boolean; readOnly?: boolean; ref?: { current: { focus: () => void } | null }; "aria-label"?: string; onClick?: (event?: { currentTarget: Pick<HTMLElement, "focus"> }) => unknown; onChange?: (event: { target: { value: string; checked: boolean } }) => unknown; onConfirm?: () => unknown; onClose?: () => void; }
+interface NodeProps { children?: ReactNode; value?: unknown; checked?: boolean; id?: string; title?: string; type?: string; disabled?: boolean; className?: string; open?: boolean; hidden?: boolean; readOnly?: boolean; ref?: { current: { focus: () => void } | null }; "aria-label"?: string; onClick?: (event?: { currentTarget: Pick<HTMLElement, "focus"> }) => unknown; onChange?: (event: { target: { value: string; checked: boolean } }) => unknown; onConfirm?: () => unknown; onClose?: () => void; }
 let tree: ReactNode;
 let props: Parameters<typeof IntelligenceWorkbench>[0];
 let localValues: Map<string, string>;
@@ -63,11 +62,12 @@ function control(id: string) { const found = nodes().find((node) => node.props.i
 function labeled(label: string) { const found = nodes().find((node) => node.props["aria-label"] === label); if (!found) throw new Error(`Элемент не найден: ${label}`); return found; }
 function sourceId(name: string) { const found = nodes().find((node) => node.type === "li" && text(node.props.children).includes(name)); if (!found?.key) throw new Error(`Источник не найден: ${name}`); return String(found.key); }
 function field(key: string) { const found = nodes().find((node) => typeof node.props.id === "string" && /^iw-[0-9a-f]{8}-/.test(node.props.id) && node.props.id.endsWith(`-${key}`)); if (!found) throw new Error(`Поле карточки не найдено: ${key}`); return found; }
-async function selectPreparationMethod(method: "model" | "source-contract" | "whole-proposal") { labeled(method === "model" ? "Подготовка с ИИ" : method === "whole-proposal" ? "Полный черновик КП по семи областям" : "Локальная подготовка по полному договору").props.onChange!({ target: { value: method, checked: true } }); await flush(); }
+async function selectPreparationMethod(method: "model" | "source-contract" | "whole-proposal") { labeled(method === "model" ? "Подготовка с ИИ" : method === "whole-proposal" ? "Полный КП по исходным фактам" : "Локальная подготовка по полному договору").props.onChange!({ target: { value: method, checked: true } }); await flush(); }
 async function click(label: string) { if (label === "Подготовить по договору без модели") await selectPreparationMethod("source-contract"); button(label).props.onClick!(); await flush(); }
 function goalPicker(): TaskGoalPickerProps { return nodes().find((node) => node.type === TaskGoalPicker)!.props as unknown as TaskGoalPickerProps; }
 async function selectGoals(...selected: IntelligenceDestination[]) { goalPicker().onChange(selected); await flush(); }
 function preparationButton() { const task = nodes().find((node) => node.props.className === "surface iw-task")!; return nodes(task).find((node) => node.type === "button" && node.props.className === "primary")!; }
+function taskTools() { return nodes().find((node) => node.props.className === "iw-task-tools")!; }
 async function prepare() { await selectPreparationMethod("model"); preparationButton().props.onClick!(); await flush(); }
 async function edit(id: string, value: string) { control(id).props.onChange!({ target: { value, checked: false } }); await flush(); }
 async function editLabeled(label: string, value: string) { labeled(label).props.onChange!({ target: { value, checked: false } }); await flush(); }
@@ -373,10 +373,11 @@ describe("explicit local proposal preparation from a complete contract", () => {
   });
 });
 
-describe("seven-area whole proposal route — synthetic callback integration, not GUI or model acceptance", () => {
+describe("typed-fact whole proposal route — synthetic callback integration, not GUI or model acceptance", () => {
   const sourceName = "Синтетический структурированный договор.docx", previousRaw = "KEEP-MANUAL-RAW-EXACT";
   const cards = () => nodes().filter(node => node.props.className === "iw-card");
-  const editor = () => nodes().find(node => node.type === ProposalWholeWorkingRoute)?.props as unknown as ProposalWholeDraftWorkspaceProps & { open: boolean } | undefined;
+  const editor = () => nodes().find(node => node.type === ProposalWorkingHost)?.props as unknown as Parameters<typeof ProposalWorkingHost>[0] | undefined;
+  const editorOpen = () => !nodes().find(node => node.props["aria-label"] === "Работа с полным КП")?.props.hidden;
   async function until(done: () => boolean) {
     for (let turn = 0; turn < 250 && !done(); turn++) { await new Promise<void>(resolve => setTimeout(resolve, 0)); await flush(); }
     expect(done()).toBe(true);
@@ -392,12 +393,22 @@ describe("seven-area whole proposal route — synthetic callback integration, no
     await click("Добавить PDF, DOCX или XLSX"); await edit("iw-response", previousRaw);
   }
   function reply(schema: Record<string, unknown>, badReview = false) {
-    const properties = schema.properties as Record<string, { enum?: string[] }>, review = "reviewPlanKey" in properties;
-    return { model: "synthetic-callback-only", text: JSON.stringify({
-      ...Object.fromEntries(Object.entries(properties).filter(([key]) => key !== "areas").map(([key, value]) => [key, value.enum![0]])),
-      areas: Object.fromEntries(PROPOSAL_AREAS.map(area => [area, review ? { decision: badReview && area === "payment" ? "answer-not-supported" : "answer-complete", verdict: badReview && area === "payment" ? "unsupported" : "supported", reason: "Synthetic reviewer, not accuracy evidence.", basis: badReview && area === "payment" ? "answer-unsupported" : "answer-supported", counterexample: null }
-        : { status: "answered", answer: `  SYNTHETIC_WHOLE_${area}\r\nNo source completion.  `, evidenceRefs: [{ ownerId: "whole-owner", cellIndex: null }] }])),
-    }) };
+    const properties = schema.properties as Record<string, { enum?: unknown[] }>, review = "reviewPlanKey" in properties;
+    const unitIds = (properties.units as unknown as { items: { properties: { unitId: { enum: string[] } } } }).items.properties.unitId.enum;
+    const scalar = Object.fromEntries(Object.entries(properties).filter(([key]) => !["units", "issues"].includes(key)).map(([key, value]) => [key, value.enum![0]]));
+    const units = unitIds.map(unitId => ({
+      unitId, status: "facts", uncertainties: [], questions: [], facts: PROPOSAL_AREAS.map(area => {
+        const kind = ({ "work-scope": "work", deliverables: "deliverable", "checked-facets": "facet", "price-vat": "price", payment: "payment", "parties-roles": "party", schedule: "schedule" } as const)[area];
+        const data = kind === "party" ? { name: "SYNTHETIC_FACT_parties-roles", role: "contractor", roleDescription: null,
+          representatives: [{ name: "SYNTHETIC_PERSON", title: "SYNTHETIC_TITLE", authority: "SYNTHETIC_AUTHORITY" }] }
+          : kind === "price" || kind === "payment" ? { amount: `SYNTHETIC_FACT_${area}`, currency: null, vatRate: null, vatTreatment: null, share: null, payer: null, payee: null, trigger: null, timing: null, conditions: [], alternatives: [] }
+          : { actor: null, action: `SYNTHETIC_FACT_${area}`, object: null, conditions: [], triggers: [], timing: [], notices: [], alternatives: [], inputs: [], outputs: [] };
+        return { kind, data, evidence: [{ unitId, quote: "SOURCE_ONLY_NEVER_APPEND" }], links: [] };
+      }),
+    }));
+    return { model: "synthetic-callback-only", text: JSON.stringify({ ...scalar, units, ...(review ? { issues: badReview ? [{
+      unitId: unitIds[0], kind: "uncertain", reason: "SYNTHETIC_REVIEW_OPINION", evidence: [{ unitId: unitIds[0], quote: "SOURCE_ONLY_NEVER_APPEND" }],
+    }] : [] } : {}) }) };
   }
   async function begin() { await selectPreparationMethod("whole-proposal"); preparationButton().props.onClick!(); await flush(); }
   function mockReplies() { runtime.analyze.mockImplementation((_profile: unknown, _prompt: string, _key: unknown, _request: string, schema: Record<string, unknown>) => Promise.resolve(reply(schema))); }
@@ -409,57 +420,58 @@ describe("seven-area whole proposal route — synthetic callback integration, no
     for (const call of runtime.analyze.mock.calls) {
       expect(call[0].outputMode).toBe(outputMode);
       const prompt = call[1] as string, schema = call[4] as Record<string, unknown>;
-      expect(schema).toHaveProperty('properties.schemaCarrier.enum', [outputMode === 'schema' ? 'native' : 'prompt']);
+      expect(schema).toHaveProperty('properties.protocol.enum', ['source-unit-facts-v1']);
+      expect(schema.properties).toHaveProperty('units');
       if (outputMode === 'json') {
-        expect(prompt).toContain(`Схема: ${JSON.stringify(schema)}`);
+        expect(prompt).toContain(`JSON-схема: ${JSON.stringify(schema)}`);
         expect(prompt).not.toContain('Полная закрытая JSON-схема передана провайдеру отдельно');
       } else {
-        expect(prompt).not.toContain(`Схема: ${JSON.stringify(schema)}`);
-        expect(prompt).toContain('Полная закрытая JSON-схема передана провайдеру отдельно');
+        expect(prompt).not.toContain(`JSON-схема: ${JSON.stringify(schema)}`);
+        expect(prompt).toContain('source-unit-facts-v1');
       }
     }
     expect(control('iw-output-mode').props.value).toBe(outputMode);
     expect(control('iw-response').props.value).toBe(previousRaw);
   });
 
-  it("requires an explicit complete-native source and confirmation, never falls back for an ineligible source", async () => {
-    await setup({ native: false }); expect(labeled("Полный черновик КП по семи областям").props.disabled).toBe(true);
+  it("requires complete extraction and confirmation, never falls back for incomplete material", async () => {
+    await setup({ complete: false }); expect(labeled("Полный КП по исходным фактам").props.disabled).toBe(true);
     await selectPreparationMethod("whole-proposal"); expect(preparationButton().props.disabled).toBe(true); expect(runtime.analyze).not.toHaveBeenCalled();
-    expect(text()).toContain("исходной структурой"); expect(editor()).toBeUndefined();
+    expect(text()).toContain("полностью извлечённые материалы"); expect(editor()).toBeUndefined();
   });
 
   it("discloses request/time/payload cost before any call and leaves the method opt-in", async () => {
     await setup(); expect(preparationButton().props.disabled).toBe(true); await begin();
     const confirmation = nodes().find(node => node.type === ConfirmDialog)!;
-    expect(confirmation.props.title).toBe("Подготовить черновик по семи областям?");
+    expect(confirmation.props.title).toBe("Подготовить полное КП?");
     const message = (confirmation.props as unknown as { message: string }).message;
-    for (const cap of ["128", "20 минут", "4 МиБ", "2 МиБ", "без сохранения"]) expect(message).toContain(cap);
-    expect(message).toContain("Сам проход завершается без сохранения в общую базу");
-    expect(message).toContain("явно перейти в рабочий редактор"); expect(message).toContain("подготовить DOCX/PDF после проверки пользователем");
+    for (const cap of ["128", "90 минут", "8 МиБ", "2 МиБ"]) expect(message).toContain(cap);
+    expect(message).toContain("восстановительную копию в рабочей папке");
+    expect(message).toContain("откроется обычный рабочий редактор"); expect(message).toContain("DOCX/PDF после проверки пользователем");
     expect(message).toContain("восстановительную копию"); expect(message).not.toContain("без сохранения и клиентского экспорта");
     expect(runtime.analyze).not.toHaveBeenCalled(); confirmation.props.onClose!(); await flush(); expect(runtime.analyze).not.toHaveBeenCalled(); expect(control("iw-response").props.value).toBe(previousRaw);
   });
 
-  it("runs all seven areas and separate review, atomically opens a private draft and preserves old cards/manual response without a worker/source tail", async () => {
+  it("runs all source units and revised typed facts, atomically opens an ordinary working document and preserves old cards/manual response without a worker/source tail", async () => {
     await setup(); await edit("iw-new-destination", "staff"); await click("Добавить карточку вручную"); const before = cards().map(card => card.key);
     const workers = holdPreparations(); mockReplies(); await begin(); await confirm(); await until(() => Boolean(editor()));
     expect(runtime.analyze).toHaveBeenCalledTimes(2); const calls = runtime.analyze.mock.calls;
-    expect(Object.keys(calls[0][4].properties.areas.properties)).toEqual(PROPOSAL_AREAS);
-    expect(calls[1][4].properties).toHaveProperty("reviewPlanKey"); expect(calls.every(call => !call[4].properties.items && !call[4].properties.units)).toBe(true);
-    const value = editor()!; expect(value.stale).toBe(false); expect(value.handoff.sections.map(section => section.area)).toEqual(PROPOSAL_AREAS);
-    expect(value.handoff.sections.flatMap(section => section.blocks.map(block => block.text))).toEqual(PROPOSAL_AREAS.map(area => `  SYNTHETIC_WHOLE_${area}\r\nNo source completion.  `));
-    expect(JSON.stringify(value.handoff.sections)).not.toContain("SOURCE_ONLY_NEVER_APPEND"); expect(value.handoff.readyForClient).toBe(false);
+    expect(calls[0][4].properties).toHaveProperty("units");
+    expect(calls[1][4].properties).toHaveProperty("reviewPlanKey"); expect(calls.every(call => !call[4].properties.items && !call[4].properties.areas)).toBe(true);
+    const value = editor()!; expect(value.stale).toBe(false); expect(value.seed.document.sections.map(section => section.area)).toEqual(PROPOSAL_AREAS);
+    value.seed.document.sections.forEach(section => expect(section.blocks[0].text).toContain(`SYNTHETIC_FACT_${section.area}`));
+    expect(JSON.stringify(value.seed.document.sections)).not.toContain("SOURCE_ONLY_NEVER_APPEND"); expect(JSON.parse(value.seed.historyJson!).readyForClient).toBe(false);
     expect(cards().map(card => card.key)).toEqual(before); expect(control("iw-response").props.value).toBe(previousRaw); expect(workers).toHaveLength(0); expect(transfer).not.toHaveBeenCalled();
     expect(runtime.invoke.mock.calls.map(([command]) => command)).toEqual(["scanner_run"]); expect(text()).toContain("Ответы полного черновика"); expect(text()).not.toContain("Исходные ответы выбора цитат");
   });
 
   it("hides rather than unmounting the ordinary-editor route when folded, preserving the same handoff/session owner", async () => {
     await setup(); mockReplies(); await begin(); await confirm(); await until(() => Boolean(editor()));
-    const before = editor()!, original = before.handoff;
-    expect(before.open).toBe(true); before.onClose!(); await flush();
-    expect(editor()!.handoff).toBe(original); expect(editor()!.open).toBe(false);
+    const before = editor()!, original = before.seed.document;
+    expect(editorOpen()).toBe(true); before.onClose!(); await flush();
+    expect(editor()!.seed.document).toBe(original); expect(editorOpen()).toBe(false);
     await click("Открыть редактор черновика");
-    expect(editor()!.handoff).toBe(original); expect(editor()!.open).toBe(true);
+    expect(editor()!.seed.document).toBe(original); expect(editorOpen()).toBe(true);
     expect(runtime.analyze).toHaveBeenCalledTimes(2); expect(runtime.invoke.mock.calls.map(([command]) => command)).toEqual(["scanner_run"]);
   });
 
@@ -493,34 +505,38 @@ describe("seven-area whole proposal route — synthetic callback integration, no
   });
 
   it("keeps a previous whole draft readable but stale after editing its source, without merging source text into it", async () => {
-    await setup(); mockReplies(); await begin(); await confirm(); await until(() => Boolean(editor())); const original = editor()!.handoff;
+    await setup(); mockReplies(); await begin(); await confirm(); await until(() => Boolean(editor())); const original = editor()!.seed.document;
     await editLabeled(`Текст источника ${sourceName}`, "Replacement source text.");
-    expect(editor()!.handoff).toBe(original); expect(editor()!.stale).toBe(true); expect(original.sections[0].blocks[0].text).not.toContain("Replacement");
+    expect(editor()!.seed.document).toBe(original); expect(editor()!.stale).toBe(true); expect(original.sections[0].blocks[0].text).not.toContain("Replacement");
   });
 
-  it.each(["excluded", "hidden"] as const)("fails complete native preflight for a %s owner without a legacy request or source-tail fallback", async variant => {
-    await setup({ [variant]: true }); await begin(); await confirm(); await until(() => text().includes("Подготовка полного черновика остановлена"));
+  it("blocks hidden units before any model call and does not insert a source tail", async () => {
+    await setup({ hidden: true }); await begin(); await confirm(); await until(() => Boolean(nodes().find(node => node.props["aria-label"] === "Незавершённый полный черновик")));
     expect(runtime.analyze).not.toHaveBeenCalled(); expect(editor()).toBeUndefined(); expect(control("iw-response").props.value).toBe(previousRaw);
+  });
+  it("supports complete supplied text without native metadata and visible-sheet default inclusion", async () => {
+    await setup({ native: false, excluded: true }); mockReplies(); await begin(); await confirm(); await until(() => Boolean(editor()));
+    expect(runtime.analyze).toHaveBeenCalledTimes(2); expect(editor()!.seed.document.sections).toHaveLength(7);
   });
 
   it("warns that successful re-preparation replaces manual whole-draft edits and preserves them on confirmation cancellation", async () => {
-    await setup(); mockReplies(); await begin(); await confirm(); await until(() => Boolean(editor())); const original = editor()!.handoff;
+    await setup(); mockReplies(); await begin(); await confirm(); await until(() => Boolean(editor())); const original = editor()!.seed.document;
     original.sections[0].userText = "My unsaved session-only addition.";
     await begin(); const confirmation = nodes().find(node => node.type === ConfirmDialog)!;
     const message = (confirmation.props as unknown as { message: string }).message;
     expect(message).toContain("предыдущий полный черновик КП будет заменён"); expect(message).toContain("ручные правки блоков"); expect(message).toContain("будут потеряны");
-    confirmation.props.onClose!(); await flush(); expect(editor()!.handoff).toBe(original); expect(original.sections[0].userText).toBe("My unsaved session-only addition."); expect(runtime.analyze).toHaveBeenCalledTimes(2);
+    confirmation.props.onClose!(); await flush(); expect(editor()!.seed.document).toBe(original); expect(original.sections[0].userText).toBe("My unsaved session-only addition."); expect(runtime.analyze).toHaveBeenCalledTimes(2);
   });
 
   it("confirms reset for an unsaved whole draft even after the last source and legacy raw are removed, preserving edits on cancellation", async () => {
-    await setup(); mockReplies(); await begin(); await confirm(); await until(() => Boolean(editor())); const original = editor()!.handoff;
+    await setup(); mockReplies(); await begin(); await confirm(); await until(() => Boolean(editor())); const original = editor()!.seed.document;
     original.sections[0].userText = "UNSAVED-WHOLE-DRAFT-ADDITION";
     await edit("iw-response", ""); labeled(`Удалить источник ${sourceName}`).props.onClick!(); await flush(); await confirm();
-    expect(editor()!.handoff).toBe(original); expect(editor()!.stale).toBe(true); expect(cards()).toHaveLength(0); expect(control("iw-response").props.value).toBe("");
+    expect(editor()!.seed.document).toBe(original); expect(editor()!.stale).toBe(true); expect(cards()).toHaveLength(0); expect(control("iw-response").props.value).toBe("");
     await click("Новая задача"); const confirmation = nodes().find(node => node.type === ConfirmDialog)!;
     expect(confirmation.props.title).toBe("Очистить окно ИИ?"); const message = (confirmation.props as unknown as { message: string }).message;
     for (const warning of ["Полный черновик КП", "ручные правки блоков", "дополнения", "ответы на уточнения", "будет удалён"]) expect(message).toContain(warning);
-    confirmation.props.onClose!(); await flush(); expect(editor()!.handoff).toBe(original); expect(original.sections[0].userText).toBe("UNSAVED-WHOLE-DRAFT-ADDITION");
+    confirmation.props.onClose!(); await flush(); expect(editor()!.seed.document).toBe(original); expect(original.sections[0].userText).toBe("UNSAVED-WHOLE-DRAFT-ADDITION");
     await click("Новая задача"); await confirm(); expect(editor()).toBeUndefined(); expect(runtime.analyze).toHaveBeenCalledTimes(2); expect(transfer).not.toHaveBeenCalled();
   });
 
@@ -536,10 +552,10 @@ describe("seven-area whole proposal route — synthetic callback integration, no
   });
 
   it("rejects a malformed reviewer reply, preserves the previous whole draft, and displays each failed raw only once under its run identity", async () => {
-    await setup(); mockReplies(); await begin(); await confirm(); await until(() => Boolean(editor())); const original = editor()!.handoff;
+    await setup(); mockReplies(); await begin(); await confirm(); await until(() => Boolean(editor())); const original = editor()!.seed.document;
     runtime.analyze.mockImplementation((_profile: unknown, _prompt: string, _key: unknown, _id: string, schema: Record<string, unknown>) => Promise.resolve("reviewPlanKey" in (schema.properties as object) ? { text: "MALFORMED_REVIEW_NO_FALLBACK", model: "synthetic" } : reply(schema)));
     await begin(); await confirm(); await until(() => Boolean(nodes().find(node => node.props["aria-label"] === "Незавершённый полный черновик")));
-    expect(runtime.analyze).toHaveBeenCalledTimes(4); expect(editor()!.handoff).toBe(original); expect(control("iw-response").props.value).toBe(previousRaw);
+    expect(runtime.analyze).toHaveBeenCalledTimes(4); expect(editor()!.seed.document).toBe(original); expect(control("iw-response").props.value).toBe(previousRaw);
     expect(text(labeled("Незавершённый полный черновик"))).toContain("проход №2");
     expect(text().split("MALFORMED_REVIEW_NO_FALLBACK")).toHaveLength(2); expect(nodes().filter(node => node.props.className === "iw-analysis-parts")).toEqual([]);
     expect(button("Разобрать ответ").props.disabled).toBe(true); expect(button("Скопировать запрос для другой модели").props.disabled).toBe(true); expect(text()).toContain("Ручной JSON items — отдельный прежний формат");
@@ -1526,6 +1542,68 @@ describe("unified intelligence workflow", () => {
     await edit("iw-timeout", "120"); const test = deferred<{ models: string[]; message: string }>(); runtime.testConnection.mockReturnValueOnce(test.promise);
     const handler = button("Проверить подключение").props.onClick!; handler(); handler(); await flush(); expect(runtime.testConnection).toHaveBeenCalledTimes(1);
     test.resolve({ models: ["new-model"], message: "Проверено" }); await flush(); expect(text()).toContain("Проверено");
+  });
+  it("selects the only discovered model and opens the task without sending material", async () => {
+    expect(taskTools().props).toHaveProperty("hidden", true);
+    expect(taskTools().props).toHaveProperty("inert", true);
+    expect(button("Новая задача").props.hidden).toBe(true);
+    await click("Настроить подключение");
+    await click("Проверить подключение");
+    expect(control("iw-model").props.value).toBe("qa-model");
+    expect(text()).toContain("Модель подключена");
+    expect(taskTools().props).toHaveProperty("hidden", false);
+    expect(taskTools().props).toHaveProperty("inert", false);
+    expect(button("Новая задача").props.hidden).toBe(false);
+    await selectGoals("procurement"); await addText(); await selectPreparationMethod("model");
+    expect(preparationButton().props.disabled).toBe(false);
+    const heading = nodes().find(node => node.type === "h3" && text(node) === "Источники")!;
+    const focus = vi.fn();
+    heading.props.ref!.current = { focus };
+    await click("Перейти к задаче");
+    expect(focus).toHaveBeenCalledOnce();
+    expect(nodes().some(node => node.props.id === "iw-model")).toBe(false);
+    expect(runtime.analyze).not.toHaveBeenCalled();
+  });
+  it("lets the user choose from several models and clears the previous check when credentials change", async () => {
+    await click("Настроить подключение");
+    runtime.testConnection.mockResolvedValueOnce({ models: ["first-model", "second-model"], message: "Выберите модель" });
+    await click("Проверить подключение");
+    expect(control("iw-model").props.value).toBe("");
+    expect(text()).not.toContain("Модель подключена");
+    expect(taskTools().props.hidden).toBe(true);
+    await editLabeled("Доступные модели", "second-model");
+    expect(control("iw-model").props.value).toBe("second-model");
+    expect(text()).toContain("Модель подключена");
+    expect(taskTools().props.hidden).toBe(false);
+    await addText("Материал до смены ключа");
+    await edit("iw-api-key", "session-only");
+    expect(taskTools().props.hidden).toBe(true);
+    expect(text()).not.toContain("Модель подключена");
+    expect(nodes().some(node => node.props["aria-label"] === "Доступные модели")).toBe(false);
+    runtime.testConnection.mockResolvedValueOnce({ models: ["second-model"], message: "Проверено" });
+    await click("Проверить подключение");
+    expect(taskTools().props.hidden).toBe(false);
+    expect(text()).toContain("Материал до смены ключа");
+    expect(runtime.analyze).not.toHaveBeenCalled();
+  });
+  it("keeps the tools hidden for a manually entered model until the current connection passes verification", async () => {
+    await configureModel();
+    expect(taskTools().props.hidden).toBe(true);
+    expect(nodes().some(node => text(node.props.children) === "Перейти к задаче")).toBe(false);
+    const stale = deferred<{ models: string[]; message: string }>();
+    runtime.testConnection.mockReturnValueOnce(stale.promise);
+    await click("Проверить подключение");
+    expect(taskTools().props.hidden).toBe(true);
+    await edit("iw-endpoint", "http://localhost:1234");
+    stale.resolve({ models: ["qa-model"], message: "Старый сервис ответил" });
+    await flush();
+    expect(taskTools().props.hidden).toBe(true);
+    runtime.testConnection.mockRejectedValueOnce(new Error("Сервис недоступен"));
+    await click("Проверить подключение");
+    expect(taskTools().props.hidden).toBe(true);
+    expect(text()).toContain("Сервис недоступен");
+    await click("Проверить подключение");
+    expect(taskTools().props.hidden).toBe(false);
   });
   it("warns before clearing local material and keeps it when the dialog is cancelled", async () => {
     await addText(); await paste(); await click("Новая задача"); const dialog = nodes().find((node) => node.type === ConfirmDialog)!;

@@ -1,3 +1,5 @@
+import { scannerSourceStem } from "./scannerSource";
+
 // Settings only: never serialize document rasters, OCR text or facsimile pixels.
 export function scannerSettingsKey(value: unknown): string {
   return JSON.stringify(value, (key, item) => key === "imageUrl" ? undefined : item);
@@ -96,5 +98,8 @@ export function scannerRetryLabel(operation: ScannerRetryOperation) {
 }
 
 export function plannedBatchNames(paths: string[]): string[] {
-  return paths.map((path, index) => `${(path.split(/[\\/]/).pop() || `документ-${index + 1}`).replace(/\.(pdf|docx)$/i, "")} — обработано.pdf`);
+  return paths.map((path, index) => {
+    const name = path.split(/[\\/]/).pop() || `документ-${index + 1}`;
+    return `${scannerSourceStem(name)} — обработано.pdf`;
+  });
 }

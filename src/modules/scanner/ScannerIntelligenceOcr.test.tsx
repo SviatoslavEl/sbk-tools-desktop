@@ -6,8 +6,10 @@ import { Scanner } from "./Scanner";
 const runtime = vi.hoisted(() => ({
   cursor: 0, changed: false, paused: false, sourceValid: true, outputRevision: "output-revision-a",
   slots: [] as Array<{ value?: unknown; deps?: readonly unknown[]; cleanup?: () => void; effect?: () => void | (() => void) }>, effects: [] as Array<() => void>,
-  invoke: vi.fn(), preview: vi.fn(), chooseOpen: vi.fn(), chooseSave: vi.fn(), journalSave: vi.fn(),
+  invoke: vi.fn(), preview: vi.fn(), chooseOpen: vi.fn(), chooseSave: vi.fn(), journalSave: vi.fn(), listenForDrop: vi.fn(),
 }));
+vi.mock("@tauri-apps/api/webview", () => ({ getCurrentWebview: () => ({ onDragDropEvent: runtime.listenForDrop }) }));
+vi.mock("@tauri-apps/api/event", () => ({ listen: async () => () => undefined }));
 vi.mock("react", async (original) => {
   const memo = (factory: () => unknown, deps?: readonly unknown[]) => {
     const index = runtime.cursor++, old = runtime.slots[index];
@@ -75,6 +77,7 @@ async function saveOcr() { expect(button("Сохранить PDF").props.disable
 beforeEach(() => {
   runtime.cursor = 0; runtime.changed = false; runtime.paused = false; runtime.sourceValid = true; runtime.outputRevision = "output-revision-a";
   runtime.slots = []; runtime.effects = []; runtime.preview.mockReset(); runtime.invoke.mockReset(); runtime.chooseOpen.mockReset().mockResolvedValue("/synthetic/unrelated.pdf"); runtime.chooseSave.mockReset().mockResolvedValue("/synthetic/ocr.pdf"); runtime.journalSave.mockReset().mockResolvedValue(undefined); ready.mockReset();
+  runtime.listenForDrop.mockReset().mockResolvedValue(() => undefined);
   runtime.invoke.mockImplementation(async (command: string) => {
     if (command === "scanner_source_revision") return runtime.outputRevision;
     if (command === "scanner_run") return { outputPath: "/synthetic/ocr.pdf", outputSha256: "c".repeat(64), ocrText: "Распознанный синтетический текст", outputBytes: 900, originalBytes: 1000 };
@@ -87,6 +90,27 @@ beforeEach(() => {
   props = { intelligenceOcrRequest: { id: "request-a", inputPath: "/synthetic/scan-a.pdf" }, onIntelligenceOcrReady: ready };
 });
 afterEach(() => { for (const slot of runtime.slots) slot.cleanup?.(); vi.unstubAllGlobals(); });
+
+describe("scanner image inputs", () => {
+  it("offers both JPEG extensions and PNG in the file picker and opens the selected JPEG", async () => {
+    props = {};
+    runtime.chooseOpen.mockResolvedValue("/synthetic/Оборот.JPEG");
+    render(); await flush();
+    button("Выбрать файл").props.onClick!(); await flush();
+    expect(runtime.chooseOpen).toHaveBeenCalledWith(expect.stringContaining("JPEG и PNG"), ["pdf", "docx", "jpg", "jpeg", "png"]);
+    expect(runtime.preview).toHaveBeenCalledWith("/synthetic/Оборот.JPEG");
+  });
+
+  it("opens a dropped PNG from a Windows path", async () => {
+    props = {};
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {} });
+    render(); await flush();
+    const path = "C:\\Тест\\Лист.PNG";
+    const onDragDrop = runtime.listenForDrop.mock.calls[0][0];
+    onDragDrop({ payload: { type: "drop", paths: [path] } }); await flush();
+    expect(runtime.preview).toHaveBeenCalledWith(path);
+  });
+});
 
 describe("scanner explicit OCR round trip", () => {
   it("starts the explicit AI OCR request in a genuinely empty scanner without a redundant replacement prompt", async () => {

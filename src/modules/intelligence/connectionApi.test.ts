@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cancelIntelligenceRequest, intelligenceTransportLimitBytes, publicConnectionProfile,
-  intelligenceSchemaLimitBytes, runIntelligenceAnalysis, testIntelligenceConnection, validateConnectionProfile, type ConnectionProfile, type IntelligenceAnalysisDiagnostics, type IntelligenceAnalysisResult } from "./connectionApi";
+  intelligenceSchemaLimitBytes, runIntelligenceAnalysis, runContractFactAnalysis, testIntelligenceConnection, validateConnectionProfile, type ConnectionProfile, type IntelligenceAnalysisDiagnostics, type IntelligenceAnalysisResult } from "./connectionApi";
 
 const ipc = vi.hoisted(() => vi.fn());
 vi.mock("@tauri-apps/api/core", () => ({ invoke: ipc }));
@@ -12,6 +12,15 @@ beforeEach(() => { vi.stubGlobal("window", { __TAURI_INTERNALS__: {} }); ipc.moc
 afterEach(() => vi.unstubAllGlobals());
 
 describe("explicit AI transport API", () => {
+  it("uses a separate explicit fact route for Ollama, leaves other provider options unknown and sends no profile extras", async () => {
+    const schema = { type: "object", additionalProperties: false, properties: {} };
+    await runContractFactAnalysis({ ...profile, outputMode: "schema" }, "SYNTHETIC_FACT_REQUEST", "SYNTHETIC_KEY", requestId, schema);
+    expect(ipc.mock.calls[0][0]).toBe("run_contract_fact_analysis");
+    expect(ipc.mock.calls[0][1].responseSchema).toEqual(schema);
+    expect(ipc.mock.calls[0][1].profile).not.toHaveProperty("num_predict");
+    await runContractFactAnalysis({ ...profile, protocol: "openai-compatible", outputMode: "schema" }, "SYNTHETIC_FACT_REQUEST", undefined, requestId, schema);
+    expect(ipc.mock.calls[1][0]).toBe("run_intelligence_analysis");
+  });
   it("keeps only public connection fields in profiles crossing IPC", async () => {
     const untrusted = { ...profile, apiKey: "should-not-be-in-profile", secretReference: "should-not-persist" };
     expect(publicConnectionProfile(untrusted)).toEqual(profile);

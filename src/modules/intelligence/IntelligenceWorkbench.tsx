@@ -6,7 +6,7 @@ import { getWorkspaceInfo } from "../../lib/storage";
 import { invoke, networkAccessIsPaused, useNetworkAccess } from "../../lib/networkDiagnostics";
 import { useWorkspaceAccess } from "../../lib/workspaceAccess";
 import { formatRussianCount } from "../../lib/russianCount";
-import { cancelIntelligenceRequest, runIntelligenceAnalysis, testIntelligenceConnection, validateConnectionProfile, type ConnectionProfile, type IntelligenceAnalysisResult } from "./connectionApi";
+import { cancelIntelligenceRequest, runIntelligenceAnalysis, runContractFactAnalysis, testIntelligenceConnection, validateConnectionProfile, type ConnectionProfile, type IntelligenceAnalysisResult } from "./connectionApi";
 import { buildIntelligenceHandoff, destinationLabels, emptyIntelligenceItem, fieldDefinitions, fieldInputValue, intelligenceFieldError, parseFieldInput, validateIntelligenceItem } from "./workbenchModel";
 import { buildAnalysisPlan, mergeAnalysisResponses, type AnalysisMode, type AnalysisResponsePart } from "./analysisPlan";
 import { buildGroundedAnalysisInput } from "./groundedAnalysis";
@@ -30,9 +30,9 @@ import { prepareCommercialTaskProposal } from "../proposals/commercialTaskPrepar
 import { useSourceFactsInventory } from "./useSourceFactsInventory";
 import { ResponsePreparationCancelled, startProposalQuotePreparation, startResponsePreparation, startSourceContractPreparation } from "./responsePreparation";
 import { assertResponsePreparationSources } from "./responsePreparationBounds";
-import { startProposalAreaRun, ProposalAreaRunError } from "./proposalAreaRun";
-import { createProposalDraftEditorHandoff, type ProposalDraftEditorHandoff } from "./proposalDraftEditorAdapter";
-import { ProposalWholeWorkingRoute } from "../proposals/ProposalWorkingRoute";
+import { startContractFactRun, ContractFactRunError } from "./contractFactRun";
+import { createWorkingProposalFromFacts } from "../proposals/contractFactWorking";
+import { ProposalWorkingHost } from "../proposals/ProposalWorkingRoute";
 import type { AutoConditionResult } from "./automaticConditions";
 import { AutomaticConditionsSummary } from "./AutomaticConditionsSummary";
 import { SourcePreparationSummary } from "./SourcePreparationSummary";
@@ -141,6 +141,16 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
   const [outputFocusRequest, setOutputFocusRequest] = useState(0);
   const [connectionBusy, setConnectionBusy] = useState(false);
   const [connectionMessage, setConnectionMessage] = useState("");
+  const sourcesHeading = useRef<HTMLHeadingElement | null>(null);
+  const [focusSources, setFocusSources] = useState(false);
+  const modelName = profile.model.trim();
+  const modelConfirmed = Boolean(modelName && models.includes(profile.model));
+  const modelIssue = useMemo(() => {
+    try { validateConnectionProfile(profile, true); return ""; }
+    catch (reason) { return errorMessage(reason); }
+  }, [profile]);
+  const taskToolsAvailable = modelConfirmed && !modelIssue;
+  const taskToolsWereAvailable = useRef(false);
   const [sources, setSources] = useState<WorkbenchSource[]>([]);
   const sourcesRef = useRef<WorkbenchSource[]>([]);
   const [sourceName, setSourceName] = useState("");
@@ -149,12 +159,12 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
   const [instruction, setInstruction] = useState("");
   const [taskDestinations, setTaskDestinations] = useState<IntelligenceDestination[]>([]);
   const [preparationMethod, setPreparationMethod] = useState<"model" | "source-contract" | "whole-proposal" | null>(null);
-  const [wholeProposal, setWholeProposal] = useState<{ id: string; handoff: ProposalDraftEditorHandoff; root: string; epoch: number } | null>(null);
+  const [wholeProposal, setWholeProposal] = useState<{ id: string; seed: Awaited<ReturnType<typeof createWorkingProposalFromFacts>>; root: string; epoch: number } | null>(null);
   const [wholeProposalOpen, setWholeProposalOpen] = useState(false);
-  const [wholeRunFailure, setWholeRunFailure] = useState<{ error: ProposalAreaRunError; runId: number } | null>(null);
+  const [wholeRunFailure, setWholeRunFailure] = useState<{ error: ContractFactRunError; runId: number } | null>(null);
   const wholeRunFailureRef = useRef<typeof wholeRunFailure>(null);
   const wholeRunSequence = useRef(0);
-  const wholeRunPending = useRef<ReturnType<typeof startProposalAreaRun> | null>(null);
+  const wholeRunPending = useRef<ReturnType<typeof startContractFactRun> | null>(null);
   const preparedResultRef = useRef<HTMLElement | null>(null);
   const [preparedResultFocus, setPreparedResultFocus] = useState(0);
   const [analysisMode, setAnalysisMode] = useState<AnalysisMode>("combined");
@@ -227,9 +237,8 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
   accessRef.current = { access, phase: network.phase, workspaceRoot };
   const selectedSources = useMemo(() => sources.filter((source) => source.selected && source.text.trim()).map(({ selected: _selected, filePath: _filePath, sheets: _sheets, ...source }) => source), [sources]);
   const quoteRouteAvailable = useMemo(() => taskDestinations.length === 1 && taskDestinations[0] === "proposals" && isProposalQuoteSelectionCandidate(selectedSources), [selectedSources, taskDestinations]);
-  const wholeProposalAvailable = taskDestinations.length === 1 && taskDestinations[0] === "proposals" && selectedSources.length === 1
-    && selectedSources[0].coverage?.complete === true && selectedSources[0].coverage.requiresOcr === false
-    && Boolean(selectedSources[0].sha256 && selectedSources[0].fragments?.length && selectedSources[0].fragments.every(fragment => fragment.structure?.format === "docx"));
+  const wholeProposalAvailable = taskDestinations.length === 1 && taskDestinations[0] === "proposals" && selectedSources.length > 0
+    && selectedSources.every(source => source.coverage?.complete !== false && !source.coverage?.requiresOcr && !source.coverage?.pagesWithoutText?.length);
   const sourceCharacters = selectedSources.reduce((count, source) => count + source.text.length, 0);
   const canTransfer = access.editor && network.phase === "connected";
   const updateSources = (update: (previous: WorkbenchSource[]) => WorkbenchSource[]) => { const next = update(sourcesRef.current); sourcesRef.current = next; setSources(next); };
@@ -293,6 +302,20 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
   }, [workspaceRoot, access.editor, network.phase]);
   useEffect(() => { if (connectionOpen && outputFocusRequest > 0) outputModeRef.current?.focus(); }, [connectionOpen, outputFocusRequest]);
   useEffect(() => { if (connectionOpen && modelFocusRequest > 0) modelInputRef.current?.focus(); }, [connectionOpen, modelFocusRequest]);
+  useEffect(() => {
+    if (!active || !taskToolsAvailable || !focusSources || connectionOpen) return;
+    sourcesHeading.current?.focus();
+    setFocusSources(false);
+  }, [active, connectionOpen, focusSources, taskToolsAvailable]);
+  useEffect(() => {
+    if (taskToolsWereAvailable.current && !taskToolsAvailable) {
+      // Dialogs render in a portal. Close any task confirmation when the
+      // tools are hidden, so no action stays visible over the connection form.
+      setConfirm(null);
+      setFocusSources(false);
+    }
+    taskToolsWereAvailable.current = taskToolsAvailable;
+  }, [taskToolsAvailable]);
   useEffect(() => { if (active && preparedResultFocus > 0) preparedResultRef.current?.focus(); }, [preparedResultFocus]);
   useEffect(() => {
     const revision = ++auditRevision.current;
@@ -334,7 +357,7 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
 
   const editProfile = (patch: Partial<ConnectionProfile>) => {
     invalidateTask(); connectionEpoch.current++; connectionPending.current = null; setConnectionBusy(false); setConnectionMessage("");
-    if ((patch.endpoint !== undefined && patch.endpoint !== profile.endpoint) || (patch.protocol !== undefined && patch.protocol !== profile.protocol) || (patch.scope !== undefined && patch.scope !== profile.scope)) { setApiKey(""); setModels([]); }
+    if ((patch.id !== undefined && patch.id !== profile.id) || (patch.endpoint !== undefined && patch.endpoint !== profile.endpoint) || (patch.protocol !== undefined && patch.protocol !== profile.protocol) || (patch.scope !== undefined && patch.scope !== profile.scope)) { setApiKey(""); setModels([]); }
     setProfile((previous) => ({ ...previous, ...patch }));
   };
   const saveProfile = () => {
@@ -351,8 +374,27 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
     const token = ++connectionEpoch.current; connectionPending.current = token; setConnectionBusy(true); setConnectionMessage("");
     try {
       const result = await testIntelligenceConnection(profile, apiKey || undefined);
-      if (mounted.current && token === connectionEpoch.current) { setModels(result.models); setConnectionMessage(result.message); }
-    } catch (reason) { if (mounted.current && token === connectionEpoch.current) setConnectionMessage(errorMessage(reason)); }
+      if (mounted.current && token === connectionEpoch.current) {
+        // The model list belongs to the current endpoint and credentials.
+        // A single discovered model can fill an empty choice without sending any material.
+        const discovered = [...new Set(result.models.filter((name) => typeof name === "string"
+          && Boolean(name.trim()) && name === name.trim() && name.length <= 200 && !/[\x00-\x1f\x7f]/u.test(name)))];
+        const onlyModel = !profile.model.trim() && discovered.length === 1 ? discovered[0] : undefined;
+        setModels(discovered);
+        if (onlyModel) {
+          invalidateTask();
+          setProfile((current) => ({ ...current, model: onlyModel }));
+        }
+        if (modelConfirmed && !discovered.includes(profile.model)) invalidateTask();
+        setConnectionMessage(discovered.length ? result.message : "Сервис ответил, но не сообщил доступных моделей. Проверьте, что модель установлена и доступна этому подключению, затем повторите проверку.");
+      }
+    } catch (reason) {
+      if (mounted.current && token === connectionEpoch.current) {
+        if (modelConfirmed) invalidateTask();
+        setModels([]);
+        setConnectionMessage(errorMessage(reason));
+      }
+    }
     finally { if (connectionPending.current === token) connectionPending.current = null; if (mounted.current && token === connectionEpoch.current) setConnectionBusy(false); }
   };
   const addTextSource = () => {
@@ -507,12 +549,13 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
     if (!selectedSources.length) { setError("Выберите хотя бы один источник."); return; }
     if (!taskDestinations.length) { setError("Выберите хотя бы один результат для подготовки."); return; }
     if (!profile.model.trim()) { setError("Для подготовки с ИИ сначала настройте и выберите модель. Локальный способ выбирается отдельно и не запускается автоматически."); return; }
+    if (modelIssue) { setError(modelIssue); return; }
     const instructionSnapshot = instruction.trim() ? instruction : generatedInstruction(taskDestinations);
     const destinationSnapshot = [...taskDestinations], snapshot = structuredClone(selectedSources), profileSnapshot = { ...profile }, keySnapshot = apiKey || undefined, modeSnapshot = analysisMode, rootSnapshot = workspaceRoot;
     // Choose the quote grammar before preflight. A budget/ID/protocol failure
     // of an eligible contract must not silently send the old full-document job.
     const useWholeProposal = preparationMethod === "whole-proposal";
-    if (useWholeProposal && !wholeProposalAvailable) { setError("Полный черновик по семи областям требует одного полностью прочитанного DOCX с исходной структурой. Другой способ не подставлен."); return; }
+    if (useWholeProposal && !wholeProposalAvailable) { setError("Для полного КП нужны полностью извлечённые материалы без пропущенных страниц OCR. Другой способ не подставлен."); return; }
     const useQuotes = !useWholeProposal && quoteRouteAvailable;
     let plan: ReturnType<typeof buildAnalysisPlan> = [];
     if (!useQuotes && !useWholeProposal) try { plan = buildAnalysisPlan(instructionSnapshot, snapshot, destinationSnapshot, modeSnapshot); } catch (reason) { setError(errorMessage(reason)); return; }
@@ -527,36 +570,39 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
         const wholeCurrent = () => current() && taskId.current === ownerTaskId && accessRef.current.access.editor === editorSnapshot && accessRef.current.phase === phaseSnapshot;
         const wholeParts: typeof analysisParts = [];
         const wholeSchemaCarrier = profileSnapshot.outputMode === "schema" ? "native" : "prompt";
-        const handle = startProposalAreaRun({ sources: snapshot, options: { instruction: instructionSnapshot, schemaCarrier: wholeSchemaCarrier }, isCurrent: wholeCurrent,
+        const factResponseBudget = profileSnapshot.protocol === "ollama" ? 4096 : null;
+        const handle = startContractFactRun({ sources: snapshot, options: { instruction: instructionSnapshot, schemaCarrier: wholeSchemaCarrier, responseTokenBudget: factResponseBudget }, isCurrent: wholeCurrent,
+          currentSources: () => sourcesRef.current.filter(source => source.selected && source.text.trim()).map(({ selected: _selected, filePath: _filePath, sheets: _sheets, ...source }) => source),
           transport: async job => {
             if (!wholeCurrent() || job.signal.aborted) throw new Error("Задача изменилась перед отправкой. Запрос не отправлен.");
             if (job.schemaCarrier !== wholeSchemaCarrier || job.schemaCarrier === "native" && profileSnapshot.outputMode !== "schema") throw new Error("Формат подключения не соответствует носителю схемы плана. Запрос не отправлен.");
+            if (job.responseTokenBudget !== factResponseBudget) throw new Error("Бюджет ответа изменился. Запрос не отправлен.");
             request.id = job.requestId;
             const abort = () => { void cancelIntelligenceRequest(job.requestId).catch(() => undefined); };
             job.signal.addEventListener("abort", abort, { once: true });
             try {
               if (job.signal.aborted) throw new Error("Запрос отменён до отправки.");
-              const reply = await runIntelligenceAnalysis(profileSnapshot, job.prompt, keySnapshot, job.requestId, job.responseSchema as Record<string, unknown>);
+              const reply = await runContractFactAnalysis(profileSnapshot, job.prompt, keySnapshot, job.requestId, job.responseSchema as Record<string, unknown>);
               return { text: reply.text, model: reply.model };
             } finally { job.signal.removeEventListener("abort", abort); }
           },
           onProgress: progress => { if (wholeCurrent()) setAnalysisProgress({ index: Math.min(progress.completedRequests + 1, progress.totalRequests || 1), total: progress.totalRequests || 1,
-            label: progress.phase === "prepare" ? "Проверка полного состава документа" : progress.phase === "extraction" ? "Извлечение семи областей КП" : progress.phase === "review" ? "Проверка ответов по источнику" : "Сборка полного черновика" }); },
+            label: progress.phase === "prepare" ? "Подготовка всех исходных единиц" : progress.phase === "extraction" ? "Извлечение отдельных фактов" : progress.phase === "review" ? "Проверка фактов и условий" : "Сборка рабочего КП" }); },
           onPart: part => { if (wholeCurrent()) { wholeParts.push({ batchId: `whole:${part.blockId}:${part.kind}`, model: part.model || profileSnapshot.model, text: part.raw, destinations: ["proposals"] }); setAnalysisParts([...wholeParts]); } },
         });
         wholeRunPending.current = handle;
         try {
           const result = await handle.promise;
           if (!wholeCurrent()) return;
-          const handoff = await createProposalDraftEditorHandoff(result.draft, result.plan, result.records, snapshot);
+          const seed = await createWorkingProposalFromFacts(result, snapshot);
           if (!wholeCurrent()) return;
-          setWholeProposal({ id: crypto.randomUUID(), handoff, root: rootSnapshot, epoch: request.epoch }); setWholeProposalOpen(true);
-          setNotice("Подготовлен отдельный черновик по семи областям. Он не дополнен локальными фактами и не заменяет прежние карточки. Проверьте условия и продолжите в рабочем редакторе для сохранения и подготовки файла.");
+          setWholeProposal({ id: crypto.randomUUID(), seed, root: rootSnapshot, epoch: request.epoch }); setWholeProposalOpen(true);
+          setNotice("Рабочий КП открыт. Проверьте факты, условия и выбранный состав перед сохранением и выгрузкой. Замечания ИИ не являются доказательством пропуска.");
         } catch (reason) {
           // Keep the first bounded failure until explicit dismissal/new task.
           // A cancelled older run cannot overwrite a newer run's diagnostics;
           // its own retained bytes remain labelled with its run identity.
-          if (reason instanceof ProposalAreaRunError && mounted.current && taskId.current === ownerTaskId && accessRef.current.workspaceRoot === rootSnapshot && !wholeRunFailureRef.current) {
+          if (reason instanceof ContractFactRunError && mounted.current && taskId.current === ownerTaskId && accessRef.current.workspaceRoot === rootSnapshot && !wholeRunFailureRef.current) {
             const failure = { error: reason, runId }; wholeRunFailureRef.current = failure; setWholeRunFailure(failure);
           }
           throw reason;
@@ -644,10 +690,12 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
   };
   const requestAnalysis = () => {
     if (!taskDestinations.length) { setError("Выберите хотя бы один результат для подготовки."); return; }
+    if (!profile.model.trim()) { setError("Для подготовки с ИИ сначала настройте и выберите модель."); return; }
+    if (modelIssue) { setError(modelIssue); return; }
     const confirmationEpoch = epoch.current;
     if (preparationMethod === "whole-proposal") {
       const replacementWarning = wholeProposal ? "При успехе предыдущий полный черновик КП будет заменён: ручные правки блоков, ваши дополнения и ответы на уточнения будут потеряны. При отмене или ошибке прежний черновик останется. " : "";
-      setConfirm({ title: "Подготовить черновик по семи областям?", message: replacementWarning + "Каждый блок документа будет отправлен модели дважды: для извлечения и отдельной проверки. Максимум 64 блока и 128 последовательных запросов; точное число появится после проверки объёма. Общие лимиты: 20 минут, 4 МиБ текста запросов и JSON-схем (без служебной упаковки провайдера), 2 МиБ ответов. При превышении необработанные блоки останутся отмеченными, частичный КП не устанавливается. Это может увеличить стоимость. Модельные выводы не являются подтверждением достоверности. Прежние карточки останутся. Сам проход завершается без сохранения в общую базу и без создания клиентского файла. После успеха можно явно перейти в рабочий редактор, выбрать блоки и реквизиты, сохранить черновик и подготовить DOCX/PDF после проверки пользователем. В режиме редактора рабочее окно также ведёт отдельную восстановительную копию; она не заменяет явное сохранение документа.", label: "Подготовить полный черновик", run: () => { setConfirm(null); if (epoch.current !== confirmationEpoch) { setError("Задача изменилась. Проверьте материалы и повторите действие."); return; } void analyze(); } });
+      setConfirm({ title: "Подготовить полное КП?", message: replacementWarning + "Каждый пакет получит два прохода ИИ: исходные и уточнённые факты. Максимум 64 пакета и 128 последовательных запросов. Общие пределы: 90 минут, 8 МиБ текста запросов и схем (без упаковки провайдера), 2 МиБ ответов. Это может занять время и увеличить стоимость; при превышении лимита частичный КП не устанавливается. Модельные факты требуют проверки. После полного прохода откроется обычный рабочий редактор: выберите состав, сохраните документ и подготовьте DOCX/PDF после проверки пользователем. Прежние карточки не изменяются, клиентский файл автоматически не создаётся. При доступе редактора рабочее окно автоматически ведёт отдельную восстановительную копию в рабочей папке, включая частную историю источников и ответов; она не заменяет явное сохранение документа.", label: "Подготовить полное КП", run: () => { setConfirm(null); if (epoch.current !== confirmationEpoch) { setError("Задача изменилась. Проверьте материалы и повторите действие."); return; } void analyze(); } });
       return;
     }
     if (items.length) setConfirm({ title: "Подготовить новый результат?", message: `${quoteRouteAvailable ? "Договор будет обработан последовательными пакетами целых фрагментов с ближайшим контекстом. Число пакетов появится после проверки объёма. " : analysisMode === "by-destination" ? `Будет ${taskDestinations.length} последовательных запросов; выбранные материалы отправятся модели ${taskDestinations.length} раз. ` : ""}После успешного разбора ответа он заменит подготовленные здесь карточки, включая внесённые вручную исправления. Уже открытые карточки в других инструментах не изменятся.`, label: quoteRouteAvailable ? "Выбрать цитаты и подготовить КП" : analysisMode === "by-destination" ? `Отправить запросы (${taskDestinations.length})` : "Отправить запрос", run: () => { setConfirm(null); if (epoch.current !== confirmationEpoch) { setError("Задача изменилась после открытия подтверждения. Проверьте материалы и отправьте запрос заново."); return; } void analyze(); } });
@@ -887,10 +935,21 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
       {!manual && completion && !completion.canTransferPrepared && completion.canOpenIncompleteDraft && <button type="button" className="secondary" disabled={preparingResponse || !canTransfer || Boolean(transferring) || Boolean(errors.length) || !evidenceReady || Boolean(evidenceState?.failed) || unreviewed.length > 0} onClick={focusBeforeConfirmation(() => requestIncompleteTransfer(item))}>{completion.priceReviewRequired ? "Открыть КП — проверить цену и условия" : "Открыть неполный черновик"}</button>}</>;
   };
   return <div className="module-stack intelligence-workbench" data-active={active} {...localAttributes}>
-    {!access.editor && <div className="notice warning" role="status">Можно подготовить и проверить данные. Для открытия карточок в общей базе включите режим редактора.{onSettings && <button type="button" className="secondary" onClick={onSettings}>Настройки доступа</button>}</div>}
-    {network.phase !== "connected" && <div className="notice warning" role="status">Связь с общей базой приостановлена. Работа с текстами и подключение к модели доступны; чтение файлов и передача карточек недоступны.</div>}
     <section className="iw-connection surface">
-      <div className="iw-connection-summary"><div className="iw-current-connection"><strong>{profile.model || "Модель не выбрана"}</strong><span className="help-text">{scopes[profile.scope]} · {profile.protocol === "ollama" ? "Ollama" : "OpenAI-совместимый API"}</span></div><div className="iw-connection-actions"><button type="button" className="secondary" aria-expanded={connectionOpen} onClick={() => setConnectionOpen(!connectionOpen)}>{connectionOpen ? "Свернуть подключение" : "Настроить подключение"}</button><button type="button" className="secondary" onClick={focusBeforeConfirmation(requestReset)}>Новая задача</button></div></div>
+      <div className="iw-connection-summary">
+        <div className="iw-current-connection"><strong>{modelName || "Модель не выбрана"}</strong>
+          {taskToolsAvailable && <span className="iw-model-connected" role="status">Модель подключена</span>}
+          <span className="help-text">{scopes[profile.scope]} · {profile.protocol === "ollama" ? "Ollama" : "OpenAI-совместимый API"}</span>
+        </div>
+        <div className="iw-connection-actions">
+          {connectionOpen && taskToolsAvailable && !connectionBusy && <button type="button" className="primary" onClick={() => { setConnectionOpen(false); setFocusSources(true); }}>Перейти к задаче</button>}
+          <button type="button" className="secondary" aria-expanded={connectionOpen} onClick={() => setConnectionOpen(!connectionOpen)}>{connectionOpen ? "Свернуть подключение" : "Настроить подключение"}</button>
+          <button type="button" className="secondary" hidden={!taskToolsAvailable} onClick={focusBeforeConfirmation(requestReset)}>Новая задача</button>
+        </div>
+      </div>
+      {!taskToolsAvailable && <p className="help-text iw-model-setup">{connectionOpen && models.length
+        ? "Выберите модель из списка доступных. После выбора откроются инструменты рабочего окна."
+        : "Настройте подключение и проверьте доступность модели, чтобы открыть инструменты рабочего окна."}</p>}
       {connectionOpen && <div className="iw-connection-editor">
         <div className="iw-profile-row"><label>Сохранённые подключения<select aria-label="Сохранённые подключения" value={profiles.some((entry) => entry.id === profile.id) ? profile.id : ""} onChange={(event) => { const next = profiles.find((entry) => entry.id === event.target.value); if (next) { editProfile(next); setApiKey(""); } }}><option value="">Несохранённое подключение</option>{profiles.map((entry) => <option value={entry.id} key={entry.id}>{entry.name}</option>)}</select></label><button type="button" className="secondary" onClick={() => { editProfile(defaultProfile()); setApiKey(""); }}>Добавить подключение</button></div>
         <div className="iw-form-grid">
@@ -898,10 +957,14 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
           <label>Где работает модель<select aria-label="Где работает модель" value={profile.scope} onChange={(event) => editProfile({ scope: event.target.value as ConnectionProfile["scope"] })}>{Object.entries(scopes).map(([key, label]) => <option value={key} key={key}>{label}</option>)}</select></label>
           <label>Протокол<select aria-label="Протокол подключения" value={profile.protocol} onChange={(event) => editProfile({ protocol: event.target.value as ConnectionProfile["protocol"], outputMode: event.target.value === "ollama" ? "schema" : "json" })}><option value="ollama">Ollama</option><option value="openai-compatible">Совместимый с OpenAI API</option></select></label>
           <label>Адрес сервиса<input id="iw-endpoint" type="url" value={profile.endpoint} maxLength={2048} placeholder={profile.scope === "local" ? "http://127.0.0.1:11434" : "https://…/v1"} onChange={(event) => editProfile({ endpoint: event.target.value })} /></label>
-          <label>Модель<input id="iw-model" ref={modelInputRef} value={profile.model} maxLength={200} list="iw-discovered-models" placeholder="Проверьте подключение или введите название" onChange={(event) => editProfile({ model: event.target.value })} /><datalist id="iw-discovered-models">{models.map((model) => <option value={model} key={model} />)}</datalist></label>
+          <label>Модель<input id="iw-model" ref={modelInputRef} value={profile.model} maxLength={200} placeholder="Проверьте подключение или введите название" onChange={(event) => editProfile({ model: event.target.value })} /></label>
+          {models.length > 0 && <label>Доступные модели<select aria-label="Доступные модели" value={modelConfirmed ? modelName : ""} onChange={(event) => {
+            const model = models.find((entry) => entry === event.target.value);
+            if (model) editProfile({ model });
+          }}><option value="" disabled>Выберите модель</option>{models.map((model) => <option value={model} key={model}>{model}</option>)}</select></label>}
           <label>Ожидание ответа, секунд<input id="iw-timeout" type="number" min={5} max={600} value={profile.timeoutSeconds} onChange={(event) => editProfile({ timeoutSeconds: Number(event.target.value) })} /></label>
           <label>Формат ответа<select id="iw-output-mode" ref={outputModeRef} value={profile.outputMode || "json"} onChange={(event) => editProfile({ outputMode: event.target.value as ConnectionProfile["outputMode"] })}><option value="schema">По схеме карточек</option><option value="json">Обычный JSON</option></select></label>
-          <label className="iw-full">Ключ доступа, если нужен<input id="iw-api-key" type="password" autoComplete="off" value={apiKey} placeholder="Хранится только до закрытия программы" onChange={(event) => { invalidateTask(); connectionEpoch.current++; connectionPending.current = null; setConnectionBusy(false); setApiKey(event.target.value); }} /></label>
+          <label className="iw-full">Ключ доступа, если нужен<input id="iw-api-key" type="password" autoComplete="off" value={apiKey} placeholder="Хранится только до закрытия программы" onChange={(event) => { invalidateTask(); connectionEpoch.current++; connectionPending.current = null; setConnectionBusy(false); setConnectionMessage(""); setModels([]); setApiKey(event.target.value); }} /></label>
         </div>
         <p className="help-text">Для сервиса на этом компьютере разрешён HTTP с адресом localhost. Для сети и внешнего сервиса нужен HTTPS. Сохраняются только адрес, модель и параметры подключения на этом компьютере; ключ и документы не сохраняются.</p>
         <p className="help-text">«По схеме карточек» задаёт сервису структуру результата и допустимые ссылки на выбранные документы. Для отбора цитат договора используется отдельная схема фрагментов, а не карточек. В режиме «Обычный JSON» схема остаётся инструкцией в тексте запроса, без принудительного ограничения ответа схемой на стороне сервиса. Формат не переключается автоматически. После выбора подключения подготовьте результат основной кнопкой задания; результат в любом режиме проверяется заново.</p>
@@ -909,6 +972,9 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
         {connectionMessage && <p className="iw-connection-message" role="status">{connectionMessage}</p>}
       </div>}
     </section>
+    <div className="iw-task-tools" hidden={!taskToolsAvailable} inert={!taskToolsAvailable}>
+    {!access.editor && <div className="notice warning" role="status">Можно подготовить и проверить данные. Для открытия карточок в общей базе включите режим редактора.{onSettings && <button type="button" className="secondary" onClick={onSettings}>Настройки доступа</button>}</div>}
+    {network.phase !== "connected" && <div className="notice warning" role="status">Связь с общей базой приостановлена. Работа с текстами и подключение к модели доступны; чтение файлов и передача карточек недоступны.</div>}
     {error && error !== (scanWithoutText ? `«${scanWithoutText.name}»: в документе не найден текст. Для скана сначала выполните распознавание в сканере.` : "") && <div className="notice error" role="alert">{error}</div>}{notice && <div className="notice" role="status">{notice}</div>}{emptyWarning && <div className="notice warning" role="status">{emptyWarning}</div>}
     {failedResponse && <section className="notice warning iw-response-recovery" aria-label="Сохранённый неразобранный ответ">
       <strong>Первая сохранённая неуспешная попытка</strong>
@@ -923,7 +989,7 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
     </section>}
     {scanWithoutText && <div className="notice warning iw-ocr-status" role="status" aria-label="Текст не найден"><div><strong>Текст не найден · {scanWithoutText.name}</strong><details><summary>Как работает распознавание</summary><p>Сохраните этот документ в сканере как полный PDF с OCR и верните текст сюда. Материалы задачи останутся; автоматической отправки модели не будет. После распознавания проверьте полноту текста.</p></details></div>{onRecognizeFile && <button type="button" className="secondary" disabled={extracting || network.phase !== "connected"} onClick={() => { if (networkAccessIsPaused() || extractionPending.current !== null) return; const request = { id: crypto.randomUUID(), inputPath: scanWithoutText.inputPath }; pendingOcr.current = { id: request.id, workspaceRoot }; try { onRecognizeFile(request); } catch (reason) { pendingOcr.current = null; setError(errorMessage(reason)); } }}>Распознать этот файл</button>}</div>}
     <div className="iw-workspace-grid">
-      <section className="surface iw-sources"><div className="iw-section-heading"><span className="iw-step">1</span><div><h3>Источники</h3><p>В модель отправятся только отмеченные тексты.</p></div></div>
+      <section className="surface iw-sources"><div className="iw-section-heading"><span className="iw-step">1</span><div><h3 ref={sourcesHeading} tabIndex={-1}>Источники</h3><p>В модель отправятся только отмеченные тексты.</p></div></div>
         {manualReviewCount > 0 && <div className="notice warning" role="status" aria-label="Предупреждение о сбросе подтверждений источников">Ручных подтверждений: {manualReviewCount}. Добавление независимого материала сохраняет решения прежнего результата. Изменение выбора, листов или текста источника из его снимка сбросит связанные подтверждения: потребуется повторная сверка; автоматически подтверждения не восстанавливаются.</div>}
         <button type="button" className="secondary iw-add-document" disabled={extracting || network.phase !== "connected"} onClick={() => void addDocument()}><ToolIcon name="folder" />{extracting ? "Извлекаем текст…" : "Добавить PDF, DOCX или XLSX"}</button>
         {extracting && <div className="iw-progress" role="status"><span className="iw-spinner" aria-hidden="true" />Читаем документ. Это может занять время.<button type="button" className="secondary" onClick={() => { extractionEpoch.current++; extractionPending.current = null; setExtracting(false); setNotice("Чтение отменено для этой задачи. Поздний результат не будет добавлен."); }}>Отмена</button></div>}
@@ -942,25 +1008,25 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
         <label>Что нужно сделать<textarea id="iw-instruction" rows={3} maxLength={20000} value={instruction} onChange={(event) => { if (event.target.value.length > 20000) { setError("Задание не должно превышать 20 000 символов."); return; } invalidateTask(); setInstruction(event.target.value); }} /></label>
         </details>
         <details className="iw-request-options iw-analysis-options"><summary>Технические параметры разбора</summary>
-        {method === "whole-proposal" ? <p className="help-text iw-batch-disclosure" role="note">По каждому целому блоку модель отвечает о работах, результатах, проверяемых аспектах, цене и НДС, оплате, сторонах и сроках. Затем отдельный запрос проверяет ответы. Максимум 128 запросов на полный проход; частичный результат не подставляется. Это неподтверждённый черновик, не гарантия полноты.</p> : quoteRouteAvailable ? <p className="help-text iw-batch-disclosure" role="note">Для КП по полному договору модель выбирает целые цитаты последовательными пакетами, с ближайшим контекстом. Документ не отправляется целиком одним большим запросом. Число пакетов появится после проверки объёма; результат устанавливается только после всех пакетов. Такой отбор не гарантирует полноту и может занять время.</p> : <><label className="iw-analysis-mode">Разбор<select id="iw-analysis-mode" value={analysisMode} onChange={(event) => { invalidateTask(); setAnalysisMode(event.target.value as AnalysisMode); }}><option value="combined">Одним запросом</option><option value="by-destination">Отдельно по направлениям</option></select></label>
+        {method === "whole-proposal" ? <p className="help-text iw-batch-disclosure" role="note">Каждая исходная единица учитывается в общем плане. Модель извлекает отдельные факты и затем возвращает уточнённые факты с условиями и связями. Рабочий КП открывается после полного прохода, максимум 128 запросов; частичный результат не подставляется. Проверка ИИ может ошибаться.</p> : quoteRouteAvailable ? <p className="help-text iw-batch-disclosure" role="note">Для КП по полному договору модель выбирает целые цитаты последовательными пакетами, с ближайшим контекстом. Документ не отправляется целиком одним большим запросом. Число пакетов появится после проверки объёма; результат устанавливается только после всех пакетов. Такой отбор не гарантирует полноту и может занять время.</p> : <><label className="iw-analysis-mode">Разбор<select id="iw-analysis-mode" value={analysisMode} onChange={(event) => { invalidateTask(); setAnalysisMode(event.target.value as AnalysisMode); }}><option value="combined">Одним запросом</option><option value="by-destination">Отдельно по направлениям</option></select></label>
         {analysisMode === "by-destination" && <p className="help-text iw-batch-disclosure" role="note">Будет {taskDestinations.length} последовательных запросов. Одни и те же выбранные материалы отправятся модели {taskDestinations.length} раз. Это дольше и может увеличить стоимость; точность и полнота не гарантируются. Карточки появятся только после завершения всех этапов.</p>}</>}
         </details>
         <div className="iw-send-summary"><span>{method === "source-contract" ? "Для локальной подготовки" : "К отправке"}: {formatRussianCount(selectedSources.length, ["источник", "источника", "источников"])} · {formatRussianCount(sourceCharacters, ["символ", "символа", "символов"])}</span>{method !== "source-contract" && (profile.scope !== "local" ? <div className="iw-disclosure" role="note"><strong>При подготовке с ИИ тексты будут переданы {profile.scope === "external" ? "внешнему сервису" : "сервису в локальной сети"}:</strong><code>{profile.endpoint || "Адрес не указан"}</code></div> : <details><summary>Параметры запроса ИИ</summary><code>{profile.endpoint || "Адрес не указан"}</code><span>Формат: {profile.outputMode === "schema" ? "по схеме карточек" : "обычный JSON"}</span></details>)}</div>
         {taskDestinations.includes("procurement") && <p className="help-text">В карточках закупок сертификаты и документы заявки автоматически дополнят результат из выбранных источников с сохранением чисел и оговорок. Неоднозначная принадлежность к карточке или лоту останется на проверке.</p>}
         <fieldset className="iw-destinations" disabled={running || preparingResponse || extracting}><legend>Способ подготовки — выберите до запуска</legend>
           <label><input type="radio" name="iw-preparation-method" aria-label="Подготовка с ИИ" checked={method === "model"} onChange={() => setPreparationMethod("model")} />С помощью ИИ — {profile.model || "модель не выбрана"}</label>
-          {localMethodAvailable && <label><input type="radio" name="iw-preparation-method" aria-label="Полный черновик КП по семи областям" checked={method === "whole-proposal"} disabled={!wholeProposalAvailable} onChange={() => setPreparationMethod("whole-proposal")} />ИИ: полный черновик КП по семи областям</label>}
+          {taskDestinations.length === 1 && taskDestinations[0] === "proposals" && <label><input type="radio" name="iw-preparation-method" aria-label="Полный КП по исходным фактам" checked={method === "whole-proposal"} disabled={!wholeProposalAvailable} onChange={() => setPreparationMethod("whole-proposal")} />ИИ: полный КП по исходным фактам</label>}
           {localMethodAvailable && <label><input type="radio" name="iw-preparation-method" aria-label="Локальная подготовка по полному договору" checked={method === "source-contract"} onChange={() => setPreparationMethod("source-contract")} />Локально по полному договору — без модели</label>}
         </fieldset>
-        {localMethodAvailable && !wholeProposalAvailable && <p className="help-text">Полный черновик по семи областям доступен для одного полностью прочитанного DOCX с исходной структурой. Текстовые вставки и другие форматы пока используют прежний разбор.</p>}
-        {(method === "model" || method === "whole-proposal") && !profile.model.trim() && <div className="notice warning">Для способа «С помощью ИИ» сначала выберите модель. Подготовка не запущена.<button type="button" className="secondary" onClick={() => { setConnectionOpen(true); setModelFocusRequest((value) => value + 1); }}>Настроить модель для ИИ</button></div>}
+        {taskDestinations.includes("proposals") && !wholeProposalAvailable && <p className="help-text">Для полного КП добавьте полностью извлечённые материалы. Страницы без текста сначала обработайте в сканере с OCR.</p>}
+        {(method === "model" || method === "whole-proposal") && modelIssue && <div className="notice warning">{modelName ? modelIssue : "Для способа «С помощью ИИ» сначала выберите модель. Подготовка не запущена."}<button type="button" className="secondary" onClick={() => { setConnectionOpen(true); setModelFocusRequest((value) => value + 1); }}>Настроить модель для ИИ</button></div>}
         {method === "source-contract" && <p className="help-text">Это отдельный локальный способ для единственного полного договора. Используется весь его состав; уточнение задания и ответ модели не применяются. Цена и спорные условия останутся на проверке. Прежний ответ модели не изменится.</p>}
-        <div className="iw-actions"><button type="button" className="primary" disabled={running || preparingResponse || extracting || !selectedSources.length || !taskDestinations.length || !method || method !== "source-contract" && !profile.model.trim()} onClick={focusBeforeConfirmation(requestPreparation)}>{preparingResponse ? "Дополняем результат из источников…" : running ? "Модель готовит ответ…" : !taskDestinations.length ? "Выберите результат" : !method ? "Выберите способ подготовки" : method === "source-contract" ? "Подготовить по договору без модели" : method === "whole-proposal" ? "Подготовить полный черновик КП" : taskDestinations.length === 1 ? preparationLabels[taskDestinations[0]] : "Подготовить результаты"}</button>{running && !preparingResponse && <button type="button" className="secondary" onClick={() => { cancelPending(); setNotice("Запрос отменён. Поздний ответ не будет добавлен."); }}>Остановить запрос</button>}</div>
-        {wholeProposal && <section className="notice" aria-label="Черновик КП по семи областям"><h4>Черновик КП по семи областям</h4><p>Это отдельный неподтверждённый результат. Прежние карточки не изменены. {wholeProposal.root !== workspaceRoot || wholeProposal.epoch !== epoch.current ? "Показан предыдущий снимок задачи." : ""}</p><button type="button" className="secondary" onClick={() => setWholeProposalOpen(value => !value)}>{wholeProposalOpen ? "Свернуть редактор черновика" : "Открыть редактор черновика"}</button></section>}
+        <div className="iw-actions"><button type="button" className="primary" disabled={running || preparingResponse || extracting || !selectedSources.length || !taskDestinations.length || !method || method !== "source-contract" && (Boolean(modelIssue) || connectionBusy)} onClick={focusBeforeConfirmation(requestPreparation)}>{preparingResponse ? "Дополняем результат из источников…" : running ? "Модель готовит ответ…" : !taskDestinations.length ? "Выберите результат" : !method ? "Выберите способ подготовки" : method === "source-contract" ? "Подготовить по договору без модели" : method === "whole-proposal" ? "Подготовить полный черновик КП" : taskDestinations.length === 1 ? preparationLabels[taskDestinations[0]] : "Подготовить результаты"}</button>{running && !preparingResponse && <button type="button" className="secondary" onClick={() => { cancelPending(); setNotice("Запрос отменён. Поздний ответ не будет добавлен."); }}>Остановить запрос</button>}</div>
+        {wholeProposal && <section className="notice" aria-label="Рабочее КП по исходным фактам"><h4>Рабочее КП по исходным фактам</h4><p>Подготовленные факты открыты в обычном рабочем редакторе. Сохранение выполняется в нём. {wholeProposal.root !== workspaceRoot || wholeProposal.epoch !== epoch.current ? "Показан предыдущий снимок задачи." : ""}</p><button type="button" className="secondary" onClick={() => setWholeProposalOpen(value => !value)}>{wholeProposalOpen ? "Свернуть редактор черновика" : "Открыть редактор черновика"}</button></section>}
         {wholeRunFailure && <details className="notice warning" aria-label="Незавершённый полный черновик"><summary>Неуспешный полный проход №{wholeRunFailure.runId} · полученные ответы ({wholeRunFailure.error.capturedParts.length})</summary><p>Сохранена диагностика первого незавершённого прохода. Новая попытка её не заменяет. {wholeRunFailure.error.message} Ответы сохранены без изменения; они не являются готовым КП. Завершение работы провайдера отдельно не подтверждено.</p>{wholeRunFailure.error.coverage && <p>Запросов начато: {wholeRunFailure.error.coverage.requestsAttempted}. Блоков не обработано: {wholeRunFailure.error.coverage.frames.filter(frame => frame.state === "NOT_PROCESSED").length} из {wholeRunFailure.error.coverage.frames.length}. Прохождение проверки структуры не подтверждает точность содержания.</p>}{wholeRunFailure.error.capturedParts.map(part => <details key={part.requestId}><summary>{part.blockId} · {part.kind === "extraction" ? "извлечение" : "проверка"}</summary><pre>{part.raw}</pre></details>)}<button type="button" className="secondary" onClick={() => { wholeRunFailureRef.current = null; setWholeRunFailure(null); }}>Убрать сохранённую диагностику</button></details>}
         {items.some((item) => item.destination === "proposals") && <section ref={preparedResultRef} tabIndex={-1} className="notice iw-prepared-proposals" aria-label="Подготовленные КП — следующий шаг"><h4>Проект подготовлен — проверьте и откройте</h4><p>{sourcePreparation?.origin === "source-contract" ? "Локальный проект по договору, без модели." : "Это подготовленный черновик, не подтверждение успешного извлечения ИИ или готовности к отправке."}{resultStale ? " Показан предыдущий результат; материалы или задание изменены." : ""} Цена, полнота и спорные условия требуют проверки в редакторе.</p>{items.filter((item) => item.destination === "proposals").map((item) => <div key={item.id} data-prepared-item-id={item.id}><strong>{proposalDisplayTitle(item)}</strong><div className="iw-actions">{openActions(item)}<a href={`#iw-result-${item.id}`}>Посмотреть замечания и состав</a></div></div>)}</section>}
         {running && !preparingResponse && analysisProgress && <p className="help-text" role="status">Этап {analysisProgress.index} из {analysisProgress.total}: {analysisProgress.label}</p>}
-        {(analysisMode === "by-destination" || analysisParts.some(part => part.batchId)) && analysisParts.length > 0 && !(wholeRunFailure?.runId === wholeRunSequence.current && analysisParts.some(part => part.batchId?.startsWith("whole:"))) && <details className="iw-analysis-parts" open={analysisPartsOpen} onToggle={event => setAnalysisPartsOpen(event.currentTarget.open)}><summary>{analysisParts.some(part => part.batchId?.startsWith("whole:")) ? "Ответы полного черновика" : analysisParts.some(part => part.batchId) ? "Исходные ответы выбора цитат" : "Ответы по этапам"} ({analysisParts.length})</summary>{analysisPartsOpen && <><p className="help-text">Диагностика отдельных запросов. Частичный результат не заменяет карточки. {analysisParts.some(part => part.batchId?.startsWith("whole:")) ? "Отдельные ответы извлечения и проверки семи областей. Они не преобразуются в items и не переписывают поле ручной вставки ниже." : analysisParts.some(part => part.batchId) ? "Это отдельная схема выбора цитат: ответы не преобразуются в выдуманный ответ items и не переписывают поле ручной вставки ниже." : "Поле готового ответа ниже содержит только полностью завершённый результат."}</p>{analysisParts.map((part, index) => <details key={part.batchId || index}><summary>{index + 1}. {part.destinations.map((destination) => destinationLabels[destination]).join(" · ")} · {part.model}</summary><pre>{part.text}</pre></details>)}</>}</details>}
+        {(analysisMode === "by-destination" || analysisParts.some(part => part.batchId)) && analysisParts.length > 0 && !(wholeRunFailure?.runId === wholeRunSequence.current && analysisParts.some(part => part.batchId?.startsWith("whole:"))) && <details className="iw-analysis-parts" open={analysisPartsOpen} onToggle={event => setAnalysisPartsOpen(event.currentTarget.open)}><summary>{analysisParts.some(part => part.batchId?.startsWith("whole:")) ? "Ответы полного черновика" : analysisParts.some(part => part.batchId) ? "Исходные ответы выбора цитат" : "Ответы по этапам"} ({analysisParts.length})</summary>{analysisPartsOpen && <><p className="help-text">Диагностика отдельных запросов. Частичный результат не заменяет карточки. {analysisParts.some(part => part.batchId?.startsWith("whole:")) ? "Исходные и проверочные факты по всем единицам. Диагностика не заменяет рабочий КП и не подставляет сведения из источника в ответы." : analysisParts.some(part => part.batchId) ? "Это отдельная схема выбора цитат: ответы не преобразуются в выдуманный ответ items и не переписывают поле ручной вставки ниже." : "Поле готового ответа ниже содержит только полностью завершённый результат."}</p>{analysisParts.map((part, index) => <details key={part.batchId || index}><summary>{index + 1}. {part.destinations.map((destination) => destinationLabels[destination]).join(" · ")} · {part.model}</summary><pre>{part.text}</pre></details>)}</>}</details>}
         {responseDetails && <details className="iw-response-technical">
           <summary>Последний ответ · технические подробности</summary>
           <div className="iw-response-metrics"><strong>Последний ответ: {responseDetails.model}</strong>
@@ -982,8 +1048,9 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
         <details className="iw-raw-response" open={Boolean(emptyWarning) || rawResponseOpen} onToggle={(event) => setRawResponseOpen(event.currentTarget.open)}><summary>{method === "whole-proposal" ? "Ручной JSON items — отдельный прежний формат" : "Ответ модели / вставить готовый ответ"}</summary><p className="help-text">{method === "whole-proposal" ? "Это не формат полного черновика по семи областям. Его ответы доступны отдельно по блокам; ручной items не используется для их восстановления. Для прежнего ручного разбора выберите другой способ подготовки." : "Можно использовать ответ другой модели. Нужен JSON с массивом items. Формат и названия полей включены в текст запроса."}</p><textarea id="iw-response" rows={8} maxLength={maxTextBytes} value={rawResponse} placeholder={'{"items": [{"destination": "procurement", "title": "Закупка", "fields": {"name": "…"}}]}'} onChange={(event) => { if (bytes(event.target.value) > maxTextBytes) { setError("Ответ не должен превышать 2 МБ."); return; } cancelPending(); setRawResponse(event.target.value); setResultStale(true); setEmptyWarning(""); setResponseDetails(null); }} /><div className="iw-actions"><button type="button" className="secondary" disabled={method === "whole-proposal" || preparingResponse || !rawResponse.trim() || !taskDestinations.length} onClick={focusBeforeConfirmation(requestParse)}>Разобрать ответ</button><button type="button" className="secondary" disabled={method === "whole-proposal" || !taskDestinations.length} onClick={() => void copyPrompt()}>Скопировать запрос для другой модели</button></div></details>
       </section>
     </div>
-    {wholeProposal && <ProposalWholeWorkingRoute key={wholeProposal.id} handoff={wholeProposal.handoff} root={workspaceRoot}
-      taskKey={`whole:${wholeProposal.id}`} open={wholeProposalOpen} stale={wholeProposal.root !== workspaceRoot || wholeProposal.epoch !== epoch.current} onClose={() => setWholeProposalOpen(false)} />}
+    {wholeProposal && <section hidden={!wholeProposalOpen} aria-label="Работа с полным КП"><ProposalWorkingHost key={wholeProposal.id}
+      seed={{ ...wholeProposal.seed, sessionKey: wholeProposal.id }} root={workspaceRoot} taskKey={`facts:${wholeProposal.id}`}
+      stale={running || wholeProposal.root !== workspaceRoot || wholeProposal.epoch !== epoch.current} onClose={() => setWholeProposalOpen(false)} /></section>}
     <section className="surface iw-results"><div className="iw-section-heading"><span className="iw-step">3</span><div><h3>Проверка и распределение</h3><p>Отметьте нужные поля. Кнопка откроет новый черновик; сохранение выполняется в самой карточке.</p></div></div>
       {preparingResponse && <div className="iw-audit-progress" role="status"><span className="iw-spinner" aria-hidden="true" />Подготавливаем результат и проверяем исходные материалы…<button type="button" className="secondary" onClick={() => { cancelPending(); setNotice("Локальный разбор отменён. Предыдущие карточки сохранены; поздний результат не будет добавлен."); }}>Остановить разбор</button></div>}
       {sourcePreparation?.origin === "source-contract" && <p className="notice" role="status">Локальный проект по тексту договора. Модель в его подготовке не использовалась; её прежний ответ, если был, оставлен в технических подробностях. Это не подтверждение готовности документа к отправке.</p>}
@@ -1064,6 +1131,7 @@ export function IntelligenceWorkbench({ active = true, workspaceRoot, onTransfer
       })}</div> : <div className="iw-empty">Результаты появятся после анализа или разбора вставленного ответа. Также можно подготовить карточку вручную.</div>}
     </section>
     <p className="help-text iw-session-note">Материалы этой задачи сохраняются при переходе между инструментами, но остаются только в памяти до закрытия программы или смены рабочей папки.</p>
+    </div>
     {confirm && <div {...localAttributes}><ConfirmDialog title={confirm.title} message={confirm.message} confirmLabel={confirm.label || "Удалить"} onConfirm={confirm.run} onClose={() => setConfirm(null)} /></div>}
   </div>;
 }

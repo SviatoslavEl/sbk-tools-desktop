@@ -14,7 +14,7 @@ export interface WorkingProposalMetadata {
 export interface WorkingProposalLayout { style: 'standard' | 'compact'; accentColor: string }
 export interface WorkingProposalBlock {
   readonly id: string; readonly frameId: string; readonly frameIndex: number;
-  text: string; origin: 'historical-model-answer' | 'user-edit-unreviewed'; included: boolean;
+  text: string; origin: 'historical-model-answer' | 'formatted-model-facts' | 'user-edit-unreviewed'; included: boolean;
 }
 export interface WorkingProposalSection {
   readonly area: ProposalArea; title: string; blocks: WorkingProposalBlock[]; userText: string; userTextIncluded: boolean;
@@ -30,7 +30,7 @@ export interface WorkingProposalHistoryReference {
 /** Ordinary historical data, NEVER an issued plan/draft, semantic approval or a
  * storage CAS. A reopened document needs a NEW explicit human-review intent. */
 export interface WorkingProposalDocument {
-  readonly kind: 'proposal-working-document'; readonly schemaVersion: 1; readonly id: string;
+  readonly kind: 'proposal-working-document'; readonly schemaVersion: 1 | 2; readonly id: string;
   readonly revision: number; title: string; metadata: WorkingProposalMetadata; layout: WorkingProposalLayout;
   sections: WorkingProposalSection[]; questions: WorkingProposalQuestion[]; readonly historicalSource: WorkingProposalHistoryReference;
 }
@@ -78,7 +78,7 @@ const documentKeys = ['kind', 'schemaVersion', 'id', 'revision', 'title', 'metad
 
 export function validateWorkingProposalDocument(value: unknown): asserts value is WorkingProposalDocument {
   object(value, documentKeys);
-  if (value.kind !== 'proposal-working-document' || value.schemaVersion !== 1 || typeof value.id !== 'string' || !uuidPattern.test(value.id)
+  if (value.kind !== 'proposal-working-document' || ![1, 2].includes(value.schemaVersion as number) || typeof value.id !== 'string' || !uuidPattern.test(value.id)
     || !Number.isSafeInteger(value.revision) || (value.revision as number) < 0) fail('Неизвестная версия, ID или редакция рабочего КП.');
   text(value.title, WORKING_PROPOSAL_LIMITS.titleCharacters);
   object(value.metadata, metadataKeys); nullableText(value.metadata.number, 200); date(value.metadata.documentDate); date(value.metadata.validUntil);
@@ -99,7 +99,7 @@ export function validateWorkingProposalDocument(value: unknown): asserts value i
       object(block, ['id', 'frameId', 'frameIndex', 'text', 'origin', 'included']); id(block.id); id(block.frameId);
       if (blockIds.has(block.id)) fail('Повторный ID блока рабочего КП.'); blockIds.add(block.id);
       if (!Number.isSafeInteger(block.frameIndex) || (block.frameIndex as number) < 0 || (block.frameIndex as number) >= 64
-        || typeof block.origin !== 'string' || !['historical-model-answer', 'user-edit-unreviewed'].includes(block.origin) || typeof block.included !== 'boolean') fail('Неверное историческое происхождение или выбор блока.');
+        || typeof block.origin !== 'string' || !(value.schemaVersion === 1 ? ['historical-model-answer', 'user-edit-unreviewed'] : ['formatted-model-facts', 'user-edit-unreviewed']).includes(block.origin) || typeof block.included !== 'boolean') fail('Неверное историческое происхождение или выбор блока.');
       text(block.text, WORKING_PROPOSAL_LIMITS.textCharacters);
     });
   });
@@ -121,7 +121,7 @@ export function validateWorkingProposalDocument(value: unknown): asserts value i
 /** One canonical explicit field order for persistence hashes, not the original
  * JSON escape spelling. Decoded LF/CR/Unicode/null and array order stay exact. */
 function canonical(document: WorkingProposalDocument): WorkingProposalDocument {
-  return { kind: 'proposal-working-document', schemaVersion: 1, id: document.id, revision: document.revision, title: document.title,
+  return { kind: 'proposal-working-document', schemaVersion: document.schemaVersion, id: document.id, revision: document.revision, title: document.title,
     metadata: { number: document.metadata.number, documentDate: document.metadata.documentDate, validUntil: document.metadata.validUntil,
       currency: document.metadata.currency, issuerName: document.metadata.issuerName, recipientName: document.metadata.recipientName },
     layout: { style: document.layout.style, accentColor: document.layout.accentColor },
@@ -227,7 +227,9 @@ export async function inspectWorkingProposalHistory(document: WorkingProposalDoc
     const history: unknown = parseUniqueJson(historyJson);
     object(history, ['version', 'purpose', 'planKey', 'sourceSnapshotKey', 'structureSnapshotKey', 'sourceSnapshot', 'owners', 'sections', 'clarificationQuestions',
       'unvalidatedDetails', 'audit', 'runCoverage', 'approvedContent', 'readyForClient', 'humanApproval', 'semanticTruth', 'completeness', 'providerAuthenticity']);
-    if (history.version !== 1 || history.purpose !== 'unapproved-model-whole-proposal-draft' || history.planKey !== document.historicalSource.planKey
+    const knownEnvelope = history.version === 1 && history.purpose === 'unapproved-model-whole-proposal-draft'
+      || history.version === 2 && history.purpose === 'unapproved-model-fact-proposal-draft';
+    if (!knownEnvelope || history.planKey !== document.historicalSource.planKey
       || history.sourceSnapshotKey !== document.historicalSource.sourceSnapshotKey || history.structureSnapshotKey !== document.historicalSource.structureSnapshotKey
       || history.readyForClient !== false || history.humanApproval !== false || history.semanticTruth !== 'not-proven' || history.completeness !== 'not-assessed'
       || history.providerAuthenticity !== 'not-attested' || !Array.isArray(history.approvedContent) || history.approvedContent.length) fail('Неверная историческая оболочка.');

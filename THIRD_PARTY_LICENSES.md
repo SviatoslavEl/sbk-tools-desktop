@@ -13,6 +13,7 @@
 | Python | runtime worker | Python Software Foundation License |
 | NumPy | обработка изображений | BSD-3-Clause |
 | Pillow | обработка изображений | HPND |
+| [pi-heif](https://pypi.org/project/pi-heif/1.4.0/) с libheif и libde265 | локальное чтение фото HEIC/HEIF | BSD-3-Clause / LGPL-3.0, полные notices входят в `heif-licenses` |
 | pypdf | операции с PDF | BSD-3-Clause |
 | pypdfium2 / PDFium | рендеринг PDF | Apache-2.0 / BSD-3-Clause и notices Chromium/PDFium |
 | python-docx | чтение DOCX | MIT |

@@ -75,7 +75,7 @@ jobs:
   build:
     needs: quality-gate
     env:
-      ARTIFACT_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('3.0.1-test.{0}', github.run_number) }}
+      ARTIFACT_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('3.0.2-test.{0}', github.run_number) }}
     strategy:
       fail-fast: false
       matrix:
@@ -354,12 +354,6 @@ jobs:
           path: |
             release-artifacts/*.zip
             release-artifacts/*.sha256
-      - name: Attach portable macOS app to release
-        if: runner.os == 'macOS' && startsWith(github.ref, 'refs/tags/v') && steps.apple_credentials.outputs.available == 'true'
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload '${{ github.ref_name }}' release-artifacts/*.zip --clobber
       - name: Build one-file Windows portable launcher
         if: runner.os == 'Windows'
         shell: pwsh
@@ -507,7 +501,7 @@ jobs:
     runs-on: windows-latest
     env:
       TARGET: x86_64-pc-windows-msvc
-      ARTIFACT_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('3.0.1-test.{0}', github.run_number) }}
+      ARTIFACT_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('3.0.2-test.{0}', github.run_number) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
@@ -1006,3 +1000,44 @@ jobs:
           path: |
             release-artifacts/SBK-Tools-Fast-Setup-*-x64.exe
             release-artifacts/SBK-Tools-Fast-Setup-*-x64.exe.sha256
+
+  draft-release:
+    name: Prepare GitHub release draft
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build, build-installed-windows]
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Attach verified macOS and Windows downloads
+        shell: bash
+        run: |
+          gh run download "$GITHUB_RUN_ID" --name SBK-Tools-aarch64-apple-darwin-App --dir release-files
+          gh run download "$GITHUB_RUN_ID" --name SBK-Tools-Windows-x64-Installed --dir release-files
+          pushd release-files
+          shopt -s nullglob
+          mac=("SBK-Tools-${RELEASE_TAG}-aarch64-apple-darwin"*.app.zip)
+          windows="SBK-Tools-Fast-Setup-${RELEASE_TAG#v}-x64.exe"
+          [[ ${#mac[@]} -eq 1 && -s "$windows" && -s "${mac[0]}" ]]
+          for artifact in "${mac[0]}" "$windows"; do
+            read -r hash _ < "$artifact.sha256"
+            printf '%s  %s\n' "$hash" "$artifact" | sha256sum --strict --check
+            printf '%s  %s\n' "$hash" "$artifact" > "$artifact.sha256"
+          done
+          popd
+          if ! gh release view "$RELEASE_TAG" --json isDraft > "$RUNNER_TEMP/release-status.json"; then
+            notes="docs/releases/$RELEASE_TAG.md"
+            if [[ -f "$notes" ]]; then
+              gh release create "$RELEASE_TAG" --verify-tag --draft --title "СБК Инструменты $RELEASE_TAG" --notes-file "$notes"
+            else
+              gh release create "$RELEASE_TAG" --verify-tag --draft --title "СБК Инструменты $RELEASE_TAG" --generate-notes
+            fi
+          else
+            jq -e '.isDraft == true' "$RUNNER_TEMP/release-status.json" > /dev/null
+          fi
+          gh release upload "$RELEASE_TAG" \
+            "release-files/${mac[0]}" "release-files/${mac[0]}.sha256" \
+            "release-files/$windows" "release-files/$windows.sha256" --clobber
+          gh release view "$RELEASE_TAG" --json url,isDraft,assets >> "$GITHUB_STEP_SUMMARY"

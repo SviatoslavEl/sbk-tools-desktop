@@ -1,0 +1,57 @@
+{
+  "starter-company-sbk": {
+    "accent": "#007F64", "logo": "sbk-logo.png", "coverArt": "sbk-ribbon.png",
+    "cover": "ribbon", "paper": "portrait", "pricing": "green",
+    "pagination": "appendices", "titleAlign": "left"
+  },
+  "starter-company-fbk": {
+    "accent": "#52287B", "logo": "fbk-logo.png", "footer": "rule",
+    "paper": "portrait", "pricing": "outlined",
+    "pagination": "specification", "titleAlign": "center"
+  },
+  "starter-company-teslatel": {
+    "accent": "#2145A0", "logo": "teslatel-logo.png",
+    "paper": "portrait", "pricing": "gray",
+    "pagination": "continuous", "titleAlign": "center"
+  },
+  "starter-company-strive": {
+    "accent": "#007E77", "logo": "strive-logo.png", "footer": "band", "footerArt": "strive-band.png",
+    "paper": "portrait", "pricing": "plain",
+    "pagination": "specification", "titleAlign": "left"
+  },
+  "starter-sbk-assessment": {
+    "accent": "#007F64", "logo": "sbk-logo.png", "coverArt": "sbk-ribbon.png",
+    "cover": "ribbon", "paper": "portrait", "pricing": "green",
+    "pagination": "specification", "titleAlign": "left"
+  },
+  "starter-sbk-software": {
+    "accent": "#007F64", "logo": "sbk-logo.png", "coverArt": "sbk-ribbon.png",
+    "cover": "ribbon", "paper": "portrait", "pricing": "green",
+    "pagination": "appendices", "titleAlign": "left"
+  },
+  "starter-fbk-quality": {
+    "accent": "#52287B", "logo": "fbk-logo.png", "coverArt": "fbk-cover.png",
+    "cover": "illustrated", "paper": "landscape", "pricing": "purple",
+    "pagination": "slides", "titleAlign": "left"
+  },
+  "starter-fbk-consulting": {
+    "accent": "#52287B", "logo": "fbk-logo.png", "footer": "rule",
+    "paper": "portrait", "pricing": "outlined",
+    "pagination": "specification", "titleAlign": "center"
+  },
+  "starter-teslatel-firewall": {
+    "accent": "#2145A0", "logo": "teslatel-logo.png",
+    "paper": "portrait", "pricing": "gray",
+    "pagination": "continuous", "titleAlign": "center"
+  },
+  "starter-teslatel-server": {
+    "accent": "#266FAC",
+    "paper": "portrait", "pricing": "blue",
+    "pagination": "continuous", "titleAlign": "center"
+  },
+  "starter-strive-development": {
+    "accent": "#007E77", "logo": "strive-logo.png", "footer": "band", "footerArt": "strive-band.png",
+    "paper": "portrait", "pricing": "plain",
+    "pagination": "specification", "titleAlign": "left"
+  }
+}

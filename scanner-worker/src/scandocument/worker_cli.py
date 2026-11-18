@@ -295,6 +295,24 @@ def preview(config: dict) -> int:
     return 0
 
 
+def convert(config: dict) -> int:
+    from scandocument.file_conversion import convert_file
+
+    validate_protocol(config)
+
+    def report_progress(done: int, total: int) -> None:
+        emit({"type": "progress", "stage": "Конвертация файлов", "currentPage": done,
+              "totalPages": total, "percent": round(95 * done / max(1, total))})
+
+    paths, warnings = convert_file(
+        Path(config["inputPath"]), Path(config["outputDirectory"]), config["outputFormat"],
+        config.get("dpi", 150), Path(config["previewCacheDir"]) if config.get("previewCacheDir") else None,
+        report_progress,
+    )
+    emit({"type": "complete", "protocolVersion": 2, "outputPaths": [str(path) for path in paths], "warnings": warnings})
+    return 0
+
+
 def prepare_preview(config: dict) -> int:
     """Prepare a bounded neighbourhood; interactive navigation can cancel this job."""
     validate_protocol(config)
@@ -474,7 +492,7 @@ def main() -> int:
     cleanup_stale_onefile_dirs()
     SecureWorkspace.cleanup_stale()
     parser = argparse.ArgumentParser(prog="sbk-scanner-worker")
-    parser.add_argument("command", choices=("preview", "preparePreview", "process", "merge", "extract", "info", "proposal"))
+    parser.add_argument("command", choices=("preview", "preparePreview", "process", "merge", "convert", "extract", "info", "proposal"))
     parser.add_argument("--config")
     args = parser.parse_args()
     try:
@@ -497,6 +515,8 @@ def main() -> int:
             return preview(config)
         if args.command == "preparePreview":
             return prepare_preview(config)
+        if args.command == "convert":
+            return convert(config)
         return merge(config) if args.command == "merge" else process(config)
     except Exception as error:
         emit({"type": "error", "message": str(error), "class": type(error).__name__})

@@ -44,8 +44,8 @@ mod intelligence_transport;
 mod network_diagnostics;
 #[cfg(test)]
 mod network_transition_regression_tests;
-mod proposals;
 mod proposal_working;
+mod proposals;
 mod publication;
 mod scanner_outputs;
 mod scanner_previews;
@@ -4749,6 +4749,16 @@ fn validate_scanner_result(operation: &str, event: &Value) -> Result<(), String>
     if event.get("protocolVersion").and_then(Value::as_i64) != Some(2) {
         return Err("Worker вернул несовместимую версию протокола".to_string());
     }
+    if operation == "convert" {
+        return event
+            .get("outputPaths")
+            .and_then(Value::as_array)
+            .filter(|paths| {
+                (1..=5_000).contains(&paths.len()) && paths.iter().all(Value::is_string)
+            })
+            .map(|_| ())
+            .ok_or_else(|| "Worker не вернул список файлов после конвертации".to_string());
+    }
     if operation == "preparePreview" {
         let previews = event
             .get("previews")
@@ -4882,6 +4892,7 @@ fn run_scanner_worker(
         && operation != "preparePreview"
         && operation != "process"
         && operation != "merge"
+        && operation != "convert"
         && operation != "extract"
     {
         return Err("Неизвестная операция сканера".to_string());
@@ -4979,7 +4990,7 @@ fn run_scanner_worker(
         .remove("previewCacheDir");
     if matches!(
         operation.as_str(),
-        "preview" | "preparePreview" | "process" | "merge"
+        "preview" | "preparePreview" | "process" | "merge" | "convert"
     ) {
         let source_cache = workspace.runtime_root().join("scanner-source-cache");
         fs::create_dir_all(&source_cache).map_err(|error| error.to_string())?;
@@ -5301,6 +5312,29 @@ async fn scanner_run(
 ) -> Result<Value, String> {
     let permit = network_diagnostics::enter_operation()?;
     let workspace = state.active_workspace()?;
+    let conversion_request = if operation == "convert" {
+        let directory = config
+            .get("outputDirectory")
+            .and_then(Value::as_str)
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .ok_or("Выберите папку для конвертации.")?;
+        let format = config
+            .get("outputFormat")
+            .and_then(Value::as_str)
+            .filter(|format| matches!(*format, "pdf" | "jpeg" | "png"))
+            .ok_or("Выберите формат конвертации.")?
+            .to_owned();
+        let input = config
+            .get("inputPath")
+            .and_then(Value::as_str)
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .ok_or("Выберите исходный файл.")?;
+        Some((directory, format, input))
+    } else {
+        None
+    };
     let jobs = state.scanner_jobs.clone();
     Uuid::parse_str(&job_id).map_err(|_| "Некорректный идентификатор задачи".to_string())?;
     let cancellation = Arc::new(AtomicBool::new(false));
@@ -5352,6 +5386,17 @@ async fn scanner_run(
                 .and_then(Value::as_str)
                 .ok_or("Не удалось подтвердить путь созданного PDF.")?;
             outputs.register(&requested, Path::new(produced))?;
+        }
+        if let Some((directory, format, input)) = conversion_request {
+            let paths = result["outputPaths"]
+                .as_array()
+                .ok_or("Не найдены результаты конвертации.")?;
+            outputs.register_conversion(
+                &directory,
+                &input,
+                &format,
+                paths.iter().filter_map(Value::as_str).map(Path::new),
+            )?;
         }
         Ok(result)
     })
@@ -5552,6 +5597,7 @@ pub fn run() {
                     validate_intelligence_configuration,
                     intelligence_transport::test_intelligence_connection,
                     intelligence_transport::run_intelligence_analysis,
+                    intelligence_transport::run_contract_fact_analysis,
                     intelligence_transport::cancel_intelligence_request,
                     analysis_job_list,
                     analysis_job_cancel,

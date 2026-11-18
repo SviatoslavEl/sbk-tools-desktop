@@ -5,6 +5,7 @@ import {
   serializeWorkingProposalDocument, type WorkingProposalDocument, type WorkingProposalPublicDocument,
 } from './workingDocument';
 import './working-proposal.css';
+import { ContractFactBlockReview, ContractFactUncertainties, readContractFactSourceContext, type ContractFactSourceContext } from './ContractFactSourceContext';
 
 export interface ProposalWorkingContext {
   workspaceRoot: string;
@@ -53,6 +54,7 @@ export interface ProposalWorkingServices {
 }
 export interface ProposalWorkingWorkspaceProps {
   initialDocument: WorkingProposalDocument;
+  initialHistoryJson?: string;
   initialStorageToken?: string | null;
   initialRecovery?: ProposalWorkingRecovery;
   sessionKey: string;
@@ -91,6 +93,18 @@ export function ProposalWorkingWorkspace(props: ProposalWorkingWorkspaceProps) {
   const [summaries, setSummaries] = useState<readonly ProposalWorkingSummary[] | null>(null);
   const [preview, setPreview] = useState<Preview | null>(null), [approval, setApproval] = useState<{ intent: ReviewIntent; serialized: string; snapshot: WorkingProposalDocument } | null>(null);
   const [reviewChecked, setReviewChecked] = useState(false), [history, setHistory] = useState<string | null>(null);
+  const contextCache = useRef<{ json: string | null; reference: string; value: ContractFactSourceContext | null }>({ json: null, reference: '', value: null });
+  if (contextCache.current.json !== history || contextCache.current.reference !== document.historicalSource.sha256) contextCache.current = {
+    json: history, reference: document.historicalSource.sha256, value: readContractFactSourceContext(history, document.historicalSource),
+  };
+  useEffect(() => {
+    let alive = true;
+    if (props.initialHistoryJson) void inspectWorkingProposalHistory(props.initialDocument, props.initialHistoryJson).then(status => {
+      if (alive && mounted.current && current.current.sessionKey === props.sessionKey && documentRef.current.id === props.initialDocument.id
+        && documentRef.current.historicalSource.sha256 === props.initialDocument.historicalSource.sha256 && status.state === 'available-unvalidated') setHistory(props.initialHistoryJson!);
+    }).catch(() => { /* Keep ordinary draft; unavailable private history is not a content gap. */ });
+    return () => { alive = false; };
+  }, [props.initialHistoryJson, props.sessionKey, props.initialDocument.historicalSource.sha256]);
   const [recoveryStatus, setRecoveryStatus] = useState<string | null>(null);
   const [confirmation, setConfirmation] = useState<{ kind: 'close' } | { kind: 'open'; summary: ProposalWorkingSummary } | null>(null);
   const view = useRef({ preview, approval, reviewChecked, confirmation, savedSerialized });
@@ -293,7 +307,7 @@ export function ProposalWorkingWorkspace(props: ProposalWorkingWorkspaceProps) {
     <nav className="working-proposal-sections" aria-label="Разделы КП">{document.sections.map(section => <a key={section.area} href={`#${prefix}-${section.area}`}>{section.title}</a>)}</nav>
     {document.sections.map(section => <section className="surface" key={section.area} id={`${prefix}-${section.area}`}><h3>{section.title}</h3>
       {section.blocks.length === 0 && <p className="help-text">Готового текста пока нет. Используйте дополнение и уточнения ниже; отсутствие ответа ИИ не доказывает отсутствие условий в источнике.</p>}
-      {section.blocks.map((block, index) => <details className="working-proposal-block" key={block.id} data-block-id={block.id} open={section.blocks.length === 1}><summary>Блок {index + 1} · {block.included ? 'в документе' : 'не включён'} · {block.origin === 'historical-model-answer' ? 'исходный ответ ИИ' : 'ваша правка'}</summary>
+      {section.blocks.map((block, index) => <details className="working-proposal-block" key={block.id} data-block-id={block.id} open={section.blocks.length === 1}><summary>Блок {index + 1} · {block.included ? 'в документе' : 'не включён'} · {block.origin === 'historical-model-answer' ? 'исходный ответ ИИ' : block.origin === 'formatted-model-facts' ? 'оформленные факты ИИ' : 'ваша правка'}</summary>
         <div className="working-proposal-actions">{([-1, 1] as const).map(direction => <button type="button" key={direction} aria-label={`Переместить блок ${index + 1} ${direction === -1 ? 'выше' : 'ниже'} — ${section.title}`}
           disabled={!localEditable || index + direction < 0 || index + direction >= section.blocks.length} onClick={() => change(draft => {
             const blocks = draft.sections.find(item => item.area === section.area)!.blocks, at = blocks.findIndex(item => item.id === block.id), next = at + direction;
@@ -301,11 +315,11 @@ export function ProposalWorkingWorkspace(props: ProposalWorkingWorkspaceProps) {
             [blocks[at], blocks[next]] = [blocks[next], blocks[at]];
           })}>{direction === -1 ? 'Выше' : 'Ниже'}</button>)}</div>
         <label className="working-proposal-check"><input type="checkbox" aria-label={`Включить блок ${index + 1} — ${section.title}`} checked={block.included} disabled={!localEditable} onChange={event => change(draft => { draft.sections.find(item => item.area === section.area)!.blocks.find(item => item.id === block.id)!.included = event.target.checked; })} />Включить полный блок в документ</label>
-        <label>Текст блока<textarea aria-label={`Текст блока ${index + 1} — ${section.title}`} rows={6} value={block.text} disabled={!localEditable} onChange={event => change(draft => { const edited = draft.sections.find(item => item.area === section.area)!.blocks.find(item => item.id === block.id)!; edited.text = event.target.value; edited.origin = 'user-edit-unreviewed'; })} /></label><p className="help-text">Правки не наследуют проверку исходного ответа. Полный текст блока остаётся доступен и при снятом флажке.</p></details>)}
+        <label>Текст блока<textarea aria-label={`Текст блока ${index + 1} — ${section.title}`} rows={6} value={block.text} disabled={!localEditable} onChange={event => change(draft => { const edited = draft.sections.find(item => item.area === section.area)!.blocks.find(item => item.id === block.id)!; edited.text = event.target.value; edited.origin = 'user-edit-unreviewed'; })} /></label><p className="help-text">Правки не наследуют проверку исходного ответа. Полный текст блока остаётся доступен и при снятом флажке.</p><ContractFactBlockReview context={contextCache.current.value} block={block} historical={props.context.stale} /></details>)}
       <details className="working-proposal-block"><summary>Ваше дополнение к разделу{section.userText ? ' · заполнено' : ''}</summary><label className="working-proposal-check"><input type="checkbox" aria-label={`Включить дополнение — ${section.title}`} checked={section.userTextIncluded} disabled={!localEditable} onChange={event => change(draft => { draft.sections.find(item => item.area === section.area)!.userTextIncluded = event.target.checked; })} />Включить дополнение в документ</label><textarea aria-label={`Дополнение — ${section.title}`} rows={4} value={section.userText} disabled={!localEditable} onChange={event => change(draft => { draft.sections.find(item => item.area === section.area)!.userText = event.target.value; })} /></details>
       {document.questions.filter(question => question.area === section.area).map(question => <details className="working-proposal-question" key={question.id} data-question-id={question.id}><summary>Уточнение · {question.state === 'resolved' ? 'отмечено решённым' : question.state === 'answered' ? 'есть ответ' : 'требует решения'}</summary><p>{question.question}</p><label>Ваш ответ<textarea aria-label={`Ответ на вопрос — ${question.id}`} rows={3} value={question.answer} disabled={!localEditable} onChange={event => change(draft => { const edited = draft.questions.find(item => item.id === question.id)!; edited.answer = event.target.value; edited.state = event.target.value ? 'answered' : 'open'; })} /></label><label className="working-proposal-check"><input type="checkbox" aria-label={`Вопрос решён — ${question.id}`} checked={question.state === 'resolved'} disabled={!localEditable} onChange={event => change(draft => { const edited = draft.questions.find(item => item.id === question.id)!; edited.state = event.target.checked ? 'resolved' : edited.answer ? 'answered' : 'open'; })} />Отметить решённым</label><p className="help-text">Ответ хранится отдельно. Отметка «решено» не вставляет его в текст КП; необходимые условия добавьте в блок или дополнение самостоятельно.</p></details>)}
     </section>)}
-    <details className="surface"><summary>Исходный контекст · только для вас</summary><p className="help-text">Исторические материалы не являются новой проверкой и не включаются в документ. Отсутствие или ошибка контекста не удаляет ваши правки.</p>{history !== null ? <pre className="working-proposal-history">{history}</pre> : <button type="button" disabled={!props.services.history || Boolean(busy) || unavailable} onClick={() => void loadHistory()}>Загрузить исходный контекст</button>}</details>
+    <details className="surface"><summary>Исходный контекст · только для вас</summary><p className="help-text">Исторические материалы не являются новой проверкой и не включаются в документ. Отсутствие или ошибка контекста не удаляет ваши правки.</p>{history !== null ? <><ContractFactUncertainties context={contextCache.current.value} /><details><summary>Подробные исторические данные</summary><pre className="working-proposal-history">{history}</pre></details></> : <button type="button" disabled={!props.services.history || Boolean(busy) || unavailable} onClick={() => void loadHistory()}>Загрузить исходный контекст</button>}</details>
     {preview && preview.serialized === serialized && <section className="surface working-proposal-preview" aria-label="Предпросмотр документа"><h3>Что будет отправлено заказчику</h3><p className="help-text">В документ попадут только выбранные блоки, дополнения и явные реквизиты. Частный контекст и ответы на уточнения исключены. Проверьте также конфиденциальность самого выбранного текста.</p>
       <div aria-label="Текст будущего файла"><h4 style={{ color: preview.document.layout.accentColor }}>{preview.document.title}</h4><p className="help-text">Оформление: {preview.document.layout.style === 'compact' ? 'компактное' : 'стандартное'}. Ниже — состав и текст будущего документа.</p><dl>{(Object.keys(metadataLabels) as (keyof WorkingProposalDocument['metadata'])[]).map(key => preview.document.metadata[key] === null ? null : <div key={key}><dt>{metadataLabels[key]}</dt><dd>{preview.document.metadata[key]}</dd></div>)}</dl>
       {preview.document.sections.map(section => <section key={section.area}><h4>{section.title}</h4>{section.blocks.map((text, index) => <p className="working-proposal-text" key={index}>{text}</p>)}{section.blocks.length === 0 && <p className="help-text">Текст не выбран.</p>}</section>)}</div>

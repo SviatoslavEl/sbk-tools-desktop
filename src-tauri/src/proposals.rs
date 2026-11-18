@@ -116,8 +116,13 @@ fn tax_schema(value: &Value) -> Result<(), String> {
 }
 const MAX_PUBLIC_BYTES: usize = 8 * 1024 * 1024;
 const WORKING_AREAS: [&str; 7] = [
-    "work-scope", "deliverables", "checked-facets", "price-vat",
-    "payment", "parties-roles", "schedule",
+    "work-scope",
+    "deliverables",
+    "checked-facets",
+    "price-vat",
+    "payment",
+    "parties-roles",
+    "schedule",
 ];
 fn working_nullable<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
     deserializer: D,
@@ -142,49 +147,80 @@ struct WorkingPublicMetadata {
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct WorkingPublicLayout { style: String, accent_color: String }
+struct WorkingPublicLayout {
+    style: String,
+    accent_color: String,
+}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct WorkingPublicSection { area: String, title: String, blocks: Vec<String> }
+struct WorkingPublicSection {
+    area: String,
+    title: String,
+    blocks: Vec<String>,
+}
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct WorkingPublicDocument {
-    kind: String, schema_version: u64, mode: String, title: String,
-    metadata: WorkingPublicMetadata, layout: WorkingPublicLayout,
+    kind: String,
+    schema_version: u64,
+    mode: String,
+    title: String,
+    metadata: WorkingPublicMetadata,
+    layout: WorkingPublicLayout,
     sections: Vec<WorkingPublicSection>,
 }
 fn working_text(value: &str, maximum: usize) -> bool {
     value.chars().take(maximum + 1).count() <= maximum
-        && !value.chars().any(|c| matches!(c as u32, 0..=8 | 11 | 12 | 14..=31 | 127..=159))
+        && !value
+            .chars()
+            .any(|c| matches!(c as u32, 0..=8 | 11 | 12 | 14..=31 | 127..=159))
 }
 fn working_date(value: &Option<String>) -> bool {
     value.as_ref().is_none_or(|text| {
         let bytes = text.as_bytes();
-        bytes.len() == 10 && !text.starts_with("0000")
+        bytes.len() == 10
+            && !text.starts_with("0000")
             && bytes.iter().enumerate().all(|(index, byte)| {
-                if matches!(index, 4 | 7) { *byte == b'-' } else { byte.is_ascii_digit() }
+                if matches!(index, 4 | 7) {
+                    *byte == b'-'
+                } else {
+                    byte.is_ascii_digit()
+                }
             })
             && chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d")
                 .is_ok_and(|date| date.format("%Y-%m-%d").to_string() == *text)
     })
 }
 fn js_trim_empty(value: &str) -> bool {
-    value.chars().all(|c| matches!(c as u32,
+    value.chars().all(|c| {
+        matches!(c as u32,
         0x0009..=0x000d | 0x0020 | 0x00a0 | 0x1680 | 0x2000..=0x200a
-        | 0x2028 | 0x2029 | 0x202f | 0x205f | 0x3000 | 0xfeff))
+        | 0x2028 | 0x2029 | 0x202f | 0x205f | 0x3000 | 0xfeff)
+    })
 }
 fn working_public_fields(document: &WorkingPublicDocument) -> Result<(), String> {
     let metadata = &document.metadata;
-    let optional_text = |value: &Option<String>, maximum| value.as_ref().is_none_or(|text| working_text(text, maximum));
-    if document.kind != "proposal-working-public-document" || document.schema_version != 3
+    let optional_text = |value: &Option<String>, maximum| {
+        value
+            .as_ref()
+            .is_none_or(|text| working_text(text, maximum))
+    };
+    if document.kind != "proposal-working-public-document"
+        || document.schema_version != 3
         || !matches!(document.mode.as_str(), "review-draft" | "final")
         || !working_text(&document.title, 500)
-        || !optional_text(&metadata.number, 200) || !working_date(&metadata.document_date)
-        || !working_date(&metadata.valid_until) || !optional_text(&metadata.currency, 80)
-        || !optional_text(&metadata.issuer_name, 2000) || !optional_text(&metadata.recipient_name, 2000)
+        || !optional_text(&metadata.number, 200)
+        || !working_date(&metadata.document_date)
+        || !working_date(&metadata.valid_until)
+        || !optional_text(&metadata.currency, 80)
+        || !optional_text(&metadata.issuer_name, 2000)
+        || !optional_text(&metadata.recipient_name, 2000)
         || !matches!(document.layout.style.as_str(), "standard" | "compact")
-        || document.layout.accent_color.len() != 7 || !document.layout.accent_color.starts_with('#')
-        || !document.layout.accent_color.as_bytes()[1..].iter().all(u8::is_ascii_hexdigit)
+        || document.layout.accent_color.len() != 7
+        || !document.layout.accent_color.starts_with('#')
+        || !document.layout.accent_color.as_bytes()[1..]
+            .iter()
+            .all(u8::is_ascii_hexdigit)
         || document.sections.len() != WORKING_AREAS.len()
     {
         return Err("Некорректная публичная схема рабочего КП. Неизвестные реквизиты должны оставаться null; частные данные запрещены.".into());
@@ -192,10 +228,17 @@ fn working_public_fields(document: &WorkingPublicDocument) -> Result<(), String>
     let mut total = 0usize;
     let mut has_text = false;
     for (index, section) in document.sections.iter().enumerate() {
-        if section.area != WORKING_AREAS[index] || !working_text(&section.title, 500)
-            || section.blocks.len() > 65 || section.blocks.iter().any(|text| !working_text(text, 20_000))
+        if section.area != WORKING_AREAS[index]
+            || !working_text(&section.title, 500)
+            || section.blocks.len() > 65
+            || section
+                .blocks
+                .iter()
+                .any(|text| !working_text(text, 20_000))
         {
-            return Err("Неверный порядок, текст или число блоков семи разделов рабочего КП".into());
+            return Err(
+                "Неверный порядок, текст или число блоков семи разделов рабочего КП".into(),
+            );
         }
         total += section.blocks.len();
         has_text |= section.blocks.iter().any(|text| !js_trim_empty(text));
@@ -206,15 +249,20 @@ fn working_public_fields(document: &WorkingPublicDocument) -> Result<(), String>
     Ok(())
 }
 fn working_public_schema(document: &Value) -> Result<(), String> {
-    let parsed: WorkingPublicDocument = serde_json::from_value(document.clone())
-        .map_err(|_| "Рабочее КП содержит лишние, отсутствующие или неверно типизированные публичные поля")?;
+    let parsed: WorkingPublicDocument = serde_json::from_value(document.clone()).map_err(
+        |_| "Рабочее КП содержит лишние, отсутствующие или неверно типизированные публичные поля",
+    )?;
     working_public_fields(&parsed)
 }
 fn lowercase_sha256(value: &str) -> bool {
-    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 fn parse_working_public(raw: &str, submitted_sha256: &str) -> Result<Value, String> {
-    if raw.len() > MAX_PUBLIC_BYTES || !lowercase_sha256(submitted_sha256)
+    if raw.len() > MAX_PUBLIC_BYTES
+        || !lowercase_sha256(submitted_sha256)
         || format!("{:x}", Sha256::digest(raw.as_bytes())) != submitted_sha256
     {
         return Err("Не совпадает размер или отпечаток отправленного публичного текста КП".into());
@@ -492,8 +540,64 @@ pub(crate) fn validate_public(document: &Value) -> Result<(), String> {
     } else {
         commercial_schema(&document["commercial"])?;
     }
-    object(&document["layout"], "style accentColor show footer", "logo")?;
+    object(
+        &document["layout"],
+        "style accentColor show footer",
+        "logo design",
+    )?;
     string_fields(&document["layout"], "style accentColor footer")?;
+    if let Some(design) = document["layout"].get("design") {
+        object(design, "id letter mode", "options")?;
+        let id = design["id"]
+            .as_str()
+            .ok_or("Некорректный шаблон оформления КП")?;
+        let catalog: Value = serde_json::from_str(include_str!(
+            "../../scanner-worker/resources/proposals/designs/catalog.json"
+        ))
+        .map_err(|_| "Не удалось прочитать встроенные шаблоны КП")?;
+        if id == "custom" {
+            let options = &design["options"];
+            object(
+                options,
+                "paper titleAlign pricing pagination heading fontSize brand cover footerArt pageNumbers",
+                "base",
+            )?;
+            if options
+                .get("base")
+                .is_some_and(|base| base.as_str().is_none_or(|id| catalog.get(id).is_none()))
+                || !matches!(options["paper"].as_str(), Some("portrait" | "landscape"))
+                || !matches!(options["titleAlign"].as_str(), Some("left" | "center"))
+                || !matches!(
+                    options["pricing"].as_str(),
+                    Some("accent" | "gray" | "outlined" | "plain")
+                )
+                || !matches!(
+                    options["pagination"].as_str(),
+                    Some("continuous" | "specification" | "appendices" | "slides")
+                )
+                || !options["fontSize"]
+                    .as_u64()
+                    .is_some_and(|n| (9..=14).contains(&n))
+                || ["brand", "cover", "footerArt", "pageNumbers"]
+                    .iter()
+                    .any(|key| !options[*key].is_boolean())
+                || options["heading"].as_str().is_none_or(|heading| {
+                    heading.trim().is_empty() || heading.chars().count() > 120
+                })
+            {
+                return Err("Недопустимые параметры пользовательского шаблона КП".into());
+            }
+            commercial_text(&options["heading"], true)?;
+        } else if catalog.get(id).is_none() || design.get("options").is_some() {
+            return Err("Неизвестный шаблон оформления КП".into());
+        }
+        if !matches!(design["mode"].as_str(), Some("review-draft" | "final"))
+            || (version == 2 && design["mode"] != document["commercial"]["mode"])
+        {
+            return Err("Режим оформления не совпадает с режимом КП".into());
+        }
+        commercial_text(&design["letter"], false)?;
+    }
     let show = object(
         &document["layout"]["show"],
         "address requisites contact signer",
@@ -659,17 +763,20 @@ fn destination_path(path: &str, format: &str, workspace: &Path) -> Result<PathBu
     }
     Ok(destination)
 }
+#[cfg(test)]
 fn publish(source: &Path, destination: &Path, cancel: &AtomicBool) -> Result<(), String> {
     publish_guarded(source, destination, cancel, None)
 }
 fn publish_complete_stage(stage: &Path, destination: &Path) -> Result<(), String> {
     crate::publication::publish_no_replace(stage, destination).map_err(|e| format!("Не удалось безопасно опубликовать КП без перезаписи ({e}). Проверьте свободное имя и доступность папки."))
 }
+type PublicationGuard<'a> = dyn Fn(&Path, &Path) -> Result<(), String> + 'a;
+
 fn publish_guarded(
     source: &Path,
     destination: &Path,
     cancel: &AtomicBool,
-    publication_guard: Option<&dyn Fn(&Path, &Path) -> Result<(), String>>,
+    publication_guard: Option<&PublicationGuard<'_>>,
 ) -> Result<(), String> {
     let parent = destination.parent().ok_or("Некорректный путь результата")?;
     let stage = parent.join(format!(".sbk-proposal-{}.part", Uuid::new_v4()));
@@ -715,16 +822,26 @@ fn publish_guarded(
     let _ = fs::remove_file(stage);
     result
 }
-fn render_worker(
-    app: AppHandle,
-    workspace: Arc<Workspace>,
-    cancellation: Arc<AtomicBool>,
+struct RenderInput {
     document: Value,
     assets: Vec<ProposalAsset>,
     format: String,
     output_path: Option<String>,
-    publication_guard: Option<&dyn Fn(&Path, &Path) -> Result<(), String>>,
+}
+
+fn render_worker(
+    app: AppHandle,
+    workspace: Arc<Workspace>,
+    cancellation: Arc<AtomicBool>,
+    input: RenderInput,
+    publication_guard: Option<&PublicationGuard<'_>>,
 ) -> Result<Value, String> {
+    let RenderInput {
+        document,
+        assets,
+        format,
+        output_path,
+    } = input;
     validate_public(&document)?;
     if !["docx", "pdf", "zip", "preview"].contains(&format.as_str()) {
         return Err("Неподдерживаемый формат КП".into());
@@ -958,7 +1075,10 @@ pub(crate) async fn proposal_render(
     output_path: Option<String>,
 ) -> Result<Value, String> {
     if document["schemaVersion"] == 3 {
-        return Err("Для рабочего КП используйте отдельную проверку папки и редакции перед выгрузкой".into());
+        return Err(
+            "Для рабочего КП используйте отдельную проверку папки и редакции перед выгрузкой"
+                .into(),
+        );
     }
     let operation_permit = crate::network_diagnostics::enter_operation()?;
     let workspace = state.active_workspace()?;
@@ -985,10 +1105,12 @@ pub(crate) async fn proposal_render(
             app,
             workspace,
             cancellation,
-            document,
-            assets,
-            format,
-            output_path,
+            RenderInput {
+                document,
+                assets,
+                format,
+                output_path,
+            },
             None,
         );
         if let Ok(mut guard) = jobs.lock() {
@@ -1021,28 +1143,37 @@ struct WorkingRenderRegistration {
 }
 impl Drop for WorkingRenderRegistration {
     fn drop(&mut self) {
-        if let Ok(mut jobs) = self.jobs.lock() {
-            if jobs.get(&self.job_id).is_some_and(|entry| Arc::ptr_eq(entry, &self.cancellation)) {
-                jobs.remove(&self.job_id);
-            }
+        if let Ok(mut jobs) = self.jobs.lock()
+            && jobs
+                .get(&self.job_id)
+                .is_some_and(|entry| Arc::ptr_eq(entry, &self.cancellation))
+        {
+            jobs.remove(&self.job_id);
         }
     }
 }
 fn working_render_document(request: &WorkingRenderRequest) -> Result<Value, String> {
     let canonical_uuid = Uuid::parse_str(&request.operation_id).is_ok_and(|id| {
-        id.to_string() == request.operation_id && request.operation_id.len() == 36
+        id.to_string() == request.operation_id
+            && request.operation_id.len() == 36
             && (b'1'..=b'8').contains(&request.operation_id.as_bytes()[14])
             && b"89ab".contains(&request.operation_id.as_bytes()[19])
     });
-    if !canonical_uuid || request.job_id != request.operation_id
+    if !canonical_uuid
+        || request.job_id != request.operation_id
         || !matches!(request.format.as_str(), "docx" | "pdf")
-        || request.output_path.len() > 4096 || request.output_path.is_empty()
+        || request.output_path.len() > 4096
+        || request.output_path.is_empty()
     {
         return Err("Неверная задача, формат или путь рабочего КП".into());
     }
     parse_working_public(&request.public_json, &request.public_sha256)
 }
-fn working_render_receipt(request: &WorkingRenderRequest, output_path: &str, output_sha256: &str) -> Value {
+fn working_render_receipt(
+    request: &WorkingRenderRequest,
+    output_path: &str,
+    output_sha256: &str,
+) -> Value {
     json!({ "operationId": request.operation_id.clone(), "root": request.scope.expected_root.clone(),
         "publicSha256": request.public_sha256.clone(), "format": request.format.clone(),
         // Keep the exact chosen path distinct from the actual canonical path.
@@ -1056,9 +1187,14 @@ fn with_working_render_scope<T>(
     scope: &crate::proposal_working::ReadScope,
     operation: impl FnOnce(Arc<Workspace>) -> Result<T, String>,
 ) -> Result<T, String> {
-    let _maintenance = state.maintenance.lock().map_err(|_| "Не удалось проверить папку рабочего КП")?;
+    let _maintenance = state
+        .maintenance
+        .lock()
+        .map_err(|_| "Не удалось проверить папку рабочего КП")?;
     if !crate::network_diagnostics::gate().connected() {
-        return Err("Подключение к общей папке остановлено. Выгрузка рабочего КП не подтверждена".into());
+        return Err(
+            "Подключение к общей папке остановлено. Выгрузка рабочего КП не подтверждена".into(),
+        );
     }
     let workspace = crate::proposal_working::read_admission(state, scope)?;
     operation(workspace)
@@ -1075,7 +1211,9 @@ pub(crate) async fn proposal_working_render(
     let jobs = state.scanner_jobs.clone();
     let cancellation = Arc::new(AtomicBool::new(false));
     with_working_render_scope(&owned_state, &request.scope, |_| {
-        let mut guard = jobs.lock().map_err(|_| "Не удалось зарегистрировать выгрузку рабочего КП")?;
+        let mut guard = jobs
+            .lock()
+            .map_err(|_| "Не удалось зарегистрировать выгрузку рабочего КП")?;
         if guard.contains_key(&request.job_id) {
             return Err("Эта задача выгрузки уже выполняется".into());
         }
@@ -1085,7 +1223,11 @@ pub(crate) async fn proposal_working_render(
     if !crate::network_diagnostics::gate().connected() {
         cancellation.store(true, Ordering::SeqCst);
     }
-    let registration = WorkingRenderRegistration { jobs, job_id: request.job_id.clone(), cancellation: cancellation.clone() };
+    let registration = WorkingRenderRegistration {
+        jobs,
+        job_id: request.job_id.clone(),
+        cancellation: cancellation.clone(),
+    };
     tauri::async_runtime::spawn_blocking(move || {
         let _operation_permit = operation_permit;
         let _registration = registration;
@@ -1106,8 +1248,9 @@ pub(crate) async fn proposal_working_render(
                 })
             };
             let event = render_worker(
-                app, workspace, cancellation.clone(), document, Vec::new(),
-                request.format.clone(), Some(request.output_path.clone()), Some(&publish_current),
+                app, workspace, cancellation.clone(),
+                RenderInput { document, assets: Vec::new(), format: request.format.clone(), output_path: Some(request.output_path.clone()) },
+                Some(&publish_current),
             )?;
             with_working_render_scope(&owned_state, &request.scope, |_| {
                 let output_path = event["outputPath"].as_str().ok_or("Не подтверждён путь файла рабочего КП")?;
@@ -1188,86 +1331,155 @@ mod tests {
             "sections":WORKING_AREAS.iter().map(|area| json!({"area":area,"title":area,"blocks":["  Полный текст\nСущественные условия 😀  "]})).collect::<Vec<_>>()})
     }
     fn working_request(raw: String) -> WorkingRenderRequest {
-        WorkingRenderRequest { scope: crate::proposal_working::ReadScope { expected_root: "synthetic-root".into(), expected_lease_generation: None },
-            operation_id: "01234567-1234-4123-8123-0123456789ab".into(), job_id: "01234567-1234-4123-8123-0123456789ab".into(),
-            public_sha256: format!("{:x}", Sha256::digest(raw.as_bytes())), public_json: raw, format: "docx".into(), output_path: "/synthetic/output.docx".into() }
+        WorkingRenderRequest {
+            scope: crate::proposal_working::ReadScope {
+                expected_root: "synthetic-root".into(),
+                expected_lease_generation: None,
+            },
+            operation_id: "01234567-1234-4123-8123-0123456789ab".into(),
+            job_id: "01234567-1234-4123-8123-0123456789ab".into(),
+            public_sha256: format!("{:x}", Sha256::digest(raw.as_bytes())),
+            public_json: raw,
+            format: "docx".into(),
+            output_path: "/synthetic/output.docx".into(),
+        }
     }
     #[test]
     fn working_v3_is_disjoint_nullable_and_has_no_assets_or_legacy_defaults() {
         let value = working_fixture();
         assert!(validate_public(&value).is_ok());
         assert!(reference_assets(&value).is_empty());
-        for key in ["number", "documentDate", "validUntil", "currency", "issuerName", "recipientName"] {
+        for key in [
+            "number",
+            "documentDate",
+            "validUntil",
+            "currency",
+            "issuerName",
+            "recipientName",
+        ] {
             assert!(value["metadata"][key].is_null());
         }
-        for key in ["questions", "historicalSource", "evidenceRefs", "attachments", "totals", "commercial", "terms"] {
-            let mut invalid = value.clone(); invalid[key] = json!([]);
+        for key in [
+            "questions",
+            "historicalSource",
+            "evidenceRefs",
+            "attachments",
+            "totals",
+            "commercial",
+            "terms",
+        ] {
+            let mut invalid = value.clone();
+            invalid[key] = json!([]);
             assert!(validate_public(&invalid).is_err());
         }
         for version in [1, 2] {
-            let mut invalid = value.clone(); invalid["schemaVersion"] = json!(version);
+            let mut invalid = value.clone();
+            invalid["schemaVersion"] = json!(version);
             assert!(validate_public(&invalid).is_err());
         }
-        let mut invalid = value.clone(); invalid["metadata"].as_object_mut().unwrap().remove("currency");
+        let mut invalid = value.clone();
+        invalid["metadata"]
+            .as_object_mut()
+            .unwrap()
+            .remove("currency");
         assert!(validate_public(&invalid).is_err());
-        let mut invalid = value; invalid["metadata"]["currency"] = json!(0);
+        let mut invalid = value;
+        invalid["metadata"]["currency"] = json!(0);
         assert!(validate_public(&invalid).is_err());
     }
     #[test]
     fn working_v3_dates_are_nullable_real_calendars_in_the_closed_year_range() {
         for date in ["0001-01-01", "2000-02-29", "9999-12-31"] {
-            let mut value = working_fixture(); value["metadata"]["documentDate"] = json!(date);
+            let mut value = working_fixture();
+            value["metadata"]["documentDate"] = json!(date);
             assert!(validate_public(&value).is_ok(), "{date}");
         }
-        for date in ["0000-01-01", "10000-01-01", "1900-02-29", "2024-02-30", "2030-2-01", "-001-01-01", "2030-01-01T00:00:00Z"] {
-            let mut value = working_fixture(); value["metadata"]["validUntil"] = json!(date);
+        for date in [
+            "0000-01-01",
+            "10000-01-01",
+            "1900-02-29",
+            "2024-02-30",
+            "2030-2-01",
+            "-001-01-01",
+            "2030-01-01T00:00:00Z",
+        ] {
+            let mut value = working_fixture();
+            value["metadata"]["validUntil"] = json!(date);
             assert!(validate_public(&value).is_err(), "{date}");
         }
     }
     #[test]
     fn working_v3_requires_the_exact_seven_area_order_and_closed_string_blocks() {
-        let mut wrong = working_fixture(); wrong["sections"].as_array_mut().unwrap().swap(0, 1);
+        let mut wrong = working_fixture();
+        wrong["sections"].as_array_mut().unwrap().swap(0, 1);
         assert!(validate_public(&wrong).is_err());
-        let mut wrong = working_fixture(); wrong["sections"].as_array_mut().unwrap().pop();
+        let mut wrong = working_fixture();
+        wrong["sections"].as_array_mut().unwrap().pop();
         assert!(validate_public(&wrong).is_err());
-        let mut wrong = working_fixture(); wrong["sections"][0]["blocks"][0] = json!({"text":"private object"});
+        let mut wrong = working_fixture();
+        wrong["sections"][0]["blocks"][0] = json!({"text":"private object"});
         assert!(validate_public(&wrong).is_err());
-        let mut wrong = working_fixture(); wrong["sections"][0]["sourceId"] = json!("private");
+        let mut wrong = working_fixture();
+        wrong["sections"][0]["sourceId"] = json!("private");
         assert!(validate_public(&wrong).is_err());
-        let mut wrong = working_fixture(); wrong["layout"]["logo"] = json!({});
+        let mut wrong = working_fixture();
+        wrong["layout"]["logo"] = json!({});
         assert!(validate_public(&wrong).is_err());
     }
     #[test]
     fn working_v3_text_bounds_count_unicode_and_preserve_whole_strings() {
-        let mut value = working_fixture(); value["sections"][0]["blocks"][0] = json!("😀".repeat(20_000));
+        let mut value = working_fixture();
+        value["sections"][0]["blocks"][0] = json!("😀".repeat(20_000));
         assert!(validate_public(&value).is_ok());
-        value["sections"][0]["blocks"][0] = json!("😀".repeat(20_001)); assert!(validate_public(&value).is_err());
-        for (field, maximum) in [("number", 200), ("currency", 80), ("issuerName", 2000), ("recipientName", 2000)] {
-            let mut value = working_fixture(); value["metadata"][field] = json!("я".repeat(maximum)); assert!(validate_public(&value).is_ok());
-            value["metadata"][field] = json!("я".repeat(maximum + 1)); assert!(validate_public(&value).is_err());
+        value["sections"][0]["blocks"][0] = json!("😀".repeat(20_001));
+        assert!(validate_public(&value).is_err());
+        for (field, maximum) in [
+            ("number", 200),
+            ("currency", 80),
+            ("issuerName", 2000),
+            ("recipientName", 2000),
+        ] {
+            let mut value = working_fixture();
+            value["metadata"][field] = json!("я".repeat(maximum));
+            assert!(validate_public(&value).is_ok());
+            value["metadata"][field] = json!("я".repeat(maximum + 1));
+            assert!(validate_public(&value).is_err());
         }
         for text in ["bad\u{0}text", "bad\u{85}text"] {
-            let mut value = working_fixture(); value["sections"][0]["blocks"][0] = json!(text); assert!(validate_public(&value).is_err());
+            let mut value = working_fixture();
+            value["sections"][0]["blocks"][0] = json!(text);
+            assert!(validate_public(&value).is_err());
         }
     }
     #[test]
     fn working_v3_final_empty_matches_js_trim_including_bom() {
         let mut value = working_fixture();
-        for section in value["sections"].as_array_mut().unwrap() { section["blocks"] = json!(["\u{feff}\u{a0}\t\n \u{2028}"]); }
+        for section in value["sections"].as_array_mut().unwrap() {
+            section["blocks"] = json!(["\u{feff}\u{a0}\t\n \u{2028}"]);
+        }
         assert!(validate_public(&value).is_err());
-        value["mode"] = json!("review-draft"); assert!(validate_public(&value).is_ok());
-        for section in value["sections"].as_array_mut().unwrap() { section["blocks"] = json!([]); }
+        value["mode"] = json!("review-draft");
         assert!(validate_public(&value).is_ok());
-        value["mode"] = json!("final"); value["sections"][0]["blocks"] = json!(["\u{200b}"]);
+        for section in value["sections"].as_array_mut().unwrap() {
+            section["blocks"] = json!([]);
+        }
+        assert!(validate_public(&value).is_ok());
+        value["mode"] = json!("final");
+        value["sections"][0]["blocks"] = json!(["\u{200b}"]);
         assert!(validate_public(&value).is_ok()); // JS trim does not erase zero-width space.
     }
     #[test]
     fn working_v3_caps_are_65_per_area_455_total_and_8_mib_without_truncation() {
         let mut value = working_fixture();
-        for section in value["sections"].as_array_mut().unwrap() { section["blocks"] = json!(vec!["x"; 65]); }
+        for section in value["sections"].as_array_mut().unwrap() {
+            section["blocks"] = json!(vec!["x"; 65]);
+        }
         assert!(validate_public(&value).is_ok());
-        value["sections"][0]["blocks"] = json!(vec!["x"; 66]); assert!(validate_public(&value).is_err());
-        for section in value["sections"].as_array_mut().unwrap() { section["blocks"] = json!(vec!["😀".repeat(20_000); 65]); }
+        value["sections"][0]["blocks"] = json!(vec!["x"; 66]);
+        assert!(validate_public(&value).is_err());
+        for section in value["sections"].as_array_mut().unwrap() {
+            section["blocks"] = json!(vec!["😀".repeat(20_000); 65]);
+        }
         assert!(validate_public(&value).unwrap_err().contains("8 МБ"));
     }
     #[test]
@@ -1275,11 +1487,16 @@ mod tests {
         let compact = serde_json::to_string(&working_fixture()).unwrap();
         let raw = format!(" {compact}\n");
         let exact = format!("{:x}", Sha256::digest(raw.as_bytes()));
-        assert_eq!(parse_working_public(&raw, &exact).unwrap(), working_fixture());
+        assert_eq!(
+            parse_working_public(&raw, &exact).unwrap(),
+            working_fixture()
+        );
         let canonical = format!("{:x}", Sha256::digest(compact.as_bytes()));
         assert!(parse_working_public(&raw, &canonical).is_err());
-        for duplicate in [compact.replacen("\"kind\":", "\"kind\":\"other\",\"kind\":", 1),
-            compact.replace("\"number\":null", "\"number\":null,\"number\":null")] {
+        for duplicate in [
+            compact.replacen("\"kind\":", "\"kind\":\"other\",\"kind\":", 1),
+            compact.replace("\"number\":null", "\"number\":null,\"number\":null"),
+        ] {
             let hash = format!("{:x}", Sha256::digest(duplicate.as_bytes()));
             assert!(parse_working_public(&duplicate, &hash).is_err());
         }
@@ -1287,16 +1504,28 @@ mod tests {
     #[test]
     fn working_render_request_is_closed_root_scoped_and_binds_one_uuid_job_and_format() {
         let raw = serde_json::to_string(&working_fixture()).unwrap();
-        let mut request = working_request(raw.clone()); assert!(working_render_document(&request).is_ok());
-        request.format = "zip".into(); assert!(working_render_document(&request).is_err());
-        request.format = "pdf".into(); request.job_id = Uuid::new_v4().to_string(); assert!(working_render_document(&request).is_err());
-        let mut request = working_request(raw); request.operation_id = "session:counter".into(); request.job_id = request.operation_id.clone();
+        let mut request = working_request(raw.clone());
+        assert!(working_render_document(&request).is_ok());
+        request.format = "zip".into();
+        assert!(working_render_document(&request).is_err());
+        request.format = "pdf".into();
+        request.job_id = Uuid::new_v4().to_string();
+        assert!(working_render_document(&request).is_err());
+        let mut request = working_request(raw);
+        request.operation_id = "session:counter".into();
+        request.job_id = request.operation_id.clone();
         assert!(working_render_document(&request).is_err());
         let input = json!({"scope":{"expectedRoot":"synthetic-root","expectedLeaseGeneration":null},"operationId":"01234567-1234-4123-8123-0123456789ab",
             "jobId":"01234567-1234-4123-8123-0123456789ab","publicJson":"{}","publicSha256":"a".repeat(64),"format":"docx","outputPath":"/synthetic/output.docx"});
         assert!(serde_json::from_value::<WorkingRenderRequest>(input.clone()).is_ok());
-        let mut extra = input.clone(); extra["document"] = working_fixture(); assert!(serde_json::from_value::<WorkingRenderRequest>(extra).is_err());
-        let mut missing_scope = input; missing_scope["scope"].as_object_mut().unwrap().remove("expectedLeaseGeneration");
+        let mut extra = input.clone();
+        extra["document"] = working_fixture();
+        assert!(serde_json::from_value::<WorkingRenderRequest>(extra).is_err());
+        let mut missing_scope = input;
+        missing_scope["scope"]
+            .as_object_mut()
+            .unwrap()
+            .remove("expectedLeaseGeneration");
         assert!(serde_json::from_value::<WorkingRenderRequest>(missing_scope).is_err());
     }
     #[test]
@@ -1324,27 +1553,50 @@ mod tests {
         fs::write(&source, "completed owned bytes").unwrap();
         let called = std::cell::Cell::new(false);
         let guard = |stage: &Path, target: &Path| -> Result<(), String> {
-            called.set(true); assert_eq!(fs::read(stage).unwrap(), fs::read(&source).unwrap()); assert_eq!(target, destination);
+            called.set(true);
+            assert_eq!(fs::read(stage).unwrap(), fs::read(&source).unwrap());
+            assert_eq!(target, destination);
             Err("STALE_ROOT_AT_PUBLICATION".into())
         };
-        assert_eq!(publish_guarded(&source, &destination, &AtomicBool::new(false), Some(&guard)).unwrap_err(), "STALE_ROOT_AT_PUBLICATION");
-        assert!(called.get()); assert!(!destination.exists()); assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+        assert_eq!(
+            publish_guarded(&source, &destination, &AtomicBool::new(false), Some(&guard))
+                .unwrap_err(),
+            "STALE_ROOT_AT_PUBLICATION"
+        );
+        assert!(called.get());
+        assert!(!destination.exists());
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
         fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn working_job_cleanup_removes_only_its_own_registration() {
         let jobs = Arc::new(Mutex::new(HashMap::new()));
         let cancellation = Arc::new(AtomicBool::new(false));
-        jobs.lock().unwrap().insert("job".into(), cancellation.clone());
-        let owned = WorkingRenderRegistration { jobs: jobs.clone(), job_id: "job".into(), cancellation: cancellation.clone() };
+        jobs.lock()
+            .unwrap()
+            .insert("job".into(), cancellation.clone());
+        let owned = WorkingRenderRegistration {
+            jobs: jobs.clone(),
+            job_id: "job".into(),
+            cancellation: cancellation.clone(),
+        };
         drop(owned);
         assert!(jobs.lock().unwrap().is_empty());
-        jobs.lock().unwrap().insert("job".into(), cancellation.clone());
-        let owned = WorkingRenderRegistration { jobs: jobs.clone(), job_id: "job".into(), cancellation };
+        jobs.lock()
+            .unwrap()
+            .insert("job".into(), cancellation.clone());
+        let owned = WorkingRenderRegistration {
+            jobs: jobs.clone(),
+            job_id: "job".into(),
+            cancellation,
+        };
         let newer = Arc::new(AtomicBool::new(false));
         jobs.lock().unwrap().insert("job".into(), newer.clone());
         drop(owned);
-        assert!(Arc::ptr_eq(jobs.lock().unwrap().get("job").unwrap(), &newer));
+        assert!(Arc::ptr_eq(
+            jobs.lock().unwrap().get("job").unwrap(),
+            &newer
+        ));
     }
     fn public_fixture(version: u64) -> Value {
         let party = json!({"name":"Компания","shortName":"","inn":"","kpp":"","ogrn":"","address":"","contact":"","paymentDetails":""});
@@ -1377,6 +1629,21 @@ mod tests {
         assert!(validate_public(&v1).is_err());
         let mut v2 = public_fixture(2);
         v2["terms"] = public_fixture(1)["terms"].clone();
+        assert!(validate_public(&v2).is_err());
+    }
+    #[test]
+    fn branded_proposals_require_a_known_design_and_keep_the_draft_mode() {
+        let design =
+            json!({"id":"starter-sbk-software","letter":"Текст письма","mode":"review-draft"});
+        let mut v1 = public_fixture(1);
+        v1["layout"]["design"] = design.clone();
+        assert!(validate_public(&v1).is_ok());
+        let mut v2 = public_fixture(2);
+        v2["layout"]["design"] = design;
+        assert!(validate_public(&v2).is_err());
+        v2["commercial"]["mode"] = json!("review-draft");
+        assert!(validate_public(&v2).is_ok());
+        v2["layout"]["design"]["id"] = json!("missing");
         assert!(validate_public(&v2).is_err());
     }
     #[test]

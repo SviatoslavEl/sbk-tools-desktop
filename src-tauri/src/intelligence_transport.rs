@@ -85,6 +85,8 @@ pub(crate) struct AnalysisDiagnostics {
     schema_bytes: Option<usize>,
     request_body_bytes: usize,
     sent_temperature: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sent_fact_options: Option<Value>,
 }
 
 #[derive(Serialize)]
@@ -669,6 +671,27 @@ async fn analyze_with_schema(
     key: Zeroizing<String>,
     response_schema: Option<Value>,
 ) -> Result<AnalysisResult, String> {
+    analyze_with_options(profile, prompt, key, response_schema, false).await
+}
+
+/// The typed-fact route declares these options explicitly. Existing analysis
+/// requests retain their previous provider defaults and unchanged wire shape.
+fn fact_generation_options() -> Value {
+    json!({"temperature":0,"num_ctx":16384,"num_predict":4096,"repeat_last_n":512,"repeat_penalty":1.1})
+}
+
+async fn analyze_with_options(
+    profile: ConnectionProfile,
+    prompt: String,
+    key: Zeroizing<String>,
+    response_schema: Option<Value>,
+    fact_mode: bool,
+) -> Result<AnalysisResult, String> {
+    if fact_mode && profile.protocol != ConnectionProtocol::Ollama {
+        return Err(
+            "Фиксированный бюджет полного прохода поддерживается подключением Ollama.".into(),
+        );
+    }
     let started = Instant::now();
     let base = validate_profile(&profile, true)?;
     if prompt.trim().is_empty() {
@@ -697,7 +720,12 @@ async fn analyze_with_schema(
     let body = match profile.protocol {
         ConnectionProtocol::Ollama => {
             let format = schema.unwrap_or_else(|| json!("json"));
-            json!({"model":profile.model,"messages":messages,"stream":false,"format":format,"options":{"temperature":0}})
+            let options = if fact_mode {
+                fact_generation_options()
+            } else {
+                json!({"temperature":0})
+            };
+            json!({"model":profile.model,"messages":messages,"stream":false,"format":format,"options":options})
         }
         ConnectionProtocol::OpenaiCompatible => {
             let format = if let Some(schema) = schema {
@@ -714,7 +742,14 @@ async fn analyze_with_schema(
         return Err("Запрос слишком большой. Сократите текст для анализа до 2 МБ.".into());
     }
     let request_body_bytes = body.len();
-    let client = client(&base, profile.timeout_seconds)?;
+    let client = client(
+        &base,
+        if fact_mode {
+            profile.timeout_seconds.min(300)
+        } else {
+            profile.timeout_seconds
+        },
+    )?;
     let response = with_api_key(
         client
             .post(service_url(&base, profile.protocol, true))
@@ -728,32 +763,57 @@ async fn analyze_with_schema(
     let json = read_json(response).await?;
     let (content, completion_reason) = match profile.protocol {
         ConnectionProtocol::Ollama => {
-            if json.get("done").and_then(Value::as_bool) != Some(true) { return Err("ИИ вернул незавершённый ответ. Повторите запрос с меньшим объёмом текста.".into()); }
+            if json.get("done").and_then(Value::as_bool) != Some(true) {
+                return Err(
+                    "ИИ вернул незавершённый ответ. Повторите запрос с меньшим объёмом текста."
+                        .into(),
+                );
+            }
             // `done` only means that the stream ended, not that generation completed.
             // Older Ollama versions may omit the reason; any supplied reason must be stop.
-            if json.get("done_reason").is_some_and(|reason| reason.as_str() != Some("stop")) {
+            if json
+                .get("done_reason")
+                .is_some_and(|reason| reason.as_str() != Some("stop"))
+            {
                 return Err("ИИ остановил ответ до полного завершения. Сократите материалы или выберите другую модель; неполный результат не перенесён.".into());
             }
             (
-                json.get("message").and_then(|message| message.get("content")).and_then(Value::as_str),
+                json.get("message")
+                    .and_then(|message| message.get("content"))
+                    .and_then(Value::as_str),
                 json.get("done_reason").map(|_| "stop"),
             )
         }
         ConnectionProtocol::OpenaiCompatible => {
-            let choice = json.get("choices").and_then(Value::as_array).and_then(|choices| choices.first())
+            let choice = json
+                .get("choices")
+                .and_then(Value::as_array)
+                .and_then(|choices| choices.first())
                 .ok_or_else(|| "ИИ-сервис не вернул результат анализа.".to_string())?;
-            if choice.get("finish_reason").and_then(Value::as_str) != Some("stop") { return Err("ИИ не завершил ответ полностью. Сократите текст или выберите другую модель.".into()); }
+            if choice.get("finish_reason").and_then(Value::as_str) != Some("stop") {
+                return Err(
+                    "ИИ не завершил ответ полностью. Сократите текст или выберите другую модель."
+                        .into(),
+                );
+            }
             let message = choice.get("message");
-            if message.and_then(|message| message.get("refusal")).is_some_and(|refusal| !refusal.is_null()) {
+            if message
+                .and_then(|message| message.get("refusal"))
+                .is_some_and(|refusal| !refusal.is_null())
+            {
                 return Err("ИИ-сервис отказался выполнять этот запрос. Измените задачу или исходный текст.".into());
             }
             (
-                message.and_then(|message| message.get("content")).and_then(Value::as_str),
+                message
+                    .and_then(|message| message.get("content"))
+                    .and_then(Value::as_str),
                 Some("stop"),
             )
         }
     };
-    let content = content.filter(|text| !text.trim().is_empty()).ok_or_else(|| "ИИ-сервис вернул пустой результат анализа.".to_string())?;
+    let content = content
+        .filter(|text| !text.trim().is_empty())
+        .ok_or_else(|| "ИИ-сервис вернул пустой результат анализа.".to_string())?;
     Ok(AnalysisResult {
         text: content.to_string(),
         model: profile.model,
@@ -766,6 +826,7 @@ async fn analyze_with_schema(
             schema_bytes,
             request_body_bytes,
             sent_temperature: (profile.protocol == ConnectionProtocol::Ollama).then_some(0),
+            sent_fact_options: fact_mode.then(fact_generation_options),
         },
     })
 }
@@ -797,6 +858,30 @@ pub(crate) async fn run_intelligence_analysis(
                 prompt,
                 Zeroizing::new(api_key.unwrap_or_default()),
                 response_schema,
+            ),
+        )
+        .await
+}
+
+#[tauri::command]
+pub(crate) async fn run_contract_fact_analysis(
+    profile: ConnectionProfile,
+    prompt: String,
+    api_key: Option<String>,
+    request_id: String,
+    response_schema: Option<Value>,
+) -> Result<AnalysisResult, String> {
+    let id = Uuid::parse_str(&request_id)
+        .map_err(|_| "Некорректный идентификатор запроса к ИИ.".to_string())?;
+    requests()
+        .run(
+            id,
+            analyze_with_options(
+                profile,
+                prompt,
+                Zeroizing::new(api_key.unwrap_or_default()),
+                response_schema,
+                true,
             ),
         )
         .await
@@ -1381,14 +1466,62 @@ mod tests {
     }
 
     #[test]
+    fn typed_fact_route_declares_ollama_options_without_changing_ordinary_defaults() {
+        let server = json_server(
+            200,
+            json!({"done":true,"done_reason":"stop","message":{"content":"{\"synthetic\":true}"}}),
+        );
+        let config = profile(&server.endpoint, ConnectionProtocol::Ollama);
+        let result = runtime()
+            .block_on(analyze_with_options(
+                config,
+                "SYNTHETIC_FACT_REQUEST".into(),
+                key(),
+                None,
+                true,
+            ))
+            .unwrap();
+        let request = server.request.recv().unwrap();
+        let body: Value = serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(body["options"], fact_generation_options());
+        assert_eq!(
+            result.diagnostics.sent_fact_options,
+            Some(fact_generation_options())
+        );
+        assert_eq!(result.text, "{\"synthetic\":true}");
+        assert!(server.request.try_recv().is_err());
+        let other = profile("http://127.0.0.1:1", ConnectionProtocol::OpenaiCompatible);
+        assert!(
+            runtime()
+                .block_on(analyze_with_options(
+                    other,
+                    "SYNTHETIC".into(),
+                    key(),
+                    None,
+                    true
+                ))
+                .err()
+                .unwrap()
+                .contains("Ollama")
+        );
+    }
+    #[test]
     fn successful_analysis_reports_only_observed_request_and_completion_diagnostics() {
         for (protocol, mode, reason) in [
             (ConnectionProtocol::Ollama, OutputMode::Json, None),
             (ConnectionProtocol::Ollama, OutputMode::Schema, None),
             (ConnectionProtocol::Ollama, OutputMode::Json, Some("stop")),
             (ConnectionProtocol::Ollama, OutputMode::Schema, Some("stop")),
-            (ConnectionProtocol::OpenaiCompatible, OutputMode::Json, Some("stop")),
-            (ConnectionProtocol::OpenaiCompatible, OutputMode::Schema, Some("stop")),
+            (
+                ConnectionProtocol::OpenaiCompatible,
+                OutputMode::Json,
+                Some("stop"),
+            ),
+            (
+                ConnectionProtocol::OpenaiCompatible,
+                OutputMode::Schema,
+                Some("stop"),
+            ),
         ] {
             let mut answer = match protocol {
                 ConnectionProtocol::Ollama => json!({
@@ -1412,19 +1545,27 @@ mod tests {
             let mut schema = synthetic_schema();
             schema["description"] = json!("PRIVATE-SCHEMA-DIAGNOSTICS");
             let result = runtime()
-                .block_on(analyze_with_schema(config, prompt.into(), key(), Some(schema.clone())))
+                .block_on(analyze_with_schema(
+                    config,
+                    prompt.into(),
+                    key(),
+                    Some(schema.clone()),
+                ))
                 .unwrap();
             let request = server.request.recv().unwrap();
             let request_body = request.split_once("\r\n\r\n").unwrap().1;
             let body: Value = serde_json::from_str(request_body).unwrap();
             let diagnostics = serde_json::to_value(&result.diagnostics).unwrap();
-            assert_eq!(diagnostics, json!({
-                "protocol":protocol,"outputMode":mode,"completionReason":reason,
-                "promptBytes":prompt.len(),
-                "schemaBytes":(mode == OutputMode::Schema).then(|| serde_json::to_vec(&schema).unwrap().len()),
-                "requestBodyBytes":request_body.len(),
-                "sentTemperature":(protocol == ConnectionProtocol::Ollama).then_some(0)
-            }));
+            assert_eq!(
+                diagnostics,
+                json!({
+                    "protocol":protocol,"outputMode":mode,"completionReason":reason,
+                    "promptBytes":prompt.len(),
+                    "schemaBytes":(mode == OutputMode::Schema).then(|| serde_json::to_vec(&schema).unwrap().len()),
+                    "requestBodyBytes":request_body.len(),
+                    "sentTemperature":(protocol == ConnectionProtocol::Ollama).then_some(0)
+                })
+            );
             assert!(prompt.len() > prompt.chars().count());
             assert_eq!(body["messages"][1]["content"], prompt);
             if protocol == ConnectionProtocol::Ollama {
@@ -1443,8 +1584,16 @@ mod tests {
             assert!(!body.to_string().contains("synthetic-session-key"));
             assert!(body.get("num_ctx").is_none());
             assert!(body.get("max_output_tokens").is_none());
-            assert!(body.get("options").and_then(|options| options.get("num_ctx")).is_none());
-            assert!(body.get("options").and_then(|options| options.get("num_predict")).is_none());
+            assert!(
+                body.get("options")
+                    .and_then(|options| options.get("num_ctx"))
+                    .is_none()
+            );
+            assert!(
+                body.get("options")
+                    .and_then(|options| options.get("num_predict"))
+                    .is_none()
+            );
             assert!(server.request.try_recv().is_err());
         }
     }

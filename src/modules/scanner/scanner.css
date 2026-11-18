@@ -180,6 +180,25 @@
 .scanner-workspace-tabs { min-width: 0; display: flex; align-items: center; flex-wrap: wrap; gap: 3px; padding: 3px; background: #f1f4f9; border: 1px solid #e8edf5; border-radius: 10px; }
 .scanner-workspace-tabs button { min-width: 0; min-height: 32px; padding: 6px 11px; color: #64748b; background: transparent; border: 1px solid transparent; border-radius: 7px; font-size: 12px; font-weight: 600; line-height: 1.35; }
 .scanner-workspace-tabs button.active { color: #3730a3; background: #fff; border-color: #e2e8f0; box-shadow: 0 1px 3px #18243b0d; }
+.scanner-converter { flex: 1 1 auto; min-height: 0; overflow: auto; padding: clamp(14px, 3vw, 30px); }
+.scanner-converter-form { display: grid; gap: 16px; max-width: 740px; margin: 0 auto; }
+.scanner-converter-intro, .scanner-converter-directory, .scanner-converter-files li {
+  display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px;
+}
+.scanner-converter-intro > div, .scanner-converter-directory > div, .scanner-converter-files li > div { flex: 1 1 200px; min-width: 0; }
+.scanner-converter-intro h2 { font-size: 20px; margin: 0 0 5px; }
+.scanner-converter-intro p { color: var(--text-muted, #64748b); margin: 0; }
+.scanner-converter-files { list-style: none; margin: 0; padding: 0; }
+.scanner-converter-files li { padding: 10px 12px; border-bottom: 1px solid var(--line, #e2e8f0); }
+.scanner-converter-files :is(strong, small), .scanner-converter-directory :is(strong, small) { display: block; overflow-wrap: anywhere; }
+.scanner-converter :is(small, .scanner-converter-actions span) { color: var(--text-muted, #64748b); }
+.scanner-converter .scanner-converter-error { color: #9f2335; }
+.scanner-converter-options { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 210px), 1fr)); gap: 12px; }
+.scanner-converter-directory { padding: 12px; border: 1px solid var(--line, #e2e8f0); border-radius: 10px; background: var(--surface-muted, #f8fafc); }
+.scanner-converter .help-text, .scanner-converter .notice { margin: 0; }
+.scanner-converter-progress { display: grid; gap: 5px; font-size: 12px; }
+.scanner-converter-progress progress { width: 100%; accent-color: var(--primary, #4f46e5); }
+.scanner-converter-actions { align-items: center; }
 .scanner-workspace-header > span { flex: 1 1 180px; min-width: 0; color: #64748b; font-size: 11px; overflow-wrap: anywhere; }
 .merge-main-toolbar { display: flex; align-items: center; flex-wrap: wrap; justify-content: space-between; gap: 10px 16px; padding: 14px 16px; border-bottom: 1px solid #e2e8f0; background: #f8fafc; }
 .merge-main-toolbar > div:first-child { flex: 1 1 220px; display: grid; gap: 5px; min-width: 0; }

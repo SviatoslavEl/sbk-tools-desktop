@@ -13,7 +13,7 @@ pub(crate) struct ScannerOutputs {
 
 fn canonical_existing(path: &Path) -> Result<PathBuf, String> {
     if !path.is_absolute() {
-        return Err("Для открытия нужен полный путь к созданному PDF или его папке.".into());
+        return Err("Для открытия нужен полный путь к созданному файлу или его папке.".into());
     }
     path.canonicalize().map_err(|_| {
         "Файл или папка недоступны. Проверьте, что результат не перемещён и сетевая папка подключена."
@@ -47,6 +47,28 @@ fn verify_pdf(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn verify_conversion(path: &Path, format: &str) -> Result<(), String> {
+    if format == "pdf" {
+        return verify_pdf(path);
+    }
+    let (extension, signature): (&str, &[u8]) = match format {
+        "jpeg" => ("jpg", b"\xff\xd8\xff"),
+        "png" => ("png", b"\x89PNG\r\n\x1a\n"),
+        _ => return Err("Неизвестный формат конвертации.".into()),
+    };
+    let mut magic = [0; 8];
+    if path.extension().and_then(|value| value.to_str()) != Some(extension)
+        || !path.is_file()
+        || File::open(path)
+            .and_then(|mut file| file.read_exact(&mut magic[..signature.len()]))
+            .is_err()
+        || &magic[..signature.len()] != signature
+    {
+        return Err("Результат конвертации недоступен или имеет неверный формат.".into());
+    }
+    Ok(())
+}
+
 impl ScannerOutputs {
     /// Called only after a successful process/merge worker result has passed
     /// protocol, content and digest validation. The worker must have produced
@@ -68,6 +90,31 @@ impl ScannerOutputs {
         Ok(())
     }
 
+    pub(crate) fn register_conversion<'a>(
+        &self,
+        directory: &Path,
+        source: &Path,
+        format: &str,
+        paths: impl Iterator<Item = &'a Path>,
+    ) -> Result<(), String> {
+        let directory = canonical_existing(directory)?;
+        let source = canonical_existing(source)?;
+        let mut approved = HashSet::new();
+        for path in paths {
+            let path = canonical_existing(path)?;
+            if path.parent() != Some(&directory) || path == source || approved.contains(&path) {
+                return Err("Worker вернул неверный путь результата конвертации.".into());
+            }
+            verify_conversion(&path, format)?;
+            approved.insert(path);
+        }
+        self.files
+            .lock()
+            .map_err(|_| "Не удалось подтвердить доступ к результатам конвертации.")?
+            .extend(approved);
+        Ok(())
+    }
+
     pub(crate) fn resolve(&self, requested: &Path, reveal: bool) -> Result<PathBuf, String> {
         let path = canonical_existing(requested)?;
         let files = self
@@ -77,7 +124,11 @@ impl ScannerOutputs {
         if files.contains(&path) {
             // Revalidate at the point of opening: an approved filename must
             // not later become an executable, directory, or redirected link.
-            verify_pdf(&path)?;
+            match path.extension().and_then(|value| value.to_str()) {
+                Some("jpg") => verify_conversion(&path, "jpeg")?,
+                Some("png") => verify_conversion(&path, "png")?,
+                _ => verify_pdf(&path)?,
+            }
             return Ok(path);
         }
         if !reveal && path.is_dir() && files.iter().any(|file| file.parent() == Some(&path)) {
@@ -85,7 +136,7 @@ impl ScannerOutputs {
             // containing successful outputs, never arbitrary ancestors/trees.
             return Ok(path);
         }
-        Err("Этот путь не подтверждён как результат сканера в текущем запуске. Сохраните PDF заново, затем откройте его или его папку.".into())
+        Err("Этот путь не подтверждён как результат сканера в текущем запуске. Сохраните результат заново, затем откройте его или его папку.".into())
     }
 }
 
@@ -180,6 +231,37 @@ mod tests {
         assert!(scope.resolve(&output, false).is_err());
         fs::remove_file(&output).unwrap();
         assert!(scope.resolve(&output, false).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn converter_scope_checks_the_format_directory_and_source() {
+        let root = fixture();
+        let directory = root.join("exports");
+        fs::create_dir(&directory).unwrap();
+        let source = directory.join("source.png");
+        let result = directory.join("result.png");
+        let elsewhere = root.join("elsewhere.png");
+        for path in [&source, &result, &elsewhere] {
+            fs::write(path, b"\x89PNG\r\n\x1a\nsynthetic").unwrap();
+        }
+        let outputs = ScannerOutputs::default();
+        for (path, format) in [(&source, "png"), (&elsewhere, "png"), (&result, "jpeg")] {
+            assert!(
+                outputs
+                    .register_conversion(&directory, &source, format, [path.as_path()].into_iter())
+                    .is_err()
+            );
+        }
+        assert!(outputs.resolve(&directory, false).is_err());
+        outputs
+            .register_conversion(&directory, &source, "png", [result.as_path()].into_iter())
+            .unwrap();
+        assert!(outputs.resolve(&directory, false).is_ok());
+        assert!(outputs.resolve(&source, false).is_err());
+        assert!(outputs.resolve(&result, true).is_ok());
+        fs::write(&result, b"invalid").unwrap();
+        assert!(outputs.resolve(&result, false).is_err());
         fs::remove_dir_all(root).unwrap();
     }
 

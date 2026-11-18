@@ -12,6 +12,7 @@ from scandocument.errors import (
     PasswordProtectedError,
     UnsupportedFormatError,
 )
+from scandocument.image_engine import IMAGE_KINDS, open_raster_document
 from scandocument.models import DocumentInfo
 
 MAX_RECOMMENDED_BYTES = 250 * 1024 * 1024
@@ -19,7 +20,8 @@ MAX_FILE_BYTES = 1024 * 1024 * 1024
 MAX_PAGES = 5_000
 MAX_PAGE_POINTS = 14_400
 MAX_PAGE_PIXELS = 180_000_000
-PDF_MAGIC = b"%PDF-"
+FILE_SIGNATURES = {"pdf": b"%PDF-", "jpeg": b"\xff\xd8\xff", "png": b"\x89PNG\r\n\x1a\n"}
+INPUT_KINDS = {".pdf": "pdf", ".docx": "docx", ".jpg": "jpeg", ".jpeg": "jpeg", ".png": "png"}
 
 
 def validate_source_size(path: Path) -> int:
@@ -74,21 +76,20 @@ def _pdf_page_sizes(document) -> list[tuple[float, float]]:
 def detect_kind(path: Path) -> str:
     validate_source_size(path)
     suffix = path.suffix.lower()
-    if suffix not in {".pdf", ".docx"}:
-        raise UnsupportedFormatError("Выберите документ PDF или DOCX.")
+    expected = INPUT_KINDS.get(suffix)
+    if expected is None:
+        raise UnsupportedFormatError("Выберите файл PDF, DOCX, JPEG или PNG.")
     try:
         with path.open("rb") as stream:
             head = stream.read(8)
     except OSError as exc:
         raise CorruptDocumentError("Файл не удалось прочитать. Проверьте доступ к нему.") from exc
-    actual = "pdf" if head.startswith(PDF_MAGIC) else "docx" if zipfile.is_zipfile(path) else "unknown"
-    if actual != suffix[1:]:
-        raise UnsupportedFormatError(
-            "Содержимое файла не соответствует расширению. Не переименовывайте другой формат в PDF или DOCX."
-        )
-    if actual == "docx":
+    matches_format = zipfile.is_zipfile(path) if expected == "docx" else head.startswith(FILE_SIGNATURES[expected])
+    if not matches_format:
+        raise UnsupportedFormatError("Содержимое файла не соответствует расширению.")
+    if expected == "docx":
         validate_docx_archive(path)
-    return actual
+    return expected
 
 
 def inspect_document(
@@ -97,6 +98,7 @@ def inspect_document(
     cancelled: Callable[[], bool] | None = None,
     prepared_docx_pdf: Path | None = None,
     prepared_docx_warnings: list[str] | None = None,
+    prepared_image_size: tuple[float, float] | None = None,
 ) -> DocumentInfo:
     source = Path(path).expanduser().resolve()
     size = validate_source_size(source)
@@ -117,6 +119,11 @@ def inspect_document(
             if "password" in message or "security" in message:
                 raise PasswordProtectedError("Введите пароль PDF и повторите попытку.") from exc
             raise CorruptDocumentError("PDF повреждён, защищён или использует неподдерживаемые данные.") from exc
+    elif kind in IMAGE_KINDS:
+        if prepared_image_size is None:
+            with open_raster_document(source, kind) as image:
+                prepared_image_size = image.size
+        count, sizes = 1, [prepared_image_size]
     else:
         try:
             import pypdfium2 as pdfium

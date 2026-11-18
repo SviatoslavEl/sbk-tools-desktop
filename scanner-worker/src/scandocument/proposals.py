@@ -16,6 +16,7 @@ from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
 
 from docx import Document
+from docx.enum.section import WD_ORIENT
 from docx.enum.table import WD_TABLE_ALIGNMENT, WD_CELL_VERTICAL_ALIGNMENT
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
@@ -46,6 +47,59 @@ PROPOSAL_FONT_FILES = (
     ("Italic", "embedItalic", "d386cbc1fef5e5c6621fa96625b615c838f9865bc385f94397c6922480e32364"),
     ("BoldItalic", "embedBoldItalic", "101b87e65938570b3bc2d7a703d5d40ff3d1d1d04619c5530c7847a6c53e92b7"),
 )
+
+
+@lru_cache(maxsize=4)
+def _template_catalog(path: Path):
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _template_design(layout):
+    if "design" not in layout:
+        return None
+    selection = _object(layout["design"], "id letter mode", "options")
+    if selection["mode"] not in ("review-draft", "final"):
+        raise ValueError("Недопустимый режим оформления КП")
+    design_id = selection["id"]
+    catalog = _template_catalog(resource_path("proposals", "designs", "catalog.json"))
+    _text(selection["letter"])
+    if design_id == "custom":
+        options = _object(selection.get("options"),
+                          "paper titleAlign pricing pagination heading fontSize brand cover footerArt pageNumbers", "base")
+        base_id = options.get("base")
+        if ("base" in options and (not isinstance(base_id, str) or base_id not in catalog)
+                or options["paper"] not in ("portrait", "landscape")
+                or options["titleAlign"] not in ("left", "center")
+                or options["pricing"] not in ("accent", "gray", "outlined", "plain")
+                or options["pagination"] not in ("continuous", "specification", "appendices", "slides")
+                or type(options["fontSize"]) is not int or not 9 <= options["fontSize"] <= 14
+                or any(type(options[key]) is not bool for key in ("brand", "cover", "footerArt", "pageNumbers"))):
+            raise ValueError("Недопустимые параметры пользовательского шаблона КП")
+        _text(options["heading"], 120, required=True)
+        base = catalog.get(base_id, {})
+        design = {key: options[key] for key in ("paper", "titleAlign", "pricing", "pagination", "heading", "fontSize", "pageNumbers")}
+        if options["brand"] and base.get("logo"):
+            design["logo"] = base["logo"]
+        if options["cover"]:
+            design["cover"] = base.get("cover", "simple")
+            if design["cover"] == "illustrated" and design["paper"] != "landscape":
+                design["cover"] = "simple"
+            elif base.get("coverArt"):
+                design["coverArt"] = base["coverArt"]
+        if options["footerArt"]:
+            design["footer"] = base.get("footer", "rule")
+            if base.get("footerArt"):
+                design["footerArt"] = base["footerArt"]
+        return design
+    if not isinstance(design_id, str) or design_id not in catalog or "options" in selection:
+        raise ValueError("Неизвестный шаблон оформления КП")
+    return catalog[design_id]
+
+
+def _design_image(name):
+    if not re.fullmatch(r"[a-z0-9-]+\.png", name):
+        raise ValueError("Некорректное имя ресурса шаблона КП")
+    return str(resource_path("proposals", "designs", name))
 
 
 @lru_cache(maxsize=4)
@@ -505,7 +559,10 @@ def validate_document(document: dict) -> dict:
             _text(value)
     else:
         _commercial(document["commercial"])
-    layout = _object(document["layout"], "style accentColor show footer", "logo")
+    layout = _object(document["layout"], "style accentColor show footer", "logo design")
+    _template_design(layout)
+    if version == 2 and "design" in layout and layout["design"]["mode"] != document["commercial"]["mode"]:
+        raise ValueError("Режим оформления не совпадает с режимом КП")
     if (
         layout["style"] not in ("standard", "compact")
         or not isinstance(layout["accentColor"], str)
@@ -648,10 +705,10 @@ def _list_numbering(doc, style):
     return num_id
 
 
-def _commercial_table(doc, block, labels, accent):
+def _commercial_table(doc, block, labels, accent, design=None):
     table = doc.add_table(rows=1, cols=len(block["columns"]))
     table.alignment, table.autofit = WD_TABLE_ALIGNMENT.CENTER, False
-    width = 174 / len(block["columns"])
+    width = ((doc.sections[0].page_width.mm - doc.sections[0].left_margin.mm * 2) if design else 174) / len(block["columns"])
     for column in table.columns:
         column.width = Mm(width)
     properties = table._tbl.tblPr
@@ -667,9 +724,10 @@ def _commercial_table(doc, block, labels, accent):
     for cell, title in zip(table.rows[0].cells, block["columns"], strict=True):
         cell.width, cell.vertical_alignment = Mm(width), WD_CELL_VERTICAL_ALIGNMENT.CENTER
         cell.text = title
-        cell._tc.get_or_add_tcPr().append(_xml("w:shd", **{"w:fill": accent}))
+        fill, foreground = _design_table_colors(design, accent)
+        cell._tc.get_or_add_tcPr().append(_xml("w:shd", **{"w:fill": fill}))
         for run in cell.paragraphs[0].runs:
-            run.bold, run.font.color.rgb = True, RGBColor(255, 255, 255)
+            run.bold, run.font.color.rgb = True, RGBColor.from_string(foreground)
     for row_index, content in enumerate(block["rows"]):
         row = table.add_row()
         # Keep short rows intact, but let long legitimate deliverables flow
@@ -777,13 +835,17 @@ def _commercial_block_caption(block):
     return "Таблица сведений"
 
 
-def _render_commercial(doc, commercial, accent):
+def _render_commercial(doc, commercial, accent, design=None):
     labels = _commercial_labels(commercial)
     bookmark_ids = {anchor: index for index, anchor in enumerate(labels, 1)}
     for section_index, section in enumerate(commercial["sections"], 1):
+        if design and design["pagination"] == "slides":
+            doc.add_page_break()
+        elif design and design["pagination"] == "appendices" and any(block["kind"] == "table" for block in section["blocks"]):
+            doc.add_page_break()
         heading = doc.add_paragraph(style="Heading 1")
         end = _bookmark(heading, section["anchor"], bookmark_ids[section["anchor"]])
-        heading.add_run(f"{section_index}. {section['title']}")
+        heading.add_run(section["title"] if design else f"{section_index}. {section['title']}")
         end()
         for question in commercial["unresolved"]:
             if question["section"] == section["anchor"]:
@@ -793,8 +855,9 @@ def _render_commercial(doc, commercial, accent):
             ordinal = f"{section_index}.{block_index}"
             paragraph = doc.add_paragraph(style="Heading 2" if block.get("style") == "subheading" and block["kind"] == "paragraph" else None)
             end = _bookmark(paragraph, block["anchor"], bookmark_ids[block["anchor"]])
-            prefix = paragraph.add_run(ordinal + ". ")
-            prefix.bold = block["kind"] != "paragraph" or block.get("style") in ("lead", "subheading")
+            if not design:
+                prefix = paragraph.add_run(ordinal + ". ")
+                prefix.bold = block["kind"] != "paragraph" or block.get("style") in ("lead", "subheading")
             if block["kind"] == "paragraph":
                 _append_inlines(paragraph, block["content"], labels)
                 following = section["blocks"][block_index] if block_index < len(section["blocks"]) else None
@@ -811,7 +874,11 @@ def _render_commercial(doc, commercial, accent):
                         run.bold = True
                 end()
             else:
-                paragraph.add_run(_commercial_block_caption(block)).bold = True
+                if not design:
+                    paragraph.add_run(_commercial_block_caption(block)).bold = True
+                else:
+                    paragraph.paragraph_format.space_after = Pt(0)
+                    paragraph.add_run().font.size = Pt(2)
                 end()
                 paragraph.paragraph_format.keep_with_next = True
                 if block["kind"] == "list":
@@ -823,10 +890,60 @@ def _render_commercial(doc, commercial, accent):
                         numbering.append(_xml("w:numId", **{"w:val": num_id}))
                         item_paragraph._p.get_or_add_pPr().append(numbering)
                         _append_inlines(item_paragraph, item, labels)
-                elif _narrative_commercial_table(block, labels):
+                elif not design and _narrative_commercial_table(block, labels):
                     _commercial_narrative_records(doc, block, labels)
                 else:
-                    _commercial_table(doc, block, labels, accent)
+                    _commercial_table(doc, block, labels, accent, design)
+
+
+def _design_table_colors(design, accent):
+    if design:
+        return {
+            "gray": ("D6D6D6", "202020"),
+            "plain": ("F2F3F3", "202020"),
+            "outlined": ("F6F0FC", accent),
+        }.get(design["pricing"], (accent, "FFFFFF"))
+    return accent, "FFFFFF"
+
+
+def _brand_logo(parent, path, width, *, right=False):
+    if not path:
+        return
+    paragraph = parent.add_paragraph()
+    if right:
+        paragraph.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    paragraph.paragraph_format.space_after = Pt(8)
+    paragraph.add_run().add_picture(path, width=Mm(width))
+
+
+def _render_design_cover(doc, document, design, logo, logo_width, draft):
+    _brand_logo(doc, logo, logo_width)
+    if draft:
+        _paragraph(doc, "ЧЕРНОВИК ДЛЯ ПРОВЕРКИ", bold=True, keep=True)
+    accent = RGBColor.from_string(document["layout"]["accentColor"][1:])
+    if design["cover"] == "illustrated":
+        frame = doc.add_table(rows=1, cols=2)
+        frame.autofit = False
+        frame.columns[0].width, frame.columns[1].width = Mm(147), Mm(114)
+        text, art = frame.rows[0].cells
+        text.width, art.width = Mm(147), Mm(114)
+        header = text.paragraphs[0]
+        header.paragraph_format.space_before = Pt(34)
+        header.add_run(document["recipient"]["name"]).bold = True
+        title = text.add_paragraph(document["title"], style="Title")
+        art.paragraphs[0].add_run().add_picture(_design_image(design["coverArt"]), width=Mm(100))
+    else:
+        header = _paragraph(doc, document["recipient"]["name"], bold=True, keep=True)
+        header.paragraph_format.space_before = Pt(38)
+        _paragraph(doc, design.get("heading", "Коммерческое предложение"), keep=True)
+        title = _paragraph(doc, document["title"], style="Title")
+    for run in title.runs:
+        run.font.color.rgb = accent
+        run.font.size = Pt(25 if len(document["title"]) <= 180 else 19)
+    _paragraph(doc, document["documentDate"][:4], bold=True)
+    if design["cover"] == "ribbon":
+        _brand_logo(doc, _design_image(design["coverArt"]), 168)
+    doc.add_page_break()
 
 
 def _render_working_docx(document: dict, output: Path) -> None:
@@ -890,20 +1007,26 @@ def render_docx(document: dict, output: Path, assets: dict[str, Path]) -> None:
         return
     doc = Document()
     compact = document["layout"]["style"] == "compact"
+    design = _template_design(document["layout"])
+    landscape = bool(design and design["paper"] == "landscape")
     section = doc.sections[0]
-    section.page_width, section.page_height = Mm(210), Mm(297)
+    if landscape:
+        section.orientation = WD_ORIENT.LANDSCAPE
+    section.page_width, section.page_height = (Mm(297), Mm(210)) if landscape else (Mm(210), Mm(297))
     section.top_margin = section.bottom_margin = Mm(18 if compact else 20)
     section.left_margin = section.right_margin = Mm(18)
-    section.header_distance = section.footer_distance = Mm(9)
+    section.header_distance = section.footer_distance = Mm(7 if design else 9)
+    if design and design.get("footer") == "band":
+        section.bottom_margin = Mm(29)
     normal = doc.styles["Normal"]
-    normal.font.name, normal.font.size = PROPOSAL_FONT, Pt(11)
+    normal.font.name, normal.font.size = PROPOSAL_FONT, Pt(design.get("fontSize", 11) if design else 11)
     normal.paragraph_format.space_after = Pt(5 if compact else 7)
     normal.paragraph_format.line_spacing = 1.08
     normal.paragraph_format.widow_control = True
     for name, size in (("Title", 20), ("Heading 1", 13), ("Heading 2", 11)):
         style = doc.styles[name]
         style.font.name, style.font.size = PROPOSAL_FONT, Pt(size)
-        style.font.color.rgb = RGBColor(0, 0, 0) if document["schemaVersion"] == 2 else RGBColor.from_string(document["layout"]["accentColor"][1:])
+        style.font.color.rgb = RGBColor(0, 0, 0) if document["schemaVersion"] == 2 and not design else RGBColor.from_string(document["layout"]["accentColor"][1:])
         style.paragraph_format.keep_with_next = True
         if name == "Title":
             style.font.color.rgb = RGBColor(0, 0, 0)
@@ -917,16 +1040,29 @@ def render_docx(document: dict, output: Path, assets: dict[str, Path]) -> None:
     footer = section.footer.paragraphs[0]
     footer.alignment = WD_ALIGN_PARAGRAPH.RIGHT
     footer.paragraph_format.space_after = Pt(0)
-    review_draft = document["schemaVersion"] == 2 and document["commercial"]["mode"] == "review-draft"
+    review_draft = (document["layout"]["design"]["mode"] == "review-draft" if design else
+                    document["schemaVersion"] == 2 and document["commercial"]["mode"] == "review-draft")
+    accent = document["layout"]["accentColor"][1:]
+    header_fill, header_text = _design_table_colors(design, accent)
+    if design and design.get("footer"):
+        border = _xml("w:pBdr")
+        border.append(_xml("w:top", **{"w:val": "single", "w:sz": "7", "w:space": "3", "w:color": accent}))
+        footer._p.get_or_add_pPr().append(border)
+        if design.get("footerArt"):
+            footer.add_run().add_picture(_design_image(design["footerArt"]), width=Mm(39))
+            footer.add_run("\n")
     if review_draft:
         footer.add_run("ЧЕРНОВИК ДЛЯ ПРОВЕРКИ\n").bold = True
     if document["layout"]["footer"]:
         footer.add_run(document["layout"]["footer"] + "\n")
-    footer.add_run("Страница ")
-    footer._p.append(_xml("w:fldSimple", **{"w:instr": "PAGE"}))
+    if not design or design.get("pageNumbers", True):
+        footer.add_run("Страница ")
+        footer._p.append(_xml("w:fldSimple", **{"w:instr": "PAGE"}))
     for run in footer.runs:
         run.font.size = Pt(9)
     logo = document["layout"].get("logo")
+    logo_path = None
+    logo_width = 42
     if logo:
         source = assets[logo["sha256"]]
         with Image.open(source) as original:
@@ -944,26 +1080,47 @@ def render_docx(document: dict, output: Path, assets: dict[str, Path]) -> None:
             clean_path = output.parent / "logo-clean.png"
             clean.save(clean_path, format="PNG")
         logo_width = min(40, 20 * clean.width / clean.height)
-        doc.add_picture(str(clean_path), width=Mm(logo_width))
+        logo_path = str(clean_path)
+    elif design and design.get("logo"):
+        logo_path = _design_image(design["logo"])
+        logo_width = {"sbk-logo.png": 79, "fbk-logo.png": 50, "teslatel-logo.png": 72, "strive-logo.png": 36}[design["logo"]]
+    if design and design.get("cover"):
+        _render_design_cover(doc, document, design, logo_path, logo_width, review_draft)
+    _brand_logo(doc, logo_path, logo_width, right=bool(design and design.get("footer") == "band"))
     show = document["layout"]["show"]
     _paragraph(doc, _party_text(document["issuer"], show), bold=True, keep=True)
     if review_draft:
         _paragraph(doc, "ЧЕРНОВИК ДЛЯ ПРОВЕРКИ", bold=True, keep=True)
-    _paragraph(doc, "Коммерческое предложение", style="Title")
+    heading = _paragraph(doc, design.get("heading", "Коммерческое предложение") if design else "Коммерческое предложение", style="Title")
+    if design and design["titleAlign"] == "center":
+        heading.alignment = WD_ALIGN_PARAGRAPH.CENTER
     _paragraph(
         doc, f"№ {document['number']} от {document['documentDate']} · Редакция {document['revision']}", keep=True
     )
     _paragraph(doc, document["title"], bold=True, keep=True)
-    _paragraph(doc, "Заказчик: " + _party_text(document["recipient"], show))
+    recipient = _paragraph(doc, "Заказчик: " + _party_text(document["recipient"], show))
+    if design:
+        recipient.alignment = WD_ALIGN_PARAGRAPH.RIGHT
     addressee = document["addressee"]
     if any(addressee.values()):
-        _paragraph(doc, "Адресат: " + ", ".join(value for value in addressee.values() if value))
+        addressee_paragraph = _paragraph(doc, "Адресат: " + ", ".join(value for value in addressee.values() if value))
+        if design:
+            addressee_paragraph.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    if design and document["layout"]["design"]["letter"]:
+        _paragraph(doc, document["layout"]["design"]["letter"])
     if document["schemaVersion"] == 1 and document["terms"]["introduction"]:
         _paragraph(doc, document["terms"]["introduction"])
+    if design and design["pagination"] in ("slides", "specification"):
+        doc.add_page_break()
+        if design["pagination"] == "specification" and design["pricing"] != "plain":
+            _paragraph(doc, "Приложение 1", keep=True)
+        table_title = ("Стоимость и сроки выполнения работ" if landscape else
+                       "Коммерческие условия" if design["pricing"] == "plain" else "Спецификация")
+        _paragraph(doc, table_title, style="Heading 1")
     table = doc.add_table(rows=1, cols=5)
     table.alignment = WD_TABLE_ALIGNMENT.CENTER
     table.autofit = False
-    widths = [12, 69, 21, 35, 37]
+    widths = [13, 113, 35, 47, 53] if landscape else [12, 69, 21, 35, 37]
     for column, width in zip(table.columns, widths, strict=True):
         column.width = Mm(width)
     table._tbl.tblPr.append(_xml("w:tblLayout", **{"w:type": "fixed"}))
@@ -971,13 +1128,19 @@ def render_docx(document: dict, output: Path, assets: dict[str, Path]) -> None:
     for side in ("top", "left", "bottom", "right"):
         margins.append(_xml(f"w:{side}", **{"w:w": "75", "w:type": "dxa"}))
     table._tbl.tblPr.append(margins)
+    if design:
+        borders = _xml("w:tblBorders")
+        for side in ("top", "left", "bottom", "right", "insideH", "insideV"):
+            borders.append(_xml(f"w:{side}", **{"w:val": "single", "w:sz": "4", "w:color": "777777" if design["pricing"] == "gray" else "CDD5DC"}))
+        table._tbl.tblPr.insert_element_before(borders, "w:tblLayout", "w:tblCellMar")
     table.rows[0]._tr.get_or_add_trPr().append(_xml("w:tblHeader"))
-    for cell, title in zip(table.rows[0].cells, ["№", "Наименование", "Кол-во", "Цена, ₽", "Сумма, ₽"], strict=True):
+    for cell, width, title in zip(table.rows[0].cells, widths, ["№", "Наименование", "Кол-во", "Цена, ₽", "Сумма, ₽"], strict=True):
+        cell.width = Mm(width)
         cell.text = title
-        cell._tc.get_or_add_tcPr().append(_xml("w:shd", **{"w:fill": document["layout"]["accentColor"][1:]}))
+        cell._tc.get_or_add_tcPr().append(_xml("w:shd", **{"w:fill": header_fill}))
         for run in cell.paragraphs[0].runs:
             run.bold = True
-            run.font.color.rgb = RGBColor(255, 255, 255)
+            run.font.color.rgb = RGBColor.from_string(header_text)
     for index, line in enumerate(document["lines"], 1):
         row = table.add_row()
         tax_info = _tax_label(line["tax"]) + (
@@ -1016,14 +1179,20 @@ def render_docx(document: dict, output: Path, assets: dict[str, Path]) -> None:
             else f": {_money(group['grossMinor'])} ₽"
         )
         _paragraph(doc, _tax_label(group["tax"]) + suffix, keep=True)
-    _paragraph(doc, f"Итого к оплате: {_money(document['totals']['grossMinor'])} ₽", bold=True)
+    total = _paragraph(doc, f"Итого к оплате: {_money(document['totals']['grossMinor'])} ₽", bold=True)
+    if design:
+        total.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+        if design["pricing"] == "blue":
+            total._p.get_or_add_pPr().append(_xml("w:shd", **{"w:fill": accent}))
+            for run in total.runs:
+                run.font.color.rgb = RGBColor(255, 255, 255)
     if document["schemaVersion"] == 1:
         for label, key in (("Сроки работ и поставки", "delivery"), ("Условия оплаты", "payment")):
             if document["terms"][key]:
                 _paragraph(doc, label, style="Heading 1")
                 _paragraph(doc, document["terms"][key])
     else:
-        _render_commercial(doc, document["commercial"], document["layout"]["accentColor"][1:])
+        _render_commercial(doc, document["commercial"], accent, design)
     _paragraph(doc, "Предложение действительно до " + document["validUntil"])
     if document["schemaVersion"] == 1 and document["terms"]["conclusion"]:
         _paragraph(doc, document["terms"]["conclusion"])

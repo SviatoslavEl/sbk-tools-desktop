@@ -34,6 +34,8 @@ export interface IntelligenceAnalysisDiagnostics {
   requestBodyBytes: number;
   /** Explicitly sent 0 for Ollama; omitted provider option is represented by null. */
   sentTemperature: 0 | null;
+  /** Declared typed-fact route options, not independently verified model limits. */
+  sentFactOptions?: { temperature: 0; num_ctx: 16384; num_predict: 4096; repeat_last_n: 512; repeat_penalty: 1.1 };
 }
 export interface IntelligenceAnalysisResult { text: string; model: string; metrics?: IntelligenceAnalysisMetrics; diagnostics?: IntelligenceAnalysisDiagnostics; }
 
@@ -119,4 +121,18 @@ export async function runIntelligenceAnalysis(
 export async function cancelIntelligenceRequest(requestId: string): Promise<void> {
   requireDesktop();
   return invoke<void>("cancel_intelligence_request", { requestId });
+}
+
+/** Only the new fact route changes generation parameters. Other protocols use
+ * their existing transport with an explicitly UNKNOWN output/context budget. */
+export async function runContractFactAnalysis(profile: ConnectionProfile, prompt: string, apiKey: string | undefined,
+  requestId: ReturnType<typeof crypto.randomUUID>, responseSchema: Record<string, unknown>): Promise<IntelligenceAnalysisResult> {
+  if (profile.protocol !== 'ollama') return runIntelligenceAnalysis(profile, prompt, apiKey, requestId, responseSchema);
+  validateConnectionProfile(profile, true); requireDesktop();
+  if (!prompt.trim() || new TextEncoder().encode(prompt).byteLength > intelligenceTransportLimitBytes) throw new Error('Текст запроса фактов отсутствует или превышает 2 МиБ.');
+  if (profile.outputMode === 'schema' && (responseSchema.type !== 'object' || new TextEncoder().encode(JSON.stringify(responseSchema)).byteLength > intelligenceSchemaLimitBytes)) throw new Error('Некорректная или слишком большая схема фактов.');
+  return invoke<IntelligenceAnalysisResult>('run_contract_fact_analysis', {
+    profile: publicConnectionProfile(profile), prompt, apiKey: apiKey || null, requestId,
+    ...(profile.outputMode === 'schema' ? { responseSchema } : {}),
+  });
 }

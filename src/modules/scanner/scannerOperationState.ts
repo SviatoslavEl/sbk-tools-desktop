@@ -1,6 +1,6 @@
 import { useState } from "react";
 
-export type ScannerWorkspaceMode = "document" | "merge";
+export type ScannerWorkspaceMode = "document" | "merge" | "convert";
 export interface ScannerProgress { stage: string; currentPage: number; totalPages: number; percent: number }
 export interface ScannerOperationUi {
   resultPath: string;
@@ -13,7 +13,7 @@ export type ScannerOperationStates = Record<ScannerWorkspaceMode, ScannerOperati
 
 export function emptyScannerOperationStates(): ScannerOperationStates {
   const empty = (): ScannerOperationUi => ({ resultPath: "", resultKind: "", progress: null, error: "", warnings: [] });
-  return { document: empty(), merge: empty() };
+  return { document: empty(), merge: empty(), convert: empty() };
 }
 
 export function updateScannerOperationState(states: ScannerOperationStates, mode: ScannerWorkspaceMode, patch: Partial<ScannerOperationUi>): ScannerOperationStates {

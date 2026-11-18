@@ -48,7 +48,7 @@ export function ProposalWorkingHost({ seed, root, taskKey, stale = false, onClos
   return <div data-workspace-viewer-allowed data-workspace-managed-disabled="true">
     {failure && <p className="notice warning" role="alert">Не удалось проверить доступ: {failure} Текст оставлен в окне. <button type="button" onClick={() => setRefresh(value => value + 1)}>Проверить доступ снова</button></p>}
     {!native && !failure && <p role="status">Проверяем папку и текущий доступ…</p>}
-    <ProposalWorkingWorkspace key={seed.sessionKey} initialDocument={seed.document} initialStorageToken={seed.storageToken} initialRecovery={seed.recovery}
+    <ProposalWorkingWorkspace key={seed.sessionKey} initialDocument={seed.document} initialHistoryJson={seed.historyJson} initialStorageToken={seed.storageToken} initialRecovery={seed.recovery}
       sessionKey={seed.sessionKey} context={context} services={services} onClose={onClose} />
   </div>;
 }

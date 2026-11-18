@@ -126,6 +126,31 @@ def commercial_document_fixture(mode="final"):
     return document
 
 
+def test_custom_template_layout_controls_export(tmp_path):
+    document = commercial_document_fixture()
+    document["layout"]["design"] = {"id": "custom", "letter": "Вступление шаблона", "mode": "final", "options": {
+        "base": "starter-company-sbk", "paper": "landscape", "titleAlign": "center",
+        "pricing": "gray", "pagination": "appendices", "heading": "Предложение услуг", "fontSize": 13,
+        "brand": False, "cover": False, "footerArt": False, "pageNumbers": False,
+    }}
+    document["layout"]["footer"] = "Типовой колонтитул"
+    output = tmp_path / "custom.docx"
+    render_docx(document, output, {})
+    doc = Document(output)
+    assert doc.sections[0].page_width.mm > doc.sections[0].page_height.mm
+    assert doc.styles["Normal"].font.size.pt == 13
+    assert [heading.text for heading in doc.paragraphs if heading.style.name == "Title"] == ["Предложение услуг"]
+    assert any(paragraph.text == "Вступление шаблона" for paragraph in doc.paragraphs)
+    assert "Типовой колонтитул" in doc.sections[0].footer.paragraphs[0].text
+    assert not doc.sections[0].footer.paragraphs[0]._p.xpath("w:fldSimple")
+    assert not doc.inline_shapes
+
+    options = document["layout"]["design"]["options"]
+    options["base"] = "../untrusted"
+    with pytest.raises(ValueError, match="параметры пользовательского шаблона"):
+        validate_document(document)
+
+
 def test_public_v2_has_real_sections_lists_tables_bookmarks_without_legacy_terms(tmp_path):
     from lxml import etree
     document = commercial_document_fixture()

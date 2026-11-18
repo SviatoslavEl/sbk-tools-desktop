@@ -1,3 +1,5 @@
+import type { ScannerWorkspaceMode } from "./scannerOperationState";
+
 export interface IntelligenceOcrRequest { id: string; inputPath: string }
 export interface IntelligenceOcrReturn { id: string; outputPath: string; sha256: string }
 export interface IntelligenceOcrSource { inputPath: string; sourceGeneration: number; sourceFingerprint?: string }
@@ -16,7 +18,7 @@ export interface IntelligenceOcrSaveFacts {
   ocrText: string;
 }
 export interface IntelligenceOcrCurrent {
-  workspaceMode: "document" | "merge";
+  workspaceMode: ScannerWorkspaceMode;
   resultKind: string;
   resultPath: string;
   settingsKey: string;

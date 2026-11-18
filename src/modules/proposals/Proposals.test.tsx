@@ -6,7 +6,7 @@ import { ConfirmDialog } from '../../components/Dialog';
 import { Archive } from '../archive/Archive';
 import { createProposal } from './defaults';
 import { resetProposalDraftPersistenceForTests } from './proposalDraftPersistence';
-import { buildProposalPublic, proposalExportAssets } from './exportPublic';
+import { buildProposalDocumentPublic, buildProposalPublic, proposalExportAssets } from './exportPublic';
 import type { ProposalData, ProposalRenderResult, ProposalTemplateData } from './types';
 import type { StoredRecord } from '../../lib/storage';
 import { createTaskDocumentOrigin, projectTaskDocumentSession, taskDocumentDraftKey } from '../intelligence/taskDocumentSession';
@@ -15,6 +15,9 @@ import { CommercialProposalEditor } from './CommercialProposalEditor';
 import { ProposalFinalReview } from './ProposalFinalReview';
 import { commercialFingerprint } from './commercialDocument';
 import { ProposalAnalysisProvenance } from '../intelligence/ProposalAnalysisProvenance';
+import { ProposalStarterFields, ProposalStarterPicker } from './ProposalStarterFields';
+import { ProposalTemplateLibrary } from './ProposalTemplateLibrary';
+import { defaultTemplateLayout } from './templateDefinition';
 
 // Real component callbacks/effects with persistent hook slots. DOM layout and
 // child components are covered separately; storage and native rendering are boundaries.
@@ -370,6 +373,98 @@ describe('existing proposal editor as a single AI-task receiver', () => {
     runtime.editor = false; runtime.getWorkspace.mockResolvedValue({ root: '/tmp/qa-workspace', editor: false }); await taskSeed();
     await edit('proposal-title', 'Локальная правка'); await vi.advanceTimersByTimeAsync(1000); await flush(); await click('5. Проверка и экспорт'); await click('Скачать PDF');
     expect(projectTaskDocumentSession(last().session).exportedCurrent).toBe(true); expect(runtime.store.save).not.toHaveBeenCalled(); expect(runtime.saveDraft).not.toHaveBeenCalled();
+  });
+});
+
+describe('starter forms in new proposals', () => {
+  it('saves a new template edition and keeps the filled proposal bound to its original form', async () => {
+    const original: ProposalTemplateData = {
+      ...proposal().template, kind: 'template', id: 'user-template-first', familyId: 'user-template-family', name: 'Лист услуг',
+      form: { version: 1, company: 'Тестовая компания', layout: { ...defaultTemplateLayout(), paper: 'landscape', heading: 'Предложение услуг', pageNumbers: false },
+        fields: [{ id: 'f-required', label: 'Этап', input: 'short', required: true },
+          { id: 'f-statement', label: 'Общие сведения', input: 'fixed', defaultValue: 'Общий текст шаблона' },
+          { id: 'f-table', label: 'Таблица объёма', columns: ['Работы', 'Количество'] }] },
+    };
+    runtime.store.records = [{ ...record(original.id, proposal()), payload: original }];
+    runtime.listRecords.mockResolvedValue(runtime.store.records);
+    render(); await flush(); await click('Шаблоны КП');
+    const library = () => nodes().find(node => node.type === ProposalTemplateLibrary) as unknown as ReactElement<Parameters<typeof ProposalTemplateLibrary>[0]>;
+    expect(library()).toBeDefined();
+    const edited = { ...structuredClone(original), id: 'user-template-second', name: 'Услуги — редакция' };
+    edited.form!.fields.reverse();
+    await library().props.onSave(edited); await flush();
+    expect(runtime.store.save).toHaveBeenCalledWith(edited.name, { ...edited, version: 2 }, edited.id);
+    library().props.onUse(original); await flush();
+    const fields = () => nodes().find(node => node.type === ProposalStarterFields) as unknown as ReactElement<Parameters<typeof ProposalStarterFields>[0]>;
+    expect(fields().props.template).toEqual(original);
+    const data = { ...proposal(), template: original, starterForm: fields().props.value };
+    await expect(buildProposalDocumentPublic(data, { mode: 'final' })).rejects.toThrow('Этап');
+    fields().props.onChange({ ...fields().props.value, values: { 'f-required': 'Тестовый этап', 'f-table': [{ id: 'test-row', cells: ['Работы', '2'] }] } });
+    await flush(); await click('Сохранить КП');
+    const saved = runtime.store.save.mock.lastCall![1] as ProposalData;
+    expect(saved.issuer.name).toBe('Тестовая компания');
+    expect(saved.template.form!.fields[0].label).toBe('Этап');
+    const exported = await buildProposalDocumentPublic({ ...data, starterForm: saved.starterForm }, { mode: 'final' });
+    expect(exported.layout.design).toMatchObject({ id: 'custom', options: { paper: 'landscape', pageNumbers: false, heading: 'Предложение услуг' } });
+    if (exported.schemaVersion !== 2) throw new Error('Ожидался документ с разделами');
+    expect(exported.commercial.sections.slice(0, 3).map(section => section.title)).toEqual(['Этап', 'Общие сведения', 'Таблица объёма']);
+    expect(JSON.stringify(exported)).not.toContain(original.familyId);
+  });
+  it('offers one blank firm template per legal entity and recommends the selected company', () => {
+    const issuer = { ...createProposal().issuer, name: 'ООО «ФБК Консалтинг»' };
+    const view = nodes(ProposalStarterPicker({ issuer, disabled: false, onChange: vi.fn() }));
+    expect(view.filter(node => node.type === 'option').map(node => node.props.value)).toEqual([
+      '', 'starter-company-fbk', 'starter-company-sbk', 'starter-company-teslatel', 'starter-company-strive',
+    ]);
+  });
+  it('keeps the chosen table through a save and reopening, and exports its contents without private notes', async () => {
+    const picker = () => nodes().find(node => node.type === ProposalStarterPicker) as unknown as ReactElement<Parameters<typeof ProposalStarterPicker>[0]>;
+    const fields = () => nodes().find(node => node.type === ProposalStarterFields) as unknown as ReactElement<Parameters<typeof ProposalStarterFields>[0]>;
+    render();
+    await flush();
+    await click('Новое КП');
+    picker().props.onChange('starter-company-sbk');
+    await flush();
+    expect(button('Документ').props).toHaveProperty('aria-current', 'step');
+    const sample = { id: 'private-test-row', cells: ['Техническая документация', 'Описание интерфейсов', '30 дней', 'Согласованный комплект'] };
+    const blank = { id: 'empty-test-row', cells: ['', '', '', ''] };
+    fields().props.onChange({ ...fields().props.value, values: { specification: [sample, blank] } });
+    await flush();
+    picker().props.onChange('starter-company-fbk');
+    await flush();
+    expect(picker().props.value?.id).toBe('starter-company-sbk');
+    await click('Сохранить КП');
+    const [_, stored, id] = runtime.store.save.mock.lastCall! as [string, ProposalData, string];
+    runtime.store.records = [record(id, stored)];
+    await click('К списку');
+    render({ openRecordId: id });
+    await flush();
+    expect(button('Документ').props).toHaveProperty('aria-current', 'step');
+    expect(fields().props.value.values.specification).toEqual([sample, blank]);
+
+    const filled = { ...proposal(), template: stored.template, starterForm: stored.starterForm };
+    const document = await buildProposalDocumentPublic(filled, { mode: 'final' });
+    expect(document.schemaVersion).toBe(2);
+    expect(document.layout.design).toEqual({ id: 'starter-company-sbk', letter: '', mode: 'final' });
+    if (document.schemaVersion !== 2) throw new Error('Ожидался документ с таблицами');
+    expect(document.commercial.sections[0]).toMatchObject({ title: 'Приложение 1. Детализация предложения',
+      blocks: [{ kind: 'table', rows: [sample.cells.map(text => [{ kind: 'text', text }])] }] });
+    expect(JSON.stringify(document)).not.toMatch(/private-test-row|СЕКРЕТ/);
+  });
+  it('reopens and exports previously saved service forms by their original IDs', async () => {
+    const data = proposal();
+    const fields = { version: 1 as const, id: 'starter-teslatel-server', values: {
+      parts: [{ id: 'part-1', cells: ['Вариант 1', 'ART-001', 'Сетевой адаптер', '2'] }],
+    } };
+    data.starterForm = fields;
+    runtime.store.records = [record('old-kp', data)];
+    render({ openRecordId: 'old-kp' });
+    await flush();
+    expect(nodes().find(node => node.type === ProposalStarterFields)?.props.value).toEqual(fields);
+    expect(runtime.store.save).not.toHaveBeenCalled();
+    const publicDoc = await buildProposalDocumentPublic(data);
+    expect(publicDoc.layout.design?.id).toBe(fields.id);
+    expect(JSON.stringify(publicDoc)).toContain('ART-001');
   });
 });
 

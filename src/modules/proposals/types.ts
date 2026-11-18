@@ -2,6 +2,9 @@ import type { AttachmentInfo } from '../../lib/storage';
 import type { ProposalSourceFinancials } from './sourcePricing';
 import type { ProposalCommercialDocumentV1 } from './commercialDocument';
 import type { ProposalQuoteProvenance } from '../intelligence/proposalQuotePreparation';
+import type { StarterFormValues } from './starterForms';
+import type { StarterDesignId } from './starterDesigns';
+import type { CustomProposalForm, ProposalTemplateLayout } from './templateDefinition';
 
 export type DecimalText = string;
 export type ProposalStatus = 'draft' | 'ready' | 'sent' | 'accepted' | 'rejected';
@@ -31,6 +34,8 @@ export interface ProposalTemplate {
   show: { address: boolean; requisites: boolean; contact: boolean; signer: boolean };
   introduction: string; conclusion: string; footer: string;
   deliveryTerms?: string; paymentTerms?: string;
+  familyId?: string;
+  form?: CustomProposalForm;
 }
 export interface ProposalTemplateData extends ProposalTemplate { kind: 'template' }
 export interface ProposalData {
@@ -41,6 +46,8 @@ export interface ProposalData {
   lines: ProposalLine[]; deliveryTerms: string; paymentTerms: string;
   introduction: string; conclusion: string; attachments: AttachmentInfo[];
   template: ProposalTemplate; source?: ProposalSource; internalNote: string;
+  /** Optional fields and tables of a manually selected starter form. */
+  starterForm?: StarterFormValues;
   /** Private source candidates and explicit reviewer decision; never exported. */
   sourceFinancials?: ProposalSourceFinancials;
   /** Private historical model-selected quote receipt, not semantic approval or
@@ -75,6 +82,8 @@ export interface PublicTerms { delivery: string; payment: string; introduction: 
 export interface PublicLayout {
   style: 'standard' | 'compact'; accentColor: string; logo?: PublicAsset;
   show: ProposalTemplate['show']; footer: string;
+  design?: { id: StarterDesignId; letter: string; mode: 'review-draft' | 'final' }
+    | { id: 'custom'; letter: string; mode: 'review-draft' | 'final'; options: ProposalTemplateLayout };
 }
 export interface ProposalPublicDocument {
   schemaVersion: 1; number: string; revision: number; documentDate: string;

@@ -7,6 +7,7 @@ import { projectReadiness } from './commercialDecisions';
 import { assertPublicDocumentBudget, projectCommercialBodyPublic, projectCommercialReviewPublic, type AnyProposalPublicDocument, type ProposalPublicDocumentV2 } from './commercialPublic';
 import { hasFreshCommercialScopeSnapshot } from './commercialScopeSnapshot';
 import { validProposalQuoteProvenance } from '../intelligence/proposalQuotePreparation';
+import { getStarterForm, starterFormBody, starterFormIssues } from './starterForms';
 import type { PartySnapshot, ProposalContact, ProposalData, ProposalIssue, ProposalPublicDocument, PublicAsset } from './types';
 
 function validDate(value: string): boolean {
@@ -98,6 +99,10 @@ export function validateProposal(data: ProposalData, options: ProposalValidation
   const publicConclusion = aggregateScopeConclusion(data);
   if (publicConclusion !== undefined && textLength(publicConclusion) > 20000) issue('conclusion', 3, 'Полный состав работ вместе с заключением превышает 20 000 символов клиентского раздела. Сократите или разделите текст вручную без потери условий; экспорт не усекает его.');
   for (const question of proposalPrivateSourceQuestions(data)) issue('sourceQuestions', 3, question.message, 'warning');
+  if (data.starterForm !== undefined) {
+    if (data.commercialDocument !== undefined) issue('starterForm', 3, 'Форма шаблона и документ из источника должны находиться в отдельных КП.');
+    issues.push(...starterFormIssues(data.starterForm, data.template));
+  }
   return issues;
 }
 function publicParty(party: PartySnapshot): ProposalPublicDocument['issuer'] {
@@ -107,6 +112,7 @@ function publicContact(contact: ProposalContact): ProposalContact { return { ful
 function publicAsset(asset: AttachmentInfo): PublicAsset { return { fileName: asset.fileName, sizeBytes: asset.sizeBytes, sha256: asset.sha256.toLowerCase(), mimeType: asset.mimeType }; }
 export function buildProposalPublic(data: ProposalData, options: { allowZero?: boolean } = {}): ProposalPublicDocument {
   if (data.commercialDocument !== undefined) throw new Error('Условия находятся в структурированном документе. Используйте его проверяемую выгрузку; старые текстовые поля не подменяют документ.');
+  if (data.starterForm !== undefined) throw new Error('Для формы шаблона используйте выгрузку с разделами и таблицами.');
   return buildPublicCommon(data, options);
 }
 function buildPublicCommon(data: ProposalData, options: { allowZero?: boolean } = {}): ProposalPublicDocument {
@@ -135,7 +141,29 @@ export async function buildProposalDocumentPublic(data: ProposalData, options: {
   // price or decisions between readiness and projection.
   const captured = structuredClone(data);
   assertProposalAnalysisProvenance(captured);
-  if (captured.commercialDocument === undefined) return buildProposalPublic(captured, options);
+  if (captured.commercialDocument === undefined) {
+    if (captured.starterForm === undefined) return buildProposalPublic(captured, options);
+    const common = buildPublicCommon(captured, options);
+    const body = starterFormBody(captured);
+    const mode = options.mode ?? 'review-draft';
+    const letter = captured.introduction.trim();
+    if (captured.template.form) {
+      const { base, paper, titleAlign, pricing, pagination, heading, fontSize, brand, cover, footerArt, pageNumbers } = captured.template.form.layout;
+      common.layout.design = { id: 'custom', letter, mode, options: {
+        ...(base && { base }), paper, titleAlign, pricing, pagination, heading, fontSize, brand, cover, footerArt, pageNumbers,
+      } };
+    } else {
+      common.layout.design = { id: getStarterForm(captured.starterForm.id)!.id, letter, mode };
+    }
+    common.terms.introduction = '';
+    if (!body.sections.length) return common;
+    const { schemaVersion: _version, terms: _legacyTerms, ...metadata } = common;
+    const { sections } = projectCommercialBodyPublic(body);
+    const result: ProposalPublicDocumentV2 = { ...metadata, schemaVersion: 2,
+      commercial: { version: 1, mode, sections, unresolved: [] } };
+    assertPublicDocumentBudget(result);
+    return result;
+  }
   const sourceErrors = await validateCommercialQuoteHashes(captured.commercialDocument);
   if (sourceErrors.some((entry) => entry.severity === 'error')) throw new Error(sourceErrors[0].message);
   const readiness = await projectReadiness(captured.commercialDocument, { pricing: captured });

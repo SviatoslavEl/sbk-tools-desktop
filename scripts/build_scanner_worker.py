@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import platform
 import shutil
 import subprocess
@@ -55,6 +56,7 @@ def main() -> None:
         "--onefile-cache-mode=temporary",
         f"--output-dir={output}", f"--output-filename={executable}",
         "--include-package=scandocument", "--include-package=PIL", "--include-package=numpy",
+        "--include-package=pi_heif",
         "--include-package=pypdf", "--include-package=pypdfium2", "--include-package=docx",
         "--include-module=reportlab.pdfgen.canvas", "--include-module=reportlab.pdfbase.pdfmetrics",
         "--include-module=reportlab.pdfbase.ttfonts",
@@ -78,6 +80,20 @@ def main() -> None:
     if staged_resources.exists():
         shutil.rmtree(staged_resources)
     shutil.copytree(resources, staged_resources)
+    heif_notice_paths = subprocess.check_output([
+        args.python, "-c",
+        "from importlib.metadata import distribution\n"
+        "package = distribution('pi-heif')\n"
+        "for entry in package.files:\n"
+        "    if entry.name in ('LICENSE.txt', 'LICENSES_bundled.txt') and entry.parent.name == 'licenses':\n"
+        "        print(package.locate_file(entry))\n",
+    ], encoding="utf-8", env={**os.environ, "PYTHONIOENCODING": "utf-8"}).splitlines()
+    if len(heif_notice_paths) != 2:
+        raise FileNotFoundError("Missing pi-heif license notices")
+    heif_licenses = staged_resources / "heif-licenses"
+    heif_licenses.mkdir()
+    for license_path in heif_notice_paths:
+        shutil.copy2(license_path, heif_licenses)
     print(destination)
 
 
