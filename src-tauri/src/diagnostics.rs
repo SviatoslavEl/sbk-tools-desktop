@@ -596,17 +596,16 @@ fn invalid_path() -> std::io::Error {
 }
 
 fn is_link(metadata: &fs::Metadata) -> bool {
-    if metadata.file_type().is_symlink() {
-        return true;
-    }
+    let is_symlink = metadata.file_type().is_symlink();
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
-        if metadata.file_attributes() & 0x400 != 0 {
-            return true;
-        }
+        is_symlink || metadata.file_attributes() & 0x400 != 0
     }
-    false
+    #[cfg(not(windows))]
+    {
+        is_symlink
+    }
 }
 
 fn regular_file_metadata(path: &Path) -> std::io::Result<fs::Metadata> {

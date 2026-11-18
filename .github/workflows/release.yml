@@ -75,7 +75,7 @@ jobs:
   build:
     needs: quality-gate
     env:
-      ARTIFACT_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('3.0.2-test.{0}', github.run_number) }}
+      ARTIFACT_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('3.0.3-test.{0}', github.run_number) }}
     strategy:
       fail-fast: false
       matrix:
@@ -230,19 +230,12 @@ jobs:
         if: runner.os == 'macOS' && (!startsWith(github.ref, 'refs/tags/v') || steps.apple_credentials.outputs.available != 'true')
         shell: bash
         run: npm run tauri build -- ${{ matrix.args }}
-      - name: Build and attach signed macOS release bundles
+      - name: Build signed macOS app
         if: runner.os == 'macOS' && startsWith(github.ref, 'refs/tags/v') && steps.apple_credentials.outputs.available == 'true'
-        uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1
+        shell: bash
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          APPLE_SIGNING_IDENTITY: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.APPLE_SIGNING_IDENTITY || '-' }}
-        with:
-          tagName: v__VERSION__
-          releaseName: СБК Инструменты v__VERSION__
-          releaseBody: Portable open-source desktop release for Windows x64 and macOS Apple Silicon.
-          releaseDraft: true
-          prerelease: false
-          args: ${{ matrix.args }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: npm run tauri build -- ${{ matrix.args }}
       - name: Build Windows application
         if: runner.os == 'Windows'
         shell: pwsh
@@ -501,7 +494,7 @@ jobs:
     runs-on: windows-latest
     env:
       TARGET: x86_64-pc-windows-msvc
-      ARTIFACT_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('3.0.2-test.{0}', github.run_number) }}
+      ARTIFACT_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('3.0.3-test.{0}', github.run_number) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
