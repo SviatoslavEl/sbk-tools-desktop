@@ -10,18 +10,19 @@ import tempfile
 from pathlib import Path
 
 
-VERSION = "26.2.5"
+VERSION = "26.2.5.2"
+ARCHIVE = f"https://downloadarchive.documentfoundation.org/libreoffice/old/{VERSION}"
 PACKAGES = {
     "aarch64-apple-darwin": (
-        f"https://download.documentfoundation.org/libreoffice/stable/{VERSION}/mac/aarch64/LibreOffice_{VERSION}_MacOS_aarch64.dmg",
+        f"{ARCHIVE}/mac/aarch64/LibreOffice_{VERSION}_MacOS_aarch64.dmg",
         "c99fb4fe574437fc4cb820a4ca15271bca325920861f7139858b36d7f9df78ad",
     ),
     "x86_64-apple-darwin": (
-        f"https://download.documentfoundation.org/libreoffice/stable/{VERSION}/mac/x86_64/LibreOffice_{VERSION}_MacOS_x86-64.dmg",
+        f"{ARCHIVE}/mac/x86_64/LibreOffice_{VERSION}_MacOS_x86-64.dmg",
         "e26180298685274b54aa7fe6e1101c65465a372f457a6748ebd642720811db36",
     ),
     "x86_64-pc-windows-msvc": (
-        f"https://download.documentfoundation.org/libreoffice/stable/{VERSION}/win/x86_64/LibreOffice_{VERSION}_Win_x86-64.msi",
+        f"{ARCHIVE}/win/x86_64/LibreOffice_{VERSION}_Win_x86-64.msi",
         "f15ba07bfcb0186986cf3171063506f5d207c11f8cc051ba0d135209e9e915f9",
     ),
 }
